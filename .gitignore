@@ -56,3 +56,6 @@ dkms.conf
 
 # Runtime data
 data/
+
+# Compiled Binary
+dht_crawler
