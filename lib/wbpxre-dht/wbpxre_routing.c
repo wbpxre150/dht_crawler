@@ -607,8 +607,8 @@ int wbpxre_routing_table_get_oldest_nodes(wbpxre_routing_table_t *table,
 
     pthread_rwlock_rdlock(&table->lock);
 
-    /* Collect all nodes (up to reasonable limit) */
-    int max_collect = table->node_count < 10000 ? table->node_count : 10000;
+    /* Collect all nodes (scale limit with table size, cap at 50000) */
+    int max_collect = table->node_count < 50000 ? table->node_count : 50000;
     wbpxre_routing_node_t **all_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_collect);
     if (!all_nodes) {
         pthread_rwlock_unlock(&table->lock);
@@ -711,8 +711,8 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
 
     pthread_rwlock_rdlock(&table->lock);
 
-    /* Collect all nodes (up to reasonable limit) */
-    int max_collect = table->node_count < 10000 ? table->node_count : 10000;
+    /* Collect all nodes (scale limit with table size, cap at 50000) */
+    int max_collect = table->node_count < 50000 ? table->node_count : 50000;
     node_distance_score_t *scored_nodes = malloc(sizeof(node_distance_score_t) * max_collect);
     if (!scored_nodes) {
         pthread_rwlock_unlock(&table->lock);
