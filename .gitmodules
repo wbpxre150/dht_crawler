@@ -1,0 +1,12 @@
+[submodule "lib/bencode-c"]
+	path = lib/bencode-c
+	url = https://github.com/skeeto/bencode-c.git
+[submodule "lib/cJSON"]
+	path = lib/cJSON
+	url = https://github.com/DaveGamble/cJSON.git
+[submodule "lib/civetweb"]
+	path = lib/civetweb
+	url = https://github.com/civetweb/civetweb.git
+[submodule "lib/libbloom"]
+	path = lib/libbloom
+	url = https://github.com/jvirkki/libbloom.git
