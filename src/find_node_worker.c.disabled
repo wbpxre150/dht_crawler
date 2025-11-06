@@ -1,0 +1,177 @@
+#include "find_node_worker.h"
+#include "dht_crawler.h"
+#include "shadow_routing_table.h"
+#include <dht.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+/* Worker thread function - processes a single discovered node */
+static void process_discovered_node(void *task, void *closure) {
+    discovered_node_t *node = (discovered_node_t *)task;
+    dht_manager_t *mgr = (dht_manager_t *)closure;
+
+    if (!node || !mgr) {
+        return;
+    }
+
+    /* Update statistics based on source */
+    switch (node->source) {
+        case SOURCE_QUERY_RESPONSE:
+            __atomic_add_fetch(&mgr->stats.nodes_from_queries, 1, __ATOMIC_RELAXED);
+            break;
+        case SOURCE_INCOMING_REQUEST:
+            __atomic_add_fetch(&mgr->stats.nodes_from_incoming, 1, __ATOMIC_RELAXED);
+            break;
+        case SOURCE_BOOTSTRAP:
+            __atomic_add_fetch(&mgr->stats.nodes_from_bootstrap, 1, __ATOMIC_RELAXED);
+            break;
+    }
+
+    /* Check if node is already in shadow table */
+    if (mgr->shadow_table) {
+        /* Try to add to shadow table - it will handle deduplication */
+        node_metadata_t metadata;
+        memcpy(metadata.id, node->node_id, 20);
+        memcpy(&metadata.addr, &node->addr, sizeof(struct sockaddr_storage));
+        metadata.addr_len = node->addr_len;
+        metadata.last_seen = node->discovered_at;
+        metadata.last_responded = 0;
+        metadata.bep51_support = false;
+        metadata.next_sample_time = 0;
+        metadata.samples_discovered = 0;
+        metadata.response_rate = 0.0;
+        metadata.queries_sent = 0;
+        metadata.responses_received = 0;
+
+        int added = shadow_table_upsert(mgr->shadow_table, &metadata);
+        if (added < 0) {
+            /* Already exists or table full, skip */
+            __atomic_add_fetch(&mgr->stats.nodes_deduped, 1, __ATOMIC_RELAXED);
+            free(node);
+            return;
+        }
+    }
+
+    /* BITMAGNET APPROACH: Ping FIRST, then let jech/dht add node on response
+     * When the node responds to ping, jech/dht will call new_node(confirm=2)
+     * which sets time=now and reply_time=now, making it immediately "good"
+     *
+     * This is the key difference from our old approach which inserted first (time=0)
+     * then pinged, leaving nodes in dubious state until response arrived */
+
+    /* 1. Send ping to verify node is alive */
+    char addr_str[INET_ADDRSTRLEN];
+    if (node->addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&node->addr;
+        inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str));
+    }
+
+    int ping_ret = dht_ping_node((struct sockaddr *)&node->addr, node->addr_len);
+    if (ping_ret < 0) {
+        log_msg(LOG_DEBUG, "Failed to send ping to discovered node %s", addr_str);
+        free(node);
+        return;
+    }
+
+    /* Log first few pings for debugging */
+    static int ping_count = 0;
+    if (ping_count++ < 20) {
+        log_msg(LOG_INFO, "WORKER: Sent ping to discovered node %s", addr_str);
+    }
+
+    /* DO NOT insert node into routing table yet - jech/dht will do it automatically
+     * when the ping response arrives, with confirm=2 which sets proper timestamps */
+
+    /* Send find_node query to discover more nodes
+     * This returns "nodes" field with ~8 nodes, which get extracted and queued */
+    unsigned char random_target[20];
+    if (dht_random_bytes(random_target, 20) > 0) {
+        int fn_ret = dht_find_node(random_target, (struct sockaddr *)&node->addr, node->addr_len);
+        if (fn_ret >= 0) {
+            __atomic_add_fetch(&mgr->stats.find_node_sent, 1, __ATOMIC_RELAXED);
+        } else {
+            __atomic_add_fetch(&mgr->stats.find_node_timeout, 1, __ATOMIC_RELAXED);
+        }
+    }
+
+    free(node);
+}
+
+/* Main worker loop that pulls from discovered_nodes queue */
+void find_node_worker_func(void *arg) {
+    dht_manager_t *mgr = (dht_manager_t *)arg;
+
+    log_msg(LOG_INFO, "Find node worker thread started");
+
+    while (mgr->app_ctx->running) {
+        discovered_node_t node;
+
+        /* Dequeue a discovered node (block for up to 1 second) */
+        int ret = discovered_nodes_dequeue(&mgr->discovered_nodes, &node, 1000);
+        if (ret != 0) {
+            continue; /* Timeout or error, retry */
+        }
+
+        /* Allocate task for worker pool */
+        discovered_node_t *task = malloc(sizeof(discovered_node_t));
+        if (!task) {
+            log_msg(LOG_ERROR, "Failed to allocate task memory");
+            continue;
+        }
+
+        memcpy(task, &node, sizeof(discovered_node_t));
+
+        /* Submit to worker pool */
+        if (worker_pool_submit(mgr->find_node_worker_pool, task) != 0) {
+            log_msg(LOG_WARN, "Worker pool queue full, dropping node");
+            free(task);
+        }
+    }
+
+    log_msg(LOG_INFO, "Find node worker thread stopped");
+}
+
+int find_node_worker_init(dht_manager_t *mgr, int num_workers) {
+    if (!mgr || num_workers <= 0) {
+        return -1;
+    }
+
+    /* Initialize worker pool with large queue for aggressive processing
+     * Queue size = 10000 (was 1000) to handle rapid node discovery */
+    mgr->find_node_worker_pool = worker_pool_init(num_workers, 10000,
+                                                  process_discovered_node, mgr);
+    if (!mgr->find_node_worker_pool) {
+        log_msg(LOG_ERROR, "Failed to initialize find_node worker pool");
+        return -1;
+    }
+
+    /* Start a single feeder thread that pulls from discovered_nodes queue */
+    uv_thread_t feeder_thread;
+    int rc = uv_thread_create(&feeder_thread, find_node_worker_func, mgr);
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "Failed to create find_node feeder thread");
+        worker_pool_shutdown(mgr->find_node_worker_pool);
+        worker_pool_cleanup(mgr->find_node_worker_pool);
+        mgr->find_node_worker_pool = NULL;
+        return -1;
+    }
+
+    /* Detach thread so it cleans up automatically */
+    uv_thread_detach(&feeder_thread);
+
+    log_msg(LOG_INFO, "Find node worker pool initialized with %d workers", num_workers);
+    return 0;
+}
+
+void find_node_worker_shutdown(dht_manager_t *mgr) {
+    if (!mgr || !mgr->find_node_worker_pool) {
+        return;
+    }
+
+    log_msg(LOG_INFO, "Shutting down find_node worker pool");
+    worker_pool_shutdown(mgr->find_node_worker_pool);
+    worker_pool_cleanup(mgr->find_node_worker_pool);
+    mgr->find_node_worker_pool = NULL;
+}
