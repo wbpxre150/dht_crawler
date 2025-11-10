@@ -145,6 +145,10 @@ typedef struct {
     pthread_rwlock_t lock;
     int node_count;
     int max_nodes;
+    /* Flat array for uniform iteration (eliminates BST traversal bias) */
+    wbpxre_routing_node_t **all_nodes;  /* Array of pointers to all nodes */
+    int all_nodes_capacity;              /* Capacity of all_nodes array */
+    int iteration_offset;                /* Rotating offset for fair iteration */
 } wbpxre_routing_table_t;
 
 /* Peer info */

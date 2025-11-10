@@ -232,6 +232,17 @@ wbpxre_routing_table_t *wbpxre_routing_table_create(int max_nodes) {
     table->max_nodes = max_nodes;
     pthread_rwlock_init(&table->lock, NULL);
 
+    /* Allocate flat array for uniform iteration */
+    table->all_nodes_capacity = max_nodes > 0 ? max_nodes : 10000;
+    table->all_nodes = calloc(table->all_nodes_capacity, sizeof(wbpxre_routing_node_t *));
+    table->iteration_offset = 0;
+
+    if (!table->all_nodes) {
+        pthread_rwlock_destroy(&table->lock);
+        free(table);
+        return NULL;
+    }
+
     return table;
 }
 
@@ -247,6 +258,13 @@ void wbpxre_routing_table_destroy(wbpxre_routing_table_t *table) {
 
     pthread_rwlock_wrlock(&table->lock);
     free_routing_tree(table->root);
+
+    /* Free flat array */
+    if (table->all_nodes) {
+        free(table->all_nodes);
+        table->all_nodes = NULL;
+    }
+
     pthread_rwlock_unlock(&table->lock);
 
     pthread_rwlock_destroy(&table->lock);
@@ -286,6 +304,31 @@ static wbpxre_routing_node_t *insert_node_recursive(wbpxre_routing_node_t *root,
     return balance_tree(root);
 }
 
+/* Helper: Add node pointer to flat array (must be called with write lock held) */
+static void add_node_to_flat_array(wbpxre_routing_table_t *table, wbpxre_routing_node_t *node) {
+    if (!table || !node || !table->all_nodes) return;
+
+    /* Find first empty slot or append to end */
+    for (int i = 0; i < table->all_nodes_capacity; i++) {
+        if (table->all_nodes[i] == NULL) {
+            table->all_nodes[i] = node;
+            return;
+        }
+    }
+}
+
+/* Helper: Remove node pointer from flat array (must be called with write lock held) */
+static void remove_node_from_flat_array(wbpxre_routing_table_t *table, const uint8_t *node_id) {
+    if (!table || !node_id || !table->all_nodes) return;
+
+    for (int i = 0; i < table->all_nodes_capacity; i++) {
+        if (table->all_nodes[i] && memcmp(table->all_nodes[i]->id, node_id, WBPXRE_NODE_ID_LEN) == 0) {
+            table->all_nodes[i] = NULL;
+            return;
+        }
+    }
+}
+
 int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
                                  const wbpxre_routing_node_t *node) {
     if (!table || !node) return -1;
@@ -304,6 +347,9 @@ int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
             uint8_t lru_id[WBPXRE_NODE_ID_LEN];
             memcpy(lru_id, lru->id, WBPXRE_NODE_ID_LEN);
 
+            /* Remove from flat array first */
+            remove_node_from_flat_array(table, lru_id);
+
             /* Remove LRU node from tree */
             bool removed = false;
             table->root = remove_node_recursive(table->root, lru_id, &removed);
@@ -319,6 +365,12 @@ int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
 
     if (inserted) {
         table->node_count++;
+
+        /* Add to flat array for uniform iteration */
+        wbpxre_routing_node_t *new_node = find_node_recursive(table->root, node->id);
+        if (new_node) {
+            add_node_to_flat_array(table, new_node);
+        }
     }
 
     pthread_rwlock_unlock(&table->lock);
@@ -446,31 +498,19 @@ static bool is_sample_infohashes_candidate(wbpxre_routing_node_t *node) {
     /* Must respect interval (next_sample_time must have passed) */
     if (node->next_sample_time > now) return false;
 
-    /* Must have responded recently (within last 5 minutes) OR never been queried yet */
-    if (node->last_responded_at > 0 && (now - node->last_responded_at) > 300) {
+    /* Must have responded recently (within last 60 seconds) OR never been queried yet
+     * CHANGED: Reduced from 300s (5 min) to 60s to match rotation interval
+     * This prevents nodes from being ineligible for multiple rotations */
+    if (node->last_responded_at > 0 && (now - node->last_responded_at) > 60) {
         return false;
     }
 
     return true;
 }
 
-static void collect_sample_candidates_recursive(wbpxre_routing_node_t *root,
-                                                 wbpxre_routing_node_t **array,
-                                                 int *count, int n) {
-    if (!root || *count >= n) return;
-
-    if (is_sample_infohashes_candidate(root)) {
-        array[(*count)++] = root;
-    }
-
-    if (*count < n) {
-        collect_sample_candidates_recursive(root->left, array, count, n);
-    }
-    if (*count < n) {
-        collect_sample_candidates_recursive(root->right, array, count, n);
-    }
-}
-
+/* OPTIMIZED: Use flat array iteration instead of BST traversal
+ * This eliminates BST structure bias and provides uniform node selection
+ * Critical for hot rotation where XOR distance changes but BST doesn't */
 int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
                                                 wbpxre_routing_node_t **nodes_out,
                                                 int n) {
@@ -478,21 +518,34 @@ int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
 
     pthread_rwlock_rdlock(&table->lock);
 
-    /* Collect candidate pointers */
-    wbpxre_routing_node_t *candidates[n];
     int count = 0;
-    collect_sample_candidates_recursive(table->root, candidates, &count, n);
 
-    /* Copy nodes to avoid data races after lock release */
-    for (int i = 0; i < count; i++) {
-        wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
-        memcpy(node_copy, candidates[i], sizeof(wbpxre_routing_node_t));
-        /* Clear tree pointers since this is a standalone copy */
-        node_copy->left = NULL;
-        node_copy->right = NULL;
-        nodes_out[i] = node_copy;
+    /* Rotate starting position for fairness across calls */
+    int start_offset = table->iteration_offset;
+
+    /* Iterate flat array starting from rotating offset */
+    for (int i = 0; i < table->all_nodes_capacity && count < n; i++) {
+        int idx = (start_offset + i) % table->all_nodes_capacity;
+        wbpxre_routing_node_t *node = table->all_nodes[idx];
+
+        if (!node) continue;  /* Empty slot */
+
+        if (is_sample_infohashes_candidate(node)) {
+            /* Copy node to avoid data races after lock release */
+            wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
+            memcpy(node_copy, node, sizeof(wbpxre_routing_node_t));
+            /* Clear tree pointers since this is a standalone copy */
+            node_copy->left = NULL;
+            node_copy->right = NULL;
+            nodes_out[count++] = node_copy;
+        }
     }
 
+    pthread_rwlock_unlock(&table->lock);
+
+    /* Update rotation offset for next call (rotate by 7 for better distribution) */
+    pthread_rwlock_wrlock(&table->lock);
+    table->iteration_offset = (table->iteration_offset + 7) % table->all_nodes_capacity;
     pthread_rwlock_unlock(&table->lock);
 
     return count;
@@ -837,6 +890,9 @@ void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
     if (node) {
         node->dropped = true;
 
+        /* Remove from flat array */
+        remove_node_from_flat_array(table, node_id);
+
         /* Actually remove the node from the tree */
         bool removed = false;
         table->root = remove_node_recursive(table->root, node_id, &removed);
@@ -883,6 +939,9 @@ int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table) {
     /* Remove all dropped nodes */
     int removed_count = 0;
     for (int i = 0; i < dropped_count; i++) {
+        /* Remove from flat array */
+        remove_node_from_flat_array(table, dropped_ids[i]);
+
         bool removed = false;
         table->root = remove_node_recursive(table->root, dropped_ids[i], &removed);
 
