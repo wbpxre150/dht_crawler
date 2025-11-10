@@ -1554,8 +1554,16 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
     torrent.num_pieces = pieces_len / 20;
     torrent.added_timestamp = time(NULL);
     torrent.last_seen = time(NULL);
-    torrent.seeders = 0;
-    torrent.leechers = 0;
+
+    /* Query peer store for total peer count at time of metadata fetch */
+    int peer_count = 0;
+    if (peer->fetcher) {
+        metadata_fetcher_t *fetcher = (metadata_fetcher_t *)peer->fetcher;
+        if (fetcher->peer_store) {
+            peer_count = peer_store_count_peers(fetcher->peer_store, peer->info_hash);
+        }
+    }
+    torrent.total_peers = peer_count;
 
     /* Convert temp files to file_info_t and calculate total size */
     file_info_t *file_info = NULL;

@@ -19,8 +19,7 @@ typedef struct {
     int64_t size_bytes;
     int32_t piece_length;
     int32_t num_pieces;
-    int32_t seeders;
-    int32_t leechers;
+    int32_t total_peers;
     int64_t added_timestamp;
     int64_t last_seen;
     /* File information (for multi-file torrents) */

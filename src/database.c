@@ -15,14 +15,13 @@ static const char *CREATE_TABLES_SQL =
     "    size_bytes INTEGER NOT NULL,"
     "    piece_length INTEGER,"
     "    num_pieces INTEGER,"
-    "    seeders INTEGER DEFAULT 0,"
-    "    leechers INTEGER DEFAULT 0,"
+    "    total_peers INTEGER DEFAULT 0,"
     "    added_timestamp INTEGER NOT NULL,"
     "    last_seen INTEGER NOT NULL"
     ");"
     ""
     "CREATE INDEX IF NOT EXISTS idx_torrents_added ON torrents(added_timestamp DESC);"
-    "CREATE INDEX IF NOT EXISTS idx_torrents_seeders ON torrents(seeders DESC);"
+    "CREATE INDEX IF NOT EXISTS idx_torrents_total_peers ON torrents(total_peers DESC);"
     ""
     "CREATE TABLE IF NOT EXISTS torrent_files ("
     "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -146,8 +145,8 @@ int database_create_schema(database_t *db) {
     /* Prepare statements */
     const char *insert_torrent_sql =
         "INSERT OR REPLACE INTO torrents "
-        "(info_hash, name, size_bytes, piece_length, num_pieces, seeders, leechers, added_timestamp, last_seen) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "(info_hash, name, size_bytes, piece_length, num_pieces, total_peers, added_timestamp, last_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
     rc = sqlite3_prepare_v2(db->db, insert_torrent_sql, -1, &db->insert_torrent_stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -268,10 +267,9 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
     sqlite3_bind_int64(db->insert_torrent_stmt, 3, torrent->size_bytes);
     sqlite3_bind_int(db->insert_torrent_stmt, 4, torrent->piece_length);
     sqlite3_bind_int(db->insert_torrent_stmt, 5, torrent->num_pieces);
-    sqlite3_bind_int(db->insert_torrent_stmt, 6, torrent->seeders);
-    sqlite3_bind_int(db->insert_torrent_stmt, 7, torrent->leechers);
-    sqlite3_bind_int64(db->insert_torrent_stmt, 8, torrent->added_timestamp);
-    sqlite3_bind_int64(db->insert_torrent_stmt, 9, torrent->last_seen);
+    sqlite3_bind_int(db->insert_torrent_stmt, 6, torrent->total_peers);
+    sqlite3_bind_int64(db->insert_torrent_stmt, 7, torrent->added_timestamp);
+    sqlite3_bind_int64(db->insert_torrent_stmt, 8, torrent->last_seen);
 
     int rc = sqlite3_step(db->insert_torrent_stmt);
     if (rc != SQLITE_DONE) {

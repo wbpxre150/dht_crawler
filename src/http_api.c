@@ -271,8 +271,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
         format_size(results[i].size_bytes, size_str, sizeof(size_str));
         cJSON_AddStringToObject(item, "size", size_str);
         cJSON_AddNumberToObject(item, "size_bytes", results[i].size_bytes);
-        cJSON_AddNumberToObject(item, "seeders", results[i].seeders);
-        cJSON_AddNumberToObject(item, "leechers", results[i].leechers);
+        cJSON_AddNumberToObject(item, "total_peers", results[i].total_peers);
         cJSON_AddNumberToObject(item, "added", results[i].added_timestamp);
         cJSON_AddNumberToObject(item, "num_files", results[i].num_files);
 
@@ -327,7 +326,7 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
     /* Build FTS5 search query - searches both torrent names and file paths
      * Uses subqueries to properly utilize FTS5 MATCH function, then UNION to combine results */
     const char *sql =
-        "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.seeders, t.leechers, "
+        "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
         "       t.added_timestamp, COUNT(f.id) as file_count "
         "FROM torrents t "
         "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
@@ -366,10 +365,9 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
         memcpy(res[i].info_hash, sqlite3_column_blob(stmt, 0), 20);
         res[i].name = strdup((const char *)sqlite3_column_text(stmt, 1));
         res[i].size_bytes = sqlite3_column_int64(stmt, 2);
-        res[i].seeders = sqlite3_column_int(stmt, 3);
-        res[i].leechers = sqlite3_column_int(stmt, 4);
-        res[i].added_timestamp = sqlite3_column_int64(stmt, 5);
-        res[i].num_files = sqlite3_column_int(stmt, 6);
+        res[i].total_peers = sqlite3_column_int(stmt, 3);
+        res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
+        res[i].num_files = sqlite3_column_int(stmt, 5);
 
         /* Get file listings for this torrent */
         if (res[i].num_files > 0) {

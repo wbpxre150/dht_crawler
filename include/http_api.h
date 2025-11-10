@@ -22,8 +22,7 @@ typedef struct {
     uint8_t info_hash[20];
     char *name;
     int64_t size_bytes;
-    int32_t seeders;
-    int32_t leechers;
+    int32_t total_peers;
     int64_t added_timestamp;
     int num_files;
     char **file_paths;
