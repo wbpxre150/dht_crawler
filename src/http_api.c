@@ -414,6 +414,34 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     /* Wait for DHT responses (blocks for up to 8 seconds) */
     int peer_count = refresh_query_wait(query, 8);
     int timed_out = query->timed_out;
+    int retry_attempted = 0;
+
+    /* Retry logic: If zero peers found, try one more time immediately */
+    if (peer_count == 0) {
+        log_msg(LOG_DEBUG, "First query returned 0 peers for %s, retrying...", hash_buf);
+
+        /* Remove old query */
+        refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
+
+        /* Create new query for retry */
+        query = refresh_query_create(api->dht_manager->refresh_query_store, info_hash);
+        if (query) {
+            /* Trigger second priority query */
+            rc = dht_manager_query_peers(api->dht_manager, info_hash, true);
+            if (rc == 0) {
+                /* Wait for retry results (up to 8 seconds) */
+                peer_count = refresh_query_wait(query, 8);
+                timed_out = query->timed_out;
+                retry_attempted = 1;
+
+                if (peer_count > 0) {
+                    log_msg(LOG_DEBUG, "Retry successful: found %d peers for %s", peer_count, hash_buf);
+                } else {
+                    log_msg(LOG_DEBUG, "Retry also returned 0 peers for %s", hash_buf);
+                }
+            }
+        }
+    }
 
     /* Remove query from store */
     refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
@@ -424,14 +452,20 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "total_peers", peer_count);
     cJSON_AddBoolToObject(root, "live_query", 1);
     cJSON_AddBoolToObject(root, "timed_out", timed_out);
+    cJSON_AddBoolToObject(root, "retry_attempted", retry_attempted);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
 
     if (timed_out && peer_count == 0) {
         cJSON_AddStringToObject(root, "warning",
+            retry_attempted ?
+            "Both queries timed out with no peers - torrent may have no active peers" :
             "Query timed out with no peers found - torrent may have no active peers");
     } else if (timed_out) {
         cJSON_AddStringToObject(root, "warning",
             "Query timed out - partial peer count returned");
+    } else if (retry_attempted && peer_count > 0) {
+        cJSON_AddStringToObject(root, "info",
+            "Peers found on retry attempt");
     }
 
     char *json = cJSON_Print(root);
