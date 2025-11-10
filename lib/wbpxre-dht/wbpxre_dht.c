@@ -532,36 +532,26 @@ static void *maintenance_thread_func(void *arg) {
                                                             old_nodes, batch_size,
                                                             verification_threshold);
 
-        int verified = 0, dropped = 0;
-
-        /* Ping old nodes to verify they're still alive */
+        /* Push old nodes to ping queue for asynchronous verification
+         * The ping worker threads will handle the actual pinging, node updates,
+         * and statistics tracking. This avoids blocking the maintenance thread. */
+        int queued = 0, skipped = 0;
         for (int i = 0; i < old_count; i++) {
-            /* Phase 4: Track query sent */
+            /* Track that we're querying this node */
             wbpxre_routing_table_update_node_queried(dht->routing_table, old_nodes[i]->id);
 
-            uint8_t response_id[WBPXRE_NODE_ID_LEN];
-            int result = wbpxre_protocol_ping(dht, &old_nodes[i]->addr.addr, response_id);
-
-            if (result == 0) {
-                /* Node responded - update last_responded_at and response count */
-                wbpxre_routing_table_update_node_responded(dht->routing_table, old_nodes[i]->id);
-                verified++;
+            /* Push to ping worker queue (non-blocking to avoid stalling maintenance thread) */
+            if (wbpxre_queue_try_push(dht->nodes_for_ping, old_nodes[i])) {
+                queued++;
+                /* Note: Ping worker will free old_nodes[i] after processing */
             } else {
-                /* Node didn't respond - mark as dropped (will be removed) */
-                wbpxre_routing_table_drop_node(dht->routing_table, old_nodes[i]->id);
-                dropped++;
-
-                /* Update dropped nodes statistics */
-                pthread_mutex_lock(&dht->stats_mutex);
-                dht->stats.nodes_dropped++;
-                pthread_mutex_unlock(&dht->stats_mutex);
+                /* Queue full - free the node copy and skip */
+                free(old_nodes[i]);
+                skipped++;
             }
-
-            /* Free the node copy */
-            free(old_nodes[i]);
         }
 
-        /* Free the nodes array */
+        /* Free the nodes array (not the individual nodes, which are now owned by workers) */
         free(old_nodes);
 
         /* ====================================================================
@@ -774,6 +764,11 @@ static void *ping_worker_func(void *arg) {
         } else {
             /* Failed -> drop node */
             wbpxre_routing_table_drop_node(dht->routing_table, node->id);
+
+            /* Update dropped nodes statistics */
+            pthread_mutex_lock(&dht->stats_mutex);
+            dht->stats.nodes_dropped++;
+            pthread_mutex_unlock(&dht->stats_mutex);
         }
 
         free(node);
