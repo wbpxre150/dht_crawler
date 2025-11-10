@@ -324,14 +324,19 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
     *results = NULL;
     *count = 0;
 
-    /* Build FTS5 search query */
+    /* Build FTS5 search query - searches both torrent names and file paths
+     * Uses subqueries to properly utilize FTS5 MATCH function, then UNION to combine results */
     const char *sql =
         "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.seeders, t.leechers, "
         "       t.added_timestamp, COUNT(f.id) as file_count "
         "FROM torrents t "
-        "LEFT JOIN torrent_search ts ON t.id = ts.rowid "
         "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
-        "WHERE ts.name MATCH ? "
+        "WHERE t.id IN ("
+        "    SELECT rowid FROM torrent_search WHERE name MATCH ?"
+        "    UNION"
+        "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+        "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE path MATCH ?)"
+        ") "
         "GROUP BY t.id "
         "ORDER BY t.added_timestamp DESC "
         "LIMIT ?";
@@ -343,8 +348,10 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
         return -1;
     }
 
+    /* Bind query parameter twice (once for torrent names, once for file paths) */
     sqlite3_bind_text(stmt, 1, query, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 2, HTTP_API_MAX_RESULTS);
+    sqlite3_bind_text(stmt, 2, query, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
 
     /* Allocate results array */
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
