@@ -10,7 +10,9 @@
 static int search_handler(struct mg_connection *conn, void *cbdata);
 static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int root_handler(struct mg_connection *conn, void *cbdata);
+static int refresh_handler(struct mg_connection *conn, void *cbdata);
 static char* url_decode(const char *str);
+static char* generate_search_results_html(search_result_t *results, int count, const char *query);
 
 /* Helper: Format info_hash as hex */
 static void format_hex(const uint8_t *data, size_t len, char *out) {
@@ -74,6 +76,7 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/", root_handler, api);
     mg_set_request_handler(api->mg_ctx, "/search", search_handler, api);
     mg_set_request_handler(api->mg_ctx, "/stats", stats_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/refresh", refresh_handler, api);
 
     api->running = 1;
     log_msg(LOG_DEBUG, "HTTP API server started on port %d", api->port);
@@ -145,6 +148,7 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "  <h2>Search Form:</h2>\n"
         "  <form action='/search' method='get'>\n"
         "    <input type='text' name='q' placeholder='Enter search query...' size='50'>\n"
+        "    <input type='hidden' name='format' value='html'>\n"
         "    <input type='submit' value='Search'>\n"
         "  </form>\n"
         "</body>\n"
@@ -209,16 +213,111 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     return 200;
 }
 
-/* Search handler - Perform FTS5 search and return JSON */
+/* Refresh handler - Get updated peer count for a specific torrent */
+static int refresh_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
+
+    /* Get info_hash parameter */
+    char hash_buf[256] = {0};
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+
+    int hash_len = mg_get_var(ri->query_string, strlen(ri->query_string ? ri->query_string : ""),
+                               "hash", hash_buf, sizeof(hash_buf));
+
+    if (hash_len <= 0 || strlen(hash_buf) != 40) {
+        const char *error = "{\"error\":\"Missing or invalid hash parameter (expected 40 hex chars)\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 400 Bad Request\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 400;
+    }
+
+    /* Convert hex string to binary */
+    uint8_t info_hash[20];
+    for (int i = 0; i < 20; i++) {
+        sscanf(hash_buf + i * 2, "%2hhx", &info_hash[i]);
+    }
+
+    /* Query database for peer count */
+    const char *sql = "SELECT total_peers, last_seen FROM torrents WHERE info_hash = ?";
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(api->database->db, sql, -1, &stmt, NULL);
+
+    if (rc != SQLITE_OK) {
+        const char *error = "{\"error\":\"Database query failed\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 500;
+    }
+
+    sqlite3_bind_blob(stmt, 1, info_hash, 20, SQLITE_STATIC);
+
+    cJSON *root = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int total_peers = sqlite3_column_int(stmt, 0);
+        int64_t last_seen = sqlite3_column_int64(stmt, 1);
+
+        root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "info_hash", hash_buf);
+        cJSON_AddNumberToObject(root, "total_peers", total_peers);
+        cJSON_AddNumberToObject(root, "last_seen", last_seen);
+    } else {
+        sqlite3_finalize(stmt);
+        const char *error = "{\"error\":\"Torrent not found\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 404 Not Found\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 404;
+    }
+
+    sqlite3_finalize(stmt);
+
+    char *json = cJSON_Print(root);
+    cJSON_Delete(root);
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %d\r\n"
+              "Access-Control-Allow-Origin: *\r\n"
+              "\r\n"
+              "%s",
+              (int)strlen(json), json);
+
+    free(json);
+    return 200;
+}
+
+/* Search handler - Perform FTS5 search and return JSON or HTML */
 static int search_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
 
     /* Get query parameter */
     char query_buf[256] = {0};
+    char format_buf[16] = {0};
     const struct mg_request_info *ri = mg_get_request_info(conn);
 
     int query_len = mg_get_var(ri->query_string, strlen(ri->query_string ? ri->query_string : ""),
                                 "q", query_buf, sizeof(query_buf));
+
+    /* Get format parameter (default: json) */
+    mg_get_var(ri->query_string, strlen(ri->query_string ? ri->query_string : ""),
+               "format", format_buf, sizeof(format_buf));
+
+    int want_html = (strcmp(format_buf, "html") == 0);
 
     if (query_len <= 0 || strlen(query_buf) == 0) {
         const char *error = "{\"error\":\"Missing query parameter 'q'\"}";
@@ -233,7 +332,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     char *query = url_decode(query_buf);
-    log_msg(LOG_DEBUG, "Search query: %s", query);
+    log_msg(LOG_DEBUG, "Search query: %s (format: %s)", query, want_html ? "html" : "json");
 
     /* Search database */
     search_result_t *results = NULL;
@@ -251,6 +350,70 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
                   "%s",
                   (int)strlen(error), error);
         return 500;
+    }
+
+    /* Return HTML if requested */
+    if (want_html) {
+        if (count == 0) {
+            /* No results - show empty state */
+            char empty_html[2048];
+            snprintf(empty_html, sizeof(empty_html),
+                "<!DOCTYPE html>\n"
+                "<html>\n"
+                "<head>\n"
+                "  <meta charset='UTF-8'>\n"
+                "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+                "  <title>No Results</title>\n"
+                "  <style>\n"
+                "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
+                "    .message { margin: 50px 0; color: #666; }\n"
+                "    a { color: #1a73e8; text-decoration: none; }\n"
+                "  </style>\n"
+                "</head>\n"
+                "<body>\n"
+                "  <h1>No Results Found</h1>\n"
+                "  <p class='message'>No torrents matched your query: \"%s\"</p>\n"
+                "  <a href='/'>← Back to Search</a>\n"
+                "</body>\n"
+                "</html>", query_buf);
+
+            mg_printf(conn,
+                      "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: text/html\r\n"
+                      "Content-Length: %d\r\n"
+                      "\r\n"
+                      "%s",
+                      (int)strlen(empty_html), empty_html);
+
+            free_search_results(results, count);
+            return 200;
+        }
+
+        char *html = generate_search_results_html(results, count, query_buf);
+        if (!html) {
+            const char *error = "{\"error\":\"Failed to generate HTML\"}";
+            mg_printf(conn,
+                      "HTTP/1.1 500 Internal Server Error\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Content-Length: %d\r\n"
+                      "\r\n"
+                      "%s",
+                      (int)strlen(error), error);
+            free_search_results(results, count);
+            return 500;
+        }
+
+        mg_printf(conn,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(html), html);
+
+        free(html);
+        free_search_results(results, count);
+        return 200;
     }
 
     /* Build JSON response */
@@ -337,7 +500,7 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
         "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE path MATCH ?)"
         ") "
         "GROUP BY t.id "
-        "ORDER BY t.added_timestamp DESC "
+        "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
         "LIMIT ?";
 
     sqlite3_stmt *stmt;
@@ -458,4 +621,306 @@ static char* url_decode(const char *str) {
     decoded[j] = '\0';
 
     return decoded;
+}
+
+/* Generate HTML page for search results */
+static char* generate_search_results_html(search_result_t *results, int count, const char *query) {
+    if (!results || count <= 0) {
+        return NULL;
+    }
+
+    /* Build HTML dynamically */
+    size_t capacity = 1024 * 100;  /* Start with 100KB */
+    char *html = (char *)malloc(capacity);
+    if (!html) return NULL;
+
+    size_t offset = 0;
+
+    /* Helper macro to append string safely */
+    #define APPEND(fmt, ...) do { \
+        int needed = snprintf(html + offset, capacity - offset, fmt, ##__VA_ARGS__); \
+        if (needed < 0) { free(html); return NULL; } \
+        if ((size_t)needed >= capacity - offset) { \
+            capacity *= 2; \
+            char *new_html = (char *)realloc(html, capacity); \
+            if (!new_html) { free(html); return NULL; } \
+            html = new_html; \
+            needed = snprintf(html + offset, capacity - offset, fmt, ##__VA_ARGS__); \
+        } \
+        offset += needed; \
+    } while(0)
+
+    /* HTML header with CSS */
+    APPEND("<!DOCTYPE html>\n"
+           "<html>\n"
+           "<head>\n"
+           "  <meta charset='UTF-8'>\n"
+           "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+           "  <title>Search Results: %s</title>\n"
+           "  <style>\n"
+           "    * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+           "    body {\n"
+           "      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;\n"
+           "      background: #f5f5f5;\n"
+           "      color: #333;\n"
+           "      padding: 16px;\n"
+           "      font-size: 16px;\n"
+           "      line-height: 1.5;\n"
+           "    }\n"
+           "    .container {\n"
+           "      max-width: 900px;\n"
+           "      margin: 0 auto;\n"
+           "    }\n"
+           "    .header {\n"
+           "      background: white;\n"
+           "      padding: 20px;\n"
+           "      border-radius: 8px;\n"
+           "      margin-bottom: 16px;\n"
+           "      box-shadow: 0 1px 3px rgba(0,0,0,0.1);\n"
+           "    }\n"
+           "    h1 {\n"
+           "      font-size: 24px;\n"
+           "      margin-bottom: 12px;\n"
+           "      color: #1a73e8;\n"
+           "    }\n"
+           "    .search-form {\n"
+           "      display: flex;\n"
+           "      gap: 8px;\n"
+           "      flex-wrap: wrap;\n"
+           "    }\n"
+           "    .search-form input[type='text'] {\n"
+           "      flex: 1;\n"
+           "      min-width: 200px;\n"
+           "      padding: 12px 16px;\n"
+           "      border: 2px solid #ddd;\n"
+           "      border-radius: 6px;\n"
+           "      font-size: 16px;\n"
+           "    }\n"
+           "    .search-form input[type='text']:focus {\n"
+           "      outline: none;\n"
+           "      border-color: #1a73e8;\n"
+           "    }\n"
+           "    .btn {\n"
+           "      padding: 12px 24px;\n"
+           "      background: #1a73e8;\n"
+           "      color: white;\n"
+           "      border: none;\n"
+           "      border-radius: 6px;\n"
+           "      font-size: 16px;\n"
+           "      cursor: pointer;\n"
+           "      min-height: 44px;\n"
+           "      font-weight: 500;\n"
+           "    }\n"
+           "    .btn:hover { background: #1557b0; }\n"
+           "    .btn:active { transform: scale(0.98); }\n"
+           "    .btn-small {\n"
+           "      padding: 8px 12px;\n"
+           "      font-size: 14px;\n"
+           "      min-height: 36px;\n"
+           "      background: #f1f3f4;\n"
+           "      color: #333;\n"
+           "      border: 1px solid #ddd;\n"
+           "    }\n"
+           "    .btn-small:hover { background: #e8eaed; }\n"
+           "    .results-info {\n"
+           "      margin-bottom: 16px;\n"
+           "      color: #5f6368;\n"
+           "      font-size: 14px;\n"
+           "    }\n"
+           "    .torrent-card {\n"
+           "      background: white;\n"
+           "      border-radius: 8px;\n"
+           "      margin-bottom: 12px;\n"
+           "      box-shadow: 0 1px 3px rgba(0,0,0,0.1);\n"
+           "      overflow: hidden;\n"
+           "      transition: box-shadow 0.2s;\n"
+           "    }\n"
+           "    .torrent-card:hover {\n"
+           "      box-shadow: 0 2px 8px rgba(0,0,0,0.15);\n"
+           "    }\n"
+           "    .torrent-header {\n"
+           "      padding: 16px;\n"
+           "      cursor: pointer;\n"
+           "      user-select: none;\n"
+           "    }\n"
+           "    .torrent-name {\n"
+           "      font-size: 18px;\n"
+           "      font-weight: 500;\n"
+           "      margin-bottom: 8px;\n"
+           "      color: #1a73e8;\n"
+           "      word-wrap: break-word;\n"
+           "    }\n"
+           "    .torrent-meta {\n"
+           "      display: flex;\n"
+           "      gap: 12px;\n"
+           "      flex-wrap: wrap;\n"
+           "      align-items: center;\n"
+           "      font-size: 14px;\n"
+           "      color: #5f6368;\n"
+           "    }\n"
+           "    .peer-count {\n"
+           "      font-weight: 600;\n"
+           "      padding: 4px 8px;\n"
+           "      border-radius: 4px;\n"
+           "      background: #e8f5e9;\n"
+           "      color: #2e7d32;\n"
+           "    }\n"
+           "    .peer-count.low { background: #f5f5f5; color: #666; }\n"
+           "    .peer-count.medium { background: #fff8e1; color: #f57f17; }\n"
+           "    .refresh-btn {\n"
+           "      background: none;\n"
+           "      border: none;\n"
+           "      font-size: 18px;\n"
+           "      cursor: pointer;\n"
+           "      padding: 4px 8px;\n"
+           "      border-radius: 4px;\n"
+           "      min-height: 32px;\n"
+           "      min-width: 32px;\n"
+           "      transition: background 0.2s;\n"
+           "    }\n"
+           "    .refresh-btn:hover { background: #f1f3f4; }\n"
+           "    .refresh-btn.loading { animation: spin 1s linear infinite; }\n"
+           "    @keyframes spin {\n"
+           "      from { transform: rotate(0deg); }\n"
+           "      to { transform: rotate(360deg); }\n"
+           "    }\n"
+           "    .file-list {\n"
+           "      border-top: 1px solid #e0e0e0;\n"
+           "      padding: 16px;\n"
+           "      background: #fafafa;\n"
+           "      display: none;\n"
+           "    }\n"
+           "    .file-list.show { display: block; }\n"
+           "    .file-list ul { list-style: none; }\n"
+           "    .file-list li {\n"
+           "      padding: 8px 0;\n"
+           "      border-bottom: 1px solid #e0e0e0;\n"
+           "      font-size: 14px;\n"
+           "      display: flex;\n"
+           "      justify-content: space-between;\n"
+           "      gap: 12px;\n"
+           "      word-break: break-word;\n"
+           "    }\n"
+           "    .file-list li:last-child { border-bottom: none; }\n"
+           "    .file-path { flex: 1; color: #333; }\n"
+           "    .file-size { color: #5f6368; white-space: nowrap; }\n"
+           "    .no-files { color: #999; font-style: italic; }\n"
+           "  </style>\n"
+           "</head>\n"
+           "<body>\n"
+           "  <div class='container'>\n"
+           "    <div class='header'>\n"
+           "      <h1>Search Results</h1>\n"
+           "      <form class='search-form' action='/search' method='get'>\n"
+           "        <input type='text' name='q' placeholder='Search torrents...' value='%s'>\n"
+           "        <input type='hidden' name='format' value='html'>\n"
+           "        <button type='submit' class='btn'>Search</button>\n"
+           "      </form>\n"
+           "    </div>\n"
+           "    <div class='results-info'>Found %d result%s</div>\n",
+           query, query, count, count == 1 ? "" : "s");
+
+    /* Generate torrent cards */
+    for (int i = 0; i < count; i++) {
+        char hex[41];
+        format_hex(results[i].info_hash, 20, hex);
+
+        char size_str[64];
+        format_size(results[i].size_bytes, size_str, sizeof(size_str));
+
+        /* Determine peer count class */
+        const char *peer_class = "low";
+        if (results[i].total_peers > 100) peer_class = "";
+        else if (results[i].total_peers > 10) peer_class = "medium";
+
+        APPEND("    <div class='torrent-card'>\n"
+               "      <div class='torrent-header' onclick='toggleFiles(\"%s\")'>\n"
+               "        <div class='torrent-name'>%s</div>\n"
+               "        <div class='torrent-meta'>\n"
+               "          <span class='peer-count %s' id='peers-%s'>%d peer%s</span>\n"
+               "          <button class='refresh-btn' onclick='refreshPeers(event, \"%s\")' title='Refresh peer count'>↻</button>\n"
+               "          <span>%s</span>\n"
+               "          <span>%d file%s</span>\n"
+               "        </div>\n"
+               "      </div>\n",
+               hex, results[i].name, peer_class, hex,
+               results[i].total_peers, results[i].total_peers == 1 ? "" : "s",
+               hex, size_str, results[i].num_files, results[i].num_files == 1 ? "" : "s");
+
+        /* File list */
+        APPEND("      <div class='file-list' id='files-%s'>\n", hex);
+
+        if (results[i].num_files > 0 && results[i].file_paths) {
+            APPEND("        <ul>\n");
+            for (int j = 0; j < results[i].num_files && j < 10; j++) {
+                char file_size_str[64];
+                format_size(results[i].file_sizes[j], file_size_str, sizeof(file_size_str));
+
+                APPEND("          <li>\n"
+                       "            <span class='file-path'>%s</span>\n"
+                       "            <span class='file-size'>%s</span>\n"
+                       "          </li>\n",
+                       results[i].file_paths[j], file_size_str);
+            }
+            if (results[i].num_files > 10) {
+                APPEND("          <li class='no-files'>...and %d more file%s</li>\n",
+                       results[i].num_files - 10, results[i].num_files - 10 == 1 ? "" : "s");
+            }
+            APPEND("        </ul>\n");
+        } else {
+            APPEND("        <div class='no-files'>No file information available</div>\n");
+        }
+
+        APPEND("      </div>\n"
+               "    </div>\n");
+    }
+
+    /* JavaScript for interactivity */
+    APPEND("  </div>\n"
+           "  <script>\n"
+           "    function toggleFiles(hash) {\n"
+           "      const fileList = document.getElementById('files-' + hash);\n"
+           "      if (fileList.classList.contains('show')) {\n"
+           "        fileList.classList.remove('show');\n"
+           "      } else {\n"
+           "        fileList.classList.add('show');\n"
+           "      }\n"
+           "    }\n"
+           "\n"
+           "    function refreshPeers(event, hash) {\n"
+           "      event.stopPropagation();\n"
+           "      const btn = event.target;\n"
+           "      const peerSpan = document.getElementById('peers-' + hash);\n"
+           "      \n"
+           "      if (btn.classList.contains('loading')) return;\n"
+           "      \n"
+           "      btn.classList.add('loading');\n"
+           "      \n"
+           "      fetch('/refresh?hash=' + hash)\n"
+           "        .then(response => response.json())\n"
+           "        .then(data => {\n"
+           "          const peers = data.total_peers;\n"
+           "          peerSpan.textContent = peers + (peers === 1 ? ' peer' : ' peers');\n"
+           "          \n"
+           "          // Update color class\n"
+           "          peerSpan.className = 'peer-count';\n"
+           "          if (peers > 100) peerSpan.className += '';\n"
+           "          else if (peers > 10) peerSpan.className += ' medium';\n"
+           "          else peerSpan.className += ' low';\n"
+           "        })\n"
+           "        .catch(err => {\n"
+           "          console.error('Failed to refresh peer count:', err);\n"
+           "          alert('Failed to refresh peer count');\n"
+           "        })\n"
+           "        .finally(() => {\n"
+           "          btn.classList.remove('loading');\n"
+           "        });\n"
+           "    }\n"
+           "  </script>\n"
+           "</body>\n"
+           "</html>");
+
+    #undef APPEND
+
+    return html;
 }
