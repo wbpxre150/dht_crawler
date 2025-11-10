@@ -148,14 +148,9 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 mgr->active_search_count--;
             }
 
-            /* NEW: Mark refresh query as complete */
+            /* Mark refresh query as complete */
             if (info_hash && mgr->refresh_query_store) {
-                char hex[41];
-                format_infohash(info_hash, hex, sizeof(hex));
-                log_msg(LOG_DEBUG, "DHT event: search done for hash %s", hex);
                 refresh_query_complete(mgr->refresh_query_store, info_hash);
-            } else {
-                log_msg(LOG_DEBUG, "DHT event: search done (no info_hash or no refresh_query_store)");
             }
 
             /* Track peer query completion */
