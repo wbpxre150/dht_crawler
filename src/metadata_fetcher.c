@@ -51,6 +51,9 @@ static void retry_thread_fn(void *arg);
 static uint32_t hash_infohash(const uint8_t *info_hash);
 static infohash_attempt_t* lookup_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash);
 static infohash_attempt_t* create_or_get_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash, int peer_count);
+static infohash_attempt_t* create_or_get_attempt_with_peers(metadata_fetcher_t *fetcher, const uint8_t *info_hash,
+                                                             struct sockaddr_storage *peers, socklen_t *peer_lens, int peer_count);
+static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt);
 static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash);
 static void update_attempt_statistics(infohash_attempt_t *attempt, peer_connection_t *peer, const char *close_reason);
 static failure_classification_t classify_failure(infohash_attempt_t *attempt);
@@ -82,9 +85,6 @@ static void on_connection_request(uv_async_t *handle) {
     /* Process all pending connection requests */
     connection_request_t *req;
     while ((req = connection_request_queue_try_pop(fetcher->conn_request_queue)) != NULL) {
-        char hex[41];
-        format_infohash_hex(req->info_hash, hex);
-
         /* Check global connection limit */
         uv_mutex_lock(&fetcher->mutex);
         int current_active = fetcher->active_count;
@@ -95,40 +95,18 @@ static void on_connection_request(uv_async_t *handle) {
             continue;
         }
 
-        /* Create or get infohash attempt entry */
-        infohash_attempt_t *attempt = create_or_get_attempt(fetcher, req->info_hash, req->peer_count);
+        /* Create or get infohash attempt entry with peer queue */
+        infohash_attempt_t *attempt = create_or_get_attempt_with_peers(
+            fetcher, req->info_hash, req->peers, req->peer_lens, req->peer_count
+        );
         if (!attempt) {
             log_msg(LOG_ERROR, "Failed to create attempt entry");
             free(req);
             continue;
         }
 
-        /* Now we're in the main event loop thread - safe to use libuv */
-        int max_concurrent = (req->peer_count < fetcher->max_concurrent_per_infohash) ?
-                              req->peer_count : fetcher->max_concurrent_per_infohash;
-
-        for (int i = 0; i < req->peer_count && i < max_concurrent; i++) {
-            /* Check limit again before each connection */
-            uv_mutex_lock(&fetcher->mutex);
-            current_active = fetcher->active_count;
-            uv_mutex_unlock(&fetcher->mutex);
-
-            if (current_active >= fetcher->max_global_connections) {
-                break;
-            }
-
-            /* This is safe now - we're in the event loop thread */
-            peer_connection_t *peer = create_peer_connection(
-                fetcher, req->info_hash, (struct sockaddr *)&req->peers[i]
-            );
-
-            if (peer) {
-                /* Increment active_connections in attempt entry */
-                uv_mutex_lock(&fetcher->attempt_table_mutex);
-                attempt->active_connections++;
-                uv_mutex_unlock(&fetcher->attempt_table_mutex);
-            }
-        }
+        /* Start initial batch of connections using the new peer queue mechanism */
+        start_next_peer_connections(fetcher, attempt);
 
         free(req);
     }
@@ -1829,16 +1807,34 @@ static void close_peer_connection_locked(peer_connection_t *peer, const char *re
             /* Update failure statistics based on close reason (unless successful) */
             if (peer->state != PEER_STATE_COMPLETE) {
                 update_attempt_statistics(attempt, peer, reason);
+
+                /* If connection failed and there are more peers to try, start next peer */
+                if (attempt->peers_tried < attempt->total_peer_count) {
+                    uv_mutex_unlock(&fetcher->attempt_table_mutex);
+                    uv_mutex_unlock(&fetcher->mutex);
+
+                    /* Try next peer immediately to maintain concurrent connections */
+                    start_next_peer_connections(fetcher, attempt);
+
+                    uv_mutex_lock(&fetcher->mutex);
+                    uv_mutex_lock(&fetcher->attempt_table_mutex);
+
+                    /* Re-lookup attempt in case it was modified */
+                    attempt = lookup_attempt(fetcher, peer->info_hash);
+                }
             }
 
             /* If this was the last connection for this infohash */
-            if (attempt->active_connections == 0) {
+            if (attempt && attempt->active_connections == 0) {
                 /* Only handle failure if we didn't successfully fetch metadata */
                 if (peer->state != PEER_STATE_COMPLETE) {
                     /* Check if ANY connection for this infohash succeeded */
                     int already_fetched = database_check_exists(fetcher->database, peer->info_hash);
                     if (!already_fetched) {
-                        should_handle_failure = 1;
+                        /* Only mark as failure if we've exhausted all peers */
+                        if (attempt->peers_tried >= attempt->total_peer_count) {
+                            should_handle_failure = 1;
+                        }
                     }
                 }
             }
@@ -2166,6 +2162,141 @@ static infohash_attempt_t* create_or_get_attempt(metadata_fetcher_t *fetcher, co
     return attempt;
 }
 
+/* Create or get existing attempt entry with peer queue (thread-safe) */
+static infohash_attempt_t* create_or_get_attempt_with_peers(
+    metadata_fetcher_t *fetcher,
+    const uint8_t *info_hash,
+    struct sockaddr_storage *peers,
+    socklen_t *peer_lens,
+    int peer_count
+) {
+    if (!fetcher || !info_hash || !peers || !peer_lens || peer_count <= 0) {
+        return NULL;
+    }
+
+    uv_mutex_lock(&fetcher->attempt_table_mutex);
+
+    /* Check if entry already exists */
+    infohash_attempt_t *attempt = lookup_attempt(fetcher, info_hash);
+    if (attempt) {
+        /* Entry exists - don't overwrite peer queue, just return it */
+        uv_mutex_unlock(&fetcher->attempt_table_mutex);
+        return attempt;
+    }
+
+    /* Create new entry */
+    attempt = (infohash_attempt_t *)calloc(1, sizeof(infohash_attempt_t));
+    if (!attempt) {
+        uv_mutex_unlock(&fetcher->attempt_table_mutex);
+        return NULL;
+    }
+
+    memcpy(attempt->info_hash, info_hash, 20);
+    attempt->first_attempt_time = time(NULL);
+    attempt->last_attempt_time = time(NULL);
+
+    /* Allocate and copy peer list */
+    attempt->available_peers = malloc(sizeof(struct sockaddr_storage) * peer_count);
+    attempt->available_peer_lens = malloc(sizeof(socklen_t) * peer_count);
+
+    if (!attempt->available_peers || !attempt->available_peer_lens) {
+        free(attempt->available_peers);
+        free(attempt->available_peer_lens);
+        free(attempt);
+        uv_mutex_unlock(&fetcher->attempt_table_mutex);
+        return NULL;
+    }
+
+    memcpy(attempt->available_peers, peers, sizeof(struct sockaddr_storage) * peer_count);
+    memcpy(attempt->available_peer_lens, peer_lens, sizeof(socklen_t) * peer_count);
+    attempt->total_peer_count = peer_count;
+    attempt->peers_tried = 0;
+    attempt->max_concurrent_for_this_hash = fetcher->max_concurrent_per_infohash;
+    attempt->peer_count_at_start = peer_count;
+    attempt->furthest_state = PEER_STATE_CONNECTING;
+    attempt->active_connections = 0;
+
+    /* Insert into hash table */
+    uint32_t bucket = hash_infohash(info_hash);
+    attempt->next = fetcher->attempt_table[bucket];
+    fetcher->attempt_table[bucket] = attempt;
+
+    uv_mutex_unlock(&fetcher->attempt_table_mutex);
+    return attempt;
+}
+
+/* Try to start next peer connection(s) for an infohash - maintains concurrent connections */
+static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt) {
+    if (!fetcher || !attempt) {
+        return;
+    }
+
+    uv_mutex_lock(&fetcher->attempt_table_mutex);
+
+    /* Calculate how many more connections we can start */
+    int active = attempt->active_connections;
+    int max_concurrent = attempt->max_concurrent_for_this_hash;
+    int peers_remaining = attempt->total_peer_count - attempt->peers_tried;
+
+    int to_start = max_concurrent - active;
+    if (to_start > peers_remaining) {
+        to_start = peers_remaining;
+    }
+
+    if (to_start <= 0) {
+        uv_mutex_unlock(&fetcher->attempt_table_mutex);
+        return;
+    }
+
+    /* Check global connection limit */
+    uv_mutex_lock(&fetcher->mutex);
+    int current_global = fetcher->active_count;
+    int global_remaining = fetcher->max_global_connections - current_global;
+    uv_mutex_unlock(&fetcher->mutex);
+
+    if (to_start > global_remaining) {
+        to_start = global_remaining;
+    }
+
+    if (to_start <= 0) {
+        uv_mutex_unlock(&fetcher->attempt_table_mutex);
+        return;
+    }
+
+    /* Collect peers to connect to while holding lock */
+    struct sockaddr_storage peer_addrs[20];  /* Max concurrent per hash is 20 */
+    int peers_to_connect = 0;
+
+    for (int i = 0; i < to_start && attempt->peers_tried < attempt->total_peer_count; i++) {
+        int peer_idx = attempt->peers_tried;
+        peer_addrs[peers_to_connect] = attempt->available_peers[peer_idx];
+        attempt->peers_tried++;
+        peers_to_connect++;
+    }
+
+    uint8_t info_hash_copy[20];
+    memcpy(info_hash_copy, attempt->info_hash, 20);
+
+    uv_mutex_unlock(&fetcher->attempt_table_mutex);
+
+    /* Start connections without holding lock */
+    for (int i = 0; i < peers_to_connect; i++) {
+        peer_connection_t *peer = create_peer_connection(
+            fetcher, info_hash_copy, (struct sockaddr *)&peer_addrs[i]
+        );
+
+        if (peer) {
+            uv_mutex_lock(&fetcher->attempt_table_mutex);
+            /* Re-lookup attempt in case it was removed */
+            infohash_attempt_t *current_attempt = lookup_attempt(fetcher, info_hash_copy);
+            if (current_attempt) {
+                current_attempt->active_connections++;
+            }
+            uv_mutex_unlock(&fetcher->attempt_table_mutex);
+        }
+    }
+}
+
 /* Remove attempt entry (thread-safe) */
 static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash) {
     uv_mutex_lock(&fetcher->attempt_table_mutex);
@@ -2177,6 +2308,13 @@ static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash
     while (attempt) {
         if (memcmp(attempt->info_hash, info_hash, 20) == 0) {
             *prev_ptr = attempt->next;
+            /* Free peer queue arrays if allocated */
+            if (attempt->available_peers) {
+                free(attempt->available_peers);
+            }
+            if (attempt->available_peer_lens) {
+                free(attempt->available_peer_lens);
+            }
             free(attempt);
             uv_mutex_unlock(&fetcher->attempt_table_mutex);
             return;

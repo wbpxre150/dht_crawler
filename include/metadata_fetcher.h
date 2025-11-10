@@ -123,6 +123,14 @@ typedef struct infohash_attempt {
     uint8_t info_hash[20];
     time_t first_attempt_time;
     time_t last_attempt_time;
+
+    /* Peer queue for sequential attempts - try all available peers until success or exhaustion */
+    struct sockaddr_storage *available_peers;
+    socklen_t *available_peer_lens;
+    int total_peer_count;
+    int peers_tried;
+    int max_concurrent_for_this_hash;  /* How many concurrent connections allowed */
+
     int total_connections_tried;
     int connections_failed;
     int connections_timeout;
