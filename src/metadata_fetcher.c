@@ -1460,7 +1460,7 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
                 /* Pieces hash */
                 pieces_data = (const uint8_t *)b.tok;
                 pieces_len = b.toklen;
-            } else if (in_path_list && !in_file_dict) {
+            } else if (in_path_list) {
                 /* Path component in multi-file mode */
                 if (strlen(path_buffer) > 0) {
                     strncat(path_buffer, "/", sizeof(path_buffer) - strlen(path_buffer) - 1);
@@ -1487,13 +1487,16 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
                 }
             }
         } else if (token == BENCODE_LIST_BEGIN) {
-            if (b.size > 0 && b.stack[b.size - 1].key != NULL &&
-                b.stack[b.size - 1].keylen == 5 &&
-                memcmp(b.stack[b.size - 1].key, "files", 5) == 0) {
+            /* When BENCODE_LIST_BEGIN is encountered, the list has been pushed onto the stack.
+             * The key for this list is in the PARENT dictionary (stack[size-2]), not the current level.
+             * Check b.size >= 2 to ensure we have a parent dict. */
+            if (b.size >= 2 && b.stack[b.size - 2].key != NULL &&
+                b.stack[b.size - 2].keylen == 5 &&
+                memcmp(b.stack[b.size - 2].key, "files", 5) == 0) {
                 in_files_list = 1;
-            } else if (in_file_dict && b.size > 0 && b.stack[b.size - 1].key != NULL &&
-                      b.stack[b.size - 1].keylen == 4 &&
-                      memcmp(b.stack[b.size - 1].key, "path", 4) == 0) {
+            } else if (in_file_dict && b.size >= 2 && b.stack[b.size - 2].key != NULL &&
+                      b.stack[b.size - 2].keylen == 4 &&
+                      memcmp(b.stack[b.size - 2].key, "path", 4) == 0) {
                 in_path_list = 1;
                 path_buffer[0] = '\0';
             }
