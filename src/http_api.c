@@ -111,48 +111,156 @@ void http_api_cleanup(http_api_t *api) {
     log_msg(LOG_DEBUG, "HTTP API cleaned up");
 }
 
-/* Root handler - Simple HTML interface */
+/* Root handler - Google-like search interface */
 static int root_handler(struct mg_connection *conn, void *cbdata) {
-    (void)cbdata;
+    http_api_t *api = (http_api_t *)cbdata;
 
-    const char *html =
+    /* Get database statistics */
+    sqlite3_stmt *stmt;
+    int torrent_count = 0;
+    int file_count = 0;
+
+    const char *count_sql = "SELECT COUNT(*) FROM torrents";
+    if (sqlite3_prepare_v2(api->database->db, count_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            torrent_count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    const char *files_sql = "SELECT COUNT(*) FROM torrent_files";
+    if (sqlite3_prepare_v2(api->database->db, files_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            file_count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    /* Format numbers with commas */
+    char torrent_count_str[32];
+    char file_count_str[32];
+
+    if (torrent_count >= 1000000) {
+        snprintf(torrent_count_str, sizeof(torrent_count_str), "%d,%03d,%03d",
+                 torrent_count / 1000000, (torrent_count / 1000) % 1000, torrent_count % 1000);
+    } else if (torrent_count >= 1000) {
+        snprintf(torrent_count_str, sizeof(torrent_count_str), "%d,%03d",
+                 torrent_count / 1000, torrent_count % 1000);
+    } else {
+        snprintf(torrent_count_str, sizeof(torrent_count_str), "%d", torrent_count);
+    }
+
+    if (file_count >= 1000000) {
+        snprintf(file_count_str, sizeof(file_count_str), "%d,%03d,%03d",
+                 file_count / 1000000, (file_count / 1000) % 1000, file_count % 1000);
+    } else if (file_count >= 1000) {
+        snprintf(file_count_str, sizeof(file_count_str), "%d,%03d",
+                 file_count / 1000, file_count % 1000);
+    } else {
+        snprintf(file_count_str, sizeof(file_count_str), "%d", file_count);
+    }
+
+    /* Build HTML */
+    char html[4096];
+    snprintf(html, sizeof(html),
         "<!DOCTYPE html>\n"
         "<html>\n"
         "<head>\n"
-        "  <title>DHT Crawler API</title>\n"
+        "  <meta charset='UTF-8'>\n"
+        "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+        "  <title>DHT Crawler</title>\n"
         "  <style>\n"
-        "    body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }\n"
-        "    h1 { color: #333; }\n"
-        "    .endpoint { background: #f4f4f4; padding: 15px; margin: 10px 0; border-radius: 5px; }\n"
-        "    code { background: #e0e0e0; padding: 2px 6px; border-radius: 3px; }\n"
+        "    * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+        "    body {\n"
+        "      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;\n"
+        "      background: #f5f5f5;\n"
+        "      color: #333;\n"
+        "      min-height: 100vh;\n"
+        "      display: flex;\n"
+        "      align-items: center;\n"
+        "      justify-content: center;\n"
+        "      padding: 20px;\n"
+        "    }\n"
+        "    .container {\n"
+        "      text-align: center;\n"
+        "      max-width: 600px;\n"
+        "      width: 100%%;\n"
+        "    }\n"
+        "    .logo {\n"
+        "      font-size: 64px;\n"
+        "      font-weight: 300;\n"
+        "      color: #1a73e8;\n"
+        "      margin-bottom: 32px;\n"
+        "      letter-spacing: -1px;\n"
+        "    }\n"
+        "    .search-box {\n"
+        "      background: white;\n"
+        "      border-radius: 24px;\n"
+        "      box-shadow: 0 2px 8px rgba(0,0,0,0.1);\n"
+        "      padding: 20px;\n"
+        "      margin-bottom: 24px;\n"
+        "    }\n"
+        "    .search-form {\n"
+        "      display: flex;\n"
+        "      flex-direction: column;\n"
+        "      gap: 16px;\n"
+        "    }\n"
+        "    .search-form input[type='text'] {\n"
+        "      width: 100%%;\n"
+        "      padding: 16px 20px;\n"
+        "      border: 2px solid #ddd;\n"
+        "      border-radius: 24px;\n"
+        "      font-size: 16px;\n"
+        "      transition: border-color 0.2s;\n"
+        "    }\n"
+        "    .search-form input[type='text']:focus {\n"
+        "      outline: none;\n"
+        "      border-color: #1a73e8;\n"
+        "    }\n"
+        "    .btn {\n"
+        "      padding: 14px 32px;\n"
+        "      background: #1a73e8;\n"
+        "      color: white;\n"
+        "      border: none;\n"
+        "      border-radius: 24px;\n"
+        "      font-size: 16px;\n"
+        "      font-weight: 500;\n"
+        "      cursor: pointer;\n"
+        "      transition: background 0.2s, transform 0.1s;\n"
+        "    }\n"
+        "    .btn:hover { background: #1557b0; }\n"
+        "    .btn:active { transform: scale(0.98); }\n"
+        "    .stats {\n"
+        "      color: #5f6368;\n"
+        "      font-size: 14px;\n"
+        "      line-height: 1.8;\n"
+        "    }\n"
+        "    @media (max-width: 640px) {\n"
+        "      .logo { font-size: 48px; margin-bottom: 24px; }\n"
+        "      .search-box { border-radius: 16px; padding: 16px; }\n"
+        "      .search-form input[type='text'] { padding: 14px 16px; }\n"
+        "      .btn { padding: 12px 24px; }\n"
+        "    }\n"
         "  </style>\n"
         "</head>\n"
         "<body>\n"
-        "  <h1>DHT Crawler API v0.1.0</h1>\n"
-        "  <p>Welcome to the DHT Crawler HTTP API!</p>\n"
-        "  \n"
-        "  <h2>Available Endpoints:</h2>\n"
-        "  \n"
-        "  <div class='endpoint'>\n"
-        "    <h3>GET /search?q=&lt;query&gt;</h3>\n"
-        "    <p>Search for torrents by name or file path.</p>\n"
-        "    <p>Example: <code>/search?q=ubuntu</code></p>\n"
+        "  <div class='container'>\n"
+        "    <div class='logo'>DHT Crawler</div>\n"
+        "    <div class='search-box'>\n"
+        "      <form class='search-form' action='/search' method='get'>\n"
+        "        <input type='text' name='q' placeholder='Search torrents...' autofocus required>\n"
+        "        <input type='hidden' name='format' value='html'>\n"
+        "        <button type='submit' class='btn'>Search</button>\n"
+        "      </form>\n"
+        "    </div>\n"
+        "    <div class='stats'>\n"
+        "      <div>%s torrents indexed</div>\n"
+        "      <div>%s files indexed</div>\n"
+        "    </div>\n"
         "  </div>\n"
-        "  \n"
-        "  <div class='endpoint'>\n"
-        "    <h3>GET /stats</h3>\n"
-        "    <p>Get crawler statistics and database metrics.</p>\n"
-        "    <p>Example: <code>/stats</code></p>\n"
-        "  </div>\n"
-        "  \n"
-        "  <h2>Search Form:</h2>\n"
-        "  <form action='/search' method='get'>\n"
-        "    <input type='text' name='q' placeholder='Enter search query...' size='50'>\n"
-        "    <input type='hidden' name='format' value='html'>\n"
-        "    <input type='submit' value='Search'>\n"
-        "  </form>\n"
         "</body>\n"
-        "</html>";
+        "</html>",
+        torrent_count_str, file_count_str);
 
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
