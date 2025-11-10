@@ -1044,13 +1044,15 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
 /* Sample infohashes feeder thread - continuously feeds nodes to the worker queue */
 static void *sample_infohashes_feeder_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+    static time_t last_queue_full_warn = 0;
 
     while (dht->running) {
-        /* Get up to 60 nodes suitable for sample_infohashes */
-        wbpxre_routing_node_t *candidates[60];
-        int count = wbpxre_routing_table_get_sample_candidates(dht->routing_table, candidates, 60);
+        /* Get up to 200 nodes suitable for sample_infohashes (increased from 60) */
+        wbpxre_routing_node_t *candidates[200];
+        int count = wbpxre_routing_table_get_sample_candidates(dht->routing_table, candidates, 200);
 
         /* Feed them to worker queue */
+        int dropped = 0;
         for (int i = 0; i < count; i++) {
             if (!dht->running) {
                 /* Free remaining candidates */
@@ -1063,6 +1065,16 @@ static void *sample_infohashes_feeder_func(void *arg) {
             /* Try to push (non-blocking to avoid deadlock) */
             if (!wbpxre_queue_try_push(dht->nodes_for_sample_infohashes, candidates[i])) {
                 free(candidates[i]);  /* Queue full, discard */
+                dropped++;
+            }
+        }
+
+        /* Log queue saturation warning (throttled to once per 10 seconds) */
+        if (dropped > 0) {
+            time_t now = time(NULL);
+            if (now - last_queue_full_warn >= 10) {
+                fprintf(stderr, "WARNING: sample_infohashes queue full, dropped %d/%d nodes\n", dropped, count);
+                last_queue_full_warn = now;
             }
         }
 

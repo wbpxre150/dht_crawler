@@ -498,10 +498,10 @@ static bool is_sample_infohashes_candidate(wbpxre_routing_node_t *node) {
     /* Must respect interval (next_sample_time must have passed) */
     if (node->next_sample_time > now) return false;
 
-    /* Must have responded recently (within last 60 seconds) OR never been queried yet
-     * CHANGED: Reduced from 300s (5 min) to 60s to match rotation interval
-     * This prevents nodes from being ineligible for multiple rotations */
-    if (node->last_responded_at > 0 && (now - node->last_responded_at) > 60) {
+    /* Must have responded recently (within last 180 seconds) OR never been queried yet
+     * CHANGED: Increased from 60s to 180s to keep nodes eligible across 2-3 rotation cycles
+     * This prevents nodes from aging out too quickly and causing worker starvation */
+    if (node->last_responded_at > 0 && (now - node->last_responded_at) > 180) {
         return false;
     }
 
