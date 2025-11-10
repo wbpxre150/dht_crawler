@@ -806,6 +806,35 @@ static char* url_decode(const char *str) {
     return decoded;
 }
 
+/* URL encode helper - encodes string for use in magnet links */
+static char* url_encode(const char *str) {
+    if (!str) return NULL;
+
+    size_t len = strlen(str);
+    /* Worst case: each character becomes %XX (3x expansion) */
+    char *encoded = (char *)malloc(len * 3 + 1);
+    if (!encoded) return NULL;
+
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)str[i];
+
+        /* Safe characters: alphanumeric, dash, underscore, period, tilde */
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            encoded[j++] = c;
+        } else {
+            /* Encode as %XX */
+            snprintf(encoded + j, 4, "%%%02X", c);
+            j += 3;
+        }
+    }
+    encoded[j] = '\0';
+
+    return encoded;
+}
+
 /* Generate HTML page for search results */
 static char* generate_search_results_html(search_result_t *results, int count, const char *query) {
     if (!results || count <= 0) {
@@ -967,6 +996,23 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "      from { transform: rotate(0deg); }\n"
            "      to { transform: rotate(360deg); }\n"
            "    }\n"
+           "    .copy-btn {\n"
+           "      background: none;\n"
+           "      border: none;\n"
+           "      font-size: 18px;\n"
+           "      cursor: pointer;\n"
+           "      padding: 4px 8px;\n"
+           "      border-radius: 4px;\n"
+           "      min-height: 32px;\n"
+           "      min-width: 32px;\n"
+           "      transition: background 0.2s, transform 0.1s;\n"
+           "    }\n"
+           "    .copy-btn:hover { background: #f1f3f4; }\n"
+           "    .copy-btn:active { transform: scale(0.95); }\n"
+           "    .copy-btn.copied {\n"
+           "      background: #e8f5e9;\n"
+           "      color: #2e7d32;\n"
+           "    }\n"
            "    .file-list {\n"
            "      border-top: 1px solid #e0e0e0;\n"
            "      padding: 16px;\n"
@@ -988,6 +1034,13 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "    .file-path { flex: 1; color: #333; }\n"
            "    .file-size { color: #5f6368; white-space: nowrap; }\n"
            "    .no-files { color: #999; font-style: italic; }\n"
+           "    @media (max-width: 640px) {\n"
+           "      .refresh-btn, .copy-btn {\n"
+           "        min-height: 44px;\n"
+           "        min-width: 44px;\n"
+           "        font-size: 20px;\n"
+           "      }\n"
+           "    }\n"
            "  </style>\n"
            "</head>\n"
            "<body>\n"
@@ -1011,6 +1064,12 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         char size_str[64];
         format_size(results[i].size_bytes, size_str, sizeof(size_str));
 
+        /* URL encode torrent name for magnet link */
+        char *encoded_name = url_encode(results[i].name);
+        if (!encoded_name) {
+            continue;  /* Skip this torrent if encoding fails */
+        }
+
         /* Determine peer count class */
         const char *peer_class = "low";
         if (results[i].total_peers > 100) peer_class = "";
@@ -1022,13 +1081,16 @@ static char* generate_search_results_html(search_result_t *results, int count, c
                "        <div class='torrent-meta'>\n"
                "          <span class='peer-count %s' id='peers-%s'>%d peer%s</span>\n"
                "          <button class='refresh-btn' onclick='refreshPeers(event, \"%s\")' title='Refresh peer count'>↻</button>\n"
+               "          <button class='copy-btn' onclick='copyMagnet(event, \"%s\", \"%s\")' title='Copy magnet link'>\xF0\x9F\xA7\xB2</button>\n"
                "          <span>%s</span>\n"
                "          <span>%d file%s</span>\n"
                "        </div>\n"
                "      </div>\n",
                hex, results[i].name, peer_class, hex,
                results[i].total_peers, results[i].total_peers == 1 ? "" : "s",
-               hex, size_str, results[i].num_files, results[i].num_files == 1 ? "" : "s");
+               hex, hex, encoded_name, size_str, results[i].num_files, results[i].num_files == 1 ? "" : "s");
+
+        free(encoded_name);
 
         /* File list */
         APPEND("      <div class='file-list' id='files-%s'>\n", hex);
@@ -1140,6 +1202,73 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "        .finally(() => {\n"
            "          btn.classList.remove('loading');\n"
            "        });\n"
+           "    }\n"
+           "\n"
+           "    function copyMagnet(event, hash, encodedName) {\n"
+           "      event.stopPropagation();\n"
+           "      \n"
+           "      const magnetLink = 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodedName;\n"
+           "      const btn = event.target;\n"
+           "      \n"
+           "      // Try modern Clipboard API first (works on localhost/HTTPS)\n"
+           "      if (navigator.clipboard && navigator.clipboard.writeText) {\n"
+           "        navigator.clipboard.writeText(magnetLink)\n"
+           "          .then(() => showCopySuccess(btn))\n"
+           "          .catch(() => fallbackCopy(magnetLink, btn));\n"
+           "      } else {\n"
+           "        // Primary method for HTTP local network\n"
+           "        fallbackCopy(magnetLink, btn);\n"
+           "      }\n"
+           "    }\n"
+           "\n"
+           "    function fallbackCopy(text, btn) {\n"
+           "      // Create temporary textarea for copy\n"
+           "      const textarea = document.createElement('textarea');\n"
+           "      textarea.value = text;\n"
+           "      textarea.style.position = 'fixed';\n"
+           "      textarea.style.left = '-9999px';\n"
+           "      textarea.style.top = '0';\n"
+           "      document.body.appendChild(textarea);\n"
+           "      \n"
+           "      // Select text\n"
+           "      textarea.focus();\n"
+           "      textarea.select();\n"
+           "      textarea.setSelectionRange(0, 99999);\n"
+           "      \n"
+           "      let success = false;\n"
+           "      try {\n"
+           "        success = document.execCommand('copy');\n"
+           "      } catch (err) {\n"
+           "        console.error('Copy failed:', err);\n"
+           "      }\n"
+           "      \n"
+           "      // Clean up\n"
+           "      document.body.removeChild(textarea);\n"
+           "      \n"
+           "      // Show result\n"
+           "      if (success) {\n"
+           "        showCopySuccess(btn);\n"
+           "      } else {\n"
+           "        // Last resort: show magnet link in alert for manual copy\n"
+           "        alert('Could not copy automatically. Magnet link:\\n\\n' + text);\n"
+           "      }\n"
+           "    }\n"
+           "\n"
+           "    function showCopySuccess(btn) {\n"
+           "      const originalContent = btn.textContent;\n"
+           "      const originalTitle = btn.title;\n"
+           "      \n"
+           "      // Visual feedback\n"
+           "      btn.textContent = '\\u2713';\n"
+           "      btn.title = 'Copied!';\n"
+           "      btn.classList.add('copied');\n"
+           "      \n"
+           "      // Restore after 2 seconds\n"
+           "      setTimeout(() => {\n"
+           "        btn.textContent = originalContent;\n"
+           "        btn.title = originalTitle;\n"
+           "        btn.classList.remove('copied');\n"
+           "      }, 2000);\n"
            "    }\n"
            "  </script>\n"
            "</body>\n"
