@@ -80,6 +80,7 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 const wbpxre_peer_t *peer_array = (const wbpxre_peer_t *)data;
                 int num_peers = data_len / sizeof(wbpxre_peer_t);
                 int peers_added = 0;
+                int valid_peers = 0;  /* NEW: Count valid peers */
 
                 for (int i = 0; i < num_peers; i++) {
                     const wbpxre_peer_t *peer = &peer_array[i];
@@ -103,6 +104,8 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                         continue;
                     }
 
+                    valid_peers++;  /* NEW: Count valid peer */
+
                     /* Add valid peer to peer_store */
                     if (peer_store_add_peer(mgr->peer_store, info_hash,
                                           (struct sockaddr *)&peer->addr,
@@ -110,6 +113,11 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                         peers_added++;
                         mgr->stats.total_peers_discovered++;
                     }
+                }
+
+                /* NEW: Update any pending refresh query */
+                if (mgr->refresh_query_store && valid_peers > 0) {
+                    refresh_query_add_peers(mgr->refresh_query_store, info_hash, valid_peers);
                 }
 
                 /* Track filtered peers */
@@ -139,6 +147,11 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
             log_msg(LOG_DEBUG, "DHT event: search done");
             if (mgr->active_search_count > 0) {
                 mgr->active_search_count--;
+            }
+
+            /* NEW: Mark refresh query as complete */
+            if (info_hash && mgr->refresh_query_store) {
+                refresh_query_complete(mgr->refresh_query_store, info_hash);
             }
 
             /* Track peer query completion */
@@ -562,6 +575,14 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     mgr->bootstrap_reseed_timer.data = mgr;
     mgr->timers_initialized = true;  /* Mark timers as initialized */
 
+    /* Initialize refresh query store for HTTP API */
+    mgr->refresh_query_store = refresh_query_store_init(1009, 10);  /* 1009 buckets, 10 sec timeout */
+    if (!mgr->refresh_query_store) {
+        log_msg(LOG_WARN, "Failed to initialize refresh query store");
+    } else {
+        log_msg(LOG_DEBUG, "Refresh query store initialized");
+    }
+
     log_msg(LOG_DEBUG, "DHT manager initialized successfully");
     return 0;
 }
@@ -773,6 +794,13 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
 
     /* Cleanup cache */
     dht_cache_cleanup(&mgr->cache);
+
+    /* Cleanup refresh query store */
+    if (mgr->refresh_query_store) {
+        log_msg(LOG_DEBUG, "Cleaning up refresh query store...");
+        refresh_query_store_cleanup(mgr->refresh_query_store);
+        mgr->refresh_query_store = NULL;
+    }
 
     /* Cleanup close tracker synchronization primitives */
     pthread_cond_destroy(&mgr->close_tracker.cond);

@@ -7,6 +7,7 @@
 #include "peer_store.h"
 #include "discovered_nodes.h"
 #include "wbpxre_dht.h"
+#include "refresh_query.h"
 #include <uv.h>
 #include <stdbool.h>
 
@@ -164,6 +165,8 @@ typedef struct {
     time_t rotation_phase_start;      /* When current phase started */
     /* Metadata fetcher reference for statistics */
     void *metadata_fetcher;           /* Pointer to metadata_fetcher_t */
+    /* Refresh query tracking for HTTP API */
+    refresh_query_store_t *refresh_query_store;
     /* Close tracker for safe shutdown */
     close_tracker_t close_tracker;
     /* Initialization state flags */

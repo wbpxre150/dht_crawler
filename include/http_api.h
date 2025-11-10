@@ -3,6 +3,7 @@
 
 #include "dht_crawler.h"
 #include "database.h"
+#include "dht_manager.h"
 
 /* HTTP server configuration */
 #define HTTP_API_PORT 8080
@@ -13,6 +14,7 @@ typedef struct {
     void *mg_ctx;  /* CivetWeb context */
     app_context_t *app_ctx;
     database_t *database;
+    dht_manager_t *dht_manager;
     int port;
     int running;
 } http_api_t;
@@ -30,7 +32,8 @@ typedef struct {
 } search_result_t;
 
 /* Function declarations */
-int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database, int port);
+int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
+                  dht_manager_t *dht_manager, int port);
 int http_api_start(http_api_t *api);
 void http_api_stop(http_api_t *api);
 void http_api_cleanup(http_api_t *api);

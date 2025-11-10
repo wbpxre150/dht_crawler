@@ -1,5 +1,7 @@
 #include "http_api.h"
 #include "dht_crawler.h"
+#include "dht_manager.h"
+#include "refresh_query.h"
 #include <civetweb.h>
 #include <cJSON.h>
 #include <string.h>
@@ -36,14 +38,16 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
 }
 
 /* Initialize HTTP API */
-int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database, int port) {
-    if (!api || !app_ctx || !database) {
+int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
+                  dht_manager_t *dht_manager, int port) {
+    if (!api || !app_ctx || !database || !dht_manager) {
         return -1;
     }
 
     memset(api, 0, sizeof(http_api_t));
     api->app_ctx = app_ctx;
     api->database = database;
+    api->dht_manager = dht_manager;
     api->port = port;
     api->running = 0;
 
@@ -321,7 +325,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     return 200;
 }
 
-/* Refresh handler - Get updated peer count for a specific torrent */
+/* Refresh handler - Query DHT network for live peer count */
 static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
 
@@ -350,37 +354,20 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         sscanf(hash_buf + i * 2, "%2hhx", &info_hash[i]);
     }
 
-    /* Query database for peer count */
-    const char *sql = "SELECT total_peers, last_seen FROM torrents WHERE info_hash = ?";
-    sqlite3_stmt *stmt;
-    int rc = sqlite3_prepare_v2(api->database->db, sql, -1, &stmt, NULL);
-
-    if (rc != SQLITE_OK) {
-        const char *error = "{\"error\":\"Database query failed\"}";
-        mg_printf(conn,
-                  "HTTP/1.1 500 Internal Server Error\r\n"
-                  "Content-Type: application/json\r\n"
-                  "Content-Length: %d\r\n"
-                  "\r\n"
-                  "%s",
-                  (int)strlen(error), error);
-        return 500;
+    /* Verify torrent exists in database */
+    const char *check_sql = "SELECT 1 FROM torrents WHERE info_hash = ? LIMIT 1";
+    sqlite3_stmt *check_stmt;
+    int exists = 0;
+    if (sqlite3_prepare_v2(api->database->db, check_sql, -1, &check_stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(check_stmt, 1, info_hash, 20, SQLITE_STATIC);
+        if (sqlite3_step(check_stmt) == SQLITE_ROW) {
+            exists = 1;
+        }
+        sqlite3_finalize(check_stmt);
     }
 
-    sqlite3_bind_blob(stmt, 1, info_hash, 20, SQLITE_STATIC);
-
-    cJSON *root = NULL;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int total_peers = sqlite3_column_int(stmt, 0);
-        int64_t last_seen = sqlite3_column_int64(stmt, 1);
-
-        root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "info_hash", hash_buf);
-        cJSON_AddNumberToObject(root, "total_peers", total_peers);
-        cJSON_AddNumberToObject(root, "last_seen", last_seen);
-    } else {
-        sqlite3_finalize(stmt);
-        const char *error = "{\"error\":\"Torrent not found\"}";
+    if (!exists) {
+        const char *error = "{\"error\":\"Torrent not found in database\"}";
         mg_printf(conn,
                   "HTTP/1.1 404 Not Found\r\n"
                   "Content-Type: application/json\r\n"
@@ -391,7 +378,61 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         return 404;
     }
 
-    sqlite3_finalize(stmt);
+    /* Check DHT manager availability */
+    if (!api->dht_manager || !api->dht_manager->refresh_query_store) {
+        const char *error = "{\"error\":\"DHT query system not available\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 503 Service Unavailable\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 503;
+    }
+
+    /* Create pending query */
+    refresh_query_t *query = refresh_query_create(api->dht_manager->refresh_query_store, info_hash);
+    if (!query) {
+        const char *error = "{\"error\":\"Failed to create DHT query\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 500;
+    }
+
+    /* Trigger DHT get_peers query */
+    int rc = dht_manager_query_peers(api->dht_manager, info_hash);
+    if (rc != 0) {
+        log_msg(LOG_WARN, "Failed to trigger DHT query for refresh");
+    }
+
+    /* Wait for DHT responses (blocks for up to 10 seconds) */
+    int peer_count = refresh_query_wait(query, 10);
+    int timed_out = query->timed_out;
+
+    /* Remove query from store */
+    refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
+
+    /* Build JSON response */
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "info_hash", hash_buf);
+    cJSON_AddNumberToObject(root, "total_peers", peer_count);
+    cJSON_AddBoolToObject(root, "live_query", 1);
+    cJSON_AddBoolToObject(root, "timed_out", timed_out);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    if (timed_out && peer_count == 0) {
+        cJSON_AddStringToObject(root, "warning",
+            "Query timed out with no peers found - torrent may have no active peers");
+    } else if (timed_out) {
+        cJSON_AddStringToObject(root, "warning",
+            "Query timed out - partial peer count returned");
+    }
 
     char *json = cJSON_Print(root);
     cJSON_Delete(root);
