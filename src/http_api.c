@@ -65,7 +65,7 @@ int http_api_start(http_api_t *api) {
     const char *options[] = {
         "listening_ports", "8080",
         "num_threads", "2",
-        "request_timeout_ms", "10000",
+        "request_timeout_ms", "15000",
         NULL
     };
 
@@ -411,8 +411,8 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         log_msg(LOG_WARN, "Failed to trigger priority DHT query for refresh");
     }
 
-    /* Wait for DHT responses (blocks for up to 10 seconds) */
-    int peer_count = refresh_query_wait(query, 10);
+    /* Wait for DHT responses (blocks for up to 8 seconds) */
+    int peer_count = refresh_query_wait(query, 8);
     int timed_out = query->timed_out;
 
     /* Remove query from store */
@@ -1043,10 +1043,26 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "      \n"
            "      if (btn.classList.contains('loading')) return;\n"
            "      \n"
-           "      btn.classList.add('loading');\n"
+           "      // Store original content for rollback on error\n"
+           "      const originalContent = peerSpan.textContent;\n"
+           "      const originalClass = peerSpan.className;\n"
            "      \n"
-           "      fetch('/refresh?hash=' + hash)\n"
-           "        .then(response => response.json())\n"
+           "      btn.classList.add('loading');\n"
+           "      peerSpan.textContent = 'Refreshing...';\n"
+           "      peerSpan.className = 'peer-count';\n"
+           "      \n"
+           "      // Create AbortController with 12 second timeout\n"
+           "      const controller = new AbortController();\n"
+           "      const timeoutId = setTimeout(() => controller.abort(), 12000);\n"
+           "      \n"
+           "      fetch('/refresh?hash=' + hash, { signal: controller.signal })\n"
+           "        .then(response => {\n"
+           "          clearTimeout(timeoutId);\n"
+           "          if (!response.ok) {\n"
+           "            throw new Error('Server returned ' + response.status);\n"
+           "          }\n"
+           "          return response.json();\n"
+           "        })\n"
            "        .then(data => {\n"
            "          const peers = data.total_peers;\n"
            "          peerSpan.textContent = peers + (peers === 1 ? ' peer' : ' peers');\n"
@@ -1056,10 +1072,36 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "          if (peers > 100) peerSpan.className += '';\n"
            "          else if (peers > 10) peerSpan.className += ' medium';\n"
            "          else peerSpan.className += ' low';\n"
+           "          \n"
+           "          // Show warning if query timed out\n"
+           "          if (data.timed_out && peers === 0) {\n"
+           "            peerSpan.title = 'Query timed out - no active peers found';\n"
+           "          } else if (data.timed_out) {\n"
+           "            peerSpan.title = 'Query timed out - partial count shown';\n"
+           "          } else {\n"
+           "            peerSpan.title = 'Live peer count from DHT network';\n"
+           "          }\n"
            "        })\n"
            "        .catch(err => {\n"
+           "          clearTimeout(timeoutId);\n"
            "          console.error('Failed to refresh peer count:', err);\n"
-           "          alert('Failed to refresh peer count');\n"
+           "          \n"
+           "          // Restore original content\n"
+           "          peerSpan.textContent = originalContent;\n"
+           "          peerSpan.className = originalClass;\n"
+           "          \n"
+           "          // Show specific error message\n"
+           "          let errorMsg = 'Failed to refresh peer count';\n"
+           "          if (err.name === 'AbortError') {\n"
+           "            errorMsg = 'Request timed out (>12s). Try again.';\n"
+           "          } else if (err.message.includes('Server returned')) {\n"
+           "            errorMsg = 'Server error: ' + err.message;\n"
+           "          } else if (err.message.includes('Failed to fetch')) {\n"
+           "            errorMsg = 'Network error. Check connection.';\n"
+           "          }\n"
+           "          \n"
+           "          peerSpan.title = errorMsg;\n"
+           "          alert(errorMsg);\n"
            "        })\n"
            "        .finally(() => {\n"
            "          btn.classList.remove('loading');\n"
