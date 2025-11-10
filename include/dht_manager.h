@@ -187,8 +187,10 @@ void dht_manager_cleanup(dht_manager_t *mgr);
 void dht_manager_print_stats(dht_manager_t *mgr);
 void dht_manager_set_metadata_fetcher(dht_manager_t *mgr, void *metadata_fetcher);
 
-/* Peer discovery functions */
-int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash);
+/* Peer discovery functions
+ * priority: if true, query is processed immediately (for /refresh API)
+ *           if false, query is queued normally (for automatic discovery) */
+int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash, bool priority);
 
 /* Node ID rotation functions */
 int dht_manager_rotate_node_id(dht_manager_t *mgr);

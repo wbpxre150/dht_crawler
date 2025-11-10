@@ -378,8 +378,10 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
 int wbpxre_dht_insert_node(wbpxre_dht_t *dht, const uint8_t *node_id,
                             const struct sockaddr_in *addr);
 
-/* Queue info_hash for get_peers query */
-int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash);
+/* Queue info_hash for get_peers query
+ * priority: if true, add to front of queue (for on-demand queries)
+ *           if false, add to back of queue (for automatic discovery) */
+int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool priority);
 
 /* Get routing table stats */
 int wbpxre_dht_nodes(wbpxre_dht_t *dht, int *good_return, int *dubious_return);
@@ -542,6 +544,9 @@ int wbpxre_queue_push(wbpxre_work_queue_t *queue, void *item);
 
 /* Try to push item to queue (non-blocking) */
 bool wbpxre_queue_try_push(wbpxre_work_queue_t *queue, void *item);
+
+/* Try to push item to front of queue (non-blocking, for priority items) */
+bool wbpxre_queue_try_push_front(wbpxre_work_queue_t *queue, void *item);
 
 /* Pop item from queue (blocking if empty) */
 void *wbpxre_queue_pop(wbpxre_work_queue_t *queue);

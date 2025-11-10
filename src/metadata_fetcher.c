@@ -2021,7 +2021,7 @@ static void retry_thread_fn(void *arg) {
 
                 /* Re-query DHT for fresh peers before retry (critical fix) */
                 if (fetcher->dht_manager) {
-                    dht_manager_query_peers((dht_manager_t *)fetcher->dht_manager, to_retry->info_hash);
+                    dht_manager_query_peers((dht_manager_t *)fetcher->dht_manager, to_retry->info_hash, false);
                     /* Small delay to let DHT responses populate peer_store */
                     usleep(500000);  /* 500ms - balance between freshness and latency */
                 }

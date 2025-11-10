@@ -405,10 +405,10 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         return 500;
     }
 
-    /* Trigger DHT get_peers query */
-    int rc = dht_manager_query_peers(api->dht_manager, info_hash);
+    /* Trigger DHT get_peers query with PRIORITY (skip to front of queue) */
+    int rc = dht_manager_query_peers(api->dht_manager, info_hash, true);
     if (rc != 0) {
-        log_msg(LOG_WARN, "Failed to trigger DHT query for refresh");
+        log_msg(LOG_WARN, "Failed to trigger priority DHT query for refresh");
     }
 
     /* Wait for DHT responses (blocks for up to 10 seconds) */

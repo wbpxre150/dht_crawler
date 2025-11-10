@@ -983,6 +983,12 @@ static void *get_peers_worker_func(void *arg) {
             }
         }
 
+        /* Notify that get_peers search is complete (whether peers found or not) */
+        if (dht->config.callback) {
+            dht->config.callback(dht->config.callback_closure, WBPXRE_EVENT_SEARCH_DONE,
+                                work->info_hash, NULL, 0);
+        }
+
         free(work);
     }
 
@@ -1332,7 +1338,7 @@ int wbpxre_dht_insert_node(wbpxre_dht_t *dht, const uint8_t *node_id,
     return wbpxre_routing_table_insert(dht->routing_table, &node);
 }
 
-int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash) {
+int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool priority) {
     if (!dht || !info_hash || !dht->infohashes_for_get_peers) {
         return -1;
     }
@@ -1344,8 +1350,13 @@ int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash) {
     memcpy(work->info_hash, info_hash, WBPXRE_INFO_HASH_LEN);
     work->added_at = time(NULL);
 
-    /* Try to push to queue (non-blocking to avoid blocking DHT callback) */
-    if (!wbpxre_queue_try_push(dht->infohashes_for_get_peers, work)) {
+    /* Try to push to queue (non-blocking to avoid blocking DHT callback)
+     * Use front insertion for priority queries (e.g., on-demand /refresh requests) */
+    bool success = priority ?
+        wbpxre_queue_try_push_front(dht->infohashes_for_get_peers, work) :
+        wbpxre_queue_try_push(dht->infohashes_for_get_peers, work);
+
+    if (!success) {
         free(work);
         return -1;  /* Queue full */
     }

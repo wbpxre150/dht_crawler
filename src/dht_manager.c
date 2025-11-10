@@ -144,14 +144,18 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
         }
 
         case WBPXRE_EVENT_SEARCH_DONE:
-            log_msg(LOG_DEBUG, "DHT event: search done");
             if (mgr->active_search_count > 0) {
                 mgr->active_search_count--;
             }
 
             /* NEW: Mark refresh query as complete */
             if (info_hash && mgr->refresh_query_store) {
+                char hex[41];
+                format_infohash(info_hash, hex, sizeof(hex));
+                log_msg(LOG_DEBUG, "DHT event: search done for hash %s", hex);
                 refresh_query_complete(mgr->refresh_query_store, info_hash);
+            } else {
+                log_msg(LOG_DEBUG, "DHT event: search done (no info_hash or no refresh_query_store)");
             }
 
             /* Track peer query completion */
@@ -191,8 +195,8 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                     const uint8_t *hash = samples + (i * 20);
                     mgr->stats.infohashes_discovered++;
 
-                    /* Query DHT for peers */
-                    dht_manager_query_peers(mgr, hash);
+                    /* Query DHT for peers (normal priority for automatic discovery) */
+                    dht_manager_query_peers(mgr, hash, false);
                 }
             }
             break;
@@ -818,18 +822,25 @@ void dht_manager_set_metadata_fetcher(dht_manager_t *mgr, void *metadata_fetcher
 }
 
 /* Query peers for an info_hash */
-int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash) {
+int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash, bool priority) {
     if (!mgr || !mgr->dht || !info_hash) {
         return -1;
     }
 
-    /* Queue the info_hash for the wbpxre-dht get_peers pipeline */
-    int rc = wbpxre_dht_query_peers(mgr->dht, info_hash);
+    /* Queue the info_hash for the wbpxre-dht get_peers pipeline
+     * Priority queries (e.g., from /refresh API) skip to front of queue */
+    int rc = wbpxre_dht_query_peers(mgr->dht, info_hash, priority);
 
     if (rc == 0) {
         /* Track the request */
         mgr->stats.get_peers_queries_sent++;
         mgr->active_peer_queries++;
+
+        if (priority) {
+            char hex[41];
+            format_infohash(info_hash, hex, sizeof(hex));
+            log_msg(LOG_DEBUG, "Priority get_peers query for hash %s", hex);
+        }
     }
 
     return rc;

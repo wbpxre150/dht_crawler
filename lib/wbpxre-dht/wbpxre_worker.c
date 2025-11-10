@@ -108,6 +108,29 @@ bool wbpxre_queue_try_push(wbpxre_work_queue_t *queue, void *item) {
     return true;
 }
 
+/* Push item to front of queue (for priority items) - non-blocking */
+bool wbpxre_queue_try_push_front(wbpxre_work_queue_t *queue, void *item) {
+    if (!queue || !item) return false;
+
+    pthread_mutex_lock(&queue->mutex);
+
+    /* Check if queue is full */
+    if (queue->size >= queue->capacity || queue->shutdown) {
+        pthread_mutex_unlock(&queue->mutex);
+        return false;
+    }
+
+    /* Add item to front by decrementing head */
+    queue->head = (queue->head - 1 + queue->capacity) % queue->capacity;
+    queue->items[queue->head] = item;
+    queue->size++;
+
+    pthread_cond_signal(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
+
+    return true;
+}
+
 void *wbpxre_queue_pop(wbpxre_work_queue_t *queue) {
     if (!queue) return NULL;
 
