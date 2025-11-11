@@ -263,7 +263,8 @@ int main(int argc, char *argv[]) {
 
     /* Initialize HTTP API */
     log_msg(LOG_DEBUG, "Initializing HTTP API...");
-    rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, &g_dht_mgr, HTTP_API_PORT);
+    rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, &g_dht_mgr,
+                       g_fetcher.batch_writer, HTTP_API_PORT);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize HTTP API: %d", rc);
         dht_manager_stop(&g_dht_mgr);

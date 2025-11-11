@@ -5,6 +5,9 @@
 #include "database.h"
 #include "dht_manager.h"
 
+/* Forward declaration */
+typedef struct batch_writer batch_writer_t;
+
 /* HTTP server configuration */
 #define HTTP_API_PORT 8080
 #define HTTP_API_MAX_RESULTS 50
@@ -15,6 +18,7 @@ typedef struct {
     app_context_t *app_ctx;
     database_t *database;
     dht_manager_t *dht_manager;
+    batch_writer_t *batch_writer;
     int port;
     int running;
 } http_api_t;
@@ -33,7 +37,7 @@ typedef struct {
 
 /* Function declarations */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  dht_manager_t *dht_manager, int port);
+                  dht_manager_t *dht_manager, batch_writer_t *batch_writer, int port);
 int http_api_start(http_api_t *api);
 void http_api_stop(http_api_t *api);
 void http_api_cleanup(http_api_t *api);

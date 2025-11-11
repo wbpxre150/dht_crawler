@@ -2,6 +2,7 @@
 #include "dht_crawler.h"
 #include "dht_manager.h"
 #include "refresh_query.h"
+#include "batch_writer.h"
 #include <civetweb.h>
 #include <cJSON.h>
 #include <string.h>
@@ -39,7 +40,7 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
 
 /* Initialize HTTP API */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  dht_manager_t *dht_manager, int port) {
+                  dht_manager_t *dht_manager, batch_writer_t *batch_writer, int port) {
     if (!api || !app_ctx || !database || !dht_manager) {
         return -1;
     }
@@ -48,6 +49,7 @@ int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
     api->app_ctx = app_ctx;
     api->database = database;
     api->dht_manager = dht_manager;
+    api->batch_writer = batch_writer;
     api->port = port;
     api->running = 0;
 
@@ -123,6 +125,7 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
     sqlite3_stmt *stmt;
     int torrent_count = 0;
     int file_count = 0;
+    size_t hourly_count = 0;
 
     const char *count_sql = "SELECT COUNT(*) FROM torrents";
     if (sqlite3_prepare_v2(api->database->db, count_sql, -1, &stmt, NULL) == SQLITE_OK) {
@@ -140,9 +143,15 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         sqlite3_finalize(stmt);
     }
 
+    /* Get hourly count from batch writer */
+    if (api->batch_writer) {
+        hourly_count = batch_writer_get_hourly_count(api->batch_writer);
+    }
+
     /* Format numbers with commas */
     char torrent_count_str[32];
     char file_count_str[32];
+    char hourly_count_str[32];
 
     if (torrent_count >= 1000000) {
         snprintf(torrent_count_str, sizeof(torrent_count_str), "%d,%03d,%03d",
@@ -162,6 +171,16 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
                  file_count / 1000, file_count % 1000);
     } else {
         snprintf(file_count_str, sizeof(file_count_str), "%d", file_count);
+    }
+
+    if (hourly_count >= 1000000) {
+        snprintf(hourly_count_str, sizeof(hourly_count_str), "%zu,%03zu,%03zu",
+                 hourly_count / 1000000, (hourly_count / 1000) % 1000, hourly_count % 1000);
+    } else if (hourly_count >= 1000) {
+        snprintf(hourly_count_str, sizeof(hourly_count_str), "%zu,%03zu",
+                 hourly_count / 1000, hourly_count % 1000);
+    } else {
+        snprintf(hourly_count_str, sizeof(hourly_count_str), "%zu", hourly_count);
     }
 
     /* Build HTML */
@@ -260,11 +279,12 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "    <div class='stats'>\n"
         "      <div>%s torrents indexed</div>\n"
         "      <div>%s files indexed</div>\n"
+        "      <div>%s found in last hour</div>\n"
         "    </div>\n"
         "  </div>\n"
         "</body>\n"
         "</html>",
-        torrent_count_str, file_count_str);
+        torrent_count_str, file_count_str, hourly_count_str);
 
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
@@ -285,6 +305,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     sqlite3_stmt *stmt;
     int torrent_count = 0;
     int file_count = 0;
+    size_t hourly_count = 0;
 
     const char *count_sql = "SELECT COUNT(*) FROM torrents";
     if (sqlite3_prepare_v2(api->database->db, count_sql, -1, &stmt, NULL) == SQLITE_OK) {
@@ -302,11 +323,17 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         sqlite3_finalize(stmt);
     }
 
+    /* Get hourly count from batch writer */
+    if (api->batch_writer) {
+        hourly_count = batch_writer_get_hourly_count(api->batch_writer);
+    }
+
     /* Build JSON response */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "version", DHT_CRAWLER_VERSION);
     cJSON_AddNumberToObject(root, "torrents_indexed", torrent_count);
     cJSON_AddNumberToObject(root, "files_indexed", file_count);
+    cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
 
     char *json = cJSON_Print(root);

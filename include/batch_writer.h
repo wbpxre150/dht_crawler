@@ -4,15 +4,24 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <uv.h>
+#include <time.h>
 #include "database.h"
 #include "bloom_filter.h"
 
 /**
  * Batched database writer for high-throughput torrent insertion
- * 
+ *
  * Provides 10-100x improvement in write speed by batching
  * multiple inserts into single transactions.
  */
+
+/**
+ * Per-minute statistics for rolling hourly count
+ */
+typedef struct {
+    time_t minute;        /* Unix timestamp / 60 */
+    size_t count;         /* Torrents written in this minute */
+} minute_stat_t;
 
 typedef struct batch_writer batch_writer_t;
 
@@ -61,6 +70,13 @@ int batch_writer_flush(batch_writer_t *writer);
 void batch_writer_stats(batch_writer_t *writer, size_t *out_batch_size,
                        size_t *out_batch_capacity, uint64_t *out_total_written,
                        uint64_t *out_total_flushes);
+
+/**
+ * Get torrents discovered in the last hour
+ * @param writer Batch writer instance
+ * @return Number of torrents written in the last 60 minutes
+ */
+size_t batch_writer_get_hourly_count(batch_writer_t *writer);
 
 /**
  * Shutdown batch writer (flush pending writes)

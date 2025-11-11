@@ -22,6 +22,9 @@ struct batch_writer {
 
     uint64_t total_written;
     uint64_t total_flushes;
+
+    /* Rolling 60-minute window for hourly statistics */
+    minute_stat_t hourly_stats[60];
 };
 
 /* Timer callback for periodic flush */
@@ -90,16 +93,19 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     }
     
     writer->flush_timer.data = writer;
-    
+
+    /* Initialize hourly stats array (zero out) */
+    memset(writer->hourly_stats, 0, sizeof(writer->hourly_stats));
+
     /* Start periodic flush timer */
     if (flush_interval_sec > 0) {
         uint64_t interval_ms = flush_interval_sec * 1000;
         uv_timer_start(&writer->flush_timer, flush_timer_cb, interval_ms, interval_ms);
     }
-    
+
     log_msg(LOG_DEBUG, "Batch writer initialized: capacity=%zu, flush_interval=%ds",
             batch_capacity, flush_interval_sec);
-    
+
     return writer;
 }
 
@@ -265,6 +271,21 @@ int batch_writer_flush(batch_writer_t *writer) {
     writer->total_written += written;
     writer->total_flushes++;
     size_t total = writer->total_written;
+
+    /* Update hourly statistics - record torrents written in current minute */
+    if (written > 0) {
+        time_t current_minute = time(NULL) / 60;
+        int bucket = current_minute % 60;
+
+        /* If this is a new minute, reset the bucket; otherwise accumulate */
+        if (writer->hourly_stats[bucket].minute != current_minute) {
+            writer->hourly_stats[bucket].minute = current_minute;
+            writer->hourly_stats[bucket].count = written;
+        } else {
+            writer->hourly_stats[bucket].count += written;
+        }
+    }
+
     uv_mutex_unlock(&writer->mutex);
 
     log_msg(LOG_INFO, "Batch flush: %zu items written (total: %lu)", written, total);
@@ -278,9 +299,9 @@ void batch_writer_stats(batch_writer_t *writer, size_t *out_batch_size,
     if (!writer) {
         return;
     }
-    
+
     uv_mutex_lock(&writer->mutex);
-    
+
     if (out_batch_size) {
         *out_batch_size = writer->batch_size;
     }
@@ -293,8 +314,33 @@ void batch_writer_stats(batch_writer_t *writer, size_t *out_batch_size,
     if (out_total_flushes) {
         *out_total_flushes = writer->total_flushes;
     }
-    
+
     uv_mutex_unlock(&writer->mutex);
+}
+
+size_t batch_writer_get_hourly_count(batch_writer_t *writer) {
+    if (!writer) {
+        return 0;
+    }
+
+    uv_mutex_lock(&writer->mutex);
+
+    time_t current_minute = time(NULL) / 60;
+    size_t total_count = 0;
+
+    /* Sum all entries in the 60-minute window that are recent */
+    for (int i = 0; i < 60; i++) {
+        time_t stat_minute = writer->hourly_stats[i].minute;
+
+        /* Only count if this entry is within the last 60 minutes */
+        if (stat_minute > 0 && (current_minute - stat_minute) < 60) {
+            total_count += writer->hourly_stats[i].count;
+        }
+    }
+
+    uv_mutex_unlock(&writer->mutex);
+
+    return total_count;
 }
 
 void batch_writer_shutdown(batch_writer_t *writer) {
