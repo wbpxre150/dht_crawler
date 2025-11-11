@@ -471,8 +471,10 @@ int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
                                       wbpxre_routing_node_t **nodes_out, int k);
 
 /* Get nodes suitable for sample_infohashes
- * Returns copies of nodes (caller must free each node in nodes_out array) */
+ * Returns copies of nodes (caller must free each node in nodes_out array)
+ * current_node_id: Used for keyspace-aware filtering (prioritize close nodes) */
 int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
+                                                const uint8_t *current_node_id,
                                                 wbpxre_routing_node_t **nodes_out,
                                                 int n);
 
@@ -505,6 +507,13 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
                                              const uint8_t *current_node_id,
                                              wbpxre_routing_node_t **nodes_out,
                                              int n);
+
+/* Get keyspace distribution statistics (close vs distant nodes)
+ * Used for monitoring keyspace composition after rotation */
+void wbpxre_routing_table_get_keyspace_distribution(wbpxre_routing_table_t *table,
+                                                      const uint8_t *current_node_id,
+                                                      int *close_nodes,
+                                                      int *distant_nodes);
 
 /* Update node after successful response */
 void wbpxre_routing_table_update_node_responded(wbpxre_routing_table_t *table,

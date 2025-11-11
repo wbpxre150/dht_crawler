@@ -486,7 +486,11 @@ int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
  * BEP 51 Sample Candidates
  * ============================================================================ */
 
-static bool is_sample_infohashes_candidate(wbpxre_routing_node_t *node) {
+/* Forward declaration of wbpxre_xor_distance (defined in wbpxre_dht.c) */
+extern void wbpxre_xor_distance(const uint8_t *a, const uint8_t *b, uint8_t *result);
+
+static bool is_sample_infohashes_candidate(wbpxre_routing_node_t *node,
+                                            const uint8_t *current_node_id) {
     time_t now = time(NULL);
 
     /* Must not be dropped */
@@ -498,11 +502,24 @@ static bool is_sample_infohashes_candidate(wbpxre_routing_node_t *node) {
     /* Must respect interval (next_sample_time must have passed) */
     if (node->next_sample_time > now) return false;
 
-    /* Must have responded recently (within last 180 seconds) OR never been queried yet
-     * CHANGED: Increased from 60s to 180s to keep nodes eligible across 2-3 rotation cycles
-     * This prevents nodes from aging out too quickly and causing worker starvation */
-    if (node->last_responded_at > 0 && (now - node->last_responded_at) > 180) {
-        return false;
+    /* FIX #1: Keyspace distance filter
+     * Calculate XOR distance between our node_id and this node
+     * If first byte distance > 128 (opposite half of keyspace), apply stricter rules */
+    uint8_t distance[WBPXRE_NODE_ID_LEN];
+    wbpxre_xor_distance(current_node_id, node->id, distance);
+
+    bool is_distant = distance[0] > 128;  /* First byte differs significantly */
+
+    if (is_distant) {
+        /* Distant nodes: stricter eligibility (60 seconds instead of 300) */
+        if (node->last_responded_at > 0 && (now - node->last_responded_at) > 60) {
+            return false;
+        }
+    } else {
+        /* Close nodes: normal eligibility (300 seconds) */
+        if (node->last_responded_at > 0 && (now - node->last_responded_at) > 300) {
+            return false;
+        }
     }
 
     return true;
@@ -512,9 +529,10 @@ static bool is_sample_infohashes_candidate(wbpxre_routing_node_t *node) {
  * This eliminates BST structure bias and provides uniform node selection
  * Critical for hot rotation where XOR distance changes but BST doesn't */
 int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
+                                                const uint8_t *current_node_id,
                                                 wbpxre_routing_node_t **nodes_out,
                                                 int n) {
-    if (!table || !nodes_out || n <= 0) return 0;
+    if (!table || !current_node_id || !nodes_out || n <= 0) return 0;
 
     pthread_rwlock_rdlock(&table->lock);
 
@@ -530,7 +548,7 @@ int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
 
         if (!node) continue;  /* Empty slot */
 
-        if (is_sample_infohashes_candidate(node)) {
+        if (is_sample_infohashes_candidate(node, current_node_id)) {
             /* Copy node to avoid data races after lock release */
             wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
             memcpy(node_copy, node, sizeof(wbpxre_routing_node_t));
@@ -809,6 +827,39 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
     pthread_rwlock_unlock(&table->lock);
 
     return to_return;
+}
+
+/* Get keyspace distribution statistics (close vs distant nodes)
+ * Used for monitoring keyspace composition after rotation */
+void wbpxre_routing_table_get_keyspace_distribution(wbpxre_routing_table_t *table,
+                                                      const uint8_t *current_node_id,
+                                                      int *close_nodes,
+                                                      int *distant_nodes) {
+    if (!table || !current_node_id || !close_nodes || !distant_nodes) return;
+
+    *close_nodes = 0;
+    *distant_nodes = 0;
+
+    pthread_rwlock_rdlock(&table->lock);
+
+    /* Iterate all nodes and classify by distance */
+    for (int i = 0; i < table->all_nodes_capacity; i++) {
+        wbpxre_routing_node_t *node = table->all_nodes[i];
+        if (!node || node->dropped) continue;
+
+        /* Calculate XOR distance */
+        uint8_t distance[WBPXRE_NODE_ID_LEN];
+        wbpxre_xor_distance(current_node_id, node->id, distance);
+
+        /* Classify by first byte distance */
+        if (distance[0] > 128) {
+            (*distant_nodes)++;
+        } else {
+            (*close_nodes)++;
+        }
+    }
+
+    pthread_rwlock_unlock(&table->lock);
 }
 
 /* ============================================================================

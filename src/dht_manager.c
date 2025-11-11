@@ -1069,21 +1069,51 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "  Fully migrated to new keyspace position");
             log_msg(LOG_INFO, "  No downtime - all workers kept running!");
 
-            /* Post-rotation cleanup: Aggressively evict nodes from old keyspace
-             * This creates room for new nodes from the current keyspace */
+            /* Post-rotation cleanup: Prune 30% of distant nodes to make room for new keyspace */
             int post_good = 0, post_dubious = 0;
             wbpxre_dht_nodes(mgr->dht, &post_good, &post_dubious);
             int current_nodes = post_good + post_dubious;
 
-            /* If routing table is >60% full, evict distant nodes to make room */
-            if (current_nodes > 24000) {  /* 60% of 40K target */
-                log_msg(LOG_INFO, "=== Post-Rotation Cleanup ===");
-                log_msg(LOG_INFO, "  Current nodes: %d", current_nodes);
-                log_msg(LOG_INFO, "  Triggering aggressive keyspace cleanup...");
+            /* Target: Remove 30% of distant nodes (not 30% of total table) */
+            uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
+            pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
+            memcpy(current_node_id, mgr->app_ctx->node_id, WBPXRE_NODE_ID_LEN);
+            pthread_rwlock_unlock(&mgr->dht->node_id_lock);
 
-                /* Trigger happens automatically in maintenance thread via capacity-based eviction
-                 * No explicit action needed here - just log that cleanup will happen */
-                log_msg(LOG_INFO, "  Capacity-based eviction will reduce table to ~70%% in next maintenance cycle");
+            /* Estimate: ~40% of nodes are distant (opposite half of keyspace) */
+            int estimated_distant = (int)(current_nodes * 0.4);
+            int nodes_to_prune = (int)(estimated_distant * 0.3);  /* 30% of distant nodes */
+
+            log_msg(LOG_INFO, "=== Post-Rotation Keyspace Pruning ===");
+            log_msg(LOG_INFO, "  Current nodes: %d", current_nodes);
+            log_msg(LOG_INFO, "  Estimated distant nodes: %d", estimated_distant);
+            log_msg(LOG_INFO, "  Target pruning: %d distant nodes (%.1f%% of table)",
+                    nodes_to_prune, (nodes_to_prune * 100.0) / current_nodes);
+
+            /* Get distant nodes and drop them */
+            wbpxre_routing_node_t **distant_nodes = malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_prune);
+            if (distant_nodes) {
+                int pruned_count = wbpxre_routing_table_get_distant_nodes(
+                    mgr->dht->routing_table,
+                    current_node_id,
+                    distant_nodes,
+                    nodes_to_prune
+                );
+
+                for (int i = 0; i < pruned_count; i++) {
+                    wbpxre_routing_table_drop_node(mgr->dht->routing_table, distant_nodes[i]->id);
+                    free(distant_nodes[i]);
+                }
+
+                free(distant_nodes);
+
+                wbpxre_dht_nodes(mgr->dht, &post_good, &post_dubious);
+                int new_count = post_good + post_dubious;
+
+                log_msg(LOG_INFO, "  Pruned: %d distant nodes", pruned_count);
+                log_msg(LOG_INFO, "  Routing table after pruning: %d nodes", new_count);
+                log_msg(LOG_INFO, "  Space available for new keyspace nodes: ~%d slots",
+                        mgr->config.max_routing_table_nodes - new_count);
             }
 
             return 0;
@@ -1171,6 +1201,25 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                     good + dubious);
             log_msg(LOG_INFO, "  wbpxre-dht: good=%d dubious=%d total=%d",
                     good, dubious, good + dubious);
+
+            /* Print keyspace distribution statistics */
+            uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
+            pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
+            memcpy(current_node_id, mgr->dht->config.node_id, WBPXRE_NODE_ID_LEN);
+            pthread_rwlock_unlock(&mgr->dht->node_id_lock);
+
+            int close_nodes = 0, distant_nodes = 0;
+            wbpxre_routing_table_get_keyspace_distribution(mgr->dht->routing_table,
+                                                             current_node_id,
+                                                             &close_nodes,
+                                                             &distant_nodes);
+
+            int total_nodes = close_nodes + distant_nodes;
+            if (total_nodes > 0) {
+                log_msg(LOG_INFO, "  Keyspace distribution: close=%d (%.1f%%) distant=%d (%.1f%%)",
+                        close_nodes, (close_nodes * 100.0) / total_nodes,
+                        distant_nodes, (distant_nodes * 100.0) / total_nodes);
+            }
 
             /* Calculate and display nodes dropped in last interval */
             uint64_t current_dropped = wbpxre_stats.nodes_dropped;

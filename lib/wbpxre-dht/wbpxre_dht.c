@@ -591,8 +591,8 @@ static void *maintenance_thread_func(void *arg) {
         /* ====================================================================
          * Phase 5: Capacity-based Eviction (IMPROVED + KEYSPACE-AWARE)
          * When table is near full, aggressively evict distant nodes
-         * Lower trigger threshold (80% instead of 90%) for earlier eviction
-         * Target lower capacity (70% instead of 85%) to create more room
+         * FIX: Raised trigger threshold (90% instead of 80%) to reduce churn
+         * Target higher capacity (85% instead of 70%) to maintain routing table density
          * Increase batch size when critically full (>95%)
          * Use keyspace-aware eviction to prioritize nodes from old keyspaces
          * ==================================================================== */
@@ -601,10 +601,10 @@ static void *maintenance_thread_func(void *arg) {
         int current_nodes = dht->routing_table->node_count;
         double fill_ratio = (double)current_nodes / (double)max_nodes;
 
-        /* If table is >80% full, aggressively evict distant nodes */
-        if (fill_ratio > 0.80) {
-            /* Calculate how many nodes to evict to get back to 70% capacity */
-            int target_nodes = (int)(max_nodes * 0.70);
+        /* If table is >90% full, evict distant nodes (was 80%) */
+        if (fill_ratio > 0.90) {
+            /* Calculate how many nodes to evict to get back to 85% capacity (was 70%) */
+            int target_nodes = (int)(max_nodes * 0.85);
             int nodes_to_evict = current_nodes - target_nodes;
 
             /* If critically full (>95%), use 2x batch size for faster cleanup */
@@ -1047,9 +1047,15 @@ static void *sample_infohashes_feeder_func(void *arg) {
     static time_t last_queue_full_warn = 0;
 
     while (dht->running) {
+        /* Get current node ID for keyspace-aware filtering */
+        uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
+        pthread_rwlock_rdlock(&dht->node_id_lock);
+        memcpy(current_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
+        pthread_rwlock_unlock(&dht->node_id_lock);
+
         /* Get up to 200 nodes suitable for sample_infohashes (increased from 60) */
         wbpxre_routing_node_t *candidates[200];
-        int count = wbpxre_routing_table_get_sample_candidates(dht->routing_table, candidates, 200);
+        int count = wbpxre_routing_table_get_sample_candidates(dht->routing_table, current_node_id, candidates, 200);
 
         /* Feed them to worker queue */
         int dropped = 0;
