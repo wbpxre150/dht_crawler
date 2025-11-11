@@ -1069,43 +1069,49 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "  Fully migrated to new keyspace position");
             log_msg(LOG_INFO, "  No downtime - all workers kept running!");
 
-            /* Post-rotation cleanup: Prune 30% of distant nodes to make room for new keyspace */
+            /* Post-rotation cleanup: AGGRESSIVELY prune distant nodes to make room for new keyspace */
             int post_good = 0, post_dubious = 0;
             wbpxre_dht_nodes(mgr->dht, &post_good, &post_dubious);
             int current_nodes = post_good + post_dubious;
 
-            /* Target: Remove 30% of distant nodes (not 30% of total table) */
+            /* Target: Remove 70% of distant nodes to quickly make room for close nodes
+             * With ~50/50 distribution, this prunes ~35% of total table */
             uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
             pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
             memcpy(current_node_id, mgr->app_ctx->node_id, WBPXRE_NODE_ID_LEN);
             pthread_rwlock_unlock(&mgr->dht->node_id_lock);
 
-            /* Estimate: ~40% of nodes are distant (opposite half of keyspace) */
-            int estimated_distant = (int)(current_nodes * 0.4);
-            int nodes_to_prune = (int)(estimated_distant * 0.3);  /* 30% of distant nodes */
+            /* Get actual keyspace distribution */
+            int close_nodes = 0, distant_nodes_count = 0;
+            wbpxre_routing_table_get_keyspace_distribution(mgr->dht->routing_table,
+                                                             current_node_id,
+                                                             &close_nodes,
+                                                             &distant_nodes_count);
 
-            log_msg(LOG_INFO, "=== Post-Rotation Keyspace Pruning ===");
-            log_msg(LOG_INFO, "  Current nodes: %d", current_nodes);
-            log_msg(LOG_INFO, "  Estimated distant nodes: %d", estimated_distant);
-            log_msg(LOG_INFO, "  Target pruning: %d distant nodes (%.1f%% of table)",
+            /* Prune 70% of distant nodes */
+            int nodes_to_prune = (int)(distant_nodes_count * 0.70);
+
+            log_msg(LOG_INFO, "=== Post-Rotation Aggressive Keyspace Pruning ===");
+            log_msg(LOG_INFO, "  Current nodes: %d (close=%d distant=%d)", current_nodes, close_nodes, distant_nodes_count);
+            log_msg(LOG_INFO, "  Target pruning: %d distant nodes (70%% of distant, %.1f%% of total)",
                     nodes_to_prune, (nodes_to_prune * 100.0) / current_nodes);
 
             /* Get distant nodes and drop them */
-            wbpxre_routing_node_t **distant_nodes = malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_prune);
-            if (distant_nodes) {
+            wbpxre_routing_node_t **distant_nodes_array = malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_prune);
+            if (distant_nodes_array) {
                 int pruned_count = wbpxre_routing_table_get_distant_nodes(
                     mgr->dht->routing_table,
                     current_node_id,
-                    distant_nodes,
+                    distant_nodes_array,
                     nodes_to_prune
                 );
 
                 for (int i = 0; i < pruned_count; i++) {
-                    wbpxre_routing_table_drop_node(mgr->dht->routing_table, distant_nodes[i]->id);
-                    free(distant_nodes[i]);
+                    wbpxre_routing_table_drop_node(mgr->dht->routing_table, distant_nodes_array[i]->id);
+                    free(distant_nodes_array[i]);
                 }
 
-                free(distant_nodes);
+                free(distant_nodes_array);
 
                 wbpxre_dht_nodes(mgr->dht, &post_good, &post_dubious);
                 int new_count = post_good + post_dubious;
