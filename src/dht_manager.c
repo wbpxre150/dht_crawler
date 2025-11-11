@@ -200,9 +200,18 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                     }
                 } else {
                     /* No retry needed - add to queue for metadata fetching */
-                    if (peer_count > 0) {
-                        /* Note: Actual queue push happens in WBPXRE_EVENT_VALUES */
-                    } else {
+                    if (peer_count > 0 && mgr->infohash_queue) {
+                        /* FIXED: Push to queue immediately after retry completion
+                         * This ensures infohashes with peers reach the metadata fetcher */
+                        infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
+                        if (!infohash_queue_is_full(queue)) {
+                            infohash_queue_push(queue, info_hash);
+                        } else {
+                            char hex[41];
+                            format_infohash(info_hash, hex, sizeof(hex));
+                            log_msg(LOG_WARN, "Infohash queue is full after retry completion, dropping %s", hex);
+                        }
+                    } else if (peer_count == 0) {
                         mgr->stats.info_hashes_no_peers++;
                     }
 
@@ -217,7 +226,18 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
             /* Fallback for when retry tracker is disabled */
             else if (info_hash && mgr->peer_store) {
                 int peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
-                if (peer_count == 0) {
+
+                if (peer_count > 0 && mgr->infohash_queue) {
+                    /* Push to queue for metadata fetching */
+                    infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
+                    if (!infohash_queue_is_full(queue)) {
+                        infohash_queue_push(queue, info_hash);
+                    } else {
+                        char hex[41];
+                        format_infohash(info_hash, hex, sizeof(hex));
+                        log_msg(LOG_WARN, "Infohash queue is full, dropping %s", hex);
+                    }
+                } else if (peer_count == 0) {
                     mgr->stats.info_hashes_no_peers++;
                 }
 
