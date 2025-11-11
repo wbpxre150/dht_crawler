@@ -277,6 +277,21 @@ static void stats_timer_cb(uv_timer_t *handle) {
         dht_cache_save(&mgr->cache);
         cache_save_counter = 0;
     }
+
+    /* Peer store cleanup (every 300 seconds / 5 minutes) */
+    static int cleanup_counter = 0;
+    cleanup_counter += 10;  /* Timer fires every 10 seconds */
+
+    if (cleanup_counter >= 300) {  /* Every 5 minutes */
+        if (mgr->peer_store) {
+            log_msg(LOG_DEBUG, "Running periodic peer store cleanup");
+            int expired = peer_store_cleanup_expired(mgr->peer_store);
+            if (expired > 0) {
+                log_msg(LOG_DEBUG, "Peer store cleanup: %d expired peers removed", expired);
+            }
+        }
+        cleanup_counter = 0;
+    }
 }
 
 /* Bootstrap the DHT by connecting to known routers */

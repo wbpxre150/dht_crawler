@@ -1857,9 +1857,18 @@ static void close_peer_connection_locked(peer_connection_t *peer, const char *re
             }
 
             uv_mutex_lock(&fetcher->mutex);
-        } else if (attempt && attempt->active_connections == 0) {
-            /* No failure to handle, but still need to remove attempt entry */
-            remove_attempt(fetcher, info_hash_copy);
+        } else {
+            /* No failure to handle, but may need to remove attempt entry on success */
+            /* Re-acquire attempt_table_mutex to safely check and remove */
+            uv_mutex_lock(&fetcher->attempt_table_mutex);
+            attempt = lookup_attempt(fetcher, info_hash_copy);
+            if (attempt && attempt->active_connections == 0) {
+                uv_mutex_unlock(&fetcher->attempt_table_mutex);
+                /* Remove attempt entry (successful or no more connections) */
+                remove_attempt(fetcher, info_hash_copy);
+            } else {
+                uv_mutex_unlock(&fetcher->attempt_table_mutex);
+            }
         }
     }
 
@@ -2308,6 +2317,15 @@ static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash
     while (attempt) {
         if (memcmp(attempt->info_hash, info_hash, 20) == 0) {
             *prev_ptr = attempt->next;
+
+            /* Log removal for debugging memory leaks */
+            char hex[41];
+            for (int i = 0; i < 20; i++) {
+                sprintf(hex + i*2, "%02x", info_hash[i]);
+            }
+            log_msg(LOG_DEBUG, "Removed attempt entry for %s (connections_tried=%d, peers_tried=%d/%d)",
+                    hex, attempt->total_connections_tried, attempt->peers_tried, attempt->total_peer_count);
+
             /* Free peer queue arrays if allocated */
             if (attempt->available_peers) {
                 free(attempt->available_peers);
