@@ -8,6 +8,7 @@
 #include "discovered_nodes.h"
 #include "wbpxre_dht.h"
 #include "refresh_query.h"
+#include "peer_retry_tracker.h"
 #include <uv.h>
 #include <stdbool.h>
 
@@ -72,6 +73,8 @@ typedef struct {
     time_t last_rotation_time;           /* Last rotation timestamp */
     /* Node pruning statistics */
     uint64_t last_nodes_dropped;         /* Nodes dropped at last stats print (for delta calculation) */
+    /* Peer retry statistics */
+    uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
 } dht_stats_t;
 
 /* DHT configuration */
@@ -167,6 +170,8 @@ typedef struct {
     void *metadata_fetcher;           /* Pointer to metadata_fetcher_t */
     /* Refresh query tracking for HTTP API */
     refresh_query_store_t *refresh_query_store;
+    /* Peer retry tracking */
+    peer_retry_tracker_t *peer_retry_tracker;
     /* Close tracker for safe shutdown */
     close_tracker_t close_tracker;
     /* Initialization state flags */

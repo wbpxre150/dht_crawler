@@ -98,6 +98,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->node_rotation_enabled = 1;
     config->node_rotation_interval_sec = 300;  /* 5 minutes */
     config->node_rotation_drain_timeout_sec = 10;
+
+    /* Peer discovery retry defaults */
+    config->peer_retry_enabled = 1;
+    config->peer_retry_max_attempts = 3;
+    config->peer_retry_min_threshold = 10;
+    config->peer_retry_delay_ms = 500;
 }
 
 /* Load config from INI-style file */
@@ -290,6 +296,16 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->node_rotation_interval_sec = atoi(value);
         } else if (strcmp(key, "node_rotation_drain_timeout_sec") == 0) {
             config->node_rotation_drain_timeout_sec = atoi(value);
+        }
+        /* Peer discovery retry settings */
+        else if (strcmp(key, "peer_retry_enabled") == 0) {
+            config->peer_retry_enabled = atoi(value);
+        } else if (strcmp(key, "peer_retry_max_attempts") == 0) {
+            config->peer_retry_max_attempts = atoi(value);
+        } else if (strcmp(key, "peer_retry_min_threshold") == 0) {
+            config->peer_retry_min_threshold = atoi(value);
+        } else if (strcmp(key, "peer_retry_delay_ms") == 0) {
+            config->peer_retry_delay_ms = atoi(value);
         }
     }
 

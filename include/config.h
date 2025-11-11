@@ -90,6 +90,12 @@ typedef struct {
     int node_rotation_enabled;           /* Enable periodic node ID rotation */
     int node_rotation_interval_sec;      /* Rotation interval in seconds */
     int node_rotation_drain_timeout_sec; /* Time to wait for in-flight operations */
+
+    /* Peer discovery retry settings */
+    int peer_retry_enabled;              /* Enable multi-retry peer discovery */
+    int peer_retry_max_attempts;         /* Max get_peers retries (1-5, default: 3) */
+    int peer_retry_min_threshold;        /* Min peers before stopping retries (default: 10) */
+    int peer_retry_delay_ms;             /* Delay between retries in ms (default: 500) */
 } crawler_config_t;
 
 /* Initialize config with default values */

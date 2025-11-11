@@ -31,9 +31,17 @@ static const bootstrap_node_t bootstrap_nodes[] = {
 /* Global DHT manager for statistics tracking */
 static dht_manager_t *g_dht_manager = NULL;
 
+/* Timer context for delayed retries */
+typedef struct {
+    uint8_t info_hash[20];
+    dht_manager_t *mgr;
+    uv_timer_t timer;
+} retry_context_t;
+
 /* Forward declaration */
 static int bootstrap_dht(dht_manager_t *mgr);
 static void node_rotation_timer_cb(uv_timer_t *handle);
+static void retry_timer_cb(uv_timer_t *handle);
 
 /* Close callback for timer handles */
 static void on_timer_closed(uv_handle_t *handle) {
@@ -127,8 +135,15 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                     mgr->stats.get_peers_responses++;
                     mgr->stats.info_hashes_with_peers++;
 
-                    /* Add to queue for metadata fetching */
-                    if (mgr->infohash_queue) {
+                    /* Only add to queue if NOT in retry tracking (or retry is disabled) */
+                    bool in_retry = false;
+                    if (mgr->peer_retry_tracker) {
+                        peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
+                        in_retry = (entry != NULL);
+                    }
+
+                    /* Add to queue for metadata fetching (skip if waiting for retries) */
+                    if (!in_retry && mgr->infohash_queue) {
                         infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
                         if (!infohash_queue_is_full(queue)) {
                             infohash_queue_push(queue, info_hash);
@@ -153,14 +168,56 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 refresh_query_complete(mgr->refresh_query_store, info_hash);
             }
 
-            /* Track peer query completion */
-            if (info_hash && mgr->peer_store) {
+            /* Check if we should retry for more peers */
+            if (info_hash && mgr->peer_store && mgr->peer_retry_tracker) {
                 int peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
-                if (peer_count > 0) {
-                    /* Peers were already added to queue in WBPXRE_EVENT_VALUES
-                     * Don't add duplicates here - just track statistics */
-                    /* Note: info_hashes_with_peers incremented in WBPXRE_EVENT_VALUES */
+
+                /* Check if retry is needed */
+                if (peer_retry_should_retry(mgr->peer_retry_tracker, info_hash, peer_count)) {
+                    /* Schedule retry after delay */
+                    peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
+                    if (entry) {
+                        pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
+                        entry->attempts_made++;
+                        entry->peer_count = peer_count;
+                        entry->query_in_progress = 0;
+                        mgr->peer_retry_tracker->retries_triggered++;
+                        pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
+
+                        mgr->stats.peer_retries_triggered++;
+
+                        /* Use libuv timer for delayed retry */
+                        retry_context_t *retry_ctx = malloc(sizeof(retry_context_t));
+                        if (retry_ctx) {
+                            memcpy(retry_ctx->info_hash, info_hash, 20);
+                            retry_ctx->mgr = mgr;
+                            retry_ctx->timer.data = retry_ctx;
+
+                            uv_timer_init(mgr->app_ctx->loop, &retry_ctx->timer);
+                            uv_timer_start(&retry_ctx->timer, retry_timer_cb,
+                                          mgr->peer_retry_tracker->retry_delay_ms, 0);
+                        }
+                    }
                 } else {
+                    /* No retry needed - add to queue for metadata fetching */
+                    if (peer_count > 0) {
+                        /* Note: Actual queue push happens in WBPXRE_EVENT_VALUES */
+                    } else {
+                        mgr->stats.info_hashes_no_peers++;
+                    }
+
+                    /* Mark as complete and remove from tracker */
+                    peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, peer_count);
+                }
+
+                if (mgr->active_peer_queries > 0) {
+                    mgr->active_peer_queries--;
+                }
+            }
+            /* Fallback for when retry tracker is disabled */
+            else if (info_hash && mgr->peer_store) {
+                int peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
+                if (peer_count == 0) {
                     mgr->stats.info_hashes_no_peers++;
                 }
 
@@ -189,6 +246,11 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 for (int i = 0; i < num_samples; i++) {
                     const uint8_t *hash = samples + (i * 20);
                     mgr->stats.infohashes_discovered++;
+
+                    /* Create retry tracker entry if enabled */
+                    if (mgr->peer_retry_tracker) {
+                        peer_retry_entry_create(mgr->peer_retry_tracker, hash);
+                    }
 
                     /* Query DHT for peers (normal priority for automatic discovery) */
                     dht_manager_query_peers(mgr, hash, false);
@@ -597,6 +659,26 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         log_msg(LOG_DEBUG, "Refresh query store initialized");
     }
 
+    /* Initialize peer retry tracker */
+    if (cfg && cfg->peer_retry_enabled) {
+        mgr->peer_retry_tracker = peer_retry_tracker_init(
+            1009,  /* 1009 buckets */
+            cfg->peer_retry_max_attempts,
+            cfg->peer_retry_min_threshold,
+            cfg->peer_retry_delay_ms,
+            60  /* max age 60s */
+        );
+        if (!mgr->peer_retry_tracker) {
+            log_msg(LOG_WARN, "Failed to initialize peer retry tracker");
+        } else {
+            log_msg(LOG_INFO, "Peer retry tracker initialized (max_attempts=%d, threshold=%d, delay=%dms)",
+                    cfg->peer_retry_max_attempts, cfg->peer_retry_min_threshold, cfg->peer_retry_delay_ms);
+        }
+    } else {
+        mgr->peer_retry_tracker = NULL;
+        log_msg(LOG_INFO, "Peer retry disabled");
+    }
+
     log_msg(LOG_DEBUG, "DHT manager initialized successfully");
     return 0;
 }
@@ -814,6 +896,14 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
         log_msg(LOG_DEBUG, "Cleaning up refresh query store...");
         refresh_query_store_cleanup(mgr->refresh_query_store);
         mgr->refresh_query_store = NULL;
+    }
+
+    /* Cleanup peer retry tracker */
+    if (mgr->peer_retry_tracker) {
+        log_msg(LOG_DEBUG, "Cleaning up peer retry tracker...");
+        peer_retry_print_stats(mgr->peer_retry_tracker);
+        peer_retry_tracker_cleanup(mgr->peer_retry_tracker);
+        mgr->peer_retry_tracker = NULL;
     }
 
     /* Cleanup close tracker synchronization primitives */
@@ -1168,6 +1258,34 @@ static void node_rotation_timer_cb(uv_timer_t *handle) {
     }
 }
 
+/* Retry timer callback - triggers next get_peers attempt */
+static void retry_timer_cb(uv_timer_t *handle) {
+    retry_context_t *ctx = (retry_context_t *)handle->data;
+    dht_manager_t *mgr = ctx->mgr;
+
+    char hex[41];
+    format_infohash(ctx->info_hash, hex, sizeof(hex));
+
+    peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, ctx->info_hash);
+    if (entry) {
+        log_msg(LOG_DEBUG, "Retry attempt %d for %s (current peers: %d)",
+                entry->attempts_made + 1, hex, entry->peer_count);
+
+        /* Mark query as in progress */
+        pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
+        entry->query_in_progress = 1;
+        entry->last_attempt_time = time(NULL);
+        pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
+
+        /* Trigger another get_peers query */
+        dht_manager_query_peers(mgr, ctx->info_hash, false);
+    }
+
+    /* Cleanup timer */
+    uv_close((uv_handle_t *)&ctx->timer, NULL);
+    free(ctx);
+}
+
 /* Print DHT statistics */
 void dht_manager_print_stats(dht_manager_t *mgr) {
     if (!mgr) {
@@ -1289,6 +1407,11 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "    Samples: %llu",
                     (unsigned long long)mgr->samples_since_rotation);
         }
+    }
+
+    /* Print retry statistics */
+    if (mgr->peer_retry_tracker) {
+        peer_retry_print_stats(mgr->peer_retry_tracker);
     }
 
     /* Print metadata fetcher statistics */
