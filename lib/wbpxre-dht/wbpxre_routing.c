@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <urcu.h>
+#include <urcu/rculist.h>
 
 /* ============================================================================
  * AVL Tree Operations
@@ -230,7 +232,9 @@ wbpxre_routing_table_t *wbpxre_routing_table_create(int max_nodes) {
     table->root = NULL;
     table->node_count = 0;
     table->max_nodes = max_nodes;
-    pthread_rwlock_init(&table->lock, NULL);
+
+    /* Initialize update lock (only for writers - RCU allows lock-free reads) */
+    pthread_mutex_init(&table->update_lock, NULL);
 
     /* Allocate flat array for uniform iteration */
     table->all_nodes_capacity = max_nodes > 0 ? max_nodes : 10000;
@@ -238,7 +242,7 @@ wbpxre_routing_table_t *wbpxre_routing_table_create(int max_nodes) {
     table->iteration_offset = 0;
 
     if (!table->all_nodes) {
-        pthread_rwlock_destroy(&table->lock);
+        pthread_mutex_destroy(&table->update_lock);
         free(table);
         return NULL;
     }
@@ -256,7 +260,10 @@ static void free_routing_tree(wbpxre_routing_node_t *node) {
 void wbpxre_routing_table_destroy(wbpxre_routing_table_t *table) {
     if (!table) return;
 
-    pthread_rwlock_wrlock(&table->lock);
+    /* Wait for all readers to finish (CRITICAL for RCU safety) */
+    synchronize_rcu();
+
+    /* Now safe to free all nodes */
     free_routing_tree(table->root);
 
     /* Free flat array */
@@ -265,9 +272,7 @@ void wbpxre_routing_table_destroy(wbpxre_routing_table_t *table) {
         table->all_nodes = NULL;
     }
 
-    pthread_rwlock_unlock(&table->lock);
-
-    pthread_rwlock_destroy(&table->lock);
+    pthread_mutex_destroy(&table->update_lock);
     free(table);
 }
 
@@ -333,7 +338,7 @@ int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
                                  const wbpxre_routing_node_t *node) {
     if (!table || !node) return -1;
 
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
 
     /* Check if node already exists (in which case we update, not insert) */
     wbpxre_routing_node_t *existing = find_node_recursive(table->root, node->id);
@@ -373,7 +378,7 @@ int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
         }
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
     return 0;
 }
 
@@ -396,9 +401,9 @@ wbpxre_routing_node_t *wbpxre_routing_table_find(wbpxre_routing_table_t *table,
                                                   const uint8_t *node_id) {
     if (!table || !node_id) return NULL;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
     wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     return node;
 }
@@ -452,7 +457,7 @@ int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
                                       wbpxre_routing_node_t **nodes_out, int k) {
     if (!table || !target || !nodes_out || k <= 0) return 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     /* Collect all nodes with distances */
     int capacity = 1000;
@@ -477,7 +482,7 @@ int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
     }
 
     free(all_nodes);
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     return result_count;
 }
@@ -534,7 +539,7 @@ int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
                                                 int n) {
     if (!table || !current_node_id || !nodes_out || n <= 0) return 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     int count = 0;
 
@@ -559,12 +564,12 @@ int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
         }
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     /* Update rotation offset for next call (rotate by 7 for better distribution) */
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
     table->iteration_offset = (table->iteration_offset + 7) % table->all_nodes_capacity;
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
 
     return count;
 }
@@ -608,7 +613,7 @@ int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
                                                  int n, double min_rate, int min_queries) {
     if (!table || !nodes_out || n <= 0) return 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     /* Collect low-quality node pointers */
     wbpxre_routing_node_t *candidates[n];
@@ -625,7 +630,7 @@ int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
         nodes_out[i] = node_copy;
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     return count;
 }
@@ -676,13 +681,13 @@ int wbpxre_routing_table_get_oldest_nodes(wbpxre_routing_table_t *table,
                                             int n) {
     if (!table || !nodes_out || n <= 0) return 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     /* Collect all nodes (scale limit with table size, cap at 50000) */
     int max_collect = table->node_count < 50000 ? table->node_count : 50000;
     wbpxre_routing_node_t **all_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_collect);
     if (!all_nodes) {
-        pthread_rwlock_unlock(&table->lock);
+        rcu_read_unlock();
         return 0;
     }
 
@@ -704,7 +709,7 @@ int wbpxre_routing_table_get_oldest_nodes(wbpxre_routing_table_t *table,
     }
 
     free(all_nodes);
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     return to_return;
 }
@@ -780,13 +785,13 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
                                              int n) {
     if (!table || !current_node_id || !nodes_out || n <= 0) return 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     /* Collect all nodes (scale limit with table size, cap at 50000) */
     int max_collect = table->node_count < 50000 ? table->node_count : 50000;
     node_distance_score_t *scored_nodes = malloc(sizeof(node_distance_score_t) * max_collect);
     if (!scored_nodes) {
-        pthread_rwlock_unlock(&table->lock);
+        rcu_read_unlock();
         return 0;
     }
 
@@ -794,7 +799,7 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
     wbpxre_routing_node_t **temp_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_collect);
     if (!temp_nodes) {
         free(scored_nodes);
-        pthread_rwlock_unlock(&table->lock);
+        rcu_read_unlock();
         return 0;
     }
 
@@ -824,7 +829,7 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
 
     free(temp_nodes);
     free(scored_nodes);
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     return to_return;
 }
@@ -840,7 +845,7 @@ void wbpxre_routing_table_get_keyspace_distribution(wbpxre_routing_table_t *tabl
     *close_nodes = 0;
     *distant_nodes = 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     /* Iterate all nodes and classify by distance */
     for (int i = 0; i < table->all_nodes_capacity; i++) {
@@ -859,7 +864,7 @@ void wbpxre_routing_table_get_keyspace_distribution(wbpxre_routing_table_t *tabl
         }
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 }
 
 /* ============================================================================
@@ -870,7 +875,7 @@ void wbpxre_routing_table_update_node_responded(wbpxre_routing_table_t *table,
                                                  const uint8_t *node_id) {
     if (!table || !node_id) return;
 
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
 
     wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
     if (node) {
@@ -878,7 +883,7 @@ void wbpxre_routing_table_update_node_responded(wbpxre_routing_table_t *table,
         node->responses_received++;  /* Phase 4: Track response */
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
 }
 
 /* Phase 4: Track query sent to node */
@@ -886,14 +891,14 @@ void wbpxre_routing_table_update_node_queried(wbpxre_routing_table_t *table,
                                                const uint8_t *node_id) {
     if (!table || !node_id) return;
 
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
 
     wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
     if (node) {
         node->queries_sent++;
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
 }
 
 void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
@@ -903,7 +908,7 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
                                                   int interval) {
     if (!table || !node_id) return;
 
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
 
     wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
     if (node) {
@@ -927,14 +932,14 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
         }
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
 }
 
 void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
                                      const uint8_t *node_id) {
     if (!table || !node_id) return;
 
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
 
     /* Mark as dropped first, then remove */
     wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
@@ -953,7 +958,7 @@ void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
         }
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
 }
 
 /* ============================================================================
@@ -979,7 +984,7 @@ static void collect_dropped_nodes_recursive(wbpxre_routing_node_t *root,
 int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table) {
     if (!table) return 0;
 
-    pthread_rwlock_wrlock(&table->lock);
+    pthread_mutex_lock(&table->update_lock);
 
     /* Collect dropped node IDs (up to 1000 at a time) */
     uint8_t dropped_ids[1000][WBPXRE_NODE_ID_LEN];
@@ -1002,7 +1007,7 @@ int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table) {
         }
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    pthread_mutex_unlock(&table->update_lock);
 
     return removed_count;
 }
@@ -1041,7 +1046,7 @@ int wbpxre_routing_table_get_old_nodes(wbpxre_routing_table_t *table,
                                         int n, time_t threshold) {
     if (!table || !nodes_out || n <= 0) return 0;
 
-    pthread_rwlock_rdlock(&table->lock);
+    rcu_read_lock();
 
     /* Collect old node pointers */
     wbpxre_routing_node_t *candidates[n];
@@ -1058,7 +1063,7 @@ int wbpxre_routing_table_get_old_nodes(wbpxre_routing_table_t *table,
         nodes_out[i] = node_copy;
     }
 
-    pthread_rwlock_unlock(&table->lock);
+    rcu_read_unlock();
 
     return count;
 }

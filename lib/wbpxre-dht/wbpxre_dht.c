@@ -13,6 +13,8 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <urcu.h>
+#include <urcu/rculist.h>
 
 /* ============================================================================
  * Utility Functions
@@ -224,6 +226,10 @@ static int send_udp_packet(int sock, const struct sockaddr_in *addr,
 
 static void *udp_reader_thread_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
+
     uint8_t buf[WBPXRE_MAX_UDP_PACKET];
 
     /* Signal that UDP reader is ready (Phase 1) */
@@ -354,6 +360,8 @@ static void *udp_reader_thread_func(void *arg) {
         if (msg.token) free(msg.token);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
@@ -442,6 +450,9 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
  * ============================================================================ */
 
 wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
+    /* Initialize RCU library (MUST be called before any RCU operations) */
+    rcu_init();
+
     wbpxre_dht_t *dht = calloc(1, sizeof(wbpxre_dht_t));
     if (!dht) return NULL;
 
@@ -495,6 +506,10 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
 /* Periodic maintenance thread */
 static void *maintenance_thread_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
+
     int cycle_count = 0;  /* Track maintenance cycles for periodic tasks */
 
     while (dht->running) {
@@ -720,6 +735,8 @@ static void *maintenance_thread_func(void *arg) {
         }
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
@@ -730,6 +747,9 @@ static void *maintenance_thread_func(void *arg) {
 /* Target rotation thread - rotates the sought node ID every 10 seconds */
 static void *target_rotation_thread_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         sleep(10);  /* Rotate every 10 seconds */
@@ -742,12 +762,17 @@ static void *target_rotation_thread_func(void *arg) {
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Ping worker thread */
 static void *ping_worker_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Pop node from ping queue (blocking) */
@@ -774,12 +799,17 @@ static void *ping_worker_func(void *arg) {
         free(node);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Find node worker thread */
 static void *find_node_worker_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Pop node from find_node queue (blocking) */
@@ -829,12 +859,17 @@ static void *find_node_worker_func(void *arg) {
         free(node);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Sample infohashes worker thread */
 static void *sample_infohashes_worker_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Pop node from sample_infohashes queue (blocking) */
@@ -894,12 +929,17 @@ static void *sample_infohashes_worker_func(void *arg) {
         free(node);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Get peers worker thread */
 static void *get_peers_worker_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Pop info_hash from get_peers queue (blocking) */
@@ -992,12 +1032,17 @@ static void *get_peers_worker_func(void *arg) {
         free(work);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Get peers feeder thread - not needed as we queue info_hashes on demand */
 static void *get_peers_feeder_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     /* This thread is a placeholder for future optimizations
      * Currently, info_hashes are queued directly via wbpxre_dht_query_peers()
@@ -1007,12 +1052,17 @@ static void *get_peers_feeder_func(void *arg) {
         sleep(10);
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Discovered nodes dispatcher thread */
 static void *discovered_nodes_dispatcher_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Pop from discovered_nodes queue */
@@ -1038,12 +1088,18 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
         }
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Sample infohashes feeder thread - continuously feeds nodes to the worker queue */
 static void *sample_infohashes_feeder_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
+
     static time_t last_queue_full_warn = 0;
 
     while (dht->running) {
@@ -1087,12 +1143,17 @@ static void *sample_infohashes_feeder_func(void *arg) {
         sleep(1);  /* Run every second */
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Ping feeder thread - continuously feeds old nodes for verification */
 static void *ping_feeder_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Get old nodes that haven't responded in last 60 seconds (or never) */
@@ -1119,12 +1180,17 @@ static void *ping_feeder_func(void *arg) {
         sleep(10);  /* Run every 10 seconds */
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
 /* Find node feeder thread - continuously feeds nodes for find_node queries */
 static void *find_node_feeder_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
+
+    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     while (dht->running) {
         /* Get current target */
@@ -1156,6 +1222,8 @@ static void *find_node_feeder_func(void *arg) {
         sleep(5);  /* Run every 5 seconds */
     }
 
+    /* Unregister thread before exit (REQUIRED) */
+    rcu_unregister_thread();
     return NULL;
 }
 
@@ -1291,6 +1359,9 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
         dht->udp_socket = -1;
     }
 
+    /* Wait for all pending RCU callbacks to complete (CRITICAL!) */
+    rcu_barrier();
+
     /* Destroy routing table */
     if (dht->routing_table) {
         wbpxre_routing_table_destroy(dht->routing_table);
@@ -1385,9 +1456,8 @@ int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool pri
 int wbpxre_dht_nodes(wbpxre_dht_t *dht, int *good_return, int *dubious_return) {
     if (!dht || !dht->routing_table) return -1;
 
-    pthread_rwlock_rdlock(&dht->routing_table->lock);
+    /* With RCU, node_count is updated atomically and can be read without locks */
     int total = dht->routing_table->node_count;
-    pthread_rwlock_unlock(&dht->routing_table->lock);
 
     if (good_return) *good_return = total;
     if (dubious_return) *dubious_return = 0;

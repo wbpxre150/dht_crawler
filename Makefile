@@ -3,7 +3,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99 -D_POSIX_C_SOURCE=200809L
 INCLUDES = -Iinclude -Ilib/wbpxre-dht -Ilib/bencode-c -Ilib/cJSON -Ilib/civetweb/include -Ilib/libbloom
-LDFLAGS = -luv -lsqlite3 -lpthread -lssl -lcrypto -ldl -lm lib/libbloom/build/libbloom.a
+LDFLAGS = -luv -lsqlite3 -lpthread -lssl -lcrypto -ldl -lm -lurcu lib/libbloom/build/libbloom.a
 
 # Directories
 SRC_DIR = src
@@ -79,6 +79,7 @@ install-deps:
 	@echo "  - libsqlite3-dev"
 	@echo "  - libssl-dev"
 	@echo "  - build-essential"
+	@echo "  - liburcu (userspace-rcu on Arch, liburcu-dev on Debian/Ubuntu)"
 
 # Development helpers
 run: $(TARGET)

@@ -19,6 +19,7 @@ extern "C" {
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <urcu.h>
 
 /* ============================================================================
  * Constants
@@ -137,16 +138,19 @@ typedef struct wbpxre_routing_node {
     struct wbpxre_routing_node *left;
     struct wbpxre_routing_node *right;
     int height;
+
+    /* RCU support for lock-free reads */
+    struct rcu_head rcu_head;     /* For deferred freeing */
 } wbpxre_routing_node_t;
 
 /* Routing table */
 typedef struct {
-    wbpxre_routing_node_t *root;
-    pthread_rwlock_t lock;
-    int node_count;
+    wbpxre_routing_node_t *root;         /* RCU-protected AVL tree root */
+    pthread_mutex_t update_lock;         /* Serializes writers (RCU allows lock-free reads) */
+    int node_count;                      /* Updated atomically */
     int max_nodes;
     /* Flat array for uniform iteration (eliminates BST traversal bias) */
-    wbpxre_routing_node_t **all_nodes;  /* Array of pointers to all nodes */
+    wbpxre_routing_node_t **all_nodes;  /* RCU-protected array of pointers to all nodes */
     int all_nodes_capacity;              /* Capacity of all_nodes array */
     int iteration_offset;                /* Rotating offset for fair iteration */
 } wbpxre_routing_table_t;
