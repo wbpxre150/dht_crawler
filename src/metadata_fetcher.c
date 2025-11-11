@@ -2318,14 +2318,6 @@ static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash
         if (memcmp(attempt->info_hash, info_hash, 20) == 0) {
             *prev_ptr = attempt->next;
 
-            /* Log removal for debugging memory leaks */
-            char hex[41];
-            for (int i = 0; i < 20; i++) {
-                sprintf(hex + i*2, "%02x", info_hash[i]);
-            }
-            log_msg(LOG_DEBUG, "Removed attempt entry for %s (connections_tried=%d, peers_tried=%d/%d)",
-                    hex, attempt->total_connections_tried, attempt->peers_tried, attempt->total_peer_count);
-
             /* Free peer queue arrays if allocated */
             if (attempt->available_peers) {
                 free(attempt->available_peers);
