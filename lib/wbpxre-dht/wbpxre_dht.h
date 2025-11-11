@@ -563,6 +563,9 @@ void *wbpxre_queue_pop(wbpxre_work_queue_t *queue);
 /* Shutdown queue */
 void wbpxre_queue_shutdown(wbpxre_work_queue_t *queue);
 
+/* Clear all items from queue without shutdown */
+void wbpxre_queue_clear(wbpxre_work_queue_t *queue);
+
 /* ============================================================================
  * Pending Query Management Functions
  * ============================================================================ */

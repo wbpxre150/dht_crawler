@@ -90,6 +90,7 @@ typedef struct {
     int node_rotation_enabled;           /* Enable periodic node ID rotation */
     int node_rotation_interval_sec;      /* Rotation interval in seconds */
     int node_rotation_drain_timeout_sec; /* Time to wait for in-flight operations */
+    int clear_sample_queue_on_rotation;  /* Clear sample_infohashes queue after rotation */
 
     /* Peer discovery retry settings */
     int peer_retry_enabled;              /* Enable multi-retry peer discovery */

@@ -1232,6 +1232,22 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
                         mgr->config.max_routing_table_nodes - new_count);
             }
 
+            /* Optionally clear sample_infohashes queue after rotation */
+            crawler_config_t *crawler_cfg = (crawler_config_t *)mgr->crawler_config;
+            if (crawler_cfg && crawler_cfg->clear_sample_queue_on_rotation && mgr->dht) {
+                log_msg(LOG_INFO, "=== Post-Rotation Sample Queue Clearing ===");
+
+                /* Get queue size before clearing */
+                int queue_size_before = 0;
+                pthread_mutex_lock(&mgr->dht->nodes_for_sample_infohashes->mutex);
+                queue_size_before = mgr->dht->nodes_for_sample_infohashes->size;
+                pthread_mutex_unlock(&mgr->dht->nodes_for_sample_infohashes->mutex);
+
+                log_msg(LOG_INFO, "  Clearing sample_infohashes queue: %d nodes", queue_size_before);
+                wbpxre_queue_clear(mgr->dht->nodes_for_sample_infohashes);
+                log_msg(LOG_INFO, "  Queue cleared - feeder will repopulate with new keyspace nodes");
+            }
+
             return 0;
         }
     }

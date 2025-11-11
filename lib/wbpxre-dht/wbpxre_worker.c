@@ -167,3 +167,27 @@ void wbpxre_queue_shutdown(wbpxre_work_queue_t *queue) {
     pthread_cond_broadcast(&queue->not_full);
     pthread_mutex_unlock(&queue->mutex);
 }
+
+/* Clear all items from queue without shutdown */
+void wbpxre_queue_clear(wbpxre_work_queue_t *queue) {
+    if (!queue) return;
+
+    pthread_mutex_lock(&queue->mutex);
+
+    /* Free all items in the queue */
+    while (queue->size > 0) {
+        void *item = queue->items[queue->head];
+        free(item);  /* Free the node structure */
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->size--;
+    }
+
+    /* Reset queue state */
+    queue->head = 0;
+    queue->tail = 0;
+
+    /* Signal waiting threads that space is available */
+    pthread_cond_broadcast(&queue->not_full);
+
+    pthread_mutex_unlock(&queue->mutex);
+}
