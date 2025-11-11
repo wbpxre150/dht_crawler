@@ -149,6 +149,9 @@ typedef struct {
     wbpxre_routing_node_t **all_nodes;  /* Array of pointers to all nodes */
     int all_nodes_capacity;              /* Capacity of all_nodes array */
     int iteration_offset;                /* Rotating offset for fair iteration */
+
+    /* Pointer back to DHT context for cache access */
+    struct wbpxre_dht *dht;
 } wbpxre_routing_table_t;
 
 /* Peer info */
@@ -273,7 +276,7 @@ typedef struct {
 } wbpxre_config_t;
 
 /* Main DHT context */
-typedef struct {
+typedef struct wbpxre_dht {
     wbpxre_config_t config;
 
     /* Node ID protection (for hot rotation) */
@@ -324,6 +327,14 @@ typedef struct {
     bool udp_reader_ready;
     pthread_cond_t udp_reader_ready_cond;
     pthread_mutex_t udp_reader_ready_mutex;
+
+    /* Thread-local cache support */
+    pthread_key_t cache_key;           /* TLS key for routing cache */
+    bool cache_enabled;                /* Global cache enable flag */
+
+    /* Global cache statistics (atomic) */
+    _Atomic uint64_t cache_hits;
+    _Atomic uint64_t cache_misses;
 
     /* Statistics */
     struct {
@@ -605,6 +616,16 @@ const char *wbpxre_addr_to_string(const struct sockaddr_in *addr);
 
 /* Hex dump for debugging */
 void wbpxre_hex_dump(const uint8_t *data, int len, const char *label);
+
+/* ============================================================================
+ * Cache Functions (internal use)
+ * ============================================================================ */
+
+/* Forward declaration for cache type */
+typedef struct wbpxre_routing_cache wbpxre_routing_cache_t;
+
+/* Get thread-local routing cache (for internal use) */
+wbpxre_routing_cache_t *wbpxre_get_thread_cache(wbpxre_dht_t *dht);
 
 #ifdef __cplusplus
 }

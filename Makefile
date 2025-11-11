@@ -21,6 +21,7 @@ LIB_OBJS = $(BUILD_DIR)/wbpxre_dht.o \
            $(BUILD_DIR)/wbpxre_routing.o \
            $(BUILD_DIR)/wbpxre_protocol.o \
            $(BUILD_DIR)/wbpxre_worker.o \
+           $(BUILD_DIR)/wbpxre_cache.o \
            $(BUILD_DIR)/bencode.o \
            $(BUILD_DIR)/cJSON.o \
            $(BUILD_DIR)/civetweb.o
@@ -52,6 +53,9 @@ $(BUILD_DIR)/wbpxre_protocol.o: $(LIB_DIR)/wbpxre-dht/wbpxre_protocol.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/wbpxre_worker.o: $(LIB_DIR)/wbpxre-dht/wbpxre_worker.c
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/wbpxre_cache.o: $(LIB_DIR)/wbpxre-dht/wbpxre_cache.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/bencode.o: $(LIB_DIR)/bencode-c/bencode.c
