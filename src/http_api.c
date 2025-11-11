@@ -328,20 +328,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         hourly_count = batch_writer_get_hourly_count(api->batch_writer);
     }
 
-    /* Get cache statistics from wbpxre-dht */
-    uint64_t cache_hits = 0;
-    uint64_t cache_misses = 0;
-    double cache_hit_rate = 0.0;
-
-    if (api->dht_manager && api->dht_manager->dht) {
-        cache_hits = api->dht_manager->dht->cache_hits;
-        cache_misses = api->dht_manager->dht->cache_misses;
-        uint64_t total_lookups = cache_hits + cache_misses;
-        if (total_lookups > 0) {
-            cache_hit_rate = (double)cache_hits / (double)total_lookups;
-        }
-    }
-
     /* Build JSON response */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "version", DHT_CRAWLER_VERSION);
@@ -349,13 +335,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "files_indexed", file_count);
     cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
-
-    /* Add cache statistics */
-    cJSON *cache_stats = cJSON_CreateObject();
-    cJSON_AddNumberToObject(cache_stats, "hits", (double)cache_hits);
-    cJSON_AddNumberToObject(cache_stats, "misses", (double)cache_misses);
-    cJSON_AddNumberToObject(cache_stats, "hit_rate", cache_hit_rate);
-    cJSON_AddItemToObject(root, "routing_cache", cache_stats);
 
     char *json = cJSON_Print(root);
     cJSON_Delete(root);

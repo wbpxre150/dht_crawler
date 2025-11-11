@@ -4,7 +4,6 @@
 
 #define _DEFAULT_SOURCE
 #include "wbpxre_dht.h"
-#include "wbpxre_cache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,39 +56,6 @@ void wbpxre_hex_dump(const uint8_t *data, int len, const char *label) {
     }
     if (len > 40) printf("...");
     printf("\n");
-}
-
-/* ============================================================================
- * Thread-Local Cache Management
- * ============================================================================ */
-
-/* Destructor for thread-local cache */
-static void cache_destructor(void *cache_ptr) {
-    wbpxre_routing_cache_t *cache = (wbpxre_routing_cache_t *)cache_ptr;
-    if (cache) {
-        wbpxre_cache_destroy(cache);
-    }
-}
-
-/* Get or create thread-local cache for current thread */
-wbpxre_routing_cache_t *wbpxre_get_thread_cache(wbpxre_dht_t *dht) {
-    if (!dht || !dht->cache_enabled) {
-        return NULL;
-    }
-
-    /* Try to get existing cache from TLS */
-    wbpxre_routing_cache_t *cache =
-        (wbpxre_routing_cache_t *)pthread_getspecific(dht->cache_key);
-
-    if (!cache) {
-        /* First access from this thread - create cache */
-        cache = wbpxre_cache_create();
-        if (cache) {
-            pthread_setspecific(dht->cache_key, cache);
-        }
-    }
-
-    return cache;
 }
 
 /* ============================================================================
@@ -497,15 +463,6 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
         free(dht);
         return NULL;
     }
-
-    /* Link routing table back to DHT context for cache access */
-    dht->routing_table->dht = dht;
-
-    /* Create thread-local storage key for caches */
-    pthread_key_create(&dht->cache_key, cache_destructor);
-    dht->cache_enabled = true; /* Enable by default */
-    dht->cache_hits = 0;
-    dht->cache_misses = 0;
 
     /* Initialize mutexes and locks */
     pthread_rwlock_init(&dht->node_id_lock, NULL);
@@ -1333,9 +1290,6 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
         close(dht->udp_socket);
         dht->udp_socket = -1;
     }
-
-    /* Destroy TLS key (automatically calls destructors for all thread-local caches) */
-    pthread_key_delete(dht->cache_key);
 
     /* Destroy routing table */
     if (dht->routing_table) {

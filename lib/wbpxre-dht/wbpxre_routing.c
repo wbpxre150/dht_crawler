@@ -5,7 +5,6 @@
  */
 
 #include "wbpxre_dht.h"
-#include "wbpxre_cache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -453,18 +452,6 @@ int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
                                       wbpxre_routing_node_t **nodes_out, int k) {
     if (!table || !target || !nodes_out || k <= 0) return 0;
 
-    /* Try thread-local cache first (NO LOCK!) */
-    wbpxre_routing_cache_t *cache = wbpxre_get_thread_cache(table->dht);
-    if (cache) {
-        int cached_count = wbpxre_cache_lookup(cache, target, nodes_out, k, table->dht);
-        if (cached_count > 0) {
-            /* Cache hit - return immediately without locking! */
-            return cached_count;
-        }
-        /* Cache miss - fall through to locked path */
-    }
-
-    /* Cache miss or disabled - use shared routing table with lock */
     pthread_rwlock_rdlock(&table->lock);
 
     /* Collect all nodes with distances */
@@ -491,11 +478,6 @@ int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
 
     free(all_nodes);
     pthread_rwlock_unlock(&table->lock);
-
-    /* Populate cache for next time (if cache is enabled) */
-    if (cache && result_count > 0) {
-        wbpxre_cache_insert(cache, target, nodes_out, result_count);
-    }
 
     return result_count;
 }
