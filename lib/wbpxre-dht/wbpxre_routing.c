@@ -662,15 +662,11 @@ static void collect_non_bep51_nodes_recursive(wbpxre_routing_node_t *root,
         /* Node explicitly rejected BEP51 - prune regardless of query count */
         is_non_bep51 = true;
     } else if (root->bep51_support == WBPXRE_PROTOCOL_UNKNOWN) {
-        time_t now = time(NULL);
-
-        /* If node was never queried or has few queries, use age-based pruning */
+        /* If node was never queried or has few queries, assume no BEP51 support
+         * This catches nodes that aged out of sample candidate pool without being queried */
         if (root->queries_sent < min_queries) {
-            /* Prune if node is old (>3 minutes) and never proved BEP51 support
-             * This catches nodes that aged out of sample candidate pool without being queried */
-            if (root->discovered_at > 0 && (now - root->discovered_at) > 180) {
-                is_non_bep51 = true;
-            }
+            /* Prune immediately - no age check needed */
+            is_non_bep51 = true;
         } else {
             /* Node has been queried enough times without BEP51 response */
             is_non_bep51 = true;
