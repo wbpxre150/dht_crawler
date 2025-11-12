@@ -33,13 +33,15 @@ struct worker_pool {
 static void worker_thread(void *arg) {
     worker_pool_t *pool = (worker_pool_t*)arg;
 
+    /* Mark this worker as idle initially */
+    uv_mutex_lock(&pool->mutex);
+    pool->idle_workers++;
+    uv_mutex_unlock(&pool->mutex);
+
     while (1) {
         uv_mutex_lock(&pool->mutex);
 
-        /* Mark as idle while waiting */
-        pool->idle_workers++;
-
-        /* Wait for tasks or shutdown signal */
+        /* Wait for tasks or shutdown signal while idle */
         while (pool->running && pool->queue.size == 0) {
             uv_cond_wait(&pool->task_available, &pool->mutex);
         }
@@ -65,20 +67,17 @@ static void worker_thread(void *arg) {
 
         uv_mutex_unlock(&pool->mutex);
 
-        /* Execute task */
+        /* Execute task WITHOUT holding mutex - this is where blocking work happens */
         if (task && pool->worker_fn) {
             pool->worker_fn(task, pool->closure);
-
-            uv_mutex_lock(&pool->mutex);
-            pool->tasks_processed++;
-            pool->active_workers--;
-            uv_mutex_unlock(&pool->mutex);
-        } else {
-            /* No task, just decrement active counter */
-            uv_mutex_lock(&pool->mutex);
-            pool->active_workers--;
-            uv_mutex_unlock(&pool->mutex);
         }
+
+        /* Mark as idle again after completing task */
+        uv_mutex_lock(&pool->mutex);
+        pool->tasks_processed++;
+        pool->active_workers--;
+        pool->idle_workers++;
+        uv_mutex_unlock(&pool->mutex);
     }
 }
 
