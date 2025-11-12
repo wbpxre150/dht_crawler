@@ -667,6 +667,70 @@ static void *maintenance_thread_func(void *arg) {
             }
         }
 
+        /* ====================================================================
+         * BEP51-Focused Pruning (SIMPLE - NEW)
+         * When table >90% full, aggressively remove non-BEP51 nodes
+         * ==================================================================== */
+
+        /* Check if BEP51 pruning is enabled and it's time to run */
+        int bep51_prune_interval = dht->config.bep51_pruning_interval_sec > 0 ?
+                                   dht->config.bep51_pruning_interval_sec : 30;
+        int bep51_prune_cycles = (bep51_prune_interval + 4) / 5;
+
+        if (dht->config.bep51_pruning_enabled &&
+            cycle_count % bep51_prune_cycles == 0) {
+
+            int current_nodes = dht->routing_table->node_count;
+            int max_nodes = dht->config.max_routing_table_nodes > 0 ?
+                           dht->config.max_routing_table_nodes : 10000;
+            double fill_ratio = (double)current_nodes / (double)max_nodes;
+
+            /* Only run when >90% full */
+            if (fill_ratio > 0.90) {
+                /* How many to remove to get back to 85% */
+                int target_nodes = (int)(max_nodes * 0.85);
+                int nodes_to_remove = current_nodes - target_nodes;
+
+                if (nodes_to_remove > 0) {
+                    /* Get non-BEP51 nodes */
+                    wbpxre_routing_node_t **non_bep51 =
+                        malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_remove);
+
+                    if (non_bep51) {
+                        int min_queries_threshold = dht->config.node_quality_min_queries > 0 ?
+                                                   dht->config.node_quality_min_queries : 10;
+
+                        int found = wbpxre_routing_table_get_non_bep51_nodes(
+                            dht->routing_table,
+                            non_bep51,
+                            nodes_to_remove,
+                            min_queries_threshold
+                        );
+
+                        /* Drop them */
+                        for (int i = 0; i < found; i++) {
+                            wbpxre_routing_table_drop_node(dht->routing_table,
+                                                           non_bep51[i]->id);
+                            pthread_mutex_lock(&dht->stats_mutex);
+                            dht->stats.nodes_dropped++;
+                            pthread_mutex_unlock(&dht->stats_mutex);
+                            free(non_bep51[i]);
+                        }
+
+                        if (found > 0) {
+                            int new_node_count = dht->routing_table->node_count;
+                            double new_fill_ratio = (double)new_node_count / (double)max_nodes;
+                            printf("[wbpxre-dht] BEP51 pruning: removed %d non-BEP51 nodes "
+                                   "(%.1f%% full -> %.1f%% full)\n",
+                                   found, fill_ratio * 100.0, new_fill_ratio * 100.0);
+                        }
+
+                        free(non_bep51);
+                    }
+                }
+            }
+        }
+
         /* Send wandering searches (random target IDs) */
         uint8_t random_target[WBPXRE_NODE_ID_LEN];
         wbpxre_random_bytes(random_target, WBPXRE_NODE_ID_LEN);

@@ -271,6 +271,10 @@ typedef struct {
     double min_node_response_rate;     /* Evict nodes with response rate below this (default: 0.20) */
     int node_quality_min_queries;      /* Minimum queries before judging quality (default: 5) */
 
+    /* BEP51-focused pruning */
+    int bep51_pruning_enabled;         /* Enable BEP51-focused node pruning (default: 1) */
+    int bep51_pruning_interval_sec;    /* How often to check and prune (default: 30) */
+
     /* Callbacks */
     wbpxre_callback_t callback;
     void *callback_closure;
@@ -493,6 +497,13 @@ int wbpxre_routing_table_get_old_nodes(wbpxre_routing_table_t *table,
 int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
                                                  wbpxre_routing_node_t **nodes_out,
                                                  int n, double min_rate, int min_queries);
+
+/* Get nodes that don't support BEP51 (for prioritized eviction)
+ * Returns copies of nodes (caller must free each node in nodes_out array)
+ * Selects nodes where bep51_support == NO or UNKNOWN after min_queries */
+int wbpxre_routing_table_get_non_bep51_nodes(wbpxre_routing_table_t *table,
+                                               wbpxre_routing_node_t **nodes_out,
+                                               int n, int min_queries);
 
 /* Get oldest nodes (sorted by last_responded_at, oldest first)
  * Returns copies of nodes (caller must free each node in nodes_out array)

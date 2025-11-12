@@ -105,6 +105,10 @@ void config_init_defaults(crawler_config_t *config) {
     config->peer_retry_max_attempts = 3;
     config->peer_retry_min_threshold = 10;
     config->peer_retry_delay_ms = 500;
+
+    /* BEP51-focused pruning defaults */
+    config->bep51_pruning_enabled = 1;          /* Enabled by default */
+    config->bep51_pruning_interval_sec = 30;    /* Check every 30 seconds */
 }
 
 /* Load config from INI-style file */
@@ -309,6 +313,12 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->peer_retry_min_threshold = atoi(value);
         } else if (strcmp(key, "peer_retry_delay_ms") == 0) {
             config->peer_retry_delay_ms = atoi(value);
+        }
+        /* BEP51-focused pruning settings */
+        else if (strcmp(key, "bep51_pruning_enabled") == 0) {
+            config->bep51_pruning_enabled = atoi(value);
+        } else if (strcmp(key, "bep51_pruning_interval_sec") == 0) {
+            config->bep51_pruning_interval_sec = atoi(value);
         }
     }
 

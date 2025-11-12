@@ -636,6 +636,8 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.node_cleanup_interval_sec = cfg->node_cleanup_interval_sec;
         dht_config.min_node_response_rate = cfg->min_node_response_rate;
         dht_config.node_quality_min_queries = cfg->node_quality_min_queries;
+        dht_config.bep51_pruning_enabled = cfg->bep51_pruning_enabled;
+        dht_config.bep51_pruning_interval_sec = cfg->bep51_pruning_interval_sec;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -649,6 +651,8 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.node_cleanup_interval_sec = 30;
         dht_config.min_node_response_rate = 0.20;
         dht_config.node_quality_min_queries = 5;
+        dht_config.bep51_pruning_enabled = 1;
+        dht_config.bep51_pruning_interval_sec = 30;
     }
 
     /* Callback setup */
@@ -1156,6 +1160,8 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.node_cleanup_interval_sec = cfg->node_cleanup_interval_sec;
         dht_config.min_node_response_rate = cfg->min_node_response_rate;
         dht_config.node_quality_min_queries = cfg->node_quality_min_queries;
+        dht_config.bep51_pruning_enabled = cfg->bep51_pruning_enabled;
+        dht_config.bep51_pruning_interval_sec = cfg->bep51_pruning_interval_sec;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -1169,6 +1175,8 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.node_cleanup_interval_sec = 30;
         dht_config.min_node_response_rate = 0.20;
         dht_config.node_quality_min_queries = 5;
+        dht_config.bep51_pruning_enabled = 1;
+        dht_config.bep51_pruning_interval_sec = 30;
     }
 
     /* Callback setup */

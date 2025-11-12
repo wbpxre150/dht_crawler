@@ -636,6 +636,75 @@ int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
 }
 
 /* ============================================================================
+ * Get Non-BEP51 Nodes (for BEP51-focused pruning)
+ * ============================================================================ */
+
+static void collect_non_bep51_nodes_recursive(wbpxre_routing_node_t *root,
+                                                wbpxre_routing_node_t **array,
+                                                int *count, int n,
+                                                int min_queries) {
+    if (!root || *count >= n) return;
+
+    /* Skip dropped nodes */
+    if (root->dropped) {
+        collect_non_bep51_nodes_recursive(root->left, array, count, n, min_queries);
+        collect_non_bep51_nodes_recursive(root->right, array, count, n, min_queries);
+        return;
+    }
+
+    /* Check if node is non-BEP51:
+     * 1. Confirmed NO support
+     * 2. UNKNOWN after sufficient queries (probably doesn't support it) */
+    bool is_non_bep51 = false;
+
+    if (root->bep51_support == WBPXRE_PROTOCOL_NO) {
+        is_non_bep51 = true;
+    } else if (root->bep51_support == WBPXRE_PROTOCOL_UNKNOWN &&
+               root->queries_sent >= min_queries) {
+        is_non_bep51 = true;
+    }
+
+    if (is_non_bep51) {
+        array[(*count)++] = root;
+    }
+
+    /* Recursively collect from subtrees */
+    if (*count < n) {
+        collect_non_bep51_nodes_recursive(root->left, array, count, n, min_queries);
+    }
+    if (*count < n) {
+        collect_non_bep51_nodes_recursive(root->right, array, count, n, min_queries);
+    }
+}
+
+int wbpxre_routing_table_get_non_bep51_nodes(wbpxre_routing_table_t *table,
+                                               wbpxre_routing_node_t **nodes_out,
+                                               int n, int min_queries) {
+    if (!table || !nodes_out || n <= 0) return 0;
+
+    rcu_read_lock();
+
+    /* Collect non-BEP51 node pointers */
+    wbpxre_routing_node_t *candidates[n];
+    int count = 0;
+    collect_non_bep51_nodes_recursive(table->root, candidates, &count, n, min_queries);
+
+    /* Copy nodes to avoid data races after lock release */
+    for (int i = 0; i < count; i++) {
+        wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
+        memcpy(node_copy, candidates[i], sizeof(wbpxre_routing_node_t));
+        /* Clear tree pointers since this is a standalone copy */
+        node_copy->left = NULL;
+        node_copy->right = NULL;
+        nodes_out[i] = node_copy;
+    }
+
+    rcu_read_unlock();
+
+    return count;
+}
+
+/* ============================================================================
  * Get Oldest Nodes (for capacity-based eviction)
  * ============================================================================ */
 

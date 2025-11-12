@@ -97,6 +97,10 @@ typedef struct {
     int peer_retry_max_attempts;         /* Max get_peers retries (1-5, default: 3) */
     int peer_retry_min_threshold;        /* Min peers before stopping retries (default: 10) */
     int peer_retry_delay_ms;             /* Delay between retries in ms (default: 500) */
+
+    /* BEP51-focused pruning settings */
+    int bep51_pruning_enabled;           /* Enable BEP51-focused node pruning */
+    int bep51_pruning_interval_sec;      /* How often to check and prune (default: 30) */
 } crawler_config_t;
 
 /* Initialize config with default values */
