@@ -614,9 +614,14 @@ void shadow_table_cleanup(shadow_routing_table_t *table) {
         shadow_table_shutdown(table);
     }
 
-    /* Close timer handle with callback */
+    /* Close timer handle with callback if not already closing */
     log_msg(LOG_DEBUG, "Closing shadow table prune timer...");
-    uv_close((uv_handle_t*)&table->prune_timer, on_prune_timer_closed);
+    if (!uv_is_closing((uv_handle_t*)&table->prune_timer)) {
+        uv_close((uv_handle_t*)&table->prune_timer, on_prune_timer_closed);
+    } else {
+        /* If already closing, mark as closed to avoid wait loop */
+        table->timer_closed = true;
+    }
 
     /* Get the event loop from the timer handle */
     uv_loop_t *loop = uv_handle_get_loop((uv_handle_t*)&table->prune_timer);

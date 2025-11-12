@@ -371,8 +371,10 @@ void batch_writer_cleanup(batch_writer_t *writer) {
         batch_writer_shutdown(writer);
     }
     
-    /* Close timer handle */
-    uv_close((uv_handle_t*)&writer->flush_timer, NULL);
+    /* Close timer handle if not already closing */
+    if (!uv_is_closing((uv_handle_t*)&writer->flush_timer)) {
+        uv_close((uv_handle_t*)&writer->flush_timer, NULL);
+    }
     
     /* Free any remaining batch items */
     uv_mutex_lock(&writer->mutex);

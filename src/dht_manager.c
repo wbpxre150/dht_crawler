@@ -64,6 +64,12 @@ static void on_timer_closed(uv_handle_t *handle) {
     pthread_mutex_unlock(&mgr->close_tracker.mutex);
 }
 
+/* Close callback for retry timer - frees the retry context */
+static void on_retry_timer_closed(uv_handle_t *handle) {
+    retry_context_t *ctx = (retry_context_t *)handle->data;
+    free(ctx);
+}
+
 /* Helper: Format info_hash as hex string */
 static void format_infohash(const uint8_t *info_hash, char *out, size_t out_len) {
     if (out_len < 41) return;
@@ -931,9 +937,23 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
 
         /* Close timer handles with callback - must wait for close callback before freeing */
         log_msg(LOG_DEBUG, "Closing timer handles...");
-        uv_close((uv_handle_t *)&mgr->bootstrap_reseed_timer, on_timer_closed);
+        if (!uv_is_closing((uv_handle_t *)&mgr->bootstrap_reseed_timer)) {
+            uv_close((uv_handle_t *)&mgr->bootstrap_reseed_timer, on_timer_closed);
+        } else {
+            /* Already closing, decrement counter */
+            pthread_mutex_lock(&mgr->close_tracker.mutex);
+            mgr->close_tracker.handles_to_close--;
+            pthread_mutex_unlock(&mgr->close_tracker.mutex);
+        }
         if (mgr->node_rotation_enabled) {
-            uv_close((uv_handle_t *)&mgr->node_rotation_timer, on_timer_closed);
+            if (!uv_is_closing((uv_handle_t *)&mgr->node_rotation_timer)) {
+                uv_close((uv_handle_t *)&mgr->node_rotation_timer, on_timer_closed);
+            } else {
+                /* Already closing, decrement counter */
+                pthread_mutex_lock(&mgr->close_tracker.mutex);
+                mgr->close_tracker.handles_to_close--;
+                pthread_mutex_unlock(&mgr->close_tracker.mutex);
+            }
         }
     }
 
@@ -1697,9 +1717,12 @@ static void retry_timer_cb(uv_timer_t *handle) {
         dht_manager_query_peers(mgr, ctx->info_hash, false);
     }
 
-    /* Cleanup timer */
-    uv_close((uv_handle_t *)&ctx->timer, NULL);
-    free(ctx);
+    /* Cleanup timer - use close callback to safely free context */
+    if (!uv_is_closing((uv_handle_t *)&ctx->timer)) {
+        uv_close((uv_handle_t *)&ctx->timer, on_retry_timer_closed);
+    } else {
+        free(ctx);
+    }
 }
 
 /* Print DHT statistics */

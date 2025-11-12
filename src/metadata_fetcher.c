@@ -470,8 +470,10 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
         peer = next;
     }
 
-    /* Close async handle */
-    uv_close((uv_handle_t *)&fetcher->async_handle, NULL);
+    /* Close async handle if not already closing */
+    if (!uv_is_closing((uv_handle_t *)&fetcher->async_handle)) {
+        uv_close((uv_handle_t *)&fetcher->async_handle, NULL);
+    }
 
     /* Cleanup connection request queue */
     if (fetcher->conn_request_queue) {
