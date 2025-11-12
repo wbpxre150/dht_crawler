@@ -685,17 +685,11 @@ static void *maintenance_thread_func(void *arg) {
                            dht->config.max_routing_table_nodes : 10000;
             double fill_ratio = (double)current_nodes / (double)max_nodes;
 
-            printf("[wbpxre-dht] BEP51 pruning check: %d/%d nodes (%.1f%% full)\n",
-                   current_nodes, max_nodes, fill_ratio * 100.0);
-
             /* Only run when >90% full */
             if (fill_ratio > 0.90) {
                 /* How many to remove to get back to 90% */
                 int target_nodes = (int)(max_nodes * 0.90);
                 int nodes_to_remove = current_nodes - target_nodes;
-
-                printf("[wbpxre-dht] BEP51 pruning triggered: need to remove %d nodes to reach 90%%\n",
-                       nodes_to_remove);
 
                 if (nodes_to_remove > 0) {
                     /* Get non-BEP51 nodes */
@@ -714,8 +708,6 @@ static void *maintenance_thread_func(void *arg) {
                             min_queries_threshold
                         );
 
-                        printf("[wbpxre-dht] BEP51 pruning: found %d non-BEP51 nodes to remove\n", found);
-
                         /* Drop them */
                         for (int i = 0; i < found; i++) {
                             wbpxre_routing_table_drop_node(dht->routing_table,
@@ -726,24 +718,9 @@ static void *maintenance_thread_func(void *arg) {
                             free(non_bep51[i]);
                         }
 
-                        if (found > 0) {
-                            int new_node_count = dht->routing_table->node_count;
-                            double new_fill_ratio = (double)new_node_count / (double)max_nodes;
-                            printf("[wbpxre-dht] BEP51 pruning: removed %d non-BEP51 nodes "
-                                   "(%.1f%% full -> %.1f%% full)\n",
-                                   found, fill_ratio * 100.0, new_fill_ratio * 100.0);
-                        } else {
-                            printf("[wbpxre-dht] BEP51 pruning: WARNING - no non-BEP51 nodes found! "
-                                   "Routing table is %.1f%% full but all nodes appear to support BEP51.\n",
-                                   fill_ratio * 100.0);
-                        }
-
                         free(non_bep51);
                     }
                 }
-            } else {
-                printf("[wbpxre-dht] BEP51 pruning: skipped (table only %.1f%% full, threshold is 90%%)\n",
-                       fill_ratio * 100.0);
             }
         }
 
