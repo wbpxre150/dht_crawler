@@ -11,6 +11,8 @@
 #include "peer_retry_tracker.h"
 #include <uv.h>
 #include <stdbool.h>
+#include <stdatomic.h>
+#include <pthread.h>
 
 /* DHT statistics */
 typedef struct {
@@ -126,6 +128,38 @@ typedef enum {
     ROTATION_STATE_TRANSITIONING    // Using new ID
 } rotation_state_t;
 
+/* Async pruning infrastructure */
+
+/* Pruning batch structure */
+typedef struct {
+    uint8_t (*node_ids)[WBPXRE_NODE_ID_LEN];  /* Array of node IDs to drop */
+    int count;                                 /* Number of nodes in this batch */
+    time_t submitted_at;                       /* When batch was submitted */
+} pruning_batch_t;
+
+/* Pruning work queue */
+typedef struct {
+    pruning_batch_t **batches;      /* Array of batch pointers */
+    int capacity;                    /* Maximum batches (default: 10) */
+    int size;                        /* Current number of batches */
+    int head;                        /* Dequeue position */
+    int tail;                        /* Enqueue position */
+
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;       /* Signal when batches available */
+    pthread_cond_t not_full;        /* Signal when space available */
+    bool shutdown;                  /* Shutdown flag */
+} pruning_queue_t;
+
+/* Pruning status tracking */
+typedef struct {
+    atomic_int total_submitted;      /* Total nodes submitted for pruning */
+    atomic_int total_processed;      /* Total nodes actually dropped */
+    atomic_bool pruning_in_progress; /* Is pruning active? */
+    time_t started_at;               /* When current pruning started */
+    time_t completed_at;             /* When last pruning completed */
+} pruning_status_t;
+
 /* DHT manager context */
 typedef struct {
     app_context_t *app_ctx;
@@ -176,6 +210,11 @@ typedef struct {
     close_tracker_t close_tracker;
     /* Initialization state flags */
     bool timers_initialized;          /* Track if timers were initialized */
+    /* Async pruning infrastructure */
+    pruning_queue_t *pruning_queue;
+    pthread_t pruning_worker_thread;
+    pruning_status_t pruning_status;
+    bool pruning_worker_started;
 } dht_manager_t;
 
 /* Bootstrap nodes */

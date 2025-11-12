@@ -961,6 +961,43 @@ void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
     pthread_mutex_unlock(&table->update_lock);
 }
 
+/* Drop multiple nodes in a single operation (batch API)
+ * More efficient than calling drop_node multiple times
+ * Returns number of nodes actually dropped */
+int wbpxre_routing_table_drop_nodes_batch(wbpxre_routing_table_t *table,
+                                           const uint8_t node_ids[][WBPXRE_NODE_ID_LEN],
+                                           int count) {
+    if (!table || !node_ids || count <= 0) return 0;
+
+    pthread_mutex_lock(&table->update_lock);
+
+    int dropped = 0;
+
+    for (int i = 0; i < count; i++) {
+        /* Find and mark as dropped */
+        wbpxre_routing_node_t *node = find_node_recursive(table->root, node_ids[i]);
+        if (!node) continue;
+
+        node->dropped = true;
+
+        /* Remove from flat array */
+        remove_node_from_flat_array(table, node_ids[i]);
+
+        /* Remove from tree */
+        bool removed = false;
+        table->root = remove_node_recursive(table->root, node_ids[i], &removed);
+
+        if (removed) {
+            table->node_count--;
+            dropped++;
+        }
+    }
+
+    pthread_mutex_unlock(&table->update_lock);
+
+    return dropped;
+}
+
 /* ============================================================================
  * Batch Cleanup of Dropped Nodes (Phase 3)
  * ============================================================================ */

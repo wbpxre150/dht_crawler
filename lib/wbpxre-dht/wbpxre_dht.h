@@ -538,6 +538,13 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
 void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
                                      const uint8_t *node_id);
 
+/* Drop multiple nodes in a single operation (batch API)
+ * Returns number of nodes actually dropped
+ * More efficient than calling drop_node multiple times */
+int wbpxre_routing_table_drop_nodes_batch(wbpxre_routing_table_t *table,
+                                           const uint8_t node_ids[][WBPXRE_NODE_ID_LEN],
+                                           int count);
+
 /* Batch cleanup of dropped nodes (Phase 3)
  * Returns number of nodes removed */
 int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table);
