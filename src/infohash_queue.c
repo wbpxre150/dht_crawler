@@ -67,28 +67,11 @@ int infohash_queue_push(infohash_queue_t *queue, const uint8_t *info_hash) {
         return -1;
     }
 
-    /* Pre-check bloom filter + database before acquiring queue mutex (optional optimization) */
-    if (queue->bloom && bloom_filter_check(queue->bloom, info_hash)) {
-        /* Likely duplicate - check database to confirm */
-        if (queue->db && database_has_infohash((database_t *)queue->db, info_hash)) {
-            /* Confirmed duplicate - increment counter under lock */
-            uv_mutex_lock(&queue->mutex);
-            queue->duplicates_filtered++;
-            uv_mutex_unlock(&queue->mutex);
-            return 0;  /* Success but filtered */
-        }
-    }
+    /* No deduplication here - it happens upstream in dht_manager_query_peers()
+     * before info_hashes enter the get_peers queue. This function now only
+     * handles queue operations. */
 
     uv_mutex_lock(&queue->mutex);
-
-    /* Double-check bloom filter under lock to prevent TOCTOU race */
-    if (queue->bloom && bloom_filter_check(queue->bloom, info_hash)) {
-        if (queue->db && database_has_infohash((database_t *)queue->db, info_hash)) {
-            queue->duplicates_filtered++;
-            uv_mutex_unlock(&queue->mutex);
-            return 0;
-        }
-    }
 
     /* Wait if queue is full */
     while (queue->count >= queue->capacity) {
@@ -102,9 +85,10 @@ int infohash_queue_push(infohash_queue_t *queue, const uint8_t *info_hash) {
     queue->tail = (queue->tail + 1) % queue->capacity;
     queue->count++;
 
-    /* NOTE: Bloom filter is NOT updated here - it's updated only after successful
-     * database write in database_insert_batch() to prevent data loss from failed
-     * metadata fetches. The bloom filter check above is read-only for duplicate detection. */
+    /* NOTE: Bloom filter is NOT checked here - deduplication happens upstream
+     * in dht_manager_query_peers() before info_hashes enter the get_peers queue.
+     * Bloom filter is updated only after successful database write in
+     * database_insert_batch() to prevent data loss from failed metadata fetches. */
 
     /* Signal that queue is not empty */
     uv_cond_signal(&queue->cond_not_empty);

@@ -85,8 +85,8 @@ The project uses git submodules in `lib/` for third-party libraries:
 
 **Infohash Queue** (`src/infohash_queue.c`, `include/infohash_queue.h`):
 - Thread-safe bounded queue (default: 10,000 capacity)
-- Deduplication via bloom filter (90% reduction in database queries)
-- Checks bloom filter → database for existence before enqueuing
+- Pure queue operations only - no deduplication logic
+- Deduplication happens upstream in DHT manager before get_peers queries
 
 **Worker Pool** (`src/worker_pool.c`, `include/worker_pool.h`):
 - Generic concurrent task processing framework
@@ -130,7 +130,7 @@ Log level can be set in config.ini (DEBUG, INFO, WARN, ERROR).
 
 ## Key Invariants and Gotchas
 
-1. **Bloom filter update timing**: The bloom filter is updated by the database module AFTER successful writes, NOT when info_hashes are discovered. This prevents data loss from failed metadata fetches.
+1. **Bloom filter deduplication**: Bloom filter + database check happens ONCE in `dht_manager_query_peers()` (src/dht_manager.c:944) BEFORE info_hashes enter the get_peers queue. This prevents duplicate info_hashes from saturating the get_peers pipeline. The bloom filter is updated by the database module AFTER successful writes to prevent data loss from failed metadata fetches. Priority queries (HTTP /refresh) bypass the bloom filter check.
 
 2. **wbpxre-dht node management**: The wbpxre-dht library handles node verification internally. Do NOT manually ping dubious nodes as this interferes with the library's state machine.
 
@@ -149,12 +149,16 @@ DHT Network
     ↓ (BEP 51 sample_infohashes)
 wbpxre-dht library
     ↓ (callback with info_hashes)
-DHT Manager → Infohash Queue (bloom filter dedup)
+DHT Manager (bloom filter dedup in dht_manager_query_peers)
+    ↓ (duplicates filtered before get_peers)
+get_peers queue → get_peers workers
+    ↓ (peers discovered)
+Infohash Queue
     ↓
 Metadata Fetcher Worker Pool
     ↓ (BEP 9/10 metadata fetch from peers)
 Batch Writer → Database (SQLite)
-    ↓ (marks in bloom filter)
+    ↓ (updates bloom filter after successful write)
 HTTP API (query interface)
 ```
 

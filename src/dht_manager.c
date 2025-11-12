@@ -941,10 +941,39 @@ void dht_manager_set_metadata_fetcher(dht_manager_t *mgr, void *metadata_fetcher
     mgr->metadata_fetcher = metadata_fetcher;
 }
 
-/* Query peers for an info_hash */
+/* Query peers for an info_hash
+ *
+ * DEDUPLICATION: This is the SINGLE point where bloom filter deduplication
+ * happens for automatic discovery. All sample_infohashes pass through here
+ * and are filtered before entering the get_peers queue.
+ *
+ * priority: if true, query bypasses bloom filter (for /refresh API)
+ *           if false, query checks bloom filter + database first
+ */
 int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash, bool priority) {
     if (!mgr || !mgr->dht || !info_hash) {
         return -1;
+    }
+
+    /* DEDUPLICATION: Check bloom filter + database before queuing for get_peers
+     * This prevents duplicates from saturating the get_peers queue.
+     *
+     * BYPASS for priority queries (explicit user /refresh requests) */
+    if (!priority && mgr->infohash_queue) {
+        infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
+
+        /* Check bloom filter first (fast, probabilistic) */
+        if (queue->bloom && bloom_filter_check(queue->bloom, info_hash)) {
+            /* Bloom filter says "probably seen" - verify with database */
+            if (queue->db && database_has_infohash((database_t *)queue->db, info_hash)) {
+                /* Confirmed duplicate - skip get_peers entirely */
+                uv_mutex_lock(&queue->mutex);
+                queue->duplicates_filtered++;
+                uv_mutex_unlock(&queue->mutex);
+
+                return 0;  /* Success but filtered */
+            }
+        }
     }
 
     /* Queue the info_hash for the wbpxre-dht get_peers pipeline
