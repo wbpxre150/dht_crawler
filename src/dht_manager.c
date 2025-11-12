@@ -205,15 +205,22 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
             if (info_hash && mgr->peer_store && mgr->peer_retry_tracker) {
                 int peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
 
+                /* Clear query_in_progress flag first - the query is done regardless of whether we retry */
+                peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
+                if (entry) {
+                    pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
+                    entry->query_in_progress = 0;
+                    entry->peer_count = peer_count;
+                    pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
+                }
+
                 /* Check if retry is needed */
                 if (peer_retry_should_retry(mgr->peer_retry_tracker, info_hash, peer_count)) {
                     /* Schedule retry after delay */
-                    peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
                     if (entry) {
                         pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
                         entry->attempts_made++;
-                        entry->peer_count = peer_count;
-                        entry->query_in_progress = 0;
+                        entry->last_attempt_time = time(NULL);
                         mgr->peer_retry_tracker->retries_triggered++;
                         pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
 
