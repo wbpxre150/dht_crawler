@@ -618,16 +618,34 @@ static void *maintenance_thread_func(void *arg) {
 
         /* If table is >90% full, evict distant nodes (was 80%) */
         if (fill_ratio > 0.90) {
+            /* DISABLED: This phase interferes with BEP51 aggressive pruning
+             * BEP51 pruning (which runs every 10s) handles >90% capacity with
+             * the critical path that removes 20% immediately at >95% full.
+             * This phase would only remove 500-1000 nodes per 5s cycle, causing
+             * the table to slowly drain and never trigger the critical path.
+             */
             /* Calculate how many nodes to evict to get back to 85% capacity (was 70%) */
             int target_nodes = (int)(max_nodes * 0.85);
             int nodes_to_evict = current_nodes - target_nodes;
 
-            /* If critically full (>95%), use 2x batch size for faster cleanup */
-            int eviction_limit = (fill_ratio > 0.95) ? (batch_size * 2) : batch_size;
-
-            /* Cap at eviction_limit to avoid overwhelming the system */
-            if (nodes_to_evict > eviction_limit) {
-                nodes_to_evict = eviction_limit;
+            /* MODIFICATION: Don't cap when critically full (>95%)
+             * Let BEP51 pruning handle it with the critical path */
+            int eviction_limit;
+            if (fill_ratio > 0.95) {
+                /* Skip this phase entirely - let BEP51 critical path handle it */
+                nodes_to_evict = 0;
+            } else if (fill_ratio > 0.93) {
+                /* Near critical - use larger batch */
+                eviction_limit = batch_size * 3;
+                if (nodes_to_evict > eviction_limit) {
+                    nodes_to_evict = eviction_limit;
+                }
+            } else {
+                /* Normal - use regular batch size */
+                eviction_limit = batch_size;
+                if (nodes_to_evict > eviction_limit) {
+                    nodes_to_evict = eviction_limit;
+                }
             }
 
             if (nodes_to_evict > 0) {
