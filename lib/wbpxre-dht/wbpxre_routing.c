@@ -1004,6 +1004,21 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
     pthread_mutex_unlock(&table->update_lock);
 }
 
+/* Mark node as not supporting BEP51 (for instant pruning on first error) */
+void wbpxre_routing_table_mark_non_bep51(wbpxre_routing_table_t *table,
+                                          const uint8_t *node_id) {
+    if (!table || !node_id) return;
+
+    pthread_mutex_lock(&table->update_lock);
+
+    wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
+    if (node) {
+        node->bep51_support = WBPXRE_PROTOCOL_NO;
+    }
+
+    pthread_mutex_unlock(&table->update_lock);
+}
+
 void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
                                      const uint8_t *node_id) {
     if (!table || !node_id) return;

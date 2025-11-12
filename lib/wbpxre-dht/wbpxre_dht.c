@@ -697,8 +697,9 @@ static void *maintenance_thread_func(void *arg) {
                         malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_remove);
 
                     if (non_bep51) {
-                        int min_queries_threshold = dht->config.node_quality_min_queries > 0 ?
-                                                   dht->config.node_quality_min_queries : 10;
+                        /* Use min_queries_threshold of 1 so nodes marked as NO (after rejection)
+                         * are instantly pruned on the next maintenance cycle */
+                        int min_queries_threshold = 1;
 
                         int found = wbpxre_routing_table_get_non_bep51_nodes(
                             dht->routing_table,
@@ -986,8 +987,8 @@ static void *sample_infohashes_worker_func(void *arg) {
 
             if (hashes) free(hashes);
         } else {
-            /* Failed -> drop node */
-            wbpxre_routing_table_drop_node(dht->routing_table, node->id);
+            /* Failed -> mark as non-BEP51 for instant pruning */
+            wbpxre_routing_table_mark_non_bep51(dht->routing_table, node->id);
         }
 
         free(node);

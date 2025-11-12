@@ -545,6 +545,10 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
                                                   int total_num,
                                                   int interval);
 
+/* Mark node as not supporting BEP51 (for instant pruning on first error) */
+void wbpxre_routing_table_mark_non_bep51(wbpxre_routing_table_t *table,
+                                          const uint8_t *node_id);
+
 /* Drop node from routing table */
 void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
                                      const uint8_t *node_id);
