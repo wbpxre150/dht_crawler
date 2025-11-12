@@ -691,36 +691,62 @@ static void *maintenance_thread_func(void *arg) {
 
             /* Only run when fill_ratio exceeds configured threshold */
             if (fill_ratio > min_capacity) {
-                /* Calculate target based on fill ratio */
                 int nodes_to_remove;
+                int total_pruned = 0;
 
-                /* When >90% full, trigger aggressive 20% pruning */
-                if (fill_ratio > 0.90) {
-                    /* Aggressive: prune 20% of total capacity */
+                /* CRITICAL PATH: >95% full - force prune oldest 20% immediately */
+                if (fill_ratio > 0.95) {
+                    nodes_to_remove = (int)(max_nodes * 0.20);
+
+                    printf("[wbpxre-dht] CRITICAL: Routing table at %.1f%% capacity (%d/%d nodes)\n",
+                           fill_ratio * 100.0, current_nodes, max_nodes);
+                    printf("[wbpxre-dht] CRITICAL: Force-pruning oldest %d nodes (20%% of capacity)\n",
+                           nodes_to_remove);
+
+                    /* Get oldest nodes and prune ALL of them (no filtering) */
+                    wbpxre_routing_node_t **oldest_nodes =
+                        malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_remove);
+
+                    if (oldest_nodes) {
+                        int old_count = wbpxre_routing_table_get_oldest_nodes(
+                            dht->routing_table,
+                            oldest_nodes,
+                            nodes_to_remove
+                        );
+
+                        printf("[wbpxre-dht] CRITICAL: Retrieved %d oldest nodes for removal\n", old_count);
+
+                        /* Drop ALL oldest nodes - no threshold checks */
+                        for (int i = 0; i < old_count; i++) {
+                            wbpxre_routing_table_drop_node(dht->routing_table,
+                                                           oldest_nodes[i]->id);
+                            pthread_mutex_lock(&dht->stats_mutex);
+                            dht->stats.nodes_dropped++;
+                            dht->stats.nodes_dropped_unresponsive++;
+                            pthread_mutex_unlock(&dht->stats_mutex);
+                            free(oldest_nodes[i]);
+                            total_pruned++;
+                        }
+
+                        free(oldest_nodes);
+
+                        printf("[wbpxre-dht] CRITICAL: Removed %d oldest nodes\n", total_pruned);
+                    }
+
+                }
+                /* AGGRESSIVE PATH: 90-95% full - two-phase pruning */
+                else if (fill_ratio > 0.90) {
                     nodes_to_remove = (int)(max_nodes * 0.20);
 
                     printf("[wbpxre-dht] Routing table at %.1f%% capacity (%d/%d nodes), "
                            "triggering aggressive 20%% pruning (target: remove %d nodes)\n",
                            fill_ratio * 100.0, current_nodes, max_nodes, nodes_to_remove);
-                } else {
-                    /* Moderate: remove up to 5% of capacity per cycle */
-                    nodes_to_remove = (int)(max_nodes * 0.05);
-
-                    printf("[wbpxre-dht] Routing table at %.1f%% capacity (%d/%d nodes), "
-                           "moderate pruning (target: remove %d nodes)\n",
-                           fill_ratio * 100.0, current_nodes, max_nodes, nodes_to_remove);
-                }
-
-                if (nodes_to_remove > 0) {
-                    int total_pruned = 0;
 
                     /* PHASE 1: Get non-BEP51 nodes (highest priority) */
                     wbpxre_routing_node_t **non_bep51 =
                         malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_remove);
 
                     if (non_bep51) {
-                        /* Use min_queries_threshold of 1 so nodes marked as NO (after rejection)
-                         * are instantly pruned on the next maintenance cycle */
                         int min_queries_threshold = 1;
 
                         int found = wbpxre_routing_table_get_non_bep51_nodes(
@@ -749,13 +775,12 @@ static void *maintenance_thread_func(void *arg) {
                         }
                     }
 
-                    /* PHASE 2: If we haven't hit target, prune oldest/unresponsive nodes */
+                    /* PHASE 2: If we haven't hit target, prune unresponsive nodes >120s */
                     int remaining_to_prune = nodes_to_remove - total_pruned;
                     if (remaining_to_prune > 0) {
                         time_t now = time(NULL);
                         const time_t UNRESPONSIVE_THRESHOLD = 120;  /* 2 minutes */
 
-                        /* Get oldest nodes (sorted by last_responded_at) */
                         wbpxre_routing_node_t **old_nodes =
                             malloc(sizeof(wbpxre_routing_node_t *) * remaining_to_prune);
 
@@ -770,12 +795,8 @@ static void *maintenance_thread_func(void *arg) {
                             for (int i = 0; i < old_count && total_pruned < nodes_to_remove; i++) {
                                 time_t time_since_response = now - old_nodes[i]->last_responded_at;
 
-                                /* If critically full (>95%), prune oldest nodes regardless of threshold
-                                 * Otherwise only prune if unresponsive >120s */
-                                int should_prune = (fill_ratio > 0.95) ||
-                                                  (time_since_response > UNRESPONSIVE_THRESHOLD);
-
-                                if (should_prune) {
+                                /* Only prune if unresponsive >120s */
+                                if (time_since_response > UNRESPONSIVE_THRESHOLD) {
                                     wbpxre_routing_table_drop_node(dht->routing_table,
                                                                    old_nodes[i]->id);
                                     pthread_mutex_lock(&dht->stats_mutex);
@@ -792,27 +813,62 @@ static void *maintenance_thread_func(void *arg) {
                             free(old_nodes);
 
                             if (unresponsive_pruned > 0) {
-                                printf("[wbpxre-dht] Pruned %d oldest/unresponsive nodes (threshold: %s)\n",
-                                       unresponsive_pruned,
-                                       fill_ratio > 0.95 ? "CRITICAL - pruning oldest" : ">120s");
+                                printf("[wbpxre-dht] Pruned %d unresponsive nodes (>120s)\n",
+                                       unresponsive_pruned);
                             }
                         }
                     }
+                }
+                /* MODERATE PATH: Below 90% but above min_capacity */
+                else {
+                    nodes_to_remove = (int)(max_nodes * 0.05);
 
-                    /* Log final pruning results */
-                    if (total_pruned > 0) {
-                        int new_node_count = dht->routing_table->node_count;
-                        double new_fill_ratio = (double)new_node_count / (double)max_nodes;
+                    printf("[wbpxre-dht] Routing table at %.1f%% capacity (%d/%d nodes), "
+                           "moderate pruning (target: remove %d nodes)\n",
+                           fill_ratio * 100.0, current_nodes, max_nodes, nodes_to_remove);
 
-                        printf("[wbpxre-dht] Aggressive pruning complete: "
-                               "removed %d/%d target nodes (%.1f%% -> %.1f%%)\n",
-                               total_pruned, nodes_to_remove,
-                               fill_ratio * 100.0, new_fill_ratio * 100.0);
+                    /* Just prune non-BEP51 nodes */
+                    wbpxre_routing_node_t **non_bep51 =
+                        malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_remove);
 
-                        pthread_mutex_lock(&dht->stats_mutex);
-                        dht->stats.aggressive_prune_triggers++;
-                        pthread_mutex_unlock(&dht->stats_mutex);
+                    if (non_bep51) {
+                        int min_queries_threshold = 1;
+
+                        int found = wbpxre_routing_table_get_non_bep51_nodes(
+                            dht->routing_table,
+                            non_bep51,
+                            nodes_to_remove,
+                            min_queries_threshold
+                        );
+
+                        for (int i = 0; i < found; i++) {
+                            wbpxre_routing_table_drop_node(dht->routing_table,
+                                                           non_bep51[i]->id);
+                            pthread_mutex_lock(&dht->stats_mutex);
+                            dht->stats.nodes_dropped++;
+                            dht->stats.nodes_dropped_bep51_pruning++;
+                            pthread_mutex_unlock(&dht->stats_mutex);
+                            free(non_bep51[i]);
+                            total_pruned++;
+                        }
+
+                        free(non_bep51);
                     }
+                }
+
+                /* Log final pruning results */
+                if (total_pruned > 0) {
+                    int new_node_count = dht->routing_table->node_count;
+                    double new_fill_ratio = (double)new_node_count / (double)max_nodes;
+
+                    printf("[wbpxre-dht] Pruning complete: "
+                           "removed %d/%d target nodes (%.1f%% -> %.1f%%)\n",
+                           total_pruned, nodes_to_remove,
+                           fill_ratio * 100.0, new_fill_ratio * 100.0);
+
+                    pthread_mutex_lock(&dht->stats_mutex);
+                    dht->stats.aggressive_prune_triggers++;
+                    pthread_mutex_unlock(&dht->stats_mutex);
                 }
             }
         }
