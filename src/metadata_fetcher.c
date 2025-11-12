@@ -227,11 +227,9 @@ static void metadata_worker_fn(void *task_data, void *closure) {
         return;
     }
 
-    /* Check if already in database (thread-safe read operation) */
-    if (database_check_exists(fetcher->database, task->info_hash)) {
-        free(task);
-        return;
-    }
+    /* NOTE: Bloom filter + database deduplication already happened in dht_manager_query_peers()
+     * before the info_hash entered the get_peers queue. No need to check database again here.
+     * See src/dht_manager.c:979-1003 for the single deduplication point. */
 
     /* Get peers from peer store (thread-safe) */
     struct sockaddr_storage peers[MAX_PEERS_PER_REQUEST];
