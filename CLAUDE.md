@@ -44,6 +44,7 @@ Required system packages:
 - libsqlite3-dev
 - libssl-dev
 - build-essential
+- liburcu (userspace-rcu on Arch, liburcu-dev on Debian/Ubuntu)
 
 The project uses git submodules in `lib/` for third-party libraries:
 - `wbpxre-dht`: Custom DHT implementation with BEP 51 support
