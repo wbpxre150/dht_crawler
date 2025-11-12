@@ -82,10 +82,22 @@ static void on_connection_request(uv_async_t *handle) {
         return;
     }
 
+    /* Prevent concurrent invocations of this callback */
+    uv_mutex_lock(&fetcher->mutex);
+    if (fetcher->async_processing) {
+        /* Already processing, exit and let the current invocation handle it */
+        uv_mutex_unlock(&fetcher->mutex);
+        return;
+    }
+    fetcher->async_processing = 1;
+    uv_mutex_unlock(&fetcher->mutex);
+
     /* Batch processing: limit requests per callback to prevent event loop starvation
-     * This prevents the event loop from being blocked when processing a large backlog */
-    const int MAX_BATCH_SIZE = 100;
+     * Reduced from 100 to 50 for better event loop responsiveness */
+    const int MAX_BATCH_SIZE = 50;
     int processed = 0;
+    int connections_started = 0;  /* Track actual progress */
+    int capacity_blocked = 0;     /* Track if we hit capacity limits */
 
     /* Process up to MAX_BATCH_SIZE pending connection requests */
     connection_request_t *req;
@@ -101,8 +113,12 @@ static void on_connection_request(uv_async_t *handle) {
             /* Hit global limit - discard remaining requests */
             free(req);
             processed++;
+            capacity_blocked = 1;
             continue;
         }
+
+        /* Track active count before attempting connections */
+        int active_before = current_active;
 
         /* Create or get infohash attempt entry with peer queue */
         infohash_attempt_t *attempt = create_or_get_attempt_with_peers(
@@ -118,16 +134,41 @@ static void on_connection_request(uv_async_t *handle) {
         /* Start initial batch of connections using the new peer queue mechanism */
         start_next_peer_connections(fetcher, attempt);
 
+        /* Check if we actually created new connections */
+        uv_mutex_lock(&fetcher->mutex);
+        int active_after = fetcher->active_count;
+        uv_mutex_unlock(&fetcher->mutex);
+
+        if (active_after > active_before) {
+            connections_started += (active_after - active_before);
+        }
+
         free(req);
         processed++;
     }
 
-    /* If we hit the batch limit and there are more requests, re-trigger async
-     * This ensures we process all pending requests without starving other event loop callbacks */
-    if (processed >= MAX_BATCH_SIZE &&
-        connection_request_queue_size(fetcher->conn_request_queue) > 0) {
+    /* Update blocked state */
+    uv_mutex_lock(&fetcher->mutex);
+    fetcher->connection_queue_blocked = capacity_blocked;
+    uv_mutex_unlock(&fetcher->mutex);
+
+    size_t remaining = connection_request_queue_size(fetcher->conn_request_queue);
+
+    /* Only re-trigger async if we made progress AND there are more requests
+     * This prevents busy-looping when at capacity */
+    if (connections_started > 0 && remaining > 0) {
+        uv_async_send(&fetcher->async_handle);
+    } else if (remaining > 0 && !capacity_blocked) {
+        /* Have requests but couldn't start connections (not due to capacity)
+         * Re-trigger once to give it another try */
         uv_async_send(&fetcher->async_handle);
     }
+    /* If capacity_blocked and no progress, DON'T re-trigger to avoid busy-loop */
+
+    /* Mark async processing as complete */
+    uv_mutex_lock(&fetcher->mutex);
+    fetcher->async_processing = 0;
+    uv_mutex_unlock(&fetcher->mutex);
 }
 
 /* Initialize metadata fetcher */
@@ -145,6 +186,10 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->peer_store = peer_store;
     fetcher->max_concurrent = 5;  /* Kept for backward compatibility */
     fetcher->running = 0;
+
+    /* Initialize async callback state flags to prevent event loop starvation */
+    fetcher->async_processing = 0;
+    fetcher->connection_queue_blocked = 0;
 
     /* Load config values from provided config */
     fetcher->max_concurrent_per_infohash = config->concurrent_peers_per_torrent;
@@ -1756,6 +1801,20 @@ static void on_handle_closed(uv_handle_t *handle) {
 
     /* Only free when all handles are closed */
     if (peer->handles_to_close == 0) {
+
+        /* Check if connection queue was blocked and has pending requests
+         * If so, trigger async callback to resume processing now that capacity is available */
+        metadata_fetcher_t *fetcher = (metadata_fetcher_t *)peer->fetcher;
+        if (fetcher) {
+            uv_mutex_lock(&fetcher->mutex);
+            int queue_blocked = fetcher->connection_queue_blocked;
+            uv_mutex_unlock(&fetcher->mutex);
+
+            if (queue_blocked && connection_request_queue_size(fetcher->conn_request_queue) > 0) {
+                /* Resume processing connection requests now that a connection slot freed up */
+                uv_async_send(&fetcher->async_handle);
+            }
+        }
 
         /* Clear initialization flags to help detect use-after-free */
         peer->tcp_initialized = 0;
