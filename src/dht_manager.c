@@ -135,15 +135,41 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                     mgr->stats.get_peers_responses++;
                     mgr->stats.info_hashes_with_peers++;
 
-                    /* Only add to queue if NOT in retry tracking (or retry is disabled) */
+                    /* Hybrid approach: Allow immediate queue entry if we have enough peers
+                     * This fixes queue starvation while maintaining the 10-peer quality threshold */
+
+                    /* Get current total peer count from peer_store */
+                    int total_peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
+
+                    /* Check if in retry tracking */
                     bool in_retry = false;
                     if (mgr->peer_retry_tracker) {
                         peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
                         in_retry = (entry != NULL);
                     }
 
-                    /* Add to queue for metadata fetching (skip if waiting for retries) */
-                    if (!in_retry && mgr->infohash_queue) {
+                    /* Decision logic:
+                     * - If we have >= 10 peers: proceed to metadata fetcher immediately (even if in retry)
+                     * - If we have < 10 peers and NOT in retry: shouldn't happen, but allow through
+                     * - If we have < 10 peers and in retry: wait for retry system to collect more peers */
+                    bool should_queue = false;
+
+                    if (total_peer_count >= 10) {
+                        /* Threshold met - proceed immediately */
+                        should_queue = true;
+
+                        /* If in retry system, mark as complete since we have enough peers */
+                        if (in_retry && mgr->peer_retry_tracker) {
+                            peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, total_peer_count);
+                        }
+                    } else if (!in_retry) {
+                        /* Not in retry and <10 peers - this is first discovery, allow through
+                         * (retry system will be triggered by SEARCH_DONE if needed) */
+                        should_queue = true;
+                    }
+                    /* else: in_retry && <10 peers - wait for retry to collect more */
+
+                    if (should_queue && mgr->infohash_queue) {
                         infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
                         if (!infohash_queue_is_full(queue)) {
                             infohash_queue_push(queue, info_hash);
