@@ -104,6 +104,7 @@ peer_retry_entry_t* peer_retry_entry_create(peer_retry_tracker_t *tracker,
     entry->peer_count = 0;
     entry->query_in_progress = 1;  /* First query is in progress */
     entry->last_attempt_time = time(NULL);
+    entry->target_retry_time = 0;  /* Not scheduled for retry yet */
     entry->created_at = time(NULL);
 
     /* Add to bucket chain */
@@ -271,6 +272,43 @@ int peer_retry_cleanup_old(peer_retry_tracker_t *tracker) {
     pthread_mutex_unlock(&tracker->mutex);
 
     return removed;
+}
+
+/* Get entries that are ready for retry */
+int peer_retry_get_ready_entries(peer_retry_tracker_t *tracker,
+                                  uint8_t (*info_hashes)[20],
+                                  int max_count) {
+    if (!tracker || !info_hashes || max_count <= 0) {
+        return 0;
+    }
+
+    time_t now = time(NULL);
+    int found = 0;
+
+    pthread_mutex_lock(&tracker->mutex);
+
+    /* Scan all buckets for ready entries */
+    for (size_t i = 0; i < tracker->bucket_count && found < max_count; i++) {
+        peer_retry_entry_t *entry = tracker->buckets[i];
+
+        while (entry && found < max_count) {
+            /* Check if this entry is ready for retry */
+            if (entry->target_retry_time > 0 && entry->target_retry_time <= now) {
+                /* Copy info_hash to output array */
+                memcpy(info_hashes[found], entry->info_hash, 20);
+                found++;
+
+                /* Clear target_retry_time so it won't be retried again until rescheduled */
+                entry->target_retry_time = 0;
+            }
+
+            entry = entry->next;
+        }
+    }
+
+    pthread_mutex_unlock(&tracker->mutex);
+
+    return found;
 }
 
 /* Print statistics */

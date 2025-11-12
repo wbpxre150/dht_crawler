@@ -32,17 +32,10 @@ static const bootstrap_node_t bootstrap_nodes[] = {
 /* Global DHT manager for statistics tracking */
 static dht_manager_t *g_dht_manager = NULL;
 
-/* Timer context for delayed retries */
-typedef struct {
-    uint8_t info_hash[20];
-    dht_manager_t *mgr;
-    uv_timer_t timer;
-} retry_context_t;
-
 /* Forward declarations */
 static int bootstrap_dht(dht_manager_t *mgr);
 static void node_rotation_timer_cb(uv_timer_t *handle);
-static void retry_timer_cb(uv_timer_t *handle);
+static void peer_retry_timer_cb(uv_timer_t *handle);
 
 /* Async pruning forward declarations */
 static pruning_queue_t *pruning_queue_create(int capacity);
@@ -51,23 +44,21 @@ static bool pruning_queue_submit_batch(pruning_queue_t *queue, pruning_batch_t *
 static pruning_batch_t *pruning_queue_dequeue_batch(pruning_queue_t *queue);
 static void *pruning_worker_thread_func(void *arg);
 
-/* Close callback for timer handles */
-static void on_timer_closed(uv_handle_t *handle) {
-    dht_manager_t *mgr = (dht_manager_t *)handle->data;
-    if (!mgr) return;
+/* Structure to track pending timer closes */
+typedef struct {
+    int pending_closes;
+    pthread_mutex_t mutex;
+} timer_close_tracker_t;
 
-    pthread_mutex_lock(&mgr->close_tracker.mutex);
-    mgr->close_tracker.handles_to_close--;
-    log_msg(LOG_DEBUG, "Timer handle closed, %d handles remaining",
-            mgr->close_tracker.handles_to_close);
-    pthread_cond_signal(&mgr->close_tracker.cond);
-    pthread_mutex_unlock(&mgr->close_tracker.mutex);
-}
-
-/* Close callback for retry timer - frees the retry context */
-static void on_retry_timer_closed(uv_handle_t *handle) {
-    retry_context_t *ctx = (retry_context_t *)handle->data;
-    free(ctx);
+/* Close callback for timers - decrements pending counter */
+static void timer_close_cb(uv_handle_t *handle) {
+    timer_close_tracker_t *tracker = (timer_close_tracker_t *)handle->data;
+    if (tracker) {
+        pthread_mutex_lock(&tracker->mutex);
+        tracker->pending_closes--;
+        log_msg(LOG_DEBUG, "Timer closed, pending: %d", tracker->pending_closes);
+        pthread_mutex_unlock(&tracker->mutex);
+    }
 }
 
 /* Helper: Format info_hash as hex string */
@@ -232,17 +223,9 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
 
                         mgr->stats.peer_retries_triggered++;
 
-                        /* Use libuv timer for delayed retry */
-                        retry_context_t *retry_ctx = malloc(sizeof(retry_context_t));
-                        if (retry_ctx) {
-                            memcpy(retry_ctx->info_hash, info_hash, 20);
-                            retry_ctx->mgr = mgr;
-                            retry_ctx->timer.data = retry_ctx;
-
-                            uv_timer_init(mgr->app_ctx->loop, &retry_ctx->timer);
-                            uv_timer_start(&retry_ctx->timer, retry_timer_cb,
-                                          mgr->peer_retry_tracker->retry_delay_ms, 0);
-                        }
+                        /* Schedule retry by setting target_retry_time */
+                        time_t target_time = time(NULL) + (mgr->peer_retry_tracker->retry_delay_ms / 1000);
+                        entry->target_retry_time = target_time;
                     }
                 } else {
                     /* No retry needed - add to queue for metadata fetching */
@@ -745,6 +728,17 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         } else {
             log_msg(LOG_INFO, "Peer retry tracker initialized (max_attempts=%d, threshold=%d, delay=%dms)",
                     cfg->peer_retry_max_attempts, cfg->peer_retry_min_threshold, cfg->peer_retry_delay_ms);
+
+            /* Initialize peer retry timer (checks every 100ms for ready retries) */
+            rc = uv_timer_init(app_ctx->loop, &mgr->peer_retry_timer);
+            if (rc != 0) {
+                log_msg(LOG_ERROR, "Failed to initialize peer retry timer: %s", uv_strerror(rc));
+                peer_retry_tracker_cleanup(mgr->peer_retry_tracker);
+                mgr->peer_retry_tracker = NULL;
+            } else {
+                mgr->peer_retry_timer.data = mgr;
+                log_msg(LOG_DEBUG, "Peer retry timer initialized");
+            }
         }
     } else {
         mgr->peer_retry_tracker = NULL;
@@ -870,6 +864,16 @@ int dht_manager_start(dht_manager_t *mgr) {
         log_msg(LOG_INFO, "✗ Node ID rotation DISABLED");
     }
 
+    /* Start peer retry timer if enabled */
+    if (mgr->peer_retry_tracker) {
+        rc = uv_timer_start(&mgr->peer_retry_timer, peer_retry_timer_cb, 100, 100);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "Failed to start peer retry timer: %s", uv_strerror(rc));
+            return -1;
+        }
+        log_msg(LOG_DEBUG, "Peer retry timer started (checks every 100ms)");
+    }
+
     log_msg(LOG_DEBUG, "DHT manager started successfully");
     return 0;
 }
@@ -888,6 +892,11 @@ void dht_manager_stop(dht_manager_t *mgr) {
     /* Stop node rotation timer if enabled */
     if (mgr->node_rotation_enabled) {
         uv_timer_stop(&mgr->node_rotation_timer);
+    }
+
+    /* Stop peer retry timer if enabled */
+    if (mgr->peer_retry_tracker) {
+        uv_timer_stop(&mgr->peer_retry_timer);
     }
 
     /* Step 1: Set peer_store shutdown flag FIRST
@@ -928,57 +937,67 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
 
     log_msg(LOG_DEBUG, "Cleaning up DHT manager...");
 
-    /* Only close timers if they were initialized */
-    if (mgr->timers_initialized) {
-        /* Set handle count for timer close tracking */
-        pthread_mutex_lock(&mgr->close_tracker.mutex);
-        mgr->close_tracker.handles_to_close = mgr->node_rotation_enabled ? 2 : 1;
-        pthread_mutex_unlock(&mgr->close_tracker.mutex);
-
-        /* Close timer handles with callback - must wait for close callback before freeing */
-        log_msg(LOG_DEBUG, "Closing timer handles...");
-        if (!uv_is_closing((uv_handle_t *)&mgr->bootstrap_reseed_timer)) {
-            uv_close((uv_handle_t *)&mgr->bootstrap_reseed_timer, on_timer_closed);
-        } else {
-            /* Already closing, decrement counter */
-            pthread_mutex_lock(&mgr->close_tracker.mutex);
-            mgr->close_tracker.handles_to_close--;
-            pthread_mutex_unlock(&mgr->close_tracker.mutex);
-        }
-        if (mgr->node_rotation_enabled) {
-            if (!uv_is_closing((uv_handle_t *)&mgr->node_rotation_timer)) {
-                uv_close((uv_handle_t *)&mgr->node_rotation_timer, on_timer_closed);
-            } else {
-                /* Already closing, decrement counter */
-                pthread_mutex_lock(&mgr->close_tracker.mutex);
-                mgr->close_tracker.handles_to_close--;
-                pthread_mutex_unlock(&mgr->close_tracker.mutex);
-            }
-        }
-    }
-
-    /* Run the event loop to process close callbacks (only if timers were initialized) */
-    if (mgr->timers_initialized) {
-        log_msg(LOG_DEBUG, "Running event loop to process close callbacks...");
+    /* First, explicitly close only the timers we own */
+    if (mgr->timers_initialized && mgr->app_ctx && mgr->app_ctx->loop) {
+        log_msg(LOG_DEBUG, "Closing DHT manager timers...");
         uv_loop_t *loop = mgr->app_ctx->loop;
 
-        pthread_mutex_lock(&mgr->close_tracker.mutex);
-        while (mgr->close_tracker.handles_to_close > 0) {
-            pthread_mutex_unlock(&mgr->close_tracker.mutex);
+        /* Initialize close tracker */
+        timer_close_tracker_t close_tracker;
+        close_tracker.pending_closes = 0;
+        pthread_mutex_init(&close_tracker.mutex, NULL);
 
-            /* Run one iteration of the event loop to process callbacks */
-            if (uv_loop_alive(loop)) {
-                uv_run(loop, UV_RUN_ONCE);
-            } else {
-                /* Loop is dead but handle not closed - shouldn't happen but be safe */
-                log_msg(LOG_WARN, "Event loop dead but handle not closed, breaking wait");
-                break;
-            }
-
-            pthread_mutex_lock(&mgr->close_tracker.mutex);
+        /* Close bootstrap_reseed_timer (always initialized) */
+        if (!uv_is_closing((uv_handle_t *)&mgr->bootstrap_reseed_timer)) {
+            mgr->bootstrap_reseed_timer.data = &close_tracker;
+            close_tracker.pending_closes++;
+            uv_close((uv_handle_t *)&mgr->bootstrap_reseed_timer, timer_close_cb);
+            log_msg(LOG_DEBUG, "Closing bootstrap_reseed_timer");
         }
-        pthread_mutex_unlock(&mgr->close_tracker.mutex);
-        log_msg(LOG_DEBUG, "All timer handles closed");
+
+        /* Close peer_retry_timer (only if peer retry was enabled) */
+        if (mgr->peer_retry_tracker && !uv_is_closing((uv_handle_t *)&mgr->peer_retry_timer)) {
+            mgr->peer_retry_timer.data = &close_tracker;
+            close_tracker.pending_closes++;
+            uv_close((uv_handle_t *)&mgr->peer_retry_timer, timer_close_cb);
+            log_msg(LOG_DEBUG, "Closing peer_retry_timer");
+        }
+
+        /* Close node_rotation_timer (only if node rotation was enabled) */
+        if (mgr->node_rotation_enabled && !uv_is_closing((uv_handle_t *)&mgr->node_rotation_timer)) {
+            mgr->node_rotation_timer.data = &close_tracker;
+            close_tracker.pending_closes++;
+            uv_close((uv_handle_t *)&mgr->node_rotation_timer, timer_close_cb);
+            log_msg(LOG_DEBUG, "Closing node_rotation_timer");
+        }
+
+        /* Wait for all timer closes to complete */
+        log_msg(LOG_DEBUG, "Waiting for %d timer(s) to close...", close_tracker.pending_closes);
+        int iterations = 0;
+        while (close_tracker.pending_closes > 0 && iterations < 20) {
+            uv_run(loop, UV_RUN_NOWAIT);
+            iterations++;
+            if (iterations % 5 == 0) {
+                pthread_mutex_lock(&close_tracker.mutex);
+                int pending = close_tracker.pending_closes;
+                pthread_mutex_unlock(&close_tracker.mutex);
+                log_msg(LOG_DEBUG, "Still waiting for %d timer(s) to close (iteration %d)",
+                        pending, iterations);
+            }
+        }
+
+        pthread_mutex_lock(&close_tracker.mutex);
+        int final_pending = close_tracker.pending_closes;
+        pthread_mutex_unlock(&close_tracker.mutex);
+
+        if (final_pending == 0) {
+            log_msg(LOG_DEBUG, "All timers closed successfully");
+        } else {
+            log_msg(LOG_WARN, "Timeout waiting for timers to close (%d still pending)",
+                    final_pending);
+        }
+
+        pthread_mutex_destroy(&close_tracker.mutex);
     }
 
     /* Cleanup wbpxre-dht (only after timer is fully closed) */
@@ -1694,34 +1713,30 @@ static void node_rotation_timer_cb(uv_timer_t *handle) {
     }
 }
 
-/* Retry timer callback - triggers next get_peers attempt */
-static void retry_timer_cb(uv_timer_t *handle) {
-    retry_context_t *ctx = (retry_context_t *)handle->data;
-    dht_manager_t *mgr = ctx->mgr;
-
-    char hex[41];
-    format_infohash(ctx->info_hash, hex, sizeof(hex));
-
-    peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, ctx->info_hash);
-    if (entry) {
-        log_msg(LOG_DEBUG, "Retry attempt %d for %s (current peers: %d)",
-                entry->attempts_made + 1, hex, entry->peer_count);
-
-        /* Mark query as in progress */
-        pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
-        entry->query_in_progress = 1;
-        entry->last_attempt_time = time(NULL);
-        pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
-
-        /* Trigger another get_peers query */
-        dht_manager_query_peers(mgr, ctx->info_hash, false);
+/* Peer retry timer callback - periodically checks for retries that are ready */
+static void peer_retry_timer_cb(uv_timer_t *handle) {
+    dht_manager_t *mgr = (dht_manager_t *)handle->data;
+    if (!mgr || !mgr->peer_retry_tracker) {
+        return;
     }
 
-    /* Cleanup timer - use close callback to safely free context */
-    if (!uv_is_closing((uv_handle_t *)&ctx->timer)) {
-        uv_close((uv_handle_t *)&ctx->timer, on_retry_timer_closed);
-    } else {
-        free(ctx);
+    /* Get up to 100 ready retry entries */
+    uint8_t ready_infohashes[100][20];
+    int count = peer_retry_get_ready_entries(mgr->peer_retry_tracker, ready_infohashes, 100);
+
+    /* Trigger retries for all ready entries */
+    for (int i = 0; i < count; i++) {
+        peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, ready_infohashes[i]);
+        if (entry) {
+            /* Mark query as in progress */
+            pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
+            entry->query_in_progress = 1;
+            entry->last_attempt_time = time(NULL);
+            pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
+
+            /* Trigger another get_peers query */
+            dht_manager_query_peers(mgr, ready_infohashes[i], false);
+        }
     }
 }
 

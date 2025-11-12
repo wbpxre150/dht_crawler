@@ -12,6 +12,7 @@ typedef struct peer_retry_entry {
     int peer_count;              /* Total peers discovered */
     int query_in_progress;       /* 1 if waiting for SEARCH_DONE */
     time_t last_attempt_time;    /* Timestamp of last attempt */
+    time_t target_retry_time;    /* When this entry should be retried (0 if not scheduled) */
     time_t created_at;           /* When entry was created */
     struct peer_retry_entry *next; /* Hash table chaining */
 } peer_retry_entry_t;
@@ -83,6 +84,14 @@ void peer_retry_mark_complete(peer_retry_tracker_t *tracker,
  * Returns number of entries removed
  */
 int peer_retry_cleanup_old(peer_retry_tracker_t *tracker);
+
+/* Get entries that are ready for retry (target_retry_time <= now)
+ * Fills info_hashes array with up to max_count ready entries
+ * Returns actual number of entries found
+ */
+int peer_retry_get_ready_entries(peer_retry_tracker_t *tracker,
+                                  uint8_t (*info_hashes)[20],
+                                  int max_count);
 
 /* Print statistics */
 void peer_retry_print_stats(peer_retry_tracker_t *tracker);

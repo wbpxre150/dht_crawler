@@ -207,6 +207,7 @@ typedef struct {
     refresh_query_store_t *refresh_query_store;
     /* Peer retry tracking */
     peer_retry_tracker_t *peer_retry_tracker;
+    uv_timer_t peer_retry_timer;      /* Timer for periodic retry checking */
     /* Close tracker for safe shutdown */
     close_tracker_t close_tracker;
     /* Initialization state flags */
