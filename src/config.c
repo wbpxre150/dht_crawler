@@ -109,6 +109,7 @@ void config_init_defaults(crawler_config_t *config) {
     /* BEP51-focused pruning defaults */
     config->bep51_pruning_enabled = 1;          /* Enabled by default */
     config->bep51_pruning_interval_sec = 30;    /* Check every 30 seconds */
+    config->bep51_pruning_min_capacity = 0.0;   /* Prune immediately (proactive) */
 }
 
 /* Load config from INI-style file */
@@ -319,6 +320,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->bep51_pruning_enabled = atoi(value);
         } else if (strcmp(key, "bep51_pruning_interval_sec") == 0) {
             config->bep51_pruning_interval_sec = atoi(value);
+        } else if (strcmp(key, "bep51_pruning_min_capacity") == 0) {
+            config->bep51_pruning_min_capacity = atof(value);
+            /* Clamp to valid range [0.0, 1.0] */
+            if (config->bep51_pruning_min_capacity < 0.0) config->bep51_pruning_min_capacity = 0.0;
+            if (config->bep51_pruning_min_capacity > 1.0) config->bep51_pruning_min_capacity = 1.0;
         }
     }
 

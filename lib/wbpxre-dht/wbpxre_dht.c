@@ -668,8 +668,8 @@ static void *maintenance_thread_func(void *arg) {
         }
 
         /* ====================================================================
-         * BEP51-Focused Pruning (SIMPLE - NEW)
-         * When table >90% full, aggressively remove non-BEP51 nodes
+         * BEP51-Focused Pruning (Configurable Threshold)
+         * When table exceeds min_capacity threshold, remove non-BEP51 nodes
          * ==================================================================== */
 
         /* Check if BEP51 pruning is enabled and it's time to run */
@@ -685,11 +685,23 @@ static void *maintenance_thread_func(void *arg) {
                            dht->config.max_routing_table_nodes : 10000;
             double fill_ratio = (double)current_nodes / (double)max_nodes;
 
-            /* Only run when >90% full */
-            if (fill_ratio > 0.90) {
-                /* How many to remove to get back to 90% */
-                int target_nodes = (int)(max_nodes * 0.90);
-                int nodes_to_remove = current_nodes - target_nodes;
+            /* Get configured minimum capacity threshold (default 0.0 = always prune) */
+            double min_capacity = dht->config.bep51_pruning_min_capacity >= 0.0 ?
+                                 dht->config.bep51_pruning_min_capacity : 0.0;
+
+            /* Only run when fill_ratio exceeds configured threshold */
+            if (fill_ratio > min_capacity) {
+                /* Calculate target: when >90% full, aggressively prune back to 90%
+                 * Otherwise, prune a smaller percentage to maintain quality */
+                int nodes_to_remove;
+                if (fill_ratio > 0.90) {
+                    /* Aggressive: get back to 90% */
+                    int target_nodes = (int)(max_nodes * 0.90);
+                    nodes_to_remove = current_nodes - target_nodes;
+                } else {
+                    /* Moderate: remove up to 5% of capacity per cycle */
+                    nodes_to_remove = max_nodes / 20;
+                }
 
                 if (nodes_to_remove > 0) {
                     /* Get non-BEP51 nodes */
@@ -714,6 +726,7 @@ static void *maintenance_thread_func(void *arg) {
                                                            non_bep51[i]->id);
                             pthread_mutex_lock(&dht->stats_mutex);
                             dht->stats.nodes_dropped++;
+                            dht->stats.nodes_dropped_bep51_pruning++;
                             pthread_mutex_unlock(&dht->stats_mutex);
                             free(non_bep51[i]);
                         }
@@ -1628,6 +1641,7 @@ int wbpxre_dht_get_stats(wbpxre_dht_t *dht, wbpxre_stats_t *stats_out) {
     stats_out->get_peers_queries_sent = dht->stats.get_peers_queries_sent;
     stats_out->get_peers_responses_received = dht->stats.get_peers_responses_received;
     stats_out->nodes_dropped = dht->stats.nodes_dropped;
+    stats_out->nodes_dropped_bep51_pruning = dht->stats.nodes_dropped_bep51_pruning;
     pthread_mutex_unlock(&dht->stats_mutex);
 
     return 0;

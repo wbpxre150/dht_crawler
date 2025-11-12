@@ -101,6 +101,7 @@ typedef struct {
     /* BEP51-focused pruning settings */
     int bep51_pruning_enabled;           /* Enable BEP51-focused node pruning */
     int bep51_pruning_interval_sec;      /* How often to check and prune (default: 30) */
+    double bep51_pruning_min_capacity;   /* Min capacity ratio (0.0-1.0) before pruning (default: 0.0) */
 } crawler_config_t;
 
 /* Initialize config with default values */

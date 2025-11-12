@@ -75,6 +75,7 @@ typedef struct {
     time_t last_rotation_time;           /* Last rotation timestamp */
     /* Node pruning statistics */
     uint64_t last_nodes_dropped;         /* Nodes dropped at last stats print (for delta calculation) */
+    uint64_t last_nodes_dropped_bep51;   /* BEP51 pruning drops at last stats print (for delta calculation) */
     /* Peer retry statistics */
     uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
 } dht_stats_t;

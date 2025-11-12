@@ -106,6 +106,7 @@ typedef struct {
     uint64_t get_peers_responses_received;
     /* Node health statistics */
     uint64_t nodes_dropped;
+    uint64_t nodes_dropped_bep51_pruning;
 } wbpxre_stats_t;
 
 /* Node address */
@@ -274,6 +275,7 @@ typedef struct {
     /* BEP51-focused pruning */
     int bep51_pruning_enabled;         /* Enable BEP51-focused node pruning (default: 1) */
     int bep51_pruning_interval_sec;    /* How often to check and prune (default: 30) */
+    double bep51_pruning_min_capacity; /* Min capacity ratio to trigger pruning (default: 0.0) */
 
     /* Callbacks */
     wbpxre_callback_t callback;
@@ -351,6 +353,7 @@ typedef struct {
         uint64_t get_peers_responses_received;
         /* Node health statistics */
         uint64_t nodes_dropped;
+        uint64_t nodes_dropped_bep51_pruning;
     } stats;
     pthread_mutex_t stats_mutex;
 } wbpxre_dht_t;

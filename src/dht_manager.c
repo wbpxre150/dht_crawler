@@ -638,6 +638,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.node_quality_min_queries = cfg->node_quality_min_queries;
         dht_config.bep51_pruning_enabled = cfg->bep51_pruning_enabled;
         dht_config.bep51_pruning_interval_sec = cfg->bep51_pruning_interval_sec;
+        dht_config.bep51_pruning_min_capacity = cfg->bep51_pruning_min_capacity;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -653,6 +654,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.node_quality_min_queries = 5;
         dht_config.bep51_pruning_enabled = 1;
         dht_config.bep51_pruning_interval_sec = 30;
+        dht_config.bep51_pruning_min_capacity = 0.0;
     }
 
     /* Callback setup */
@@ -1162,6 +1164,7 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.node_quality_min_queries = cfg->node_quality_min_queries;
         dht_config.bep51_pruning_enabled = cfg->bep51_pruning_enabled;
         dht_config.bep51_pruning_interval_sec = cfg->bep51_pruning_interval_sec;
+        dht_config.bep51_pruning_min_capacity = cfg->bep51_pruning_min_capacity;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -1177,6 +1180,7 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.node_quality_min_queries = 5;
         dht_config.bep51_pruning_enabled = 1;
         dht_config.bep51_pruning_interval_sec = 30;
+        dht_config.bep51_pruning_min_capacity = 0.0;
     }
 
     /* Callback setup */
@@ -1753,10 +1757,14 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             /* Calculate and display nodes dropped in last interval */
             uint64_t current_dropped = wbpxre_stats.nodes_dropped;
             uint64_t dropped_delta = current_dropped - mgr->stats.last_nodes_dropped;
-            log_msg(LOG_INFO, "  Nodes dropped: last_10s=%llu total=%llu",
+            uint64_t current_bep51_dropped = wbpxre_stats.nodes_dropped_bep51_pruning;
+            uint64_t bep51_dropped_delta = current_bep51_dropped - mgr->stats.last_nodes_dropped_bep51;
+            log_msg(LOG_INFO, "  Nodes dropped: last_10s=%llu (bep51=%llu) total=%llu",
                     (unsigned long long)dropped_delta,
+                    (unsigned long long)bep51_dropped_delta,
                     (unsigned long long)current_dropped);
             mgr->stats.last_nodes_dropped = current_dropped;
+            mgr->stats.last_nodes_dropped_bep51 = current_bep51_dropped;
         }
     }
 
