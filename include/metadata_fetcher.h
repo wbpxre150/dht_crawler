@@ -85,6 +85,10 @@ typedef struct peer_connection {
     int retry_count;
     time_t start_time;
 
+    /* Activity-based timeout tracking */
+    time_t last_activity_time;      /* Timestamp of last data reception */
+    time_t connection_start_time;   /* Timestamp when connection started */
+
     /* Async close handling */
     int closed;                /* Flag to prevent double-close */
     int handles_to_close;      /* Reference count for async close */
@@ -171,7 +175,8 @@ typedef struct {
     /* Configuration */
     int max_concurrent_per_infohash;  /* Max connections per infohash (default: 5) */
     int max_global_connections;       /* Max global connections (default: 2000) */
-    int connection_timeout_ms;        /* Connection timeout in milliseconds (default: 10000) */
+    int connection_timeout_ms;        /* Idle timeout in milliseconds - resets on activity */
+    int max_connection_lifetime_ms;   /* Max total connection time (0=unlimited) */
 
     /* Retry logic for info_hashes with no peers */
     retry_queue_t *retry_queue;

@@ -47,7 +47,8 @@ typedef struct {
     /* Metadata fetcher settings */
     int concurrent_peers_per_torrent;
     int max_concurrent_connections;
-    int connection_timeout_sec;
+    int connection_timeout_sec;         /* Idle timeout - resets on activity */
+    int max_connection_lifetime_sec;    /* Max total connection time (0=unlimited) */
     int max_metadata_size_mb;
     int max_retry_attempts;
     int retry_delay_sec;

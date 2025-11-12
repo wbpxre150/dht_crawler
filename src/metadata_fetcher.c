@@ -34,6 +34,7 @@ static void on_tcp_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
 static void on_tcp_write(uv_write_t *req, int status);
 static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
 static void on_timeout(uv_timer_t *handle);
+static void reset_timeout_timer(peer_connection_t *peer);
 static void on_handle_closed(uv_handle_t *handle);
 static void close_peer_connection_locked(peer_connection_t *peer, const char *reason);
 static void close_peer_connection(peer_connection_t *peer, const char *reason);
@@ -190,6 +191,7 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->max_concurrent_per_infohash = config->concurrent_peers_per_torrent;
     fetcher->max_global_connections = config->max_concurrent_connections;
     fetcher->connection_timeout_ms = config->connection_timeout_sec * 1000;  /* Convert seconds to ms */
+    fetcher->max_connection_lifetime_ms = config->max_connection_lifetime_sec * 1000;  /* Convert seconds to ms */
     fetcher->retry_enabled = config->retry_enabled;
 
     /* Get worker count from config */
@@ -270,7 +272,12 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     log_msg(LOG_INFO, "  Queue capacity: %zu", queue_capacity);
     log_msg(LOG_INFO, "  Max concurrent per infohash: %d", fetcher->max_concurrent_per_infohash);
     log_msg(LOG_INFO, "  Max global connections: %d", fetcher->max_global_connections);
-    log_msg(LOG_INFO, "  Connection timeout: %d ms", fetcher->connection_timeout_ms);
+    log_msg(LOG_INFO, "  Connection idle timeout: %d ms (resets on activity)", fetcher->connection_timeout_ms);
+    if (fetcher->max_connection_lifetime_ms > 0) {
+        log_msg(LOG_INFO, "  Max connection lifetime: %d ms", fetcher->max_connection_lifetime_ms);
+    } else {
+        log_msg(LOG_INFO, "  Max connection lifetime: unlimited");
+    }
     log_msg(LOG_INFO, "  Retry enabled: %s", fetcher->retry_enabled ? "yes" : "no");
     return 0;
 }
@@ -600,6 +607,11 @@ static peer_connection_t* create_peer_connection(metadata_fetcher_t *fetcher,
     peer->handles_to_close = 2;  /* TCP + timer */
     peer->tcp_initialized = 0;
     peer->timer_initialized = 0;
+
+    /* Initialize activity timestamps for timeout tracking */
+    time_t now = time(NULL);
+    peer->connection_start_time = now;
+    peer->last_activity_time = now;
 
     /* Generate random peer ID */
     int fd = open("/dev/urandom", O_RDONLY);
@@ -971,6 +983,9 @@ static void on_tcp_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
     if (nread == 0) {
         return;
     }
+
+    /* Reset timeout timer on any data reception (activity-based timeout) */
+    reset_timeout_timer(peer);
 
     /* Validate that nread doesn't exceed buffer capacity */
     if ((size_t)nread > sizeof(peer->recv_buffer) - peer->recv_offset) {
@@ -1727,12 +1742,58 @@ static void on_timeout(uv_timer_t *handle) {
     /* Update statistics: connection timeout */
     metadata_fetcher_t *fetcher = (metadata_fetcher_t *)peer->fetcher;
     if (fetcher) {
+        /* Log timeout details with activity info */
+        time_t now = time(NULL);
+        time_t total_elapsed = now - peer->connection_start_time;
+        time_t idle_time = now - peer->last_activity_time;
+
+        char hex[41];
+        format_infohash_hex(peer->info_hash, hex);
+        log_msg(LOG_DEBUG, "Connection timeout for %s: state=%d total_time=%lds idle_time=%lds",
+                hex, peer->state, (long)total_elapsed, (long)idle_time);
+
         uv_mutex_lock(&fetcher->mutex);
         fetcher->connection_timeout++;
         uv_mutex_unlock(&fetcher->mutex);
     }
 
     close_peer_connection(peer, "timeout");
+}
+
+/* Reset the timeout timer to current idle timeout value
+ * Called whenever we receive data or make progress to implement activity-based timeout */
+static void reset_timeout_timer(peer_connection_t *peer) {
+    metadata_fetcher_t *fetcher = (metadata_fetcher_t *)peer->fetcher;
+    if (!fetcher || peer->closed || !peer->timer_initialized) {
+        return;
+    }
+
+    /* Update activity timestamp */
+    peer->last_activity_time = time(NULL);
+
+    /* Calculate remaining time if max lifetime is set */
+    uint64_t timeout_ms = fetcher->connection_timeout_ms;
+
+    if (fetcher->max_connection_lifetime_ms > 0) {
+        time_t now = time(NULL);
+        time_t elapsed_sec = now - peer->connection_start_time;
+        int64_t remaining_lifetime_ms = fetcher->max_connection_lifetime_ms - (elapsed_sec * 1000);
+
+        if (remaining_lifetime_ms <= 0) {
+            /* Already exceeded max lifetime */
+            close_peer_connection(peer, "max lifetime exceeded");
+            return;
+        }
+
+        /* Use the shorter of idle timeout or remaining lifetime */
+        if (remaining_lifetime_ms < (int64_t)timeout_ms) {
+            timeout_ms = (uint64_t)remaining_lifetime_ms;
+        }
+    }
+
+    /* Restart timer with new timeout */
+    uv_timer_stop(&peer->timeout_timer);
+    uv_timer_start(&peer->timeout_timer, on_timeout, timeout_ms, 0);
 }
 
 /* TCP connect callback */
@@ -1760,6 +1821,9 @@ static void on_tcp_connect(uv_connect_t *req, int status) {
         close_peer_connection(peer, "connect failed");
         return;
     }
+
+    /* Reset timeout timer after successful TCP connection */
+    reset_timeout_timer(peer);
 
     /* Start reading */
     int rc = uv_read_start((uv_stream_t *)&peer->tcp, alloc_buffer, on_tcp_read);
