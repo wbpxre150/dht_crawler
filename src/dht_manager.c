@@ -10,6 +10,7 @@
 #include "worker_pool.h"
 #include "wbpxre_dht.h"
 #include <unistd.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -1367,8 +1368,8 @@ static void *pruning_worker_thread_func(void *arg) {
         log_msg(LOG_INFO, "  Batch age: %ld seconds",
                 time(NULL) - batch->submitted_at);
 
-        /* Process batch in chunks with yielding to avoid lock starvation */
-        const int CHUNK_SIZE = 100;
+        /* Process batch in larger chunks for speed, yield minimally */
+        const int CHUNK_SIZE = 1000;  /* Increased from 100 to 1000 for 10x speed */
         int processed = 0;
 
         for (int chunk_start = 0; chunk_start < batch->count;
@@ -1387,9 +1388,9 @@ static void *pruning_worker_thread_func(void *arg) {
 
             processed += dropped;
 
-            /* Yield between chunks to allow other threads to acquire lock */
+            /* Only yield between chunks if not the last chunk - no sleep for speed */
             if (chunk_end < batch->count) {
-                usleep(1000);  /* 1ms sleep */
+                sched_yield();  /* Just yield CPU, no sleep - much faster */
 
                 /* Log progress every 5000 nodes */
                 if (chunk_end % 5000 == 0) {
@@ -1521,17 +1522,24 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "  Target pruning: %d distant nodes (70%% of distant, %.1f%% of total)",
                     nodes_to_prune, (nodes_to_prune * 100.0) / current_nodes);
 
-            /* Get distant nodes and submit for async pruning */
-            wbpxre_routing_node_t **distant_nodes_array = malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_prune);
-            if (distant_nodes_array) {
-                int pruned_count = wbpxre_routing_table_get_distant_nodes(
-                    mgr->dht->routing_table,
-                    current_node_id,
-                    distant_nodes_array,
-                    nodes_to_prune
-                );
+            /* Check if pruning is already in progress - prevent overlap */
+            bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
+            if (pruning_active) {
+                log_msg(LOG_WARN, "  Skipping pruning - previous pruning still in progress");
+                log_msg(LOG_WARN, "  Consider increasing node_rotation_interval_sec or investigating pruning performance");
+                /* Still do sample queue clearing below */
+            } else {
+                /* Get distant nodes and submit for async pruning */
+                wbpxre_routing_node_t **distant_nodes_array = malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_prune);
+                if (distant_nodes_array) {
+                    int pruned_count = wbpxre_routing_table_get_distant_nodes(
+                        mgr->dht->routing_table,
+                        current_node_id,
+                        distant_nodes_array,
+                        nodes_to_prune
+                    );
 
-                if (pruned_count > 0 && mgr->pruning_queue) {
+                    if (pruned_count > 0 && mgr->pruning_queue) {
                     /* Create pruning batch */
                     pruning_batch_t *batch = calloc(1, sizeof(pruning_batch_t));
                     if (batch) {
@@ -1581,7 +1589,8 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
                     }
                 }
 
-                free(distant_nodes_array);
+                    free(distant_nodes_array);
+                }
             }
 
             /* Optionally clear sample_infohashes queue after rotation */
