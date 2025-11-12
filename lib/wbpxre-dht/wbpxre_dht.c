@@ -691,19 +691,24 @@ static void *maintenance_thread_func(void *arg) {
 
             /* Only run when fill_ratio exceeds configured threshold */
             if (fill_ratio > min_capacity) {
-                /* Calculate target: when >90% full, prune 20% of total capacity
-                 * Otherwise, prune a smaller percentage to maintain quality */
+                /* Calculate target based on fill ratio */
                 int nodes_to_remove;
+
+                /* When >90% full, trigger aggressive 20% pruning */
                 if (fill_ratio > 0.90) {
                     /* Aggressive: prune 20% of total capacity */
                     nodes_to_remove = (int)(max_nodes * 0.20);
 
                     printf("[wbpxre-dht] Routing table at %.1f%% capacity (%d/%d nodes), "
-                           "triggering aggressive pruning (target: remove %d nodes)\n",
+                           "triggering aggressive 20%% pruning (target: remove %d nodes)\n",
                            fill_ratio * 100.0, current_nodes, max_nodes, nodes_to_remove);
                 } else {
                     /* Moderate: remove up to 5% of capacity per cycle */
-                    nodes_to_remove = max_nodes / 20;
+                    nodes_to_remove = (int)(max_nodes * 0.05);
+
+                    printf("[wbpxre-dht] Routing table at %.1f%% capacity (%d/%d nodes), "
+                           "moderate pruning (target: remove %d nodes)\n",
+                           fill_ratio * 100.0, current_nodes, max_nodes, nodes_to_remove);
                 }
 
                 if (nodes_to_remove > 0) {
@@ -744,7 +749,7 @@ static void *maintenance_thread_func(void *arg) {
                         }
                     }
 
-                    /* PHASE 2: If we haven't hit target, prune unresponsive nodes >120s */
+                    /* PHASE 2: If we haven't hit target, prune oldest/unresponsive nodes */
                     int remaining_to_prune = nodes_to_remove - total_pruned;
                     if (remaining_to_prune > 0) {
                         time_t now = time(NULL);
@@ -763,10 +768,14 @@ static void *maintenance_thread_func(void *arg) {
 
                             int unresponsive_pruned = 0;
                             for (int i = 0; i < old_count && total_pruned < nodes_to_remove; i++) {
-                                /* Check if unresponsive for >120s */
                                 time_t time_since_response = now - old_nodes[i]->last_responded_at;
 
-                                if (time_since_response > UNRESPONSIVE_THRESHOLD) {
+                                /* If critically full (>95%), prune oldest nodes regardless of threshold
+                                 * Otherwise only prune if unresponsive >120s */
+                                int should_prune = (fill_ratio > 0.95) ||
+                                                  (time_since_response > UNRESPONSIVE_THRESHOLD);
+
+                                if (should_prune) {
                                     wbpxre_routing_table_drop_node(dht->routing_table,
                                                                    old_nodes[i]->id);
                                     pthread_mutex_lock(&dht->stats_mutex);
@@ -783,8 +792,9 @@ static void *maintenance_thread_func(void *arg) {
                             free(old_nodes);
 
                             if (unresponsive_pruned > 0) {
-                                printf("[wbpxre-dht] Pruned %d unresponsive nodes (>120s)\n",
-                                       unresponsive_pruned);
+                                printf("[wbpxre-dht] Pruned %d oldest/unresponsive nodes (threshold: %s)\n",
+                                       unresponsive_pruned,
+                                       fill_ratio > 0.95 ? "CRITICAL - pruning oldest" : ">120s");
                             }
                         }
                     }
