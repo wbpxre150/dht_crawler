@@ -1003,22 +1003,19 @@ static void *get_peers_worker_func(void *arg) {
                     if (peers) free(peers);
                     if (returned_nodes) free(returned_nodes);
 
-                    /* If we found peers, we can stop querying other nodes for this info_hash */
-                    if (peer_count > 0) {
-                        /* Free current node */
-                        free(nodes[i]);
-                        /* Free remaining nodes and break */
-                        for (int j = i + 1; j < node_count; j++) {
-                            free(nodes[j]);
-                        }
-                        break;
-                    }
+                    /* OPTIMIZATION: Continue querying all K=8 nodes instead of stopping after first peer.
+                     * This maximizes peer discovery per query, improving metadata fetch success rates.
+                     * The retry system will collect peers from multiple queries to reach the 10+ threshold.
+                     *
+                     * Old behavior: Stop after finding 1 peer → ~1-3 peers per query
+                     * New behavior: Query all nodes → ~3-8 peers per query
+                     */
                 } else {
                     /* Failed -> drop node */
                     wbpxre_routing_table_drop_node(dht->routing_table, nodes[i]->id);
                 }
 
-                /* Free current node (unless we already freed it and broke above) */
+                /* Free current node */
                 free(nodes[i]);
             }
         }

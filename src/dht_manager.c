@@ -148,10 +148,13 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                         in_retry = (entry != NULL);
                     }
 
-                    /* Decision logic:
-                     * - If we have >= 10 peers: proceed to metadata fetcher immediately (even if in retry)
-                     * - If we have < 10 peers and NOT in retry: shouldn't happen, but allow through
-                     * - If we have < 10 peers and in retry: wait for retry system to collect more peers */
+                    /* Decision logic (FIXED):
+                     * - If we have >= 10 peers: proceed to metadata fetcher immediately
+                     * - If we have < 10 peers: WAIT for retry system to collect more peers via SEARCH_DONE
+                     *
+                     * This fixes the bug where info_hashes were queued with only 1 peer, causing
+                     * low metadata fetch success rates (4% instead of expected 25-40%).
+                     */
                     bool should_queue = false;
 
                     if (total_peer_count >= 10) {
@@ -162,12 +165,8 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                         if (in_retry && mgr->peer_retry_tracker) {
                             peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, total_peer_count);
                         }
-                    } else if (!in_retry) {
-                        /* Not in retry and <10 peers - this is first discovery, allow through
-                         * (retry system will be triggered by SEARCH_DONE if needed) */
-                        should_queue = true;
                     }
-                    /* else: in_retry && <10 peers - wait for retry to collect more */
+                    /* else: < 10 peers - let SEARCH_DONE event trigger retry system to collect more */
 
                     if (should_queue && mgr->infohash_queue) {
                         infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
