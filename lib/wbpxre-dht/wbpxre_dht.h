@@ -107,6 +107,8 @@ typedef struct {
     /* Node health statistics */
     uint64_t nodes_dropped;
     uint64_t nodes_dropped_bep51_pruning;
+    uint64_t nodes_dropped_unresponsive;
+    uint64_t aggressive_prune_triggers;
 } wbpxre_stats_t;
 
 /* Node address */
@@ -354,6 +356,8 @@ typedef struct {
         /* Node health statistics */
         uint64_t nodes_dropped;
         uint64_t nodes_dropped_bep51_pruning;
+        uint64_t nodes_dropped_unresponsive;
+        uint64_t aggressive_prune_triggers;
     } stats;
     pthread_mutex_t stats_mutex;
 } wbpxre_dht_t;

@@ -336,6 +336,42 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
 
+    /* Get DHT routing table statistics */
+    if (api->dht_manager && api->dht_manager->dht) {
+        cJSON *routing_table = cJSON_CreateObject();
+
+        /* Get node counts */
+        int good = 0, dubious = 0;
+        wbpxre_dht_nodes(api->dht_manager->dht, &good, &dubious);
+        int total_nodes = good + dubious;
+
+        /* Get max capacity from config */
+        int max_capacity = api->dht_manager->dht->config.max_routing_table_nodes;
+        if (max_capacity <= 0) max_capacity = 10000;  /* Default */
+
+        double fullness_percent = (total_nodes * 100.0) / max_capacity;
+
+        cJSON_AddNumberToObject(routing_table, "total_nodes", total_nodes);
+        cJSON_AddNumberToObject(routing_table, "good_nodes", good);
+        cJSON_AddNumberToObject(routing_table, "dubious_nodes", dubious);
+        cJSON_AddNumberToObject(routing_table, "capacity", max_capacity);
+        cJSON_AddNumberToObject(routing_table, "fullness_percent", fullness_percent);
+        cJSON_AddNumberToObject(routing_table, "high_watermark", 90);
+
+        /* Get pruning statistics */
+        wbpxre_stats_t wbpxre_stats;
+        if (wbpxre_dht_get_stats(api->dht_manager->dht, &wbpxre_stats) == 0) {
+            cJSON *pruning = cJSON_CreateObject();
+            cJSON_AddNumberToObject(pruning, "nodes_dropped_total", (double)wbpxre_stats.nodes_dropped);
+            cJSON_AddNumberToObject(pruning, "nodes_dropped_non_bep51", (double)wbpxre_stats.nodes_dropped_bep51_pruning);
+            cJSON_AddNumberToObject(pruning, "nodes_dropped_unresponsive", (double)wbpxre_stats.nodes_dropped_unresponsive);
+            cJSON_AddNumberToObject(pruning, "aggressive_prune_triggers", (double)wbpxre_stats.aggressive_prune_triggers);
+            cJSON_AddItemToObject(routing_table, "pruning_stats", pruning);
+        }
+
+        cJSON_AddItemToObject(root, "routing_table", routing_table);
+    }
+
     char *json = cJSON_Print(root);
     cJSON_Delete(root);
 
