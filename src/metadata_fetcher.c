@@ -82,15 +82,10 @@ static void on_connection_request(uv_async_t *handle) {
         return;
     }
 
-    /* Prevent concurrent invocations of this callback */
-    uv_mutex_lock(&fetcher->mutex);
-    if (fetcher->async_processing) {
-        /* Already processing, exit and let the current invocation handle it */
-        uv_mutex_unlock(&fetcher->mutex);
-        return;
-    }
-    fetcher->async_processing = 1;
-    uv_mutex_unlock(&fetcher->mutex);
+    /* Note: We do NOT prevent concurrent invocations because uv_async_send() coalesces calls.
+     * If we exit early when async_processing==1, we might miss newly queued requests
+     * that arrived while we were processing. Instead, we let libuv handle coalescing
+     * and rely on connection_request_queue_try_pop() returning NULL when empty. */
 
     /* Batch processing: limit requests per callback to prevent event loop starvation
      * Reduced from 100 to 50 for better event loop responsiveness */
@@ -98,6 +93,7 @@ static void on_connection_request(uv_async_t *handle) {
     int processed = 0;
     int connections_started = 0;  /* Track actual progress */
     int capacity_blocked = 0;     /* Track if we hit capacity limits */
+    int need_retry = 0;            /* Track if we should re-trigger */
 
     /* Process up to MAX_BATCH_SIZE pending connection requests */
     connection_request_t *req;
@@ -154,21 +150,21 @@ static void on_connection_request(uv_async_t *handle) {
 
     size_t remaining = connection_request_queue_size(fetcher->conn_request_queue);
 
-    /* Only re-trigger async if we made progress AND there are more requests
-     * This prevents busy-looping when at capacity */
+    /* Determine if we should re-trigger async callback:
+     * 1. Made progress and have more work -> continue processing
+     * 2. Have requests but couldn't start (not due to capacity) -> retry once
+     * 3. At capacity with no progress -> DON'T retry to avoid busy-loop,
+     *    but set need_retry flag so on_handle_closed will trigger us */
     if (connections_started > 0 && remaining > 0) {
+        /* Made progress, continue processing remaining requests */
         uv_async_send(&fetcher->async_handle);
     } else if (remaining > 0 && !capacity_blocked) {
-        /* Have requests but couldn't start connections (not due to capacity)
-         * Re-trigger once to give it another try */
+        /* Have requests but couldn't start connections (not due to capacity) */
         uv_async_send(&fetcher->async_handle);
+    } else if (remaining > 0 && capacity_blocked) {
+        /* At capacity - don't busy-loop, but flag that we need retry when capacity frees */
+        need_retry = 1;
     }
-    /* If capacity_blocked and no progress, DON'T re-trigger to avoid busy-loop */
-
-    /* Mark async processing as complete */
-    uv_mutex_lock(&fetcher->mutex);
-    fetcher->async_processing = 0;
-    uv_mutex_unlock(&fetcher->mutex);
 }
 
 /* Initialize metadata fetcher */
@@ -187,8 +183,7 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->max_concurrent = 5;  /* Kept for backward compatibility */
     fetcher->running = 0;
 
-    /* Initialize async callback state flags to prevent event loop starvation */
-    fetcher->async_processing = 0;
+    /* Initialize async callback state flag to prevent event loop starvation */
     fetcher->connection_queue_blocked = 0;
 
     /* Load config values from provided config */

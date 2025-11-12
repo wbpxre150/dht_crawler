@@ -193,7 +193,6 @@ typedef struct {
     int max_concurrent;
 
     /* Async callback state management to prevent event loop starvation */
-    int async_processing;              /* Flag: async callback is currently running */
     int connection_queue_blocked;      /* Flag: requests were dropped due to capacity */
 
     /* Infohash attempt tracking - hash table for aggregating per-infohash failures */
