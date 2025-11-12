@@ -1580,5 +1580,13 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                     active_workers, idle_workers, queue_size, utilization,
                     (unsigned long long)tasks_processed);
         }
+
+        /* Print connection request queue statistics */
+        if (fetcher->conn_request_queue) {
+            size_t conn_queue_size = connection_request_queue_size(fetcher->conn_request_queue);
+            double conn_queue_utilization = (100.0 * conn_queue_size / 2000.0);
+            log_msg(LOG_INFO, "    Connection request queue: size=%zu capacity=2000 utilization=%.1f%%",
+                    conn_queue_size, conn_queue_utilization);
+        }
     }
 }

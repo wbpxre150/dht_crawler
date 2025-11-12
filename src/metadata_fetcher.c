@@ -82,16 +82,25 @@ static void on_connection_request(uv_async_t *handle) {
         return;
     }
 
-    /* Process all pending connection requests */
+    /* Batch processing: limit requests per callback to prevent event loop starvation
+     * This prevents the event loop from being blocked when processing a large backlog */
+    const int MAX_BATCH_SIZE = 100;
+    int processed = 0;
+
+    /* Process up to MAX_BATCH_SIZE pending connection requests */
     connection_request_t *req;
-    while ((req = connection_request_queue_try_pop(fetcher->conn_request_queue)) != NULL) {
-        /* Check global connection limit */
+    while (processed < MAX_BATCH_SIZE &&
+           (req = connection_request_queue_try_pop(fetcher->conn_request_queue)) != NULL) {
+
+        /* Check global connection limit (start_next_peer_connections also checks this) */
         uv_mutex_lock(&fetcher->mutex);
         int current_active = fetcher->active_count;
         uv_mutex_unlock(&fetcher->mutex);
 
         if (current_active >= fetcher->max_global_connections) {
+            /* Hit global limit - discard remaining requests */
             free(req);
+            processed++;
             continue;
         }
 
@@ -102,6 +111,7 @@ static void on_connection_request(uv_async_t *handle) {
         if (!attempt) {
             log_msg(LOG_ERROR, "Failed to create attempt entry");
             free(req);
+            processed++;
             continue;
         }
 
@@ -109,6 +119,14 @@ static void on_connection_request(uv_async_t *handle) {
         start_next_peer_connections(fetcher, attempt);
 
         free(req);
+        processed++;
+    }
+
+    /* If we hit the batch limit and there are more requests, re-trigger async
+     * This ensures we process all pending requests without starving other event loop callbacks */
+    if (processed >= MAX_BATCH_SIZE &&
+        connection_request_queue_size(fetcher->conn_request_queue) > 0) {
+        uv_async_send(&fetcher->async_handle);
     }
 }
 
@@ -168,8 +186,8 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
         return -1;
     }
 
-    /* Initialize connection request queue (capacity: 1000) */
-    fetcher->conn_request_queue = connection_request_queue_init(1000);
+    /* Initialize connection request queue (capacity: 2000, matches max_concurrent_connections) */
+    fetcher->conn_request_queue = connection_request_queue_init(2000);
     if (!fetcher->conn_request_queue) {
         log_msg(LOG_ERROR, "Failed to initialize connection request queue");
         batch_writer_cleanup(fetcher->batch_writer);

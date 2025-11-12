@@ -2,6 +2,7 @@
 #include "dht_crawler.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Connection request queue implementation */
 struct connection_request_queue {
@@ -55,7 +56,20 @@ int connection_request_queue_push(connection_request_queue_t *queue, connection_
     /* Check if queue is full */
     if (queue->count >= queue->capacity) {
         uv_mutex_unlock(&queue->mutex);
-        log_msg(LOG_WARN, "Connection request queue full, dropping request");
+
+        /* Use rate-limited logging to prevent log floods */
+        static time_t last_warn_time = 0;
+        static size_t dropped_count = 0;
+        time_t now = time(NULL);
+        dropped_count++;
+
+        if (now - last_warn_time >= 5) {  /* Warn at most once per 5 seconds */
+            log_msg(LOG_WARN, "Connection request queue full (capacity=%zu), dropped %zu requests in last %ld seconds",
+                    queue->capacity, dropped_count, (long)(now - last_warn_time));
+            last_warn_time = now;
+            dropped_count = 0;
+        }
+
         return -1;
     }
 
