@@ -1354,7 +1354,6 @@ static int parse_metadata_piece(peer_connection_t *peer, const uint8_t *data, si
             fetcher->metadata_rejected++;
             uv_mutex_unlock(&fetcher->mutex);
         }
-        log_msg(LOG_WARN, "Peer rejected metadata request");
         close_peer_connection(peer, "metadata rejected");
         return -1;
     }
