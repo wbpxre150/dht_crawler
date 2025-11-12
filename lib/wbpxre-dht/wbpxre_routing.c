@@ -653,14 +653,16 @@ static void collect_non_bep51_nodes_recursive(wbpxre_routing_node_t *root,
     }
 
     /* Check if node is non-BEP51:
-     * 1. Confirmed NO support
+     * 1. Confirmed NO support (prune immediately, no min_queries check)
      * 2. UNKNOWN after sufficient queries (probably doesn't support it) */
     bool is_non_bep51 = false;
 
     if (root->bep51_support == WBPXRE_PROTOCOL_NO) {
+        /* Node explicitly rejected BEP51 - prune regardless of query count */
         is_non_bep51 = true;
     } else if (root->bep51_support == WBPXRE_PROTOCOL_UNKNOWN &&
                root->queries_sent >= min_queries) {
+        /* Node never responded to BEP51 after many queries */
         is_non_bep51 = true;
     }
 
