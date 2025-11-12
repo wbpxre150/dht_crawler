@@ -714,8 +714,8 @@ int fetch_metadata_from_dht(metadata_fetcher_t *fetcher, const uint8_t *info_has
     format_infohash_hex(info_hash, hex);
     log_msg(LOG_DEBUG, "Found %d peers for %s, attempting metadata fetch", peer_count, hex);
 
-    /* Try to connect to multiple peers concurrently (up to 3) */
-    int max_concurrent = (peer_count < 3) ? peer_count : 3;
+    /* Try to connect to multiple peers concurrently (configured value) */
+    int max_concurrent = (peer_count < fetcher->max_concurrent_per_infohash) ? peer_count : fetcher->max_concurrent_per_infohash;
     int connections_made = 0;
 
     for (int i = 0; i < peer_count && connections_made < max_concurrent; i++) {
