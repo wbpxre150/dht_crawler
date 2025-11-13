@@ -2007,34 +2007,6 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                 (unsigned long long)fetcher->metadata_rejected,
                 (unsigned long long)fetcher->hash_mismatch);
 
-        /* Print retry queue statistics only if retry queue is enabled */
-        if (fetcher->retry_queue) {
-            log_msg(LOG_INFO, "    Retry queue: added=%llu attempts=%llu submitted=%llu abandoned=%llu current_size=%zu",
-                    (unsigned long long)fetcher->retry_queue_added,
-                    (unsigned long long)fetcher->retry_attempts,
-                    (unsigned long long)fetcher->retry_submitted,
-                    (unsigned long long)fetcher->retry_abandoned,
-                    (unsigned long)fetcher->retry_queue->count);
-
-            /* Print retry queue timing details if there are pending retries */
-            if (fetcher->retry_queue->count > 0) {
-                time_t now = time(NULL);
-                time_t next_retry = 0;
-
-                uv_mutex_lock(&fetcher->retry_queue->mutex);
-                if (fetcher->retry_queue->head) {
-                    next_retry = fetcher->retry_queue->head->next_retry_time;
-                }
-                uv_mutex_unlock(&fetcher->retry_queue->mutex);
-
-                log_msg(LOG_INFO, "      Pending retries: %zu (next retry in: %ld seconds)",
-                        fetcher->retry_queue->count,
-                        next_retry > now ? (next_retry - now) : 0);
-            }
-        } else {
-            log_msg(LOG_INFO, "    Retry queue: DISABLED (all failures discarded immediately)");
-        }
-
         log_msg(LOG_INFO, "    Active: connections=%d max_per_infohash=%d max_global=%d",
                 fetcher->active_count,
                 fetcher->max_concurrent_per_infohash,

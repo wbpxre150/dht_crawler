@@ -368,7 +368,6 @@ sqlite3 data/torrents.db "DELETE FROM torrents WHERE added_timestamp < strftime(
 2. **wbpxre-dht Threads**: Separate worker pipelines for ping, find_node, sample_infohashes, get_peers
 3. **Metadata Fetcher Workers**: Pool of 30+ threads attempting TCP connections
 4. **Feeder Thread**: Dequeues info_hashes from queue and submits to worker pool
-5. **Retry Thread**: Handles exponential backoff retries
 
 ### Critical Invariants
 

@@ -44,7 +44,6 @@ typedef struct {
     int max_metadata_size_mb;
     int max_retry_attempts;
     int retry_delay_sec;
-    int retry_enabled;  /* 0=disabled, 1=enabled */
 
     /* Phase 5: Batch Writer settings */
     int batch_writes_enabled;

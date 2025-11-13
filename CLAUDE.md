@@ -73,8 +73,7 @@ The project uses git submodules in `lib/` for third-party libraries:
 - Multi-threaded worker pool for concurrent metadata fetching (configurable: 10-100 workers)
 - Implements BitTorrent Extension Protocol (BEP 9/10) for ut_metadata
 - Connection lifecycle: TCP connect → handshake → extended handshake → request metadata pieces → reassemble → verify SHA-1
-- Retry logic with exponential backoff for failed fetches
-- Tracks per-infohash attempt statistics to make smart retry decisions
+- Tracks per-infohash attempt statistics with sequential peer fallback (exhausts all available peers on first attempt)
 - Uses connection_request_queue for cross-thread communication with libuv event loop
 
 **Database** (`src/database.c`, `include/database.h`):
@@ -110,7 +109,6 @@ The application uses multiple threading models:
 2. **wbpxre-dht threads**: Multiple worker pipelines (ping, find_node, sample_infohashes, get_peers)
 3. **Metadata fetcher worker threads**: Pool of workers that attempt TCP connections to peers
 4. **Metadata fetcher feeder thread**: Dequeues info_hashes and submits to worker pool
-5. **Retry thread**: Handles exponential backoff retries for failed metadata fetches
 
 Cross-thread communication uses:
 - `uv_async_t` for triggering libuv callbacks from worker threads

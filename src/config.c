@@ -52,7 +52,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->max_metadata_size_mb = 100;
     config->max_retry_attempts = 3;
     config->retry_delay_sec = 120;
-    config->retry_enabled = 0;  /* Disabled by default - focus on new discoveries */
 
     /* Phase 5: Batch Writer defaults */
     config->batch_writes_enabled = 1;
@@ -214,8 +213,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->max_retry_attempts = atoi(value);
         } else if (strcmp(key, "retry_delay_sec") == 0) {
             config->retry_delay_sec = atoi(value);
-        } else if (strcmp(key, "retry_enabled") == 0) {
-            config->retry_enabled = atoi(value);
         }
         /* wbpxre-dht settings */
         else if (strcmp(key, "wbpxre_ping_workers") == 0) {

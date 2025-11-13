@@ -103,25 +103,6 @@ typedef struct peer_connection {
 typedef struct worker_pool worker_pool_t;
 typedef struct batch_writer batch_writer_t;
 
-/* Retry queue entry */
-typedef struct retry_entry {
-    uint8_t info_hash[20];
-    time_t next_retry_time;
-    int retry_count;
-    int consecutive_no_peers;  /* Track consecutive no-peer failures */
-    struct retry_entry *next;
-} retry_entry_t;
-
-/* Retry queue structure */
-typedef struct {
-    retry_entry_t *head;
-    retry_entry_t *tail;
-    uv_mutex_t mutex;
-    size_t count;
-    size_t max_retries;        /* Max retry attempts (default: 3) */
-    int retry_delays[3];       /* Backoff delays in seconds: [60, 300, 900] */
-} retry_queue_t;
-
 /* Infohash attempt tracking - aggregates per-connection failures to per-infohash outcomes */
 typedef struct infohash_attempt {
     uint8_t info_hash[20];
@@ -178,11 +159,6 @@ typedef struct {
     int connection_timeout_ms;        /* Idle timeout in milliseconds - resets on activity */
     int max_connection_lifetime_ms;   /* Max total connection time (0=unlimited) */
 
-    /* Retry logic for info_hashes with no peers */
-    retry_queue_t *retry_queue;
-    uv_thread_t retry_thread;
-    int retry_enabled;
-
     /* Batch writer for high-throughput database writes */
     batch_writer_t *batch_writer;
 
@@ -216,14 +192,6 @@ typedef struct {
     uint64_t hash_mismatch;            /* SHA-1 verification failures */
     uint64_t total_fetched;            /* Successfully fetched */
     uint64_t total_failed;             /* Total failures (legacy, may be removed) */
-    uint64_t retry_queue_added;        /* Info_hashes added to retry queue */
-    uint64_t retry_attempts;           /* Retry attempts made */
-    uint64_t retry_submitted;          /* Retries submitted to worker pool for fetch */
-    uint64_t retry_abandoned;          /* Retries abandoned after max attempts */
-    uint64_t retriable_failures;       /* Failures that were retried */
-    uint64_t permanent_failures;       /* Failures that weren't retried */
-    uint64_t no_peer_discards;         /* Infohashes discarded due to no peers */
-    uint64_t discarded_failures;       /* All failures discarded when retry disabled */
 
     int running;
 } metadata_fetcher_t;

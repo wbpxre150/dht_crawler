@@ -42,12 +42,6 @@ static peer_connection_t* create_peer_connection(metadata_fetcher_t *fetcher,
                                                   const uint8_t *info_hash,
                                                   struct sockaddr *addr);
 
-/* Retry queue functions */
-static retry_queue_t* retry_queue_init(size_t max_retries);
-static void retry_queue_cleanup(retry_queue_t *queue);
-static int retry_queue_add(retry_queue_t *queue, const uint8_t *info_hash, int retry_count);
-static void retry_thread_fn(void *arg);
-
 /* Infohash attempt tracking functions */
 static uint32_t hash_infohash(const uint8_t *info_hash);
 static infohash_attempt_t* lookup_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash);
@@ -94,7 +88,6 @@ static void on_connection_request(uv_async_t *handle) {
     int processed = 0;
     int connections_started = 0;  /* Track actual progress */
     int capacity_blocked = 0;     /* Track if we hit capacity limits */
-    int need_retry = 0;            /* Track if we should re-trigger */
 
     /* Process up to MAX_BATCH_SIZE pending connection requests */
     connection_request_t *req;
@@ -154,17 +147,13 @@ static void on_connection_request(uv_async_t *handle) {
     /* Determine if we should re-trigger async callback:
      * 1. Made progress and have more work -> continue processing
      * 2. Have requests but couldn't start (not due to capacity) -> retry once
-     * 3. At capacity with no progress -> DON'T retry to avoid busy-loop,
-     *    but set need_retry flag so on_handle_closed will trigger us */
+     * 3. At capacity with no progress -> DON'T retry to avoid busy-loop */
     if (connections_started > 0 && remaining > 0) {
         /* Made progress, continue processing remaining requests */
         uv_async_send(&fetcher->async_handle);
     } else if (remaining > 0 && !capacity_blocked) {
         /* Have requests but couldn't start connections (not due to capacity) */
         uv_async_send(&fetcher->async_handle);
-    } else if (remaining > 0 && capacity_blocked) {
-        /* At capacity - don't busy-loop, but flag that we need retry when capacity frees */
-        need_retry = 1;
     }
 }
 
@@ -192,7 +181,6 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->max_global_connections = config->max_concurrent_connections;
     fetcher->connection_timeout_ms = config->connection_timeout_sec * 1000;  /* Convert seconds to ms */
     fetcher->max_connection_lifetime_ms = config->max_connection_lifetime_sec * 1000;  /* Convert seconds to ms */
-    fetcher->retry_enabled = config->retry_enabled;
 
     /* Get worker count from config */
     fetcher->num_workers = config->metadata_workers;
@@ -249,24 +237,6 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     }
     fetcher->async_handle.data = fetcher;
 
-    /* Initialize retry queue (max 3 retries) - only if retry is enabled */
-    if (fetcher->retry_enabled) {
-        fetcher->retry_queue = retry_queue_init(3);
-        if (!fetcher->retry_queue) {
-            log_msg(LOG_ERROR, "Failed to initialize retry queue");
-            uv_close((uv_handle_t *)&fetcher->async_handle, NULL);
-            connection_request_queue_cleanup(fetcher->conn_request_queue);
-            batch_writer_cleanup(fetcher->batch_writer);
-            worker_pool_cleanup(fetcher->worker_pool);
-            uv_mutex_destroy(&fetcher->mutex);
-            return -1;
-        }
-        log_msg(LOG_INFO, "Retry queue initialized (max retries: 3)");
-    } else {
-        fetcher->retry_queue = NULL;
-        log_msg(LOG_INFO, "Retry queue DISABLED - all failures will be discarded immediately");
-    }
-
     log_msg(LOG_INFO, "Metadata fetcher initialized:");
     log_msg(LOG_INFO, "  Workers: %d", fetcher->num_workers);
     log_msg(LOG_INFO, "  Queue capacity: %zu", queue_capacity);
@@ -278,7 +248,6 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     } else {
         log_msg(LOG_INFO, "  Max connection lifetime: unlimited");
     }
-    log_msg(LOG_INFO, "  Retry enabled: %s", fetcher->retry_enabled ? "yes" : "no");
     return 0;
 }
 
@@ -401,19 +370,6 @@ int metadata_fetcher_start(metadata_fetcher_t *fetcher) {
         return -1;
     }
 
-    /* Start retry thread if retry is enabled */
-    if (fetcher->retry_enabled && fetcher->retry_queue) {
-        if (uv_thread_create(&fetcher->retry_thread, retry_thread_fn, fetcher) != 0) {
-            log_msg(LOG_ERROR, "Failed to create retry thread");
-            fetcher->running = 0;
-            uv_thread_join(&fetcher->feeder_thread);
-            return -1;
-        }
-        log_msg(LOG_INFO, "Retry thread started");
-    } else {
-        log_msg(LOG_INFO, "Retry thread NOT started (retry disabled)");
-    }
-
     log_msg(LOG_DEBUG, "Metadata fetcher started (%d workers)", fetcher->num_workers);
     return 0;
 }
@@ -434,12 +390,6 @@ void metadata_fetcher_stop(metadata_fetcher_t *fetcher) {
 
     /* Wait for feeder thread */
     uv_thread_join(&fetcher->feeder_thread);
-
-    /* Wait for retry thread if enabled */
-    if (fetcher->retry_enabled && fetcher->retry_queue) {
-        uv_thread_join(&fetcher->retry_thread);
-        log_msg(LOG_DEBUG, "Retry thread joined");
-    }
 
     /* Shutdown batch writer and flush any pending writes */
     if (fetcher->batch_writer) {
@@ -506,13 +456,6 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
         fetcher->worker_pool = NULL;
     }
 
-    /* Cleanup retry queue */
-    if (fetcher->retry_queue) {
-        log_msg(LOG_INFO, "Retry queue status: %zu pending retries", fetcher->retry_queue->count);
-        retry_queue_cleanup(fetcher->retry_queue);
-        fetcher->retry_queue = NULL;
-    }
-
     /* Cleanup attempt table */
     for (int i = 0; i < 1024; i++) {
         infohash_attempt_t *attempt = fetcher->attempt_table[i];
@@ -559,33 +502,6 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
     log_msg(LOG_INFO, "  Successfully fetched: %llu (%.1f%%)",
             (unsigned long long)fetcher->total_fetched,
             fetcher->total_attempts > 0 ? (fetcher->total_fetched * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "");
-    log_msg(LOG_INFO, "  Failure Breakdown:");
-    if (fetcher->retry_enabled) {
-        log_msg(LOG_INFO, "    Retriable failures: %llu (added to retry queue)",
-                (unsigned long long)fetcher->retriable_failures);
-        log_msg(LOG_INFO, "    Permanent failures: %llu (not retried)",
-                (unsigned long long)fetcher->permanent_failures);
-        log_msg(LOG_INFO, "    No peers (discarded): %llu",
-                (unsigned long long)fetcher->no_peer_discards);
-    } else {
-        log_msg(LOG_INFO, "    All failures discarded: %llu (retry disabled)",
-                (unsigned long long)fetcher->discarded_failures);
-    }
-    log_msg(LOG_INFO, "");
-    if (fetcher->retry_enabled) {
-        log_msg(LOG_INFO, "  Retry Statistics:");
-        log_msg(LOG_INFO, "    Added to retry queue: %llu", (unsigned long long)fetcher->retry_queue_added);
-        log_msg(LOG_INFO, "    Retry attempts: %llu", (unsigned long long)fetcher->retry_attempts);
-        log_msg(LOG_INFO, "    Retry submitted for fetch: %llu (%.1f%%)",
-                (unsigned long long)fetcher->retry_submitted,
-                fetcher->retry_attempts > 0 ? (fetcher->retry_submitted * 100.0 / fetcher->retry_attempts) : 0.0);
-        log_msg(LOG_INFO, "    Abandoned after max retries: %llu", (unsigned long long)fetcher->retry_abandoned);
-        log_msg(LOG_INFO, "");
-    } else {
-        log_msg(LOG_INFO, "  Retry Statistics: N/A (retry disabled)");
-        log_msg(LOG_INFO, "");
-    }
     log_msg(LOG_INFO, "===================================");
 }
 
@@ -2035,205 +1951,6 @@ static void close_peer_connection(peer_connection_t *peer, const char *reason) {
     }
 }
 
-/* Initialize retry queue */
-static retry_queue_t* retry_queue_init(size_t max_retries) {
-    retry_queue_t *queue = (retry_queue_t *)calloc(1, sizeof(retry_queue_t));
-    if (!queue) {
-        return NULL;
-    }
-
-    queue->head = NULL;
-    queue->tail = NULL;
-    queue->count = 0;
-    queue->max_retries = max_retries;
-
-    /* Set exponential backoff delays (bitmagnet-inspired): 30s, 120s (2min), 300s (5min) */
-    queue->retry_delays[0] = 30;    /* 30 seconds (was 120s) */
-    queue->retry_delays[1] = 120;   /* 2 minutes (was 600s/10min) */
-    queue->retry_delays[2] = 300;   /* 5 minutes (was 1800s/30min) */
-
-    if (uv_mutex_init(&queue->mutex) != 0) {
-        free(queue);
-        return NULL;
-    }
-
-    return queue;
-}
-
-/* Cleanup retry queue */
-static void retry_queue_cleanup(retry_queue_t *queue) {
-    if (!queue) {
-        return;
-    }
-
-    /* Free all entries */
-    retry_entry_t *entry = queue->head;
-    while (entry) {
-        retry_entry_t *next = entry->next;
-        free(entry);
-        entry = next;
-    }
-
-    uv_mutex_destroy(&queue->mutex);
-    free(queue);
-}
-
-/* Add info_hash to retry queue */
-static int retry_queue_add(retry_queue_t *queue, const uint8_t *info_hash, int retry_count) {
-    if (!queue || !info_hash || retry_count >= (int)queue->max_retries) {
-        return -1;
-    }
-
-    retry_entry_t *entry = (retry_entry_t *)calloc(1, sizeof(retry_entry_t));
-    if (!entry) {
-        return -1;
-    }
-
-    memcpy(entry->info_hash, info_hash, 20);
-    entry->retry_count = retry_count;
-    entry->consecutive_no_peers = 0;
-
-    /* Calculate next retry time based on retry count with jitter to prevent thundering herd */
-    time_t delay = queue->retry_delays[retry_count];
-    int jitter = rand() % (delay / 2);  /* Random jitter up to 50% of delay */
-    entry->next_retry_time = time(NULL) + delay + jitter;
-    entry->next = NULL;
-
-    uv_mutex_lock(&queue->mutex);
-
-    /* Add to tail of queue */
-    if (queue->tail) {
-        queue->tail->next = entry;
-    } else {
-        queue->head = entry;
-    }
-    queue->tail = entry;
-    queue->count++;
-
-    uv_mutex_unlock(&queue->mutex);
-
-    return 0;
-}
-
-/* Retry thread - periodically checks retry queue and reissues get_peers queries */
-static void retry_thread_fn(void *arg) {
-    metadata_fetcher_t *fetcher = (metadata_fetcher_t *)arg;
-
-    log_msg(LOG_DEBUG, "Retry thread started");
-
-    while (fetcher->running) {
-        time_t now = time(NULL);
-
-        uv_mutex_lock(&fetcher->retry_queue->mutex);
-
-        retry_entry_t **prev_ptr = &fetcher->retry_queue->head;
-        retry_entry_t *entry = fetcher->retry_queue->head;
-
-        while (entry) {
-            if (now >= entry->next_retry_time) {
-                /* Time to retry this info_hash */
-                retry_entry_t *to_retry = entry;
-
-                /* Remove from queue */
-                *prev_ptr = entry->next;
-                if (entry == fetcher->retry_queue->tail) {
-                    fetcher->retry_queue->tail = NULL;
-                }
-                entry = entry->next;
-                fetcher->retry_queue->count--;
-
-                uv_mutex_unlock(&fetcher->retry_queue->mutex);
-
-                /* Update statistics */
-                uv_mutex_lock(&fetcher->mutex);
-                fetcher->retry_attempts++;
-                uv_mutex_unlock(&fetcher->mutex);
-
-                /* Re-query DHT for fresh peers before retry (critical fix) */
-                if (fetcher->dht_manager) {
-                    dht_manager_query_peers((dht_manager_t *)fetcher->dht_manager, to_retry->info_hash, false);
-                    /* Small delay to let DHT responses populate peer_store */
-                    usleep(500000);  /* 500ms - balance between freshness and latency */
-                }
-
-                /* Check if peers are now available */
-                struct sockaddr_storage peers[MAX_PEERS_PER_REQUEST];
-                socklen_t peer_lens[MAX_PEERS_PER_REQUEST];
-                int peer_count = 0;
-
-                if (peer_store_get_peers(fetcher->peer_store, to_retry->info_hash,
-                                        peers, peer_lens, &peer_count, MAX_PEERS_PER_REQUEST) == 0 && peer_count > 0) {
-                    /* Peers found! Reset consecutive no-peer counter and submit */
-                    to_retry->consecutive_no_peers = 0;
-
-                    /* Create task for worker pool (REUSE existing structure) */
-                    fetch_task_t *task = (fetch_task_t *)malloc(sizeof(fetch_task_t));
-                    if (!task) {
-                        log_msg(LOG_ERROR, "Failed to allocate fetch task for retry");
-                        free(to_retry);
-                        uv_mutex_lock(&fetcher->retry_queue->mutex);
-                        continue;
-                    }
-
-                    memcpy(task->info_hash, to_retry->info_hash, 20);
-                    task->fetcher = fetcher;
-
-                    /* Submit to worker pool (REUSE existing submission mechanism) */
-                    if (worker_pool_submit(fetcher->worker_pool, task) == 0) {
-                        /* Successfully submitted for metadata fetch */
-                        uv_mutex_lock(&fetcher->mutex);
-                        fetcher->retry_submitted++;  // New counter: retries submitted to worker pool
-                        uv_mutex_unlock(&fetcher->mutex);
-                    } else {
-                        /* Worker pool full - try again next cycle */
-                        log_msg(LOG_WARN, "Worker pool full, re-queuing retry for next cycle");
-                        retry_queue_add(fetcher->retry_queue, to_retry->info_hash, to_retry->retry_count);
-                        free(task);
-                    }
-
-                    free(to_retry);
-                } else {
-                    /* Still no peers - increment consecutive no-peer counter */
-                    to_retry->consecutive_no_peers++;
-
-                    /* Abandon if 3+ consecutive no-peer failures */
-                    if (to_retry->consecutive_no_peers >= 3) {
-                        uv_mutex_lock(&fetcher->mutex);
-                        fetcher->retry_abandoned++;
-                        uv_mutex_unlock(&fetcher->mutex);
-                        free(to_retry);
-                    }
-                    /* Abandon if max retries reached */
-                    else if (to_retry->retry_count + 1 >= (int)fetcher->retry_queue->max_retries) {
-                        uv_mutex_lock(&fetcher->mutex);
-                        fetcher->retry_abandoned++;
-                        uv_mutex_unlock(&fetcher->mutex);
-                        free(to_retry);
-                    }
-                    /* Otherwise add back to retry queue with incremented count */
-                    else {
-                        retry_queue_add(fetcher->retry_queue, to_retry->info_hash, to_retry->retry_count + 1);
-                        free(to_retry);
-                    }
-                }
-
-                uv_mutex_lock(&fetcher->retry_queue->mutex);
-            } else {
-                /* Not time yet, move to next */
-                prev_ptr = &entry->next;
-                entry = entry->next;
-            }
-        }
-
-        uv_mutex_unlock(&fetcher->retry_queue->mutex);
-
-        /* Sleep for 10 seconds between scans */
-        sleep(10);
-    }
-
-    log_msg(LOG_DEBUG, "Retry thread stopped");
-}
-
 /* Hash function for infohash (simple but effective) */
 static uint32_t hash_infohash(const uint8_t *info_hash) {
     uint32_t hash = 0;
@@ -2526,50 +2243,14 @@ static failure_classification_t classify_failure(infohash_attempt_t *attempt) {
     return FAILURE_PERMANENT;
 }
 
-/* Handle infohash-level failure and potentially add to retry queue */
+/* Handle infohash-level failure (discard - no retry) */
 static void handle_infohash_failure(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt) {
     if (!fetcher || !attempt) {
         return;
     }
 
-    /* If retry is disabled, discard all failures immediately */
-    if (!fetcher->retry_enabled) {
-        uv_mutex_lock(&fetcher->mutex);
-        fetcher->discarded_failures++;
-        uv_mutex_unlock(&fetcher->mutex);
-        return;
-    }
-
-    /* Retry is enabled - classify and handle accordingly */
-    failure_classification_t classification = classify_failure(attempt);
-
-    switch (classification) {
-        case FAILURE_RETRIABLE:
-            /* Add to retry queue */
-            if (fetcher->retry_queue) {
-                if (retry_queue_add(fetcher->retry_queue, attempt->info_hash, 0) == 0) {
-                    uv_mutex_lock(&fetcher->mutex);
-                    fetcher->retry_queue_added++;
-                    fetcher->retriable_failures++;
-                    uv_mutex_unlock(&fetcher->mutex);
-                }
-            }
-            break;
-
-        case FAILURE_PERMANENT:
-            /* Discard permanently */
-            uv_mutex_lock(&fetcher->mutex);
-            fetcher->permanent_failures++;
-            uv_mutex_unlock(&fetcher->mutex);
-            break;
-
-        case FAILURE_NO_PEERS:
-            /* Discard immediately */
-            uv_mutex_lock(&fetcher->mutex);
-            fetcher->no_peer_discards++;
-            uv_mutex_unlock(&fetcher->mutex);
-            break;
-    }
+    /* All failures are discarded immediately since retry is disabled */
+    /* No additional action needed - failure is simply not retried */
 }
 
 /* Free metadata result */
