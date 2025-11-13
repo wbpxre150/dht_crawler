@@ -1742,16 +1742,6 @@ static void on_timeout(uv_timer_t *handle) {
     /* Update statistics: connection timeout */
     metadata_fetcher_t *fetcher = (metadata_fetcher_t *)peer->fetcher;
     if (fetcher) {
-        /* Log timeout details with activity info */
-        time_t now = time(NULL);
-        time_t total_elapsed = now - peer->connection_start_time;
-        time_t idle_time = now - peer->last_activity_time;
-
-        char hex[41];
-        format_infohash_hex(peer->info_hash, hex);
-        log_msg(LOG_DEBUG, "Connection timeout for %s: state=%d total_time=%lds idle_time=%lds",
-                hex, peer->state, (long)total_elapsed, (long)idle_time);
-
         uv_mutex_lock(&fetcher->mutex);
         fetcher->connection_timeout++;
         uv_mutex_unlock(&fetcher->mutex);
