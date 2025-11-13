@@ -131,17 +131,15 @@ typedef enum {
 
 /* Async pruning infrastructure - Multi-threaded worker pool */
 
-/* Pruning work item - submitted to worker pool */
+/* Pruning work item - contains pre-computed node IDs to delete */
 typedef struct {
-    uint8_t current_node_id[WBPXRE_NODE_ID_LEN];  /* Node ID for distance calculations */
-    int target_nodes;                              /* Target routing table size */
-    double distant_percent;                        /* % of distant nodes to prune */
-    double old_percent;                            /* % of old nodes to prune */
+    uint8_t (*node_ids)[WBPXRE_NODE_ID_LEN];  /* Array of node IDs to delete */
+    int node_count;                            /* Number of nodes in this chunk */
 
     /* Worker coordination fields */
-    int worker_id;                                 /* Worker identifier (0 to N-1) */
-    int total_workers;                             /* Total number of workers (N) */
-    atomic_int *workers_remaining;                 /* Shared counter for completion tracking */
+    int worker_id;                             /* Worker identifier (0 to N-1) */
+    int total_workers;                         /* Total number of workers (N) */
+    atomic_int *workers_remaining;             /* Shared counter for completion tracking */
 } pruning_work_t;
 
 /* Shared state for coordinating multiple pruning workers */
