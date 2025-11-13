@@ -89,6 +89,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->max_routing_table_nodes = 10000;  /* Default: 10000 nodes */
 
     /* Node health and pruning defaults */
+    config->maintenance_thread_enabled = 1;            /* Enabled by default */
     config->max_node_age_sec = 120;                    /* 2 minutes */
     config->node_verification_batch_size = 100;        /* 100 nodes per cycle */
     config->node_cleanup_interval_sec = 30;            /* 30 seconds */
@@ -287,7 +288,9 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->max_routing_table_nodes = atoi(value);
         }
         /* Node health and pruning settings */
-        else if (strcmp(key, "max_node_age_sec") == 0) {
+        else if (strcmp(key, "maintenance_thread_enabled") == 0) {
+            config->maintenance_thread_enabled = atoi(value);
+        } else if (strcmp(key, "max_node_age_sec") == 0) {
             config->max_node_age_sec = atoi(value);
         } else if (strcmp(key, "node_verification_batch_size") == 0) {
             config->node_verification_batch_size = atoi(value);

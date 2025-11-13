@@ -268,6 +268,7 @@ typedef struct {
     int max_routing_table_nodes;  /* Maximum nodes in routing table (default: 10000) */
 
     /* Node health and verification */
+    int maintenance_thread_enabled;    /* Enable maintenance thread (0=disabled, 1=enabled, default: 1) */
     int node_verification_batch_size;  /* Nodes to verify per maintenance cycle (default: 100) */
     int max_node_age_sec;              /* Consider nodes old after this many seconds (default: 120) */
     int node_cleanup_interval_sec;     /* Clean dropped nodes every N seconds (default: 30) */

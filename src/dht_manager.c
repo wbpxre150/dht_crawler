@@ -627,6 +627,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.get_peers_workers = cfg->wbpxre_get_peers_workers;
         dht_config.query_timeout = cfg->wbpxre_query_timeout;
         dht_config.max_routing_table_nodes = cfg->max_routing_table_nodes;
+        dht_config.maintenance_thread_enabled = cfg->maintenance_thread_enabled;
         dht_config.node_verification_batch_size = cfg->node_verification_batch_size;
         dht_config.max_node_age_sec = cfg->max_node_age_sec;
         dht_config.node_cleanup_interval_sec = cfg->node_cleanup_interval_sec;
@@ -643,6 +644,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.get_peers_workers = 100;
         dht_config.query_timeout = 5;
         dht_config.max_routing_table_nodes = 10000;
+        dht_config.maintenance_thread_enabled = 1;
         dht_config.node_verification_batch_size = 100;
         dht_config.max_node_age_sec = 120;
         dht_config.node_cleanup_interval_sec = 30;
@@ -1219,6 +1221,7 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.get_peers_workers = 100;
         dht_config.query_timeout = 5;
         dht_config.max_routing_table_nodes = 10000;
+        dht_config.maintenance_thread_enabled = 1;
         dht_config.node_verification_batch_size = 100;
         dht_config.max_node_age_sec = 120;
         dht_config.node_cleanup_interval_sec = 30;

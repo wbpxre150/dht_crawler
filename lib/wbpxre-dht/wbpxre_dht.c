@@ -1459,8 +1459,10 @@ int wbpxre_dht_start(wbpxre_dht_t *dht) {
     /* Start UDP reader thread */
     pthread_create(&dht->udp_reader_thread, NULL, udp_reader_thread_func, dht);
 
-    /* Start periodic maintenance thread */
-    pthread_create(&dht->maintenance_thread, NULL, maintenance_thread_func, dht);
+    /* Start periodic maintenance thread (if enabled) */
+    if (dht->config.maintenance_thread_enabled) {
+        pthread_create(&dht->maintenance_thread, NULL, maintenance_thread_func, dht);
+    }
 
     /* Start target rotation thread */
     pthread_create(&dht->target_rotation_thread, NULL, target_rotation_thread_func, dht);
@@ -1568,7 +1570,9 @@ int wbpxre_dht_stop(wbpxre_dht_t *dht) {
     /* Wait for other threads (UDP reader should now exit quickly) */
     pthread_join(dht->udp_reader_thread, NULL);
     pthread_join(dht->target_rotation_thread, NULL);
-    pthread_join(dht->maintenance_thread, NULL);
+    if (dht->config.maintenance_thread_enabled) {
+        pthread_join(dht->maintenance_thread, NULL);
+    }
 
     return 0;
 }
