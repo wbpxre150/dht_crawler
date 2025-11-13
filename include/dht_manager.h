@@ -195,6 +195,7 @@ typedef struct {
     int node_rotation_enabled;        /* Is rotation enabled? */
     int node_rotation_interval_sec;   /* Rotation interval in seconds */
     int node_rotation_drain_timeout_sec; /* Drain timeout in seconds */
+    int rotation_phase_duration_sec;  /* Duration of ANNOUNCING and TRANSITIONING phases */
     uint64_t samples_since_rotation;  /* Samples collected since last rotation */
     void *crawler_config;             /* Pointer to crawler_config_t for rotation */
     /* Hot rotation state */

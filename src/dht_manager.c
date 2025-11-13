@@ -572,15 +572,17 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     mgr->node_rotation_enabled = 0;  /* Default: disabled */
     mgr->node_rotation_interval_sec = 300;
     mgr->node_rotation_drain_timeout_sec = 10;
+    mgr->rotation_phase_duration_sec = 30;
     mgr->rotation_state = ROTATION_STATE_STABLE;  /* Initialize rotation state */
     mgr->rotation_phase_start = 0;
     if (cfg) {
         mgr->node_rotation_enabled = cfg->node_rotation_enabled;
         mgr->node_rotation_interval_sec = cfg->node_rotation_interval_sec;
         mgr->node_rotation_drain_timeout_sec = cfg->node_rotation_drain_timeout_sec;
-        log_msg(LOG_DEBUG, "Node rotation config: enabled=%d interval=%d drain_timeout=%d",
+        mgr->rotation_phase_duration_sec = cfg->rotation_phase_duration_sec;
+        log_msg(LOG_DEBUG, "Node rotation config: enabled=%d interval=%d drain_timeout=%d phase_duration=%d",
                 mgr->node_rotation_enabled, mgr->node_rotation_interval_sec,
-                mgr->node_rotation_drain_timeout_sec);
+                mgr->node_rotation_drain_timeout_sec, mgr->rotation_phase_duration_sec);
     } else {
         log_msg(LOG_WARN, "No config provided to dht_manager_init - rotation disabled");
     }
@@ -1688,9 +1690,9 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             format_infohash(mgr->next_node_id, new_id_hex, sizeof(new_id_hex));
             log_msg(LOG_INFO, "=== Node Rotation: Announcement Phase ===");
             log_msg(LOG_INFO, "  New ID generated: %.16s...", new_id_hex);
-            log_msg(LOG_INFO, "  Announcing to network for 30 seconds...");
+            log_msg(LOG_INFO, "  Announcing to network for %d seconds...", mgr->rotation_phase_duration_sec);
 
-            /* Schedule transition in 30 seconds (handled by timer callback) */
+            /* Schedule transition (handled by timer callback) */
             return 0;
 
         case ROTATION_STATE_ANNOUNCING:
@@ -1714,7 +1716,7 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "  Now using new ID for queries");
             log_msg(LOG_INFO, "  Routing table preserved: %d nodes (%d good, %d dubious)",
                     good + dubious, good, dubious);
-            log_msg(LOG_INFO, "  Transitioning for 30 seconds...");
+            log_msg(LOG_INFO, "  Transitioning for %d seconds...", mgr->rotation_phase_duration_sec);
 
             /* Update statistics */
             if (mgr->stats.last_rotation_time > 0) {
@@ -1813,15 +1815,15 @@ static void node_rotation_timer_cb(uv_timer_t *handle) {
             break;
 
         case ROTATION_STATE_ANNOUNCING:
-            /* Advance to transition after 30 seconds */
-            if (now - mgr->rotation_phase_start >= 30) {
+            /* Advance to transition after configured duration */
+            if (now - mgr->rotation_phase_start >= mgr->rotation_phase_duration_sec) {
                 dht_manager_rotate_node_id_hot(mgr);
             }
             break;
 
         case ROTATION_STATE_TRANSITIONING:
-            /* Complete transition after 30 seconds */
-            if (now - mgr->rotation_phase_start >= 30) {
+            /* Complete transition after configured duration */
+            if (now - mgr->rotation_phase_start >= mgr->rotation_phase_duration_sec) {
                 dht_manager_rotate_node_id_hot(mgr);
             }
             break;
