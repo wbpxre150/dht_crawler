@@ -228,8 +228,8 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
         return -1;
     }
 
-    /* Initialize connection request queue (capacity: 2000, matches max_concurrent_connections) */
-    fetcher->conn_request_queue = connection_request_queue_init(2000);
+    /* Initialize connection request queue (capacity: 4000, matches max_concurrent_connections) */
+    fetcher->conn_request_queue = connection_request_queue_init(4000);
     if (!fetcher->conn_request_queue) {
         log_msg(LOG_ERROR, "Failed to initialize connection request queue");
         batch_writer_cleanup(fetcher->batch_writer);
