@@ -9,7 +9,7 @@
 typedef struct {
     char *path;
     int64_t size_bytes;
-    int32_t file_index;
+    int16_t file_index;  /* Changed to int16_t (SMALLINT) for space savings */
 } file_info_t;
 
 /* Torrent metadata structure */
@@ -17,11 +17,8 @@ typedef struct {
     uint8_t info_hash[SHA1_DIGEST_LENGTH];
     char *name;
     int64_t size_bytes;
-    int32_t piece_length;
-    int32_t num_pieces;
     int32_t total_peers;
     int64_t added_timestamp;
-    int64_t last_seen;
     /* File information (for multi-file torrents) */
     file_info_t *files;
     int32_t num_files;
@@ -35,6 +32,8 @@ typedef struct {
     sqlite3 *db;
     sqlite3_stmt *insert_torrent_stmt;
     sqlite3_stmt *insert_file_stmt;
+    sqlite3_stmt *insert_prefix_stmt;
+    sqlite3_stmt *lookup_prefix_stmt;
     sqlite3_stmt *check_exists_stmt;
     app_context_t *app_ctx;
     int batch_count;

@@ -696,7 +696,7 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
     *results = NULL;
     *count = 0;
 
-    /* Build FTS5 search query - searches both torrent names and file paths
+    /* Build FTS5 search query - searches both torrent names and file names
      * Uses subqueries to properly utilize FTS5 MATCH function, then UNION to combine results */
     const char *sql =
         "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
@@ -707,7 +707,7 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
         "    SELECT rowid FROM torrent_search WHERE name MATCH ?"
         "    UNION"
         "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-        "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE path MATCH ?)"
+        "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?)"
         ") "
         "GROUP BY t.id "
         "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
@@ -742,11 +742,15 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
         res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
         res[i].num_files = sqlite3_column_int(stmt, 5);
 
-        /* Get file listings for this torrent */
+        /* Get file listings for this torrent - reconstruct paths from prefix + filename */
         if (res[i].num_files > 0) {
             const char *files_sql =
-                "SELECT path, size_bytes FROM torrent_files WHERE torrent_id = "
-                "(SELECT id FROM torrents WHERE info_hash = ?) ORDER BY file_index LIMIT 10";
+                "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
+                "       tf.size_bytes "
+                "FROM torrent_files tf "
+                "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+                "WHERE tf.torrent_id = (SELECT id FROM torrents WHERE info_hash = ?) "
+                "ORDER BY tf.file_index LIMIT 10";
 
             sqlite3_stmt *files_stmt;
             if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) == SQLITE_OK) {

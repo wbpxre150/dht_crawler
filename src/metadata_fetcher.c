@@ -1356,10 +1356,9 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
     memcpy(torrent.info_hash, peer->info_hash, 20);
 
     char *name = NULL;
-    int64_t piece_length = 0;
+    int64_t piece_length = 0;  /* Still needed for validation */
     int64_t single_file_length = -1;
     const uint8_t *pieces_data = NULL;
-    size_t pieces_len = 0;
 
     /* For multi-file mode */
     typedef struct {
@@ -1393,9 +1392,8 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
             } else if (b.size > 0 && b.stack[b.size - 1].key != NULL &&
                       b.stack[b.size - 1].keylen == 6 &&
                       memcmp(b.stack[b.size - 1].key, "pieces", 6) == 0) {
-                /* Pieces hash */
+                /* Pieces hash - just check existence, don't store length */
                 pieces_data = (const uint8_t *)b.tok;
-                pieces_len = b.toklen;
             } else if (in_path_list) {
                 /* Path component in multi-file mode */
                 if (strlen(path_buffer) > 0) {
@@ -1486,10 +1484,7 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
 
     /* Populate torrent metadata */
     torrent.name = name;
-    torrent.piece_length = (int32_t)piece_length;
-    torrent.num_pieces = pieces_len / 20;
     torrent.added_timestamp = time(NULL);
-    torrent.last_seen = time(NULL);
 
     /* Query peer store for total peer count at time of metadata fetch */
     int peer_count = 0;
@@ -1553,9 +1548,8 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
         return -1;
     }
 
-    log_msg(LOG_DEBUG, "Parsed torrent: %s (%lld bytes, %d pieces, %d files)",
-           name, (long long)torrent.size_bytes, torrent.num_pieces,
-           torrent.num_files);
+    log_msg(LOG_DEBUG, "Parsed torrent: %s (%lld bytes, %d files)",
+           name, (long long)torrent.size_bytes, torrent.num_files);
 
     /* Add to batch writer - batch writer will make deep copies */
     int rc = batch_writer_add(fetcher->batch_writer, &torrent);

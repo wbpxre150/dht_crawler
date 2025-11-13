@@ -13,26 +13,31 @@ static const char *CREATE_TABLES_SQL =
     "    info_hash BLOB(20) NOT NULL UNIQUE,"
     "    name TEXT NOT NULL,"
     "    size_bytes INTEGER NOT NULL,"
-    "    piece_length INTEGER,"
-    "    num_pieces INTEGER,"
     "    total_peers INTEGER DEFAULT 0,"
-    "    added_timestamp INTEGER NOT NULL,"
-    "    last_seen INTEGER NOT NULL"
+    "    added_timestamp INTEGER NOT NULL"
     ");"
     ""
     "CREATE INDEX IF NOT EXISTS idx_torrents_added ON torrents(added_timestamp DESC);"
     "CREATE INDEX IF NOT EXISTS idx_torrents_total_peers ON torrents(total_peers DESC);"
     ""
+    "CREATE TABLE IF NOT EXISTS path_prefixes ("
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "    prefix TEXT NOT NULL UNIQUE"
+    ");"
+    ""
     "CREATE TABLE IF NOT EXISTS torrent_files ("
     "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "    torrent_id INTEGER NOT NULL,"
-    "    path TEXT NOT NULL,"
+    "    prefix_id INTEGER,"
+    "    filename TEXT NOT NULL,"
     "    size_bytes INTEGER NOT NULL,"
-    "    file_index INTEGER NOT NULL,"
-    "    FOREIGN KEY (torrent_id) REFERENCES torrents(id) ON DELETE CASCADE"
+    "    file_index SMALLINT NOT NULL,"
+    "    FOREIGN KEY (torrent_id) REFERENCES torrents(id) ON DELETE CASCADE,"
+    "    FOREIGN KEY (prefix_id) REFERENCES path_prefixes(id)"
     ");"
     ""
-    "CREATE INDEX IF NOT EXISTS idx_files_torrent ON torrent_files(torrent_id);";
+    "CREATE INDEX IF NOT EXISTS idx_files_torrent ON torrent_files(torrent_id);"
+    "CREATE INDEX IF NOT EXISTS idx_files_prefix ON torrent_files(prefix_id);";
 
 static const char *CREATE_FTS_SQL =
     "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_search USING fts5("
@@ -43,7 +48,7 @@ static const char *CREATE_FTS_SQL =
     ");"
     ""
     "CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5("
-    "    path,"
+    "    filename,"
     "    tokenize='trigram',"
     "    content='torrent_files',"
     "    content_rowid='id'"
@@ -59,11 +64,11 @@ static const char *CREATE_TRIGGERS_SQL =
     "END;"
     ""
     "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON torrent_files BEGIN"
-    "    INSERT INTO file_search(rowid, path) VALUES (new.id, new.path);"
+    "    INSERT INTO file_search(rowid, filename) VALUES (new.id, new.filename);"
     "END;"
     ""
     "CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON torrent_files BEGIN"
-    "    INSERT INTO file_search(file_search, rowid, path) VALUES('delete', old.id, old.path);"
+    "    INSERT INTO file_search(file_search, rowid, filename) VALUES('delete', old.id, old.filename);"
     "END;";
 
 /* Initialize database */
@@ -87,9 +92,12 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
     sqlite3_exec(db->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(db->db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(db->db, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
-    sqlite3_exec(db->db, "PRAGMA page_size=4096;", NULL, NULL, NULL);
+    /* Larger page size for better compression (32KB) */
+    sqlite3_exec(db->db, "PRAGMA page_size=32768;", NULL, NULL, NULL);
     sqlite3_exec(db->db, "PRAGMA mmap_size=268435456;", NULL, NULL, NULL);
     sqlite3_exec(db->db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+    /* Enable auto_vacuum for better space management */
+    sqlite3_exec(db->db, "PRAGMA auto_vacuum=INCREMENTAL;", NULL, NULL, NULL);
 
     /* Initialize mutex */
     if (uv_mutex_init(&db->mutex) != 0) {
@@ -144,8 +152,8 @@ int database_create_schema(database_t *db) {
     /* Prepare statements */
     const char *insert_torrent_sql =
         "INSERT OR REPLACE INTO torrents "
-        "(info_hash, name, size_bytes, piece_length, num_pieces, total_peers, added_timestamp, last_seen) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        "(info_hash, name, size_bytes, total_peers, added_timestamp) "
+        "VALUES (?, ?, ?, ?, ?)";
 
     rc = sqlite3_prepare_v2(db->db, insert_torrent_sql, -1, &db->insert_torrent_stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -154,11 +162,30 @@ int database_create_schema(database_t *db) {
     }
 
     const char *insert_file_sql =
-        "INSERT INTO torrent_files (torrent_id, path, size_bytes, file_index) VALUES (?, ?, ?, ?)";
+        "INSERT INTO torrent_files (torrent_id, prefix_id, filename, size_bytes, file_index) "
+        "VALUES (?, ?, ?, ?, ?)";
 
     rc = sqlite3_prepare_v2(db->db, insert_file_sql, -1, &db->insert_file_stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare insert file statement: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    const char *insert_prefix_sql =
+        "INSERT OR IGNORE INTO path_prefixes (prefix) VALUES (?)";
+
+    rc = sqlite3_prepare_v2(db->db, insert_prefix_sql, -1, &db->insert_prefix_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare insert prefix statement: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    const char *lookup_prefix_sql =
+        "SELECT id FROM path_prefixes WHERE prefix = ? LIMIT 1";
+
+    rc = sqlite3_prepare_v2(db->db, lookup_prefix_sql, -1, &db->lookup_prefix_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare lookup prefix statement: %s", sqlite3_errmsg(db->db));
         return -1;
     }
 
@@ -250,6 +277,95 @@ int database_has_infohash(database_t *db, const unsigned char *hash) {
     return database_check_exists(db, hash);
 }
 
+/* Helper: Split path into prefix and filename
+ * Returns: 0 on success, -1 on error
+ * Note: Caller must free *prefix and *filename if non-NULL */
+static int split_path(const char *path, char **prefix, char **filename) {
+    if (!path || !prefix || !filename) {
+        return -1;
+    }
+
+    *prefix = NULL;
+    *filename = NULL;
+
+    /* Find last slash */
+    const char *last_slash = strrchr(path, '/');
+
+    if (!last_slash) {
+        /* No directory component - file is at root */
+        *filename = strdup(path);
+        return 0;
+    }
+
+    /* Split into prefix and filename */
+    size_t prefix_len = last_slash - path;
+    if (prefix_len > 0) {
+        *prefix = strndup(path, prefix_len);
+        if (!*prefix) {
+            return -1;
+        }
+    }
+
+    *filename = strdup(last_slash + 1);
+    if (!*filename) {
+        free(*prefix);
+        *prefix = NULL;
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Helper: Get or create path prefix ID
+ * Returns: prefix_id on success, -1 on error, 0 if prefix is NULL (root) */
+static int64_t get_or_create_prefix(database_t *db, const char *prefix) {
+    if (!db) {
+        return -1;
+    }
+
+    /* NULL prefix means root level file */
+    if (!prefix || strlen(prefix) == 0) {
+        return 0;
+    }
+
+    /* Try to lookup existing prefix */
+    sqlite3_reset(db->lookup_prefix_stmt);
+    sqlite3_bind_text(db->lookup_prefix_stmt, 1, prefix, -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(db->lookup_prefix_stmt);
+    if (rc == SQLITE_ROW) {
+        /* Found existing prefix */
+        return sqlite3_column_int64(db->lookup_prefix_stmt, 0);
+    }
+
+    /* Insert new prefix */
+    sqlite3_reset(db->insert_prefix_stmt);
+    sqlite3_bind_text(db->insert_prefix_stmt, 1, prefix, -1, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(db->insert_prefix_stmt);
+    if (rc != SQLITE_DONE) {
+        log_msg(LOG_ERROR, "Failed to insert path prefix '%s': %s",
+                prefix, sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    /* Get the ID we just inserted */
+    int64_t prefix_id = sqlite3_last_insert_rowid(db->db);
+
+    /* If prefix_id is 0, it means INSERT OR IGNORE didn't insert (race condition)
+     * Try lookup again */
+    if (prefix_id == 0) {
+        sqlite3_reset(db->lookup_prefix_stmt);
+        sqlite3_bind_text(db->lookup_prefix_stmt, 1, prefix, -1, SQLITE_STATIC);
+
+        if (sqlite3_step(db->lookup_prefix_stmt) == SQLITE_ROW) {
+            prefix_id = sqlite3_column_int64(db->lookup_prefix_stmt, 0);
+        }
+    }
+
+    return prefix_id;
+}
+
 /* Internal function: Insert torrent without mutex (transaction-safe)
  * MUST be called within a transaction or with external mutex held */
 static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata_t *torrent,
@@ -263,11 +379,8 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
     sqlite3_bind_blob(db->insert_torrent_stmt, 1, torrent->info_hash, SHA1_DIGEST_LENGTH, SQLITE_TRANSIENT);
     sqlite3_bind_text(db->insert_torrent_stmt, 2, torrent->name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(db->insert_torrent_stmt, 3, torrent->size_bytes);
-    sqlite3_bind_int(db->insert_torrent_stmt, 4, torrent->piece_length);
-    sqlite3_bind_int(db->insert_torrent_stmt, 5, torrent->num_pieces);
-    sqlite3_bind_int(db->insert_torrent_stmt, 6, torrent->total_peers);
-    sqlite3_bind_int64(db->insert_torrent_stmt, 7, torrent->added_timestamp);
-    sqlite3_bind_int64(db->insert_torrent_stmt, 8, torrent->last_seen);
+    sqlite3_bind_int(db->insert_torrent_stmt, 4, torrent->total_peers);
+    sqlite3_bind_int64(db->insert_torrent_stmt, 5, torrent->added_timestamp);
 
     int rc = sqlite3_step(db->insert_torrent_stmt);
     if (rc != SQLITE_DONE) {
@@ -284,21 +397,54 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
 
     int64_t torrent_id = sqlite3_last_insert_rowid(db->db);
 
-    /* Insert files - use SQLITE_TRANSIENT for paths */
+    /* Insert files with path normalization */
     for (int i = 0; i < num_files; i++) {
+        char *prefix = NULL;
+        char *filename = NULL;
+
+        /* Split path into prefix and filename */
+        if (split_path(files[i].path, &prefix, &filename) != 0) {
+            log_msg(LOG_ERROR, "Failed to split path '%s' for torrent_id %lld",
+                   files[i].path ? files[i].path : "(null)", (long long)torrent_id);
+            continue;
+        }
+
+        /* Get or create prefix_id */
+        int64_t prefix_id = 0;
+        if (prefix) {
+            prefix_id = get_or_create_prefix(db, prefix);
+            if (prefix_id < 0) {
+                log_msg(LOG_ERROR, "Failed to get/create prefix '%s' for torrent_id %lld",
+                       prefix, (long long)torrent_id);
+                free(prefix);
+                free(filename);
+                continue;
+            }
+        }
+
+        /* Insert file record */
         sqlite3_reset(db->insert_file_stmt);
         sqlite3_bind_int64(db->insert_file_stmt, 1, torrent_id);
-        sqlite3_bind_text(db->insert_file_stmt, 2, files[i].path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(db->insert_file_stmt, 3, files[i].size_bytes);
-        sqlite3_bind_int(db->insert_file_stmt, 4, files[i].file_index);
+        if (prefix_id > 0) {
+            sqlite3_bind_int64(db->insert_file_stmt, 2, prefix_id);
+        } else {
+            sqlite3_bind_null(db->insert_file_stmt, 2);  /* NULL for root files */
+        }
+        sqlite3_bind_text(db->insert_file_stmt, 3, filename, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(db->insert_file_stmt, 4, files[i].size_bytes);
+        sqlite3_bind_int(db->insert_file_stmt, 5, files[i].file_index);
 
         rc = sqlite3_step(db->insert_file_stmt);
         if (rc != SQLITE_DONE) {
-            log_msg(LOG_ERROR, "Failed to insert file '%s' for torrent_id %lld: %s",
+            log_msg(LOG_ERROR, "Failed to insert file '%s' (prefix: '%s', filename: '%s') for torrent_id %lld: %s",
                    files[i].path ? files[i].path : "(null)",
+                   prefix ? prefix : "(null)",
+                   filename ? filename : "(null)",
                    (long long)torrent_id, sqlite3_errmsg(db->db));
-            /* Continue with other files rather than failing completely */
         }
+
+        free(prefix);
+        free(filename);
     }
 
     return 0;
@@ -471,6 +617,16 @@ void database_cleanup(database_t *db) {
     if (db->insert_file_stmt) {
         sqlite3_finalize(db->insert_file_stmt);
         db->insert_file_stmt = NULL;
+    }
+
+    if (db->insert_prefix_stmt) {
+        sqlite3_finalize(db->insert_prefix_stmt);
+        db->insert_prefix_stmt = NULL;
+    }
+
+    if (db->lookup_prefix_stmt) {
+        sqlite3_finalize(db->lookup_prefix_stmt);
+        db->lookup_prefix_stmt = NULL;
     }
 
     if (db->check_exists_stmt) {
