@@ -74,12 +74,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->shadow_table_persist = 1;
     strncpy(config->shadow_table_path, "data/shadow_table.dat", sizeof(config->shadow_table_path) - 1);
 
-    /* Phase 7: Active Ping Verification defaults (BUGFIX) */
-    config->ping_verification_enabled = 1;
-    config->ping_verification_interval = 5;  /* Ping dubious nodes every 5 seconds */
-    config->ping_max_dubious_per_cycle = 100;  /* Ping up to 100 nodes per cycle */
-    config->ping_dubious_age_threshold = 120;  /* Nodes dubious if no response in 2 minutes */
-
     /* wbpxre-dht defaults */
     config->wbpxre_ping_workers = 10;
     config->wbpxre_find_node_workers = 20;
@@ -258,16 +252,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->shadow_table_persist = atoi(value);
         } else if (strcmp(key, "shadow_table_path") == 0) {
             strncpy(config->shadow_table_path, value, sizeof(config->shadow_table_path) - 1);
-        }
-        /* Phase 7: Ping Verification settings (BUGFIX) */
-        else if (strcmp(key, "ping_verification_enabled") == 0) {
-            config->ping_verification_enabled = atoi(value);
-        } else if (strcmp(key, "ping_verification_interval") == 0) {
-            config->ping_verification_interval = atoi(value);
-        } else if (strcmp(key, "ping_max_dubious_per_cycle") == 0) {
-            config->ping_max_dubious_per_cycle = atoi(value);
-        } else if (strcmp(key, "ping_dubious_age_threshold") == 0) {
-            config->ping_dubious_age_threshold = atoi(value);
         }
         /* Metadata fetcher settings */
         else if (strcmp(key, "concurrent_peers_per_torrent") == 0) {

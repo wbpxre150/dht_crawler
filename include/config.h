@@ -66,12 +66,6 @@ typedef struct {
     int shadow_table_persist;
     char shadow_table_path[512];
 
-    /* Phase 7: Active Ping Verification settings (BUGFIX) */
-    int ping_verification_enabled;
-    int ping_verification_interval; /* seconds */
-    int ping_max_dubious_per_cycle; /* max dubious nodes to ping per cycle */
-    int ping_dubious_age_threshold; /* seconds since last response */
-
     /* wbpxre-dht settings */
     int wbpxre_ping_workers;
     int wbpxre_find_node_workers;

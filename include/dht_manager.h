@@ -62,13 +62,6 @@ typedef struct {
     uint64_t nodes_in_jech_table;     /* Current nodes in jech/dht table */
     uint64_t nodes_expired;           /* Nodes expired due to inactivity */
     uint64_t nodes_pruned;            /* Nodes pruned from tables */
-    /* Phase 7: Active Ping Verification statistics (BUGFIX) */
-    uint64_t ping_verification_cycles;   /* Number of verification cycles run */
-    uint64_t dubious_nodes_pinged;       /* Total dubious nodes pinged */
-    uint64_t dubious_ping_responses;     /* Responses received from dubious pings */
-    uint64_t nodes_promoted_to_good;     /* Nodes that went from dubious to good */
-    uint64_t discovery_pings_sent;       /* Pings sent immediately on node discovery */
-    uint64_t discovery_ping_responses;   /* Responses to discovery pings */
     /* Node ID rotation statistics */
     uint64_t node_rotations_performed;   /* Total rotations performed */
     uint64_t samples_per_rotation;       /* Average samples per rotation period */
@@ -106,13 +99,6 @@ typedef struct {
     int old_node_check_interval_sec;      /* How often to check for old nodes */
     int old_node_threshold_sec;           /* Age threshold for old nodes */
     int max_routing_table_nodes;          /* Maximum nodes in routing table */
-    /* Phase 7: Active Ping Verification configuration (BUGFIX) */
-    int ping_verification_enabled;        /* Enable active ping verification */
-    int ping_verification_interval;       /* How often to ping dubious nodes (seconds) */
-    int ping_max_dubious_per_cycle;       /* Max dubious nodes to ping per cycle */
-    int ping_dubious_age_threshold;       /* Seconds since last response to be dubious */
-    int ping_on_discovery_enabled;        /* Ping nodes immediately when discovered */
-    int discovery_ping_probability;       /* Probability (0-100) of pinging discovered node */
 } dht_config_t;
 
 /* Close callback tracking for proper libuv handle cleanup */
@@ -193,9 +179,6 @@ typedef struct {
     void *find_node_worker_pool;      /* Worker pool for find_node queries */
     uv_timer_t bootstrap_reseed_timer; /* Timer for bootstrap reseeding */
     uv_timer_t old_node_timer;        /* Timer for old node maintenance */
-    /* Phase 7: Active Ping Verification state (BUGFIX) */
-    uv_timer_t ping_verification_timer; /* Timer for periodic dubious node pinging */
-    time_t last_ping_verification;    /* Last time we ran ping verification */
     /* Node ID rotation state */
     uv_timer_t node_rotation_timer;   /* Timer for periodic node ID rotation */
     int node_rotation_enabled;        /* Is rotation enabled? */
