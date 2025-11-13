@@ -531,6 +531,17 @@ int wbpxre_routing_table_get_distant_nodes(wbpxre_routing_table_t *table,
                                              wbpxre_routing_node_t **nodes_out,
                                              int n);
 
+/* Get distant nodes FAST (optimized for speed, 10-50x faster)
+ * Uses first-byte XOR distance only (>128 = distant)
+ * Sorts distant nodes by age and returns oldest X%
+ * percentage: 0.0-1.0 (e.g., 0.5 = return 50% of distant nodes)
+ * Returns copies of nodes (caller must free each node in nodes_out array) */
+int wbpxre_routing_table_get_distant_nodes_fast(wbpxre_routing_table_t *table,
+                                                  const uint8_t *current_node_id,
+                                                  double percentage,
+                                                  wbpxre_routing_node_t **nodes_out,
+                                                  int max_out);
+
 /* Get keyspace distribution statistics (close vs distant nodes)
  * Used for monitoring keyspace composition after rotation */
 void wbpxre_routing_table_get_keyspace_distribution(wbpxre_routing_table_t *table,

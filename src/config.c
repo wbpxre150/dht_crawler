@@ -112,6 +112,14 @@ void config_init_defaults(crawler_config_t *config) {
     config->bep51_pruning_enabled = 1;          /* Enabled by default */
     config->bep51_pruning_interval_sec = 30;    /* Check every 30 seconds */
     config->bep51_pruning_min_capacity = 0.0;   /* Prune immediately (proactive) */
+
+    /* Async node pruning defaults */
+    config->async_pruning_enabled = 1;              /* Enabled by default */
+    config->async_pruning_target_nodes = 60000;     /* Target 60K nodes after pruning */
+    config->async_pruning_distant_percent = 50.0;   /* Remove 50% of distant nodes */
+    config->async_pruning_old_percent = 30.0;       /* Remove 30% of old nodes */
+    config->async_pruning_batch_size = 1000;        /* 1000 nodes per batch */
+    config->async_pruning_log_interval = 5000;      /* Log every 5000 nodes */
 }
 
 /* Load config from INI-style file */
@@ -331,6 +339,26 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             /* Clamp to valid range [0.0, 1.0] */
             if (config->bep51_pruning_min_capacity < 0.0) config->bep51_pruning_min_capacity = 0.0;
             if (config->bep51_pruning_min_capacity > 1.0) config->bep51_pruning_min_capacity = 1.0;
+        }
+        /* Async node pruning settings */
+        else if (strcmp(key, "async_pruning_enabled") == 0) {
+            config->async_pruning_enabled = atoi(value);
+        } else if (strcmp(key, "async_pruning_target_nodes") == 0) {
+            config->async_pruning_target_nodes = atoi(value);
+        } else if (strcmp(key, "async_pruning_distant_percent") == 0) {
+            config->async_pruning_distant_percent = atof(value);
+            /* Clamp to valid range [0.0, 100.0] */
+            if (config->async_pruning_distant_percent < 0.0) config->async_pruning_distant_percent = 0.0;
+            if (config->async_pruning_distant_percent > 100.0) config->async_pruning_distant_percent = 100.0;
+        } else if (strcmp(key, "async_pruning_old_percent") == 0) {
+            config->async_pruning_old_percent = atof(value);
+            /* Clamp to valid range [0.0, 100.0] */
+            if (config->async_pruning_old_percent < 0.0) config->async_pruning_old_percent = 0.0;
+            if (config->async_pruning_old_percent > 100.0) config->async_pruning_old_percent = 100.0;
+        } else if (strcmp(key, "async_pruning_batch_size") == 0) {
+            config->async_pruning_batch_size = atoi(value);
+        } else if (strcmp(key, "async_pruning_log_interval") == 0) {
+            config->async_pruning_log_interval = atoi(value);
         }
     }
 

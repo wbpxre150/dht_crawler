@@ -946,6 +946,128 @@ void wbpxre_routing_table_get_keyspace_distribution(wbpxre_routing_table_t *tabl
 }
 
 /* ============================================================================
+ * Get Distant Nodes FAST (Optimized for Speed)
+ * Returns percentage of distant nodes for pruning after rotation
+ * 10-50x faster than composite scoring - uses first-byte distance only
+ * ============================================================================ */
+
+/* Helper: Collect distant nodes (first-byte XOR > 128) with age info */
+typedef struct {
+    wbpxre_routing_node_t *node;
+    time_t age;
+} distant_node_age_t;
+
+static void collect_distant_nodes_recursive(wbpxre_routing_node_t *root,
+                                             const uint8_t *current_node_id,
+                                             distant_node_age_t **array,
+                                             int *count, int max) {
+    if (!root || *count >= max) return;
+
+    /* Skip dropped nodes */
+    if (root->dropped) {
+        collect_distant_nodes_recursive(root->left, current_node_id, array, count, max);
+        collect_distant_nodes_recursive(root->right, current_node_id, array, count, max);
+        return;
+    }
+
+    /* Fast distance check: XOR first byte only */
+    uint8_t first_byte_distance = root->id[0] ^ current_node_id[0];
+
+    /* Classify as distant if first byte distance > 128 (opposite half of keyspace) */
+    if (first_byte_distance > 128) {
+        (*array)[*count].node = root;
+        (*array)[*count].age = root->last_responded_at;
+        (*count)++;
+    }
+
+    /* Recurse on children */
+    collect_distant_nodes_recursive(root->left, current_node_id, array, count, max);
+    collect_distant_nodes_recursive(root->right, current_node_id, array, count, max);
+}
+
+/* Comparison function for qsort - oldest first (prefer to remove old distant nodes) */
+static int compare_distant_nodes_by_age(const void *a, const void *b) {
+    const distant_node_age_t *node_a = (const distant_node_age_t *)a;
+    const distant_node_age_t *node_b = (const distant_node_age_t *)b;
+
+    /* Never responded nodes go first */
+    if (node_a->age == 0 && node_b->age != 0) return -1;
+    if (node_a->age != 0 && node_b->age == 0) return 1;
+    if (node_a->age == 0 && node_b->age == 0) return 0;
+
+    /* Otherwise sort by age (oldest first) */
+    if (node_a->age < node_b->age) return -1;
+    if (node_a->age > node_b->age) return 1;
+    return 0;
+}
+
+/* Get percentage of distant nodes for pruning
+ * percentage: 0.0-1.0 (e.g., 0.5 = 50% of distant nodes)
+ * Returns oldest X% of distant nodes for removal
+ */
+int wbpxre_routing_table_get_distant_nodes_fast(wbpxre_routing_table_t *table,
+                                                  const uint8_t *current_node_id,
+                                                  double percentage,
+                                                  wbpxre_routing_node_t **nodes_out,
+                                                  int max_out) {
+    if (!table || !current_node_id || !nodes_out || max_out <= 0) return 0;
+    if (percentage < 0.0 || percentage > 1.0) return 0;
+
+    rcu_read_lock();
+
+    /* Collect all distant nodes (scale limit with table size, cap at 50000) */
+    int max_collect = table->node_count < 50000 ? table->node_count : 50000;
+    distant_node_age_t *distant_nodes = malloc(sizeof(distant_node_age_t) * max_collect);
+    if (!distant_nodes) {
+        rcu_read_unlock();
+        return 0;
+    }
+
+    int distant_count = 0;
+    collect_distant_nodes_recursive(table->root, current_node_id,
+                                      &distant_nodes, &distant_count, max_collect);
+
+    if (distant_count == 0) {
+        free(distant_nodes);
+        rcu_read_unlock();
+        return 0;
+    }
+
+    /* Sort by age (oldest first) */
+    qsort(distant_nodes, distant_count, sizeof(distant_node_age_t),
+          compare_distant_nodes_by_age);
+
+    /* Calculate how many to return (percentage of distant nodes) */
+    int to_return = (int)(distant_count * percentage);
+    if (to_return > max_out) to_return = max_out;
+    if (to_return > distant_count) to_return = distant_count;
+
+    /* Copy the oldest N distant nodes */
+    for (int i = 0; i < to_return; i++) {
+        wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
+        if (!node_copy) {
+            /* Cleanup on allocation failure */
+            for (int j = 0; j < i; j++) {
+                free(nodes_out[j]);
+            }
+            free(distant_nodes);
+            rcu_read_unlock();
+            return 0;
+        }
+        memcpy(node_copy, distant_nodes[i].node, sizeof(wbpxre_routing_node_t));
+        /* Clear tree pointers since this is a standalone copy */
+        node_copy->left = NULL;
+        node_copy->right = NULL;
+        nodes_out[i] = node_copy;
+    }
+
+    free(distant_nodes);
+    rcu_read_unlock();
+
+    return to_return;
+}
+
+/* ============================================================================
  * Node Updates
  * ============================================================================ */
 

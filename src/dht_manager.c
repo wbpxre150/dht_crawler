@@ -43,6 +43,8 @@ static void pruning_queue_destroy(pruning_queue_t *queue);
 static bool pruning_queue_submit_batch(pruning_queue_t *queue, pruning_batch_t *batch);
 static pruning_batch_t *pruning_queue_dequeue_batch(pruning_queue_t *queue);
 static void *pruning_worker_thread_func(void *arg);
+static int prune_nodes_to_target(dht_manager_t *mgr, const uint8_t *current_node_id,
+                                  int target_nodes, double distant_percent, double old_percent);
 
 /* Structure to track pending timer closes */
 typedef struct {
@@ -1295,6 +1297,186 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
  * Async Pruning Infrastructure
  * ============================================================================ */
 
+/* Smart pruning that combines distance + age to hit target node count
+ *
+ * Algorithm:
+ * 1. Calculate how many nodes to remove: current - target
+ * 2. Get X% of distant nodes (using fast first-byte distance)
+ * 3. Get Y% of oldest nodes
+ * 4. Deduplicate (nodes in both sets counted once)
+ * 5. Adjust to hit target exactly
+ * 6. Submit to async pruning queue
+ */
+static int prune_nodes_to_target(dht_manager_t *mgr,
+                                  const uint8_t *current_node_id,
+                                  int target_nodes,
+                                  double distant_percent,  /* 0.0-1.0 */
+                                  double old_percent) {    /* 0.0-1.0 */
+    if (!mgr || !mgr->dht || !current_node_id) return -1;
+
+    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+    if (!cfg) return -1;
+
+    /* Get current routing table size */
+    int current_good = 0, current_dubious = 0;
+    wbpxre_dht_nodes(mgr->dht, &current_good, &current_dubious);
+    int current_nodes = current_good + current_dubious;
+
+    /* Edge case: target >= current (nothing to prune) */
+    if (target_nodes >= current_nodes) {
+        log_msg(LOG_INFO, "Target nodes (%d) >= current nodes (%d), skipping pruning",
+                target_nodes, current_nodes);
+        return 0;
+    }
+
+    int nodes_to_remove = current_nodes - target_nodes;
+
+    log_msg(LOG_INFO, "=== Configurable Async Pruning ===");
+    log_msg(LOG_INFO, "  Current nodes: %d, Target: %d, To remove: %d",
+            current_nodes, target_nodes, nodes_to_remove);
+    log_msg(LOG_INFO, "  Distant percent: %.1f%%, Old percent: %.1f%%",
+            distant_percent * 100.0, old_percent * 100.0);
+
+    /* Step 1: Get distant nodes using FAST method */
+    int max_distant = nodes_to_remove * 2;  /* Allocate extra space */
+    wbpxre_routing_node_t **distant_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_distant);
+    if (!distant_nodes) {
+        log_msg(LOG_ERROR, "Failed to allocate distant nodes array");
+        return -1;
+    }
+
+    int distant_count = wbpxre_routing_table_get_distant_nodes_fast(
+        mgr->dht->routing_table,
+        current_node_id,
+        distant_percent,
+        distant_nodes,
+        max_distant
+    );
+
+    log_msg(LOG_INFO, "  Distant nodes selected: %d (%.1f%% of distant)",
+            distant_count, distant_percent * 100.0);
+
+    /* Step 2: Get oldest nodes */
+    int max_old = nodes_to_remove * 2;  /* Allocate extra space */
+    wbpxre_routing_node_t **old_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_old);
+    if (!old_nodes) {
+        log_msg(LOG_ERROR, "Failed to allocate old nodes array");
+        for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
+        free(distant_nodes);
+        return -1;
+    }
+
+    int old_count = wbpxre_routing_table_get_oldest_nodes(
+        mgr->dht->routing_table,
+        old_nodes,
+        (int)(current_nodes * old_percent)
+    );
+
+    log_msg(LOG_INFO, "  Old nodes selected: %d (%.1f%% of total)",
+            old_count, old_percent * 100.0);
+
+    /* Step 3: Deduplicate - use simple hash set for node IDs
+     * We'll use a lightweight approach: mark duplicates by comparing node IDs */
+    typedef struct {
+        uint8_t id[WBPXRE_NODE_ID_LEN];
+        bool from_distant;
+        bool from_old;
+    } dedup_node_t;
+
+    int max_combined = distant_count + old_count;
+    dedup_node_t *combined = malloc(sizeof(dedup_node_t) * max_combined);
+    if (!combined) {
+        log_msg(LOG_ERROR, "Failed to allocate dedup array");
+        for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
+        for (int i = 0; i < old_count; i++) free(old_nodes[i]);
+        free(distant_nodes);
+        free(old_nodes);
+        return -1;
+    }
+
+    int unique_count = 0;
+
+    /* Add distant nodes to combined list */
+    for (int i = 0; i < distant_count; i++) {
+        memcpy(combined[unique_count].id, distant_nodes[i]->id, WBPXRE_NODE_ID_LEN);
+        combined[unique_count].from_distant = true;
+        combined[unique_count].from_old = false;
+        unique_count++;
+    }
+
+    /* Add old nodes, checking for duplicates */
+    for (int i = 0; i < old_count; i++) {
+        bool is_duplicate = false;
+        for (int j = 0; j < unique_count; j++) {
+            if (memcmp(combined[j].id, old_nodes[i]->id, WBPXRE_NODE_ID_LEN) == 0) {
+                combined[j].from_old = true;  /* Mark as both distant and old */
+                is_duplicate = true;
+                break;
+            }
+        }
+        if (!is_duplicate) {
+            memcpy(combined[unique_count].id, old_nodes[i]->id, WBPXRE_NODE_ID_LEN);
+            combined[unique_count].from_distant = false;
+            combined[unique_count].from_old = true;
+            unique_count++;
+        }
+    }
+
+    log_msg(LOG_INFO, "  Unique nodes after dedup: %d", unique_count);
+
+    /* Step 4: Adjust to hit target exactly */
+    int final_count = unique_count;
+    if (final_count > nodes_to_remove) {
+        final_count = nodes_to_remove;
+        log_msg(LOG_INFO, "  Capping to target removal: %d nodes", final_count);
+    } else if (final_count < nodes_to_remove) {
+        log_msg(LOG_WARN, "  Selected fewer nodes (%d) than target (%d)",
+                final_count, nodes_to_remove);
+        log_msg(LOG_WARN, "  Consider increasing distant_percent or old_percent");
+    }
+
+    /* Step 5: Create pruning batch and submit */
+    if (final_count > 0 && mgr->pruning_queue) {
+        pruning_batch_t *batch = calloc(1, sizeof(pruning_batch_t));
+        if (batch) {
+            batch->node_ids = malloc(final_count * WBPXRE_NODE_ID_LEN);
+            if (batch->node_ids) {
+                batch->count = final_count;
+                batch->submitted_at = time(NULL);
+
+                /* Copy node IDs to batch */
+                for (int i = 0; i < final_count; i++) {
+                    memcpy(batch->node_ids[i], combined[i].id, WBPXRE_NODE_ID_LEN);
+                }
+
+                /* Submit batch for async processing */
+                if (pruning_queue_submit_batch(mgr->pruning_queue, batch)) {
+                    log_msg(LOG_INFO, "  Submitted %d nodes for async pruning", final_count);
+                    log_msg(LOG_INFO, "  Main thread continues immediately (non-blocking)");
+                } else {
+                    log_msg(LOG_ERROR, "  Failed to submit pruning batch");
+                    free(batch->node_ids);
+                    free(batch);
+                }
+            } else {
+                log_msg(LOG_ERROR, "  Failed to allocate node IDs for batch");
+                free(batch);
+            }
+        } else {
+            log_msg(LOG_ERROR, "  Failed to allocate pruning batch");
+        }
+    }
+
+    /* Cleanup */
+    for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
+    for (int i = 0; i < old_count; i++) free(old_nodes[i]);
+    free(distant_nodes);
+    free(old_nodes);
+    free(combined);
+
+    return final_count;
+}
+
 /* Create pruning work queue */
 static pruning_queue_t *pruning_queue_create(int capacity) {
     pruning_queue_t *queue = calloc(1, sizeof(pruning_queue_t));
@@ -1556,102 +1738,32 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "  Fully migrated to new keyspace position");
             log_msg(LOG_INFO, "  No downtime - all workers kept running!");
 
-            /* Post-rotation cleanup: AGGRESSIVELY prune distant nodes to make room for new keyspace */
-            int post_good = 0, post_dubious = 0;
-            wbpxre_dht_nodes(mgr->dht, &post_good, &post_dubious);
-            int current_nodes = post_good + post_dubious;
+            /* Post-rotation cleanup: Configurable async pruning */
+            crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+            if (cfg && cfg->async_pruning_enabled) {
+                /* Check if pruning is already in progress - prevent overlap */
+                bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
+                if (pruning_active) {
+                    log_msg(LOG_WARN, "  Skipping pruning - previous pruning still in progress");
+                    log_msg(LOG_WARN, "  Consider increasing node_rotation_interval_sec or investigating pruning performance");
+                } else {
+                    /* Get current node ID */
+                    uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
+                    pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
+                    memcpy(current_node_id, mgr->app_ctx->node_id, WBPXRE_NODE_ID_LEN);
+                    pthread_rwlock_unlock(&mgr->dht->node_id_lock);
 
-            /* Target: Remove 70% of distant nodes to quickly make room for close nodes
-             * With ~50/50 distribution, this prunes ~35% of total table */
-            uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
-            pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
-            memcpy(current_node_id, mgr->app_ctx->node_id, WBPXRE_NODE_ID_LEN);
-            pthread_rwlock_unlock(&mgr->dht->node_id_lock);
-
-            /* Get actual keyspace distribution */
-            int close_nodes = 0, distant_nodes_count = 0;
-            wbpxre_routing_table_get_keyspace_distribution(mgr->dht->routing_table,
-                                                             current_node_id,
-                                                             &close_nodes,
-                                                             &distant_nodes_count);
-
-            /* Prune 70% of distant nodes */
-            int nodes_to_prune = (int)(distant_nodes_count * 0.70);
-
-            log_msg(LOG_INFO, "=== Post-Rotation Aggressive Keyspace Pruning ===");
-            log_msg(LOG_INFO, "  Current nodes: %d (close=%d distant=%d)", current_nodes, close_nodes, distant_nodes_count);
-            log_msg(LOG_INFO, "  Target pruning: %d distant nodes (70%% of distant, %.1f%% of total)",
-                    nodes_to_prune, (nodes_to_prune * 100.0) / current_nodes);
-
-            /* Check if pruning is already in progress - prevent overlap */
-            bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
-            if (pruning_active) {
-                log_msg(LOG_WARN, "  Skipping pruning - previous pruning still in progress");
-                log_msg(LOG_WARN, "  Consider increasing node_rotation_interval_sec or investigating pruning performance");
-                /* Still do sample queue clearing below */
-            } else {
-                /* Get distant nodes and submit for async pruning */
-                wbpxre_routing_node_t **distant_nodes_array = malloc(sizeof(wbpxre_routing_node_t *) * nodes_to_prune);
-                if (distant_nodes_array) {
-                    int pruned_count = wbpxre_routing_table_get_distant_nodes(
-                        mgr->dht->routing_table,
+                    /* Call configurable pruning function */
+                    prune_nodes_to_target(
+                        mgr,
                         current_node_id,
-                        distant_nodes_array,
-                        nodes_to_prune
+                        cfg->async_pruning_target_nodes,
+                        cfg->async_pruning_distant_percent / 100.0,  /* convert to 0.0-1.0 */
+                        cfg->async_pruning_old_percent / 100.0
                     );
-
-                    if (pruned_count > 0 && mgr->pruning_queue) {
-                    /* Create pruning batch */
-                    pruning_batch_t *batch = calloc(1, sizeof(pruning_batch_t));
-                    if (batch) {
-                        /* Allocate node ID array */
-                        batch->node_ids = malloc(pruned_count * WBPXRE_NODE_ID_LEN);
-                        if (batch->node_ids) {
-                            batch->count = pruned_count;
-                            batch->submitted_at = time(NULL);
-
-                            /* Copy node IDs */
-                            for (int i = 0; i < pruned_count; i++) {
-                                memcpy(batch->node_ids[i], distant_nodes_array[i]->id,
-                                       WBPXRE_NODE_ID_LEN);
-                                free(distant_nodes_array[i]);  /* Free the copy */
-                            }
-
-                            /* Submit batch for async processing (non-blocking) */
-                            if (pruning_queue_submit_batch(mgr->pruning_queue, batch)) {
-                                log_msg(LOG_INFO, "  Submitted %d nodes for async pruning",
-                                        pruned_count);
-                                log_msg(LOG_INFO, "  Main thread continues immediately (non-blocking)");
-                            } else {
-                                log_msg(LOG_ERROR, "  Failed to submit pruning batch");
-                                free(batch->node_ids);
-                                free(batch);
-                            }
-                        } else {
-                            log_msg(LOG_ERROR, "  Failed to allocate node IDs array for pruning");
-                            free(batch);
-                            /* Free distant nodes on failure */
-                            for (int i = 0; i < pruned_count; i++) {
-                                free(distant_nodes_array[i]);
-                            }
-                        }
-                    } else {
-                        log_msg(LOG_ERROR, "  Failed to allocate pruning batch");
-                        /* Free distant nodes on failure */
-                        for (int i = 0; i < pruned_count; i++) {
-                            free(distant_nodes_array[i]);
-                        }
-                    }
-                } else if (pruned_count > 0) {
-                    /* No pruning queue available - free nodes */
-                    log_msg(LOG_WARN, "  Pruning queue not available, skipping pruning");
-                    for (int i = 0; i < pruned_count; i++) {
-                        free(distant_nodes_array[i]);
-                    }
                 }
-
-                    free(distant_nodes_array);
-                }
+            } else {
+                log_msg(LOG_INFO, "  Async pruning disabled in config");
             }
 
             /* Optionally clear sample_infohashes queue after rotation */

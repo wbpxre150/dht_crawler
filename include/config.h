@@ -104,6 +104,14 @@ typedef struct {
     int bep51_pruning_enabled;           /* Enable BEP51-focused node pruning */
     int bep51_pruning_interval_sec;      /* How often to check and prune (default: 30) */
     double bep51_pruning_min_capacity;   /* Min capacity ratio (0.0-1.0) before pruning (default: 0.0) */
+
+    /* Async node pruning settings (triggered by rotation) */
+    int async_pruning_enabled;           /* Enable async pruning after rotation */
+    int async_pruning_target_nodes;      /* Target final node count after pruning */
+    double async_pruning_distant_percent; /* Percentage of distant nodes to remove (0.0-100.0) */
+    double async_pruning_old_percent;    /* Percentage of old nodes to remove (0.0-100.0) */
+    int async_pruning_batch_size;        /* Nodes per batch for drop operations */
+    int async_pruning_log_interval;      /* Log progress every N nodes */
 } crawler_config_t;
 
 /* Initialize config with default values */
