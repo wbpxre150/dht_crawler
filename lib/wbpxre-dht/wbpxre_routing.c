@@ -1309,6 +1309,105 @@ int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table) {
 }
 
 /* ============================================================================
+ * Hash Index Rebuild (Performance Optimization)
+ * ============================================================================ */
+
+/* Helper: Collect all node pointers from flat array */
+static int collect_all_nodes_from_flat_array(wbpxre_routing_table_t *table,
+                                               wbpxre_routing_node_t **nodes_out,
+                                               int max_nodes) {
+    if (!table || !nodes_out || !table->all_nodes) return 0;
+
+    int count = 0;
+    for (int i = 0; i < table->all_nodes_capacity && count < max_nodes; i++) {
+        if (table->all_nodes[i] != NULL) {
+            nodes_out[count++] = table->all_nodes[i];
+        }
+    }
+    return count;
+}
+
+/* Rebuild hash index to prevent uthash bucket array bloat
+ *
+ * Problem: uthash grows its internal bucket array as entries are added,
+ * but NEVER shrinks it when entries are deleted. After extended operation
+ * with high node churn, the bucket array becomes oversized, causing hash
+ * operations to degrade from O(1) to O(log n) or worse.
+ *
+ * Solution: Periodically rebuild the hash table from scratch using only
+ * the current nodes. This resets the bucket array size to match the
+ * current node count, restoring O(1) performance.
+ *
+ * Cost: ~100ms for 20-30K nodes (acceptable for periodic maintenance)
+ * Benefit: Prevents 150s+ pruning degradation after extended runtime
+ */
+int wbpxre_routing_table_rebuild_hash_index(wbpxre_routing_table_t *table) {
+    if (!table) return -1;
+
+    pthread_mutex_lock(&table->update_lock);
+
+    /* Step 1: Collect all current nodes from flat array */
+    int max_nodes = table->all_nodes_capacity;
+    wbpxre_routing_node_t **current_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_nodes);
+    if (!current_nodes) {
+        pthread_mutex_unlock(&table->update_lock);
+        return -1;
+    }
+
+    int node_count = collect_all_nodes_from_flat_array(table, current_nodes, max_nodes);
+
+    /* Step 2: Free old hash table */
+    node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;
+    node_index_map_entry_t *entry, *tmp;
+
+    HASH_ITER(hh, hash_table, entry, tmp) {
+        HASH_DEL(hash_table, entry);
+        free(entry);
+    }
+
+    /* Step 3: Initialize new empty hash table */
+    table->node_index_map = NULL;
+
+    /* Step 4: Rebuild hash table from current nodes */
+    int reindexed = 0;
+    for (int i = 0; i < node_count; i++) {
+        wbpxre_routing_node_t *node = current_nodes[i];
+        if (!node) continue;
+
+        /* Find this node's index in flat array */
+        int flat_index = -1;
+        for (int j = 0; j < table->all_nodes_capacity; j++) {
+            if (table->all_nodes[j] == node) {
+                flat_index = j;
+                break;
+            }
+        }
+
+        if (flat_index < 0) continue;
+
+        /* Create new hash entry */
+        node_index_map_entry_t *new_entry = malloc(sizeof(node_index_map_entry_t));
+        if (!new_entry) continue;
+
+        memcpy(new_entry->node_id, node->id, WBPXRE_NODE_ID_LEN);
+        new_entry->flat_array_index = flat_index;
+
+        /* Add to new hash table */
+        node_index_map_entry_t *new_hash_table = (node_index_map_entry_t *)table->node_index_map;
+        HASH_ADD(hh, new_hash_table, node_id, WBPXRE_NODE_ID_LEN, new_entry);
+        table->node_index_map = new_hash_table;
+
+        reindexed++;
+    }
+
+    free(current_nodes);
+
+    pthread_mutex_unlock(&table->update_lock);
+
+    return reindexed;
+}
+
+/* ============================================================================
  * Get Old Nodes for Verification
  * ============================================================================ */
 

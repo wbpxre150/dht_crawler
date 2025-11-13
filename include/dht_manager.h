@@ -161,6 +161,10 @@ typedef struct {
 
     /* Coordination structure (allocated per pruning operation) */
     pruning_coordination_t *coordination;  /* Shared across all workers */
+
+    /* Hash table rebuild tracking */
+    uint64_t pruning_cycles_completed;     /* Total pruning cycles completed */
+    time_t last_hash_rebuild;              /* Last hash table rebuild time */
 } pruning_status_t;
 
 /* DHT manager context */

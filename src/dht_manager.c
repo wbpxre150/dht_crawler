@@ -1429,6 +1429,32 @@ static void pruning_worker_fn(void *task, void *closure) {
         log_msg(LOG_INFO, "  Routing table now: %d nodes (%d good, %d dubious)",
                 good + dubious, good, dubious);
 
+        /* Increment pruning cycle counter */
+        mgr->pruning_status.pruning_cycles_completed++;
+
+        /* Check if we should rebuild hash index */
+        if (cfg && cfg->async_pruning_hash_rebuild_cycles > 0) {
+            if (mgr->pruning_status.pruning_cycles_completed % cfg->async_pruning_hash_rebuild_cycles == 0) {
+                log_msg(LOG_INFO, "=== Hash Index Rebuild Triggered ===");
+                log_msg(LOG_INFO, "  Cycle: %llu (rebuild every %d cycles)",
+                        (unsigned long long)mgr->pruning_status.pruning_cycles_completed,
+                        cfg->async_pruning_hash_rebuild_cycles);
+
+                time_t rebuild_start = time(NULL);
+                int reindexed = wbpxre_routing_table_rebuild_hash_index(mgr->dht->routing_table);
+                time_t rebuild_duration = time(NULL) - rebuild_start;
+
+                if (reindexed >= 0) {
+                    mgr->pruning_status.last_hash_rebuild = time(NULL);
+                    log_msg(LOG_INFO, "  Nodes re-indexed: %d", reindexed);
+                    log_msg(LOG_INFO, "  Duration: %ld seconds", rebuild_duration);
+                    log_msg(LOG_INFO, "  Hash table bucket array reset to optimal size");
+                } else {
+                    log_msg(LOG_ERROR, "  Hash index rebuild failed!");
+                }
+            }
+        }
+
         if (mgr->pruning_status.coordination) {
             free(mgr->pruning_status.coordination);
             mgr->pruning_status.coordination = NULL;

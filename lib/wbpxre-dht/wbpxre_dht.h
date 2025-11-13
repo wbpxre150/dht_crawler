@@ -586,6 +586,11 @@ int wbpxre_routing_table_drop_nodes_batch(wbpxre_routing_table_t *table,
  * Returns number of nodes removed */
 int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table);
 
+/* Rebuild hash index to prevent uthash bucket array bloat
+ * Clears and rebuilds the node_index_map from the current routing table
+ * Returns number of nodes re-indexed */
+int wbpxre_routing_table_rebuild_hash_index(wbpxre_routing_table_t *table);
+
 /* ============================================================================
  * Worker Queue Functions (implemented in wbpxre_worker.c)
  * ============================================================================ */
