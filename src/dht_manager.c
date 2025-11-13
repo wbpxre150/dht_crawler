@@ -1635,11 +1635,26 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
         return;
     }
 
+    /* Calculate current capacity percentage */
+    double capacity_percent = (current_nodes * 100.0) / cfg->max_routing_table_nodes;
+
+    /* Skip pruning if below minimum capacity threshold */
+    if (capacity_percent < cfg->async_pruning_min_capacity_percent) {
+        log_msg(LOG_DEBUG, "Routing table at %.1f%% capacity (%d/%d nodes), below threshold %.1f%% - skipping pruning",
+                capacity_percent, current_nodes, cfg->max_routing_table_nodes,
+                cfg->async_pruning_min_capacity_percent);
+        return;
+    }
+
+    log_msg(LOG_DEBUG, "Routing table at %.1f%% capacity (%d/%d nodes), above threshold %.1f%% - proceeding with pruning",
+            capacity_percent, current_nodes, cfg->max_routing_table_nodes,
+            cfg->async_pruning_min_capacity_percent);
+
     int nodes_to_remove = current_nodes - cfg->async_pruning_target_nodes;
 
     log_msg(LOG_INFO, "=== Periodic Async Pruning Started ===");
-    log_msg(LOG_INFO, "  Current nodes: %d, Target: %d, To remove: %d",
-            current_nodes, cfg->async_pruning_target_nodes, nodes_to_remove);
+    log_msg(LOG_INFO, "  Current nodes: %d (%.1f%% capacity), Target: %d, To remove: %d",
+            current_nodes, capacity_percent, cfg->async_pruning_target_nodes, nodes_to_remove);
 
     /* Mark pruning as active */
     atomic_store(&mgr->pruning_status.pruning_in_progress, true);

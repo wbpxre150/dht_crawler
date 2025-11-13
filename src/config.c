@@ -124,6 +124,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->async_pruning_log_interval = 5000;      /* Log every 5000 nodes */
     config->async_pruning_workers = 4;              /* 4 worker threads */
     config->async_pruning_delete_chunk_size = 100;  /* 100 nodes per delete chunk */
+    config->async_pruning_min_capacity_percent = 70.0; /* Activate pruning at 70% capacity */
 }
 
 /* Load config from INI-style file */
@@ -371,6 +372,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->async_pruning_workers = atoi(value);
         } else if (strcmp(key, "async_pruning_delete_chunk_size") == 0) {
             config->async_pruning_delete_chunk_size = atoi(value);
+        } else if (strcmp(key, "async_pruning_min_capacity_percent") == 0) {
+            config->async_pruning_min_capacity_percent = atof(value);
+            /* Clamp to valid range [0.0, 100.0] */
+            if (config->async_pruning_min_capacity_percent < 0.0) config->async_pruning_min_capacity_percent = 0.0;
+            if (config->async_pruning_min_capacity_percent > 100.0) config->async_pruning_min_capacity_percent = 100.0;
         }
     }
 
