@@ -1649,7 +1649,8 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
     /* PHASE 1: SINGLE-THREADED COLLECTION */
 
     /* Collect distant nodes */
-    int max_distant = cfg->async_pruning_target_nodes * 2;
+    /* Scale buffer size with routing table size, cap at 100K to prevent excessive memory */
+    int max_distant = current_nodes < 100000 ? current_nodes : 100000;
     wbpxre_routing_node_t **distant_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_distant);
     if (!distant_nodes) {
         log_msg(LOG_ERROR, "Failed to allocate distant nodes array");
@@ -1667,7 +1668,8 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
     );
 
     /* Collect old nodes */
-    int max_old = cfg->async_pruning_target_nodes * 2;
+    /* Scale buffer size with routing table size, cap at 100K to prevent excessive memory */
+    int max_old = current_nodes < 100000 ? current_nodes : 100000;
     wbpxre_routing_node_t **old_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_old);
     if (!old_nodes) {
         log_msg(LOG_ERROR, "Failed to allocate old nodes array");
@@ -1685,6 +1687,19 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
     );
 
     log_msg(LOG_DEBUG, "Collected %d distant nodes and %d old nodes", distant_count, old_count);
+
+    /* Defensive validation - detect buffer overruns */
+    if (distant_count > max_distant) {
+        log_msg(LOG_ERROR, "BUG: distant_count (%d) exceeds max_distant (%d) - clamping",
+                distant_count, max_distant);
+        distant_count = max_distant;
+    }
+
+    if (old_count > max_old) {
+        log_msg(LOG_ERROR, "BUG: old_count (%d) exceeds max_old (%d) - clamping",
+                old_count, max_old);
+        old_count = max_old;
+    }
 
     /* Deduplicate nodes */
     uint8_t (*combined_ids)[WBPXRE_NODE_ID_LEN] = malloc(sizeof(uint8_t[WBPXRE_NODE_ID_LEN]) * (distant_count + old_count));
@@ -1722,8 +1737,16 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
     }
 
     /* Free routing node structures - we only need IDs now */
-    for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
-    for (int i = 0; i < old_count; i++) free(old_nodes[i]);
+    /* Each node is an independent allocation from the collection functions */
+    /* No double-free is possible because deduplication happens via node IDs above */
+    for (int i = 0; i < distant_count; i++) {
+        free(distant_nodes[i]);
+    }
+
+    for (int i = 0; i < old_count; i++) {
+        free(old_nodes[i]);
+    }
+
     free(distant_nodes);
     free(old_nodes);
 
