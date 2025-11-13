@@ -1420,7 +1420,11 @@ static void pruning_worker_fn(void *task, void *closure) {
         int total_submitted = atomic_load(&mgr->pruning_status.total_submitted);
         int total_processed = atomic_load(&mgr->pruning_status.total_processed);
 
+        /* Increment pruning cycle counter */
+        mgr->pruning_status.pruning_cycles_completed++;
+
         log_msg(LOG_INFO, "=== Async Pruning Completed ===");
+        log_msg(LOG_INFO, "  Cycle: %llu", (unsigned long long)mgr->pruning_status.pruning_cycles_completed);
         log_msg(LOG_INFO, "  Workers: %d", work->total_workers);
         log_msg(LOG_INFO, "  Nodes submitted: %d", total_submitted);
         log_msg(LOG_INFO, "  Nodes dropped: %d", total_processed);
@@ -1429,8 +1433,9 @@ static void pruning_worker_fn(void *task, void *closure) {
         log_msg(LOG_INFO, "  Routing table now: %d nodes (%d good, %d dubious)",
                 good + dubious, good, dubious);
 
-        /* Increment pruning cycle counter */
-        mgr->pruning_status.pruning_cycles_completed++;
+        log_msg(LOG_DEBUG, "Pruning cycle %llu completed (rebuild every %d cycles)",
+                (unsigned long long)mgr->pruning_status.pruning_cycles_completed,
+                cfg ? cfg->async_pruning_hash_rebuild_cycles : 0);
 
         /* Check if we should rebuild hash index */
         if (cfg && cfg->async_pruning_hash_rebuild_cycles > 0) {
