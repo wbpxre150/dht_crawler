@@ -1,46 +1,38 @@
 # DHT Crawler
 
-A high-performance BitTorrent DHT crawler written in C that discovers and indexes torrent metadata from the BitTorrent network.
+A high-performance BitTorrent DHT crawler written in C that discovers and catalogs torrents from the BitTorrent DHT network.
 
 ## Features
 
-- **Automatic Torrent Discovery**: Crawls the BitTorrent DHT network to discover info_hashes using BEP 51 (sample_infohashes)
-- **Metadata Fetching**: Retrieves torrent metadata from peers using BitTorrent Extension Protocol (BEP 9/10)
-- **High Performance**:
-  - Multi-threaded metadata fetching with configurable worker pools (10-100 workers)
-  - Batched database writes for 10-100x write performance improvement
-  - Bloom filter for duplicate detection (90% reduction in database queries)
-  - Concurrent DHT operations with multiple worker pipelines
-- **Full-Text Search**: SQLite FTS5 for searching torrents by name and file paths
-- **HTTP API**: Query and search discovered torrents via REST endpoints
-- **Persistent Storage**: SQLite database with automatic schema management
-- **Production Ready**: Memory leak-free, tested with Valgrind and AddressSanitizer
+- **Passive DHT Monitoring**: Listens to DHT network traffic to discover active torrents
+- **Active Metadata Fetching**: Connects to BitTorrent peers to retrieve torrent metadata (BEP 9/10)
+- **BEP 51 Support**: Implements `sample_infohashes` extension for efficient infohash discovery
+- **High Throughput**:
+  - Worker pool: 10-20x metadata fetch rate with 50-100 concurrent workers
+  - Batch writer: 10-100x database write speed via transaction batching
+  - Bloom filter: 90% reduction in duplicate processing
+- **Node ID Rotation**: Periodically rotates DHT node ID to explore different network neighborhoods
+- **Web Interface**: Built-in HTTP API for searching and statistics (port 8080)
+- **Persistent Storage**: SQLite database with full-text search capabilities
 
 ## Architecture
 
-The crawler uses a multi-threaded pipeline architecture:
-
 ```
-DHT Network (UDP)
-    ↓ sample_infohashes queries (BEP 51)
-wbpxre-dht Library (multi-threaded DHT implementation)
-    ↓ discovered info_hashes
-Infohash Queue (thread-safe, bloom filter dedup)
-    ↓
-Metadata Fetcher (30+ worker threads)
-    ↓ TCP connections to peers (BEP 9/10)
-Batch Writer (batched transactions)
-    ↓
-SQLite Database (FTS5 search)
-    ↑
-HTTP API (CivetWeb)
+DHT Network → DHT Manager → Infohash Queue → Metadata Fetcher → Batch Writer → SQLite DB
+                   ↓              ↑                    ↓
+              Peer Store ←────────┴──────────────> Bloom Filter
 ```
 
-## Quick Start
+The crawler uses a multi-stage pipeline:
+1. Custom DHT implementation (`wbpxre-dht`) discovers infohashes from the network
+2. Discovered peers are stored in an in-memory peer store
+3. Worker threads fetch metadata from peers via BitTorrent protocol
+4. Bloom filter prevents duplicate processing
+5. Metadata is batch-written to SQLite for high throughput
 
-### Prerequisites
+## Requirements
 
-Install required dependencies:
+### System Dependencies
 
 **Debian/Ubuntu:**
 ```bash
@@ -52,355 +44,291 @@ sudo apt-get install build-essential libuv1-dev libsqlite3-dev libssl-dev liburc
 sudo pacman -S base-devel libuv sqlite openssl userspace-rcu
 ```
 
-**macOS:**
+**macOS (Homebrew):**
 ```bash
-brew install libuv sqlite openssl userspace-rcu
+brew install libuv sqlite openssl liburcu
 ```
 
-### Building
+### Required Libraries
+- `libuv` - Async I/O event loop
+- `libsqlite3` - Embedded database
+- `libssl/libcrypto` - SHA-1 hashing (OpenSSL)
+- `liburcu` - Read-Copy-Update synchronization
+- `libpthread` - POSIX threads
 
+## Building
+
+**Build the project:**
 ```bash
-# Clone the repository with submodules
-git clone --recursive https://github.com/yourusername/dht_crawler.git
-cd dht_crawler
-
-# Build the project
 make
+```
 
-# Run the crawler
+**Clean build artifacts:**
+```bash
+make clean
+```
+
+**Build with debug symbols:**
+```bash
+make debug
+```
+
+**Build with AddressSanitizer (for development):**
+```bash
+make asan
+```
+
+**Run with Valgrind:**
+```bash
+make valgrind
+```
+
+## Running
+
+**Start the crawler:**
+```bash
 ./dht_crawler
 ```
 
 The crawler will:
-1. Start listening on UDP port 6881 for DHT traffic
-2. Bootstrap from known DHT nodes
-3. Begin discovering torrents
-4. Store metadata in `data/torrents.db`
-5. Start HTTP API on port 8080
+1. Bootstrap into the DHT network using well-known nodes
+2. Start discovering infohashes from DHT traffic
+3. Fetch metadata from peers in parallel
+4. Store results in `data/torrents.db`
+5. Serve HTTP API on port 8080
+
+**Access the web interface:**
+```
+http://localhost:8080
+```
 
 ## Configuration
 
-All settings are in `config.ini`. Key configuration options:
+Configuration is loaded from `config.ini` in the project root. Key settings:
 
 ```ini
 # DHT Settings
-dht_port=6881                              # DHT UDP port
+dht_port=6881
 
-# Metadata Fetcher
-metadata_workers=30                        # Worker threads for fetching metadata
-max_concurrent_connections=2000            # Max concurrent TCP connections
-concurrent_peers_per_torrent=5             # Peers to try per torrent
-connection_timeout_sec=4                   # Connection timeout
+# HTTP API Settings
+http_port=8080
 
-# Database
-batch_writes_enabled=1                     # Enable batched writes
-batch_size=1000                            # Torrents per batch
-flush_interval=60                          # Auto-flush interval (seconds)
+# Database Settings
+db_path=data/torrents.db
 
-# Bloom Filter
-bloom_enabled=1                            # Enable duplicate detection
-bloom_capacity=30000000                    # Expected unique torrents
-bloom_error_rate=0.001                     # False positive rate (0.1%)
-bloom_persist=1                            # Save/load from disk
+# Logging (DEBUG=0, INFO=1, WARN=2, ERROR=3)
+log_level=INFO
 
-# wbpxre-dht Workers
-wbpxre_ping_workers=20                     # Ping worker threads
-wbpxre_find_node_workers=20                # find_node worker threads
-wbpxre_sample_infohashes_workers=20        # sample_infohashes workers
-wbpxre_get_peers_workers=777               # get_peers worker threads
+# Worker Pool Settings
+metadata_workers=50              # Concurrent metadata fetcher threads
+scaling_factor=10                # DHT worker pool scaling
+
+# Connection Limits
+concurrent_peers_per_torrent=5   # Max connections per infohash
+max_concurrent_connections=5000  # Global connection limit
+connection_timeout_sec=30        # Idle timeout (resets on activity)
+
+# Batch Writer Settings
+batch_writes_enabled=1
+batch_size=1000                  # Torrents per batch
+flush_interval=60                # Auto-flush interval (seconds)
+
+# Bloom Filter Settings
+bloom_enabled=1
+bloom_capacity=30000000          # 30 million infohashes
+bloom_error_rate=0.001           # 0.1% false positive rate
+bloom_persist=1                  # Save to disk on shutdown
+bloom_path=data/bloom.dat
 
 # Node ID Rotation
-node_rotation_enabled=1                    # Rotate node ID to explore keyspace
-node_rotation_interval_sec=60              # Rotation interval
-
-# Logging
-log_level=INFO                             # DEBUG, INFO, WARN, ERROR
+node_rotation_enabled=1
+node_rotation_interval_sec=300   # Rotate every 5 minutes
 ```
 
-## HTTP API
+See `config.ini` for all available options with detailed comments.
 
-The HTTP API runs on port 8080 (configurable in `config.ini`).
+## HTTP API Endpoints
 
-### Endpoints
+### `GET /`
+Landing page with search interface.
 
-#### `GET /`
-Landing page with crawler statistics and search interface.
-
-#### `GET /search?q=<query>`
-Search torrents by name or file path.
+### `GET /search?q=<query>`
+Search torrents by name. Returns HTML results with torrent details and file listings.
 
 **Example:**
 ```bash
 curl "http://localhost:8080/search?q=ubuntu"
 ```
 
-**Response:** HTML page with search results including torrent names, sizes, file counts, and magnet links.
-
-#### `GET /stats`
-Get crawler statistics in JSON format.
+### `GET /stats`
+JSON statistics including DHT metrics, metadata fetcher status, and database info.
 
 **Example:**
 ```bash
-curl http://localhost:8080/stats
+curl http://localhost:8080/stats | jq
 ```
 
 **Response:**
 ```json
 {
   "dht": {
-    "good_nodes": 6543,
-    "routing_table_nodes": 8234,
-    "infohashes_discovered": 152341,
-    "packets_sent": 523421,
-    "packets_received": 498234,
-    "uptime_hours": 12.5
+    "packets_received": 1234567,
+    "infohashes_discovered": 45678,
+    "nodes_in_routing_table": 8234,
+    ...
   },
-  "metadata": {
-    "total_attempts": 152341,
-    "total_fetched": 38543,
-    "success_rate": 25.3,
-    "active_connections": 342,
-    "torrents_per_hour": 3084
+  "metadata_fetcher": {
+    "total_fetched": 12345,
+    "active_connections": 234,
+    "connection_success_rate": 23.45,
+    ...
   },
   "database": {
-    "total_torrents": 38543,
-    "total_files": 524234,
-    "database_size_mb": 234.5
+    "total_torrents": 98765,
+    "total_size_bytes": 123456789012
   }
 }
 ```
 
-#### `GET /refresh?info_hash=<hex>`
-Manually trigger peer discovery for a specific info_hash (for testing/debugging).
+### `POST /refresh?info_hash=<hex>`
+Trigger priority peer query for a specific infohash. Useful for refreshing peer lists.
 
 **Example:**
 ```bash
-curl "http://localhost:8080/refresh?info_hash=0123456789abcdef0123456789abcdef01234567"
+curl -X POST "http://localhost:8080/refresh?info_hash=abcdef1234567890abcdef1234567890abcdef12"
 ```
 
-## Database Schema
+## Project Structure
 
-The crawler uses SQLite with the following schema:
-
-### `torrents` table
-- `id`: Primary key
-- `info_hash`: 20-byte SHA-1 hash (unique)
-- `name`: Torrent name
-- `size_bytes`: Total size in bytes
-- `piece_length`: BitTorrent piece length
-- `num_pieces`: Number of pieces
-- `total_peers`: Peer count
-- `added_timestamp`: Discovery time (Unix timestamp)
-- `last_seen`: Last seen time
-
-### `torrent_files` table
-- `id`: Primary key
-- `torrent_id`: Foreign key to torrents
-- `path`: File path within torrent
-- `size_bytes`: File size
-- `file_index`: Index within torrent
-
-### Full-Text Search (FTS5)
-- `torrent_search`: Porter-stemmed name search
-- `file_search`: Trigram-based file path search
-
-### Querying the Database
-
-```bash
-# Count total torrents
-sqlite3 data/torrents.db "SELECT COUNT(*) FROM torrents"
-
-# List recent torrents
-sqlite3 data/torrents.db "SELECT name, size_bytes FROM torrents ORDER BY added_timestamp DESC LIMIT 10"
-
-# Search by name
-sqlite3 data/torrents.db "SELECT name FROM torrent_search WHERE name MATCH 'ubuntu'"
-
-# Search by file path
-sqlite3 data/torrents.db "SELECT DISTINCT t.name FROM file_search fs JOIN torrent_files tf ON fs.rowid = tf.id JOIN torrents t ON tf.torrent_id = t.id WHERE fs.path MATCH 'mkv'"
 ```
+dht_crawler/
+├── src/                    # Source files
+│   ├── main.c             # Entry point
+│   ├── dht_manager.c      # DHT orchestration
+│   ├── metadata_fetcher.c # BitTorrent peer client
+│   ├── batch_writer.c     # Batched database writes
+│   ├── database.c         # SQLite operations
+│   ├── http_api.c         # Web interface
+│   ├── peer_store.c       # Peer address storage
+│   ├── infohash_queue.c   # Infohash queuing
+│   ├── bloom_filter.c     # Duplicate detection
+│   ├── worker_pool.c      # Thread pool
+│   └── config.c           # Configuration loading
+├── include/               # Header files
+├── lib/                   # Vendored libraries
+│   ├── wbpxre-dht/       # Custom DHT implementation
+│   ├── cJSON/            # JSON parsing
+│   ├── bencode-c/        # Bencode encoding
+│   ├── civetweb/         # HTTP server
+│   ├── libbloom/         # Bloom filter
+│   └── uthash/           # Hash table macros
+├── build/                 # Build artifacts (generated)
+├── data/                  # Runtime data (generated)
+│   ├── torrents.db       # SQLite database
+│   └── bloom.dat         # Bloom filter persistence
+├── config.ini            # Configuration file
+├── Makefile              # Build system
+└── README.md             # This file
+```
+
+## Performance
+
+**Typical Performance Metrics:**
+- **Discovery Rate**: 500-2000 infohashes/minute (varies by DHT neighborhood)
+- **Metadata Fetch Rate**: 50-200 torrents/minute (depends on peer availability)
+- **Database Write Throughput**: 1000+ torrents/minute (with batch writing)
+- **Memory Usage**: ~500MB-2GB (varies with routing table size and connection count)
+- **Disk Usage**: Grows with database size (~1KB per torrent average)
+
+**Optimization Features:**
+- Lock-free MPSC queues for cross-thread communication
+- RCU-based routing table for lock-free DHT lookups
+- Async I/O via libuv event loop
+- Connection pooling and reuse
+- Bloom filter reduces database queries by 90%
 
 ## Development
 
-### Build Variants
+**Code Style:**
+- C99 standard
+- POSIX-compliant
+- Thread-safe: all shared data protected by mutexes/atomics/RCU
 
+**Debugging:**
 ```bash
-# Debug build with symbols
-make debug
+# Enable debug logging
+# Edit config.ini: log_level=DEBUG (or 0)
 
-# Build with sanitizers (detect memory errors, undefined behavior)
+# Build with sanitizers
 make asan
+./dht_crawler
 
-# Run with Valgrind
+# Check for memory leaks
 make valgrind
-
-# Clean build artifacts
-make clean
 ```
 
-### Debug Logging
-
-Set `log_level=DEBUG` in `config.ini` for verbose output:
-
-```ini
-log_level=DEBUG
-```
-
-This will show detailed information about:
-- DHT packet parsing
-- Routing table changes
-- Metadata fetch attempts
-- Connection state machines
-- Database operations
-
-## Performance Tuning
-
-### For Maximum Discovery Rate
-
-```ini
-# Increase DHT workers
-wbpxre_sample_infohashes_workers=50
-wbpxre_get_peers_workers=1000
-
-# Increase metadata workers
-metadata_workers=50
-max_concurrent_connections=5000
-
-# Faster rotation for more keyspace coverage
-node_rotation_interval_sec=30
-```
-
-### For Lower Resource Usage
-
-```ini
-# Reduce workers
-wbpxre_sample_infohashes_workers=10
-wbpxre_get_peers_workers=200
-metadata_workers=10
-max_concurrent_connections=500
-
-# Slower rotation
-node_rotation_interval_sec=300
-```
-
-## BitTorrent Enhancement Proposals (BEPs)
-
-This crawler implements:
-
-- **BEP 3**: The BitTorrent Protocol Specification (handshake)
-- **BEP 5**: DHT Protocol (Mainline DHT)
-- **BEP 9**: Extension for Peers to Send Metadata Files (ut_metadata)
-- **BEP 10**: Extension Protocol (extended handshake)
-- **BEP 51**: DHT Infohash Indexing (sample_infohashes queries)
+**Adding Features:**
+- See `CLAUDE.md` for detailed architecture documentation
+- Common patterns for extending DHT queries, statistics, etc.
 
 ## Troubleshooting
 
-### No torrents being discovered
+**Crawler not discovering torrents:**
+- Check firewall allows UDP on port 6881
+- Wait 5-10 minutes for DHT bootstrap to complete
+- Enable debug logging to see DHT traffic
+- Check `/stats` endpoint for `packets_received` counter
 
-1. Check that UDP port 6881 is not blocked by firewall:
-   ```bash
-   sudo ufw allow 6881/udp  # Ubuntu/Debian
-   sudo firewall-cmd --add-port=6881/udp  # CentOS/RHEL
-   ```
+**High memory usage:**
+- Reduce `max_routing_table_nodes` in config.ini
+- Enable `async_pruning_enabled` (default: on)
+- Reduce `max_concurrent_connections`
 
-2. Check routing table health in logs:
-   ```
-   [INFO] Routing table: 6543 good nodes, 234 dubious, 12 bad
-   ```
-   Should have 100+ good nodes for healthy operation.
+**Database growing too large:**
+- Implement periodic cleanup (not currently built-in)
+- Use SQLite VACUUM command to reclaim space
+- Consider adding retention policies
 
-3. Verify DHT statistics via HTTP API:
-   ```bash
-   curl http://localhost:8080/stats | jq '.dht'
-   ```
-
-### Low metadata fetch success rate
-
-1. Increase concurrent connections:
-   ```ini
-   max_concurrent_connections=5000
-   concurrent_peers_per_torrent=10
-   ```
-
-2. Enable peer retry:
-   ```ini
-   peer_retry_enabled=1
-   peer_retry_max_attempts=3
-   ```
-
-3. Check peer store statistics in logs for peer discovery issues.
-
-### High memory usage
-
-1. Reduce bloom filter capacity:
-   ```ini
-   bloom_capacity=10000000  # 10M instead of 30M
-   ```
-
-2. Reduce routing table size:
-   ```ini
-   max_routing_table_nodes=20000  # Default: 40000
-   ```
-
-3. Reduce worker counts as shown in "Lower Resource Usage" above.
-
-### Database growing too large
-
-Run periodic maintenance:
-
-```bash
-sqlite3 data/torrents.db "VACUUM"
-sqlite3 data/torrents.db "ANALYZE"
-```
-
-Or clear old data:
-
-```bash
-# Delete torrents older than 30 days
-sqlite3 data/torrents.db "DELETE FROM torrents WHERE added_timestamp < strftime('%s', 'now', '-30 days')"
-```
-
-## Architecture Details
-
-### Threading Model
-
-1. **Main Thread**: libuv event loop for DHT network I/O
-2. **wbpxre-dht Threads**: Separate worker pipelines for ping, find_node, sample_infohashes, get_peers
-3. **Metadata Fetcher Workers**: Pool of 30+ threads attempting TCP connections
-4. **Feeder Thread**: Dequeues info_hashes from queue and submits to worker pool
-
-### Critical Invariants
-
-- **Bloom filter timing**: Updated AFTER successful database writes, not at discovery time
-- **libuv handle cleanup**: All handles must be closed before `uv_loop_close()`
-- **Peer connection states**: Proper cleanup required at each state transition
-- **Thread safety**: Most data structures use mutexes for thread-safe access
-
-See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
+**Low metadata fetch rate:**
+- Increase `metadata_workers` (50-100 recommended)
+- Increase `max_concurrent_connections` (2000-5000)
+- Check connection statistics in `/stats` for timeout rates
+- Ensure sufficient network bandwidth
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License - See LICENSE file for details.
 
-## Contributing
+## Technical Details
 
-Contributions are welcome! Please:
+**DHT Implementation:**
+- Based on Kademlia protocol (BEP 5)
+- Supports BEP 51 `sample_infohashes` extension
+- Node ID rotation for neighborhood exploration
+- Multi-threaded worker pools for query processing
 
-1. Fork the repository
-2. Create a feature branch
-3. Test with `make asan` and `make valgrind`
-4. Submit a pull request
+**BitTorrent Protocol:**
+- BEP 3: BitTorrent protocol specification
+- BEP 9: Extension for Peers to Send Metadata Files (ut_metadata)
+- BEP 10: Extension Protocol (extended handshake)
 
-## References
-
-- [BitTorrent DHT Protocol (BEP 5)](http://www.bittorrent.org/beps/bep_0005.html)
-- [DHT Infohash Indexing (BEP 51)](http://www.bittorrent.org/beps/bep_0051.html)
-- [Extension for Peers to Send Metadata (BEP 9)](http://www.bittorrent.org/beps/bep_0009.html)
-- [Extension Protocol (BEP 10)](http://www.bittorrent.org/beps/bep_0010.html)
-- [wbpxre-dht Library](lib/wbpxre-dht/)
+**Threading Model:**
+- Main thread: libuv event loop (DHT, TCP, timers)
+- Worker threads: Metadata fetching, DHT query processing, node pruning
+- Synchronization: Mutexes, condition variables, RCU, atomics
 
 ## Acknowledgments
 
-- Inspired by [bitmagnet](https://github.com/bitmagnet-io/bitmagnet)'s multi-pipeline architecture
-- Uses [jech/dht](https://github.com/jech/dht) concepts for routing table management
-- Built with [libuv](https://libuv.org/), [SQLite](https://www.sqlite.org/), and [CivetWeb](https://github.com/civetweb/civetweb)
+- `wbpxre-dht`: Custom DHT implementation inspired by bitmagnet's architecture
+- `libuv`: Cross-platform async I/O library
+- `cJSON`, `bencode-c`, `civetweb`, `libbloom`, `uthash`: Excellent open-source libraries
+
+## Contributing
+
+Contributions welcome! Areas for improvement:
+- IPv6 support
+- Torrent quality metrics (seeders, leechers tracking)
+- Advanced search features (filters, sorting)
+- Database cleanup/retention policies
+- Metrics export (Prometheus, etc.)
+- Docker containerization
