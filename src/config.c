@@ -122,6 +122,8 @@ void config_init_defaults(crawler_config_t *config) {
     config->async_pruning_old_percent = 30.0;       /* Remove 30% of old nodes */
     config->async_pruning_batch_size = 1000;        /* 1000 nodes per batch */
     config->async_pruning_log_interval = 5000;      /* Log every 5000 nodes */
+    config->async_pruning_workers = 4;              /* 4 worker threads */
+    config->async_pruning_delete_chunk_size = 100;  /* 100 nodes per delete chunk */
 }
 
 /* Load config from INI-style file */
@@ -365,6 +367,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->async_pruning_batch_size = atoi(value);
         } else if (strcmp(key, "async_pruning_log_interval") == 0) {
             config->async_pruning_log_interval = atoi(value);
+        } else if (strcmp(key, "async_pruning_workers") == 0) {
+            config->async_pruning_workers = atoi(value);
+        } else if (strcmp(key, "async_pruning_delete_chunk_size") == 0) {
+            config->async_pruning_delete_chunk_size = atoi(value);
         }
     }
 

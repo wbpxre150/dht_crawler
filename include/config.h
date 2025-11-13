@@ -114,6 +114,8 @@ typedef struct {
     double async_pruning_old_percent;    /* Percentage of old nodes to remove (0.0-100.0) */
     int async_pruning_batch_size;        /* Nodes per batch for drop operations */
     int async_pruning_log_interval;      /* Log progress every N nodes */
+    int async_pruning_workers;           /* Number of worker threads (default: 4) */
+    int async_pruning_delete_chunk_size; /* Nodes per delete chunk (default: 100) */
 } crawler_config_t;
 
 /* Initialize config with default values */
