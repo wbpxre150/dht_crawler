@@ -5,11 +5,19 @@
  */
 
 #include "wbpxre_dht.h"
+#include "uthash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <urcu.h>
 #include <urcu/rculist.h>
+
+/* Hash map entry: node_id → flat array index */
+typedef struct {
+    uint8_t node_id[WBPXRE_NODE_ID_LEN];  /* Key (20 bytes) */
+    int flat_array_index;                  /* Value: index in all_nodes[] */
+    UT_hash_handle hh;                     /* uthash handle */
+} node_index_map_entry_t;
 
 /* ============================================================================
  * AVL Tree Operations
@@ -247,6 +255,9 @@ wbpxre_routing_table_t *wbpxre_routing_table_create(int max_nodes) {
         return NULL;
     }
 
+    /* Initialize hash map to NULL (uthash convention) */
+    table->node_index_map = NULL;
+
     return table;
 }
 
@@ -262,6 +273,15 @@ void wbpxre_routing_table_destroy(wbpxre_routing_table_t *table) {
 
     /* Wait for all readers to finish (CRITICAL for RCU safety) */
     synchronize_rcu();
+
+    /* Free hash map entries */
+    node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;
+    node_index_map_entry_t *entry, *tmp;
+
+    HASH_ITER(hh, hash_table, entry, tmp) {
+        HASH_DEL(hash_table, entry);
+        free(entry);
+    }
 
     /* Now safe to free all nodes */
     free_routing_tree(table->root);
@@ -317,6 +337,18 @@ static void add_node_to_flat_array(wbpxre_routing_table_t *table, wbpxre_routing
     for (int i = 0; i < table->all_nodes_capacity; i++) {
         if (table->all_nodes[i] == NULL) {
             table->all_nodes[i] = node;
+
+            /* Add mapping to hash table */
+            node_index_map_entry_t *entry = malloc(sizeof(node_index_map_entry_t));
+            if (entry) {
+                memcpy(entry->node_id, node->id, WBPXRE_NODE_ID_LEN);
+                entry->flat_array_index = i;
+
+                node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;
+                HASH_ADD(hh, hash_table, node_id, WBPXRE_NODE_ID_LEN, entry);
+                table->node_index_map = hash_table;
+            }
+
             return;
         }
     }
@@ -326,11 +358,23 @@ static void add_node_to_flat_array(wbpxre_routing_table_t *table, wbpxre_routing
 static void remove_node_from_flat_array(wbpxre_routing_table_t *table, const uint8_t *node_id) {
     if (!table || !node_id || !table->all_nodes) return;
 
-    for (int i = 0; i < table->all_nodes_capacity; i++) {
-        if (table->all_nodes[i] && memcmp(table->all_nodes[i]->id, node_id, WBPXRE_NODE_ID_LEN) == 0) {
-            table->all_nodes[i] = NULL;
-            return;
+    /* O(1) hash lookup */
+    node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;
+    node_index_map_entry_t *entry = NULL;
+
+    HASH_FIND(hh, hash_table, node_id, WBPXRE_NODE_ID_LEN, entry);
+
+    if (entry) {
+        /* Remove from flat array */
+        int index = entry->flat_array_index;
+        if (index >= 0 && index < table->all_nodes_capacity) {
+            table->all_nodes[index] = NULL;
         }
+
+        /* Remove from hash table */
+        HASH_DEL(hash_table, entry);
+        table->node_index_map = hash_table;
+        free(entry);
     }
 }
 

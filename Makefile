@@ -2,7 +2,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99 -D_POSIX_C_SOURCE=200809L
-INCLUDES = -Iinclude -Ilib/wbpxre-dht -Ilib/bencode-c -Ilib/cJSON -Ilib/civetweb/include -Ilib/libbloom
+INCLUDES = -Iinclude -Ilib/wbpxre-dht -Ilib/bencode-c -Ilib/cJSON -Ilib/civetweb/include -Ilib/libbloom -Ilib/uthash/src
 LDFLAGS = -luv -lsqlite3 -lpthread -lssl -lcrypto -ldl -lm -lurcu lib/libbloom/build/libbloom.a
 
 # Directories

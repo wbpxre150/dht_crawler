@@ -156,6 +156,9 @@ typedef struct {
     wbpxre_routing_node_t **all_nodes;  /* RCU-protected array of pointers to all nodes */
     int all_nodes_capacity;              /* Capacity of all_nodes array */
     int iteration_offset;                /* Rotating offset for fair iteration */
+
+    /* Hash map for O(1) flat array index lookups */
+    void *node_index_map;                /* node_index_map_entry_t* hash table (opaque to avoid exposing uthash) */
 } wbpxre_routing_table_t;
 
 /* Peer info */

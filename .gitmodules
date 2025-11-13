@@ -10,3 +10,6 @@
 [submodule "lib/libbloom"]
 	path = lib/libbloom
 	url = https://github.com/jvirkki/libbloom.git
+[submodule "lib/uthash"]
+	path = lib/uthash
+	url = https://github.com/troydhanson/uthash.git
