@@ -77,9 +77,6 @@ peer_store_t* peer_store_init(size_t max_hashes, size_t max_peers_per_hash,
     store->lookups_success = 0;
     store->lookups_miss = 0;
 
-    log_msg(LOG_INFO, "Peer store initialized (max_hashes=%zu, max_peers=%zu, expiry=%ds)",
-            max_hashes, max_peers_per_hash, peer_expiry_seconds);
-
     return store;
 }
 
@@ -417,8 +414,6 @@ void peer_store_shutdown(peer_store_t *store) {
      * DHT worker threads check this flag and will exit operations quickly
      * This prevents deadlock where shutdown() blocks waiting for lock held by DHT callback */
     store->shutdown = true;
-
-    log_msg(LOG_INFO, "Peer store shutdown initiated (flag set without lock to avoid deadlock)");
 }
 
 /* Cleanup and free peer store */
@@ -435,9 +430,7 @@ void peer_store_cleanup(peer_store_t *store) {
 
     pthread_mutex_t *mutex = (pthread_mutex_t*)store->mutex;
 
-    log_msg(LOG_INFO, "Peer store cleanup initiated, acquiring mutex...");
     pthread_mutex_lock(mutex);
-    log_msg(LOG_INFO, "Peer store cleanup mutex acquired");
 
     /* Set shutdown flag to prevent new operations */
     store->shutdown = true;
@@ -482,14 +475,10 @@ void peer_store_cleanup(peer_store_t *store) {
     /* Unlock before destroying synchronization primitives */
     pthread_mutex_unlock(mutex);
 
-    log_msg(LOG_INFO, "Peer store cleaned up successfully");
-
     /* Destroy mutex */
     pthread_mutex_destroy(mutex);
     free(mutex);
 
     /* Free the store structure */
     free(store);
-
-    log_msg(LOG_INFO, "Peer store cleaned up");
 }

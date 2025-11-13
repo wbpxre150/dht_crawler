@@ -106,7 +106,6 @@ void database_set_bloom(database_t *db, bloom_filter_t *bloom) {
         return;
     }
     db->bloom = bloom;
-    log_msg(LOG_INFO, "Bloom filter connected to database for write tracking");
 }
 
 /* Create database schema */
@@ -171,7 +170,6 @@ int database_create_schema(database_t *db) {
         return -1;
     }
 
-    log_msg(LOG_INFO, "Database schema created successfully");
     return 0;
 }
 
@@ -414,7 +412,6 @@ int database_vacuum(database_t *db) {
         return -1;
     }
 
-    log_msg(LOG_INFO, "Running VACUUM...");
     char *err_msg = NULL;
     int rc = sqlite3_exec(db->db, "VACUUM;", NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
@@ -432,7 +429,6 @@ int database_analyze(database_t *db) {
         return -1;
     }
 
-    log_msg(LOG_INFO, "Running ANALYZE...");
     char *err_msg = NULL;
     int rc = sqlite3_exec(db->db, "ANALYZE;", NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
@@ -450,7 +446,6 @@ int database_optimize(database_t *db) {
         return -1;
     }
 
-    log_msg(LOG_INFO, "Running PRAGMA optimize...");
     char *err_msg = NULL;
     int rc = sqlite3_exec(db->db, "PRAGMA optimize;", NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {

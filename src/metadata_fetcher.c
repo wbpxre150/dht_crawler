@@ -236,17 +236,6 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     }
     fetcher->async_handle.data = fetcher;
 
-    log_msg(LOG_INFO, "Metadata fetcher initialized:");
-    log_msg(LOG_INFO, "  Workers: %d", fetcher->num_workers);
-    log_msg(LOG_INFO, "  Queue capacity: %zu", queue_capacity);
-    log_msg(LOG_INFO, "  Max concurrent per infohash: %d", fetcher->max_concurrent_per_infohash);
-    log_msg(LOG_INFO, "  Max global connections: %d", fetcher->max_global_connections);
-    log_msg(LOG_INFO, "  Connection idle timeout: %d ms (resets on activity)", fetcher->connection_timeout_ms);
-    if (fetcher->max_connection_lifetime_ms > 0) {
-        log_msg(LOG_INFO, "  Max connection lifetime: %d ms", fetcher->max_connection_lifetime_ms);
-    } else {
-        log_msg(LOG_INFO, "  Max connection lifetime: unlimited");
-    }
     return 0;
 }
 
@@ -439,12 +428,6 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
 
     /* Cleanup batch writer (will flush any remaining items) */
     if (fetcher->batch_writer) {
-        size_t batch_size, batch_capacity;
-        uint64_t total_written, total_flushes;
-        batch_writer_stats(fetcher->batch_writer, &batch_size, &batch_capacity,
-                          &total_written, &total_flushes);
-        log_msg(LOG_INFO, "Batch writer stats: %lu written, %lu flushes, %zu pending",
-                total_written, total_flushes, batch_size);
         batch_writer_cleanup(fetcher->batch_writer);
         fetcher->batch_writer = NULL;
     }

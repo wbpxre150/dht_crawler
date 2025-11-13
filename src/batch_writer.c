@@ -270,7 +270,6 @@ int batch_writer_flush(batch_writer_t *writer) {
     uv_mutex_lock(&writer->mutex);
     writer->total_written += written;
     writer->total_flushes++;
-    size_t total = writer->total_written;
 
     /* Update hourly statistics - record torrents written in current minute */
     if (written > 0) {
@@ -287,8 +286,6 @@ int batch_writer_flush(batch_writer_t *writer) {
     }
 
     uv_mutex_unlock(&writer->mutex);
-
-    log_msg(LOG_INFO, "Batch flush: %zu items written (total: %lu)", written, total);
 
     return (ret == 0) ? 0 : -1;
 }

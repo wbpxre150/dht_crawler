@@ -635,7 +635,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         if (!mgr->peer_retry_tracker) {
             log_msg(LOG_WARN, "Failed to initialize peer retry tracker");
         } else {
-            log_msg(LOG_INFO, "Peer retry tracker initialized (max_attempts=%d, threshold=%d, delay=%dms)",
+            log_msg(LOG_DEBUG, "Peer retry tracker initialized (max_attempts=%d, threshold=%d, delay=%dms)",
                     cfg->peer_retry_max_attempts, cfg->peer_retry_min_threshold, cfg->peer_retry_delay_ms);
 
             /* Initialize peer retry timer (checks every 100ms for ready retries) */
@@ -651,7 +651,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         }
     } else {
         mgr->peer_retry_tracker = NULL;
-        log_msg(LOG_INFO, "Peer retry disabled");
+        log_msg(LOG_DEBUG, "Peer retry disabled");
     }
 
     /* Initialize async pruning infrastructure - Multi-threaded worker pool */
@@ -677,7 +677,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
             mgr->pruning_status.started_at = 0;
             mgr->pruning_status.completed_at = 0;
 
-            log_msg(LOG_INFO, "Initialized pruning worker pool with %d workers", num_workers);
+            log_msg(LOG_DEBUG, "Initialized pruning worker pool with %d workers", num_workers);
         }
     } else {
         mgr->pruning_worker_pool = NULL;
@@ -761,10 +761,10 @@ int dht_manager_start(dht_manager_t *mgr) {
             return -1;
         }
 
-        log_msg(LOG_INFO, "✓ Node ID rotation ENABLED (interval: %d seconds)",
+        log_msg(LOG_DEBUG, "Node ID rotation ENABLED (interval: %d seconds)",
                 mgr->node_rotation_interval_sec);
     } else {
-        log_msg(LOG_INFO, "✗ Node ID rotation DISABLED");
+        log_msg(LOG_DEBUG, "Node ID rotation DISABLED");
     }
 
     /* Start peer retry timer if enabled */
@@ -797,10 +797,10 @@ int dht_manager_start(dht_manager_t *mgr) {
             log_msg(LOG_ERROR, "Failed to start async pruning timer: %s", uv_strerror(rc));
             return -1;
         }
-        log_msg(LOG_INFO, "✓ Async pruning timer started (interval: %d seconds)",
+        log_msg(LOG_DEBUG, "Async pruning timer started (interval: %d seconds)",
                 cfg->async_pruning_interval_sec);
     } else {
-        log_msg(LOG_INFO, "✗ Async pruning timer DISABLED");
+        log_msg(LOG_DEBUG, "Async pruning timer DISABLED");
     }
 
     log_msg(LOG_DEBUG, "DHT manager started successfully");
@@ -839,17 +839,13 @@ void dht_manager_stop(dht_manager_t *mgr) {
      * This causes DHT callbacks to exit early (see wbpxre_callback_wrapper)
      * preventing them from blocking on peer_store mutex */
     if (mgr->peer_store) {
-        log_msg(LOG_INFO, "Setting peer_store shutdown flag...");
         peer_store_shutdown(mgr->peer_store);
-        log_msg(LOG_INFO, "Peer_store shutdown flag set (DHT callbacks will now skip)");
     }
 
     /* Step 2: Stop wbpxre-dht (joins all worker threads)
      * Worker threads should exit quickly since callbacks skip when shutdown=true */
     if (mgr->dht) {
-        log_msg(LOG_INFO, "Stopping wbpxre-dht (joining worker threads)...");
         wbpxre_dht_stop(mgr->dht);
-        log_msg(LOG_INFO, "wbpxre-dht stopped successfully");
     }
 
     /* Step 3: Do NOT cleanup peer_store here - wait until dht_manager_cleanup
@@ -971,7 +967,6 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
 
     /* Shutdown pruning worker pool */
     if (mgr->pruning_worker_pool) {
-        log_msg(LOG_INFO, "Shutting down pruning worker pool...");
         worker_pool_shutdown((worker_pool_t *)mgr->pruning_worker_pool);
         worker_pool_cleanup((worker_pool_t *)mgr->pruning_worker_pool);
         mgr->pruning_worker_pool = NULL;
@@ -981,13 +976,6 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
             free(mgr->pruning_status.coordination);
             mgr->pruning_status.coordination = NULL;
         }
-
-        /* Log final statistics */
-        int total_submitted = atomic_load(&mgr->pruning_status.total_submitted);
-        int total_processed = atomic_load(&mgr->pruning_status.total_processed);
-        log_msg(LOG_INFO, "Pruning statistics: %d/%d nodes processed (%.1f%%)",
-                total_processed, total_submitted,
-                total_submitted > 0 ? (total_processed * 100.0) / total_submitted : 0.0);
     }
 
     /* Cleanup close tracker synchronization primitives */
@@ -1076,9 +1064,9 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         }
     }
 
-    log_msg(LOG_INFO, "=== Node ID Rotation #%llu ===",
+    log_msg(LOG_DEBUG, "=== Node ID Rotation #%llu ===",
             (unsigned long long)(mgr->stats.node_rotations_performed + 1));
-    log_msg(LOG_INFO, "  Samples collected since last rotation: %llu",
+    log_msg(LOG_DEBUG, "  Samples collected since last rotation: %llu",
             (unsigned long long)mgr->samples_since_rotation);
 
     /* Generate new random node ID */
@@ -1089,13 +1077,13 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
     format_infohash((const uint8_t *)mgr->app_ctx->node_id, old_id_hex, sizeof(old_id_hex));
     format_infohash(new_node_id, new_id_hex, sizeof(new_id_hex));
 
-    log_msg(LOG_INFO, "  Old node ID: %.16s...", old_id_hex);
-    log_msg(LOG_INFO, "  New node ID: %.16s...", new_id_hex);
+    log_msg(LOG_DEBUG, "  Old node ID: %.16s...", old_id_hex);
+    log_msg(LOG_DEBUG, "  New node ID: %.16s...", new_id_hex);
 
     /* Get routing table stats before rotation */
     int good_before = 0, dubious_before = 0;
     wbpxre_dht_nodes(mgr->dht, &good_before, &dubious_before);
-    log_msg(LOG_INFO, "  Routing table before: %d nodes (%d good, %d dubious)",
+    log_msg(LOG_DEBUG, "  Routing table before: %d nodes (%d good, %d dubious)",
             good_before + dubious_before, good_before, dubious_before);
 
     /* Stop wbpxre-dht (gracefully shutdown workers) */
@@ -1186,9 +1174,9 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
     /* Get routing table stats after rotation */
     int good_after = 0, dubious_after = 0;
     wbpxre_dht_nodes(mgr->dht, &good_after, &dubious_after);
-    log_msg(LOG_INFO, "  Routing table after: %d nodes (%d good, %d dubious)",
+    log_msg(LOG_DEBUG, "  Routing table after: %d nodes (%d good, %d dubious)",
             good_after + dubious_after, good_after, dubious_after);
-    log_msg(LOG_INFO, "=== Node ID Rotation Complete ===");
+    log_msg(LOG_DEBUG, "=== Node ID Rotation Complete ===");
 
     return 0;
 }
@@ -1291,14 +1279,14 @@ static void pruning_worker_fn(void *task, void *closure) {
         /* Increment pruning cycle counter */
         mgr->pruning_status.pruning_cycles_completed++;
 
-        log_msg(LOG_INFO, "=== Async Pruning Completed ===");
-        log_msg(LOG_INFO, "  Cycle: %llu", (unsigned long long)mgr->pruning_status.pruning_cycles_completed);
-        log_msg(LOG_INFO, "  Workers: %d", work->total_workers);
-        log_msg(LOG_INFO, "  Nodes submitted: %d", total_submitted);
-        log_msg(LOG_INFO, "  Nodes dropped: %d", total_processed);
-        log_msg(LOG_INFO, "  Duration: %ld seconds",
+        log_msg(LOG_DEBUG, "=== Async Pruning Completed ===");
+        log_msg(LOG_DEBUG, "  Cycle: %llu", (unsigned long long)mgr->pruning_status.pruning_cycles_completed);
+        log_msg(LOG_DEBUG, "  Workers: %d", work->total_workers);
+        log_msg(LOG_DEBUG, "  Nodes submitted: %d", total_submitted);
+        log_msg(LOG_DEBUG, "  Nodes dropped: %d", total_processed);
+        log_msg(LOG_DEBUG, "  Duration: %ld seconds",
                 mgr->pruning_status.completed_at - mgr->pruning_status.started_at);
-        log_msg(LOG_INFO, "  Routing table now: %d nodes (%d good, %d dubious)",
+        log_msg(LOG_DEBUG, "  Routing table now: %d nodes (%d good, %d dubious)",
                 good + dubious, good, dubious);
 
         log_msg(LOG_DEBUG, "Pruning cycle %llu completed (rebuild every %d cycles)",
@@ -1308,8 +1296,8 @@ static void pruning_worker_fn(void *task, void *closure) {
         /* Check if we should rebuild hash index */
         if (cfg && cfg->async_pruning_hash_rebuild_cycles > 0) {
             if (mgr->pruning_status.pruning_cycles_completed % cfg->async_pruning_hash_rebuild_cycles == 0) {
-                log_msg(LOG_INFO, "=== Hash Index Rebuild Triggered ===");
-                log_msg(LOG_INFO, "  Cycle: %llu (rebuild every %d cycles)",
+                log_msg(LOG_DEBUG, "=== Hash Index Rebuild Triggered ===");
+                log_msg(LOG_DEBUG, "  Cycle: %llu (rebuild every %d cycles)",
                         (unsigned long long)mgr->pruning_status.pruning_cycles_completed,
                         cfg->async_pruning_hash_rebuild_cycles);
 
@@ -1319,9 +1307,9 @@ static void pruning_worker_fn(void *task, void *closure) {
 
                 if (reindexed >= 0) {
                     mgr->pruning_status.last_hash_rebuild = time(NULL);
-                    log_msg(LOG_INFO, "  Nodes re-indexed: %d", reindexed);
-                    log_msg(LOG_INFO, "  Duration: %ld seconds", rebuild_duration);
-                    log_msg(LOG_INFO, "  Hash table bucket array reset to optimal size");
+                    log_msg(LOG_DEBUG, "  Nodes re-indexed: %d", reindexed);
+                    log_msg(LOG_DEBUG, "  Duration: %ld seconds", rebuild_duration);
+                    log_msg(LOG_DEBUG, "  Hash table bucket array reset to optimal size");
                 } else {
                     log_msg(LOG_ERROR, "  Hash index rebuild failed!");
                 }
@@ -1355,9 +1343,9 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
 
             char new_id_hex[41];
             format_infohash(mgr->next_node_id, new_id_hex, sizeof(new_id_hex));
-            log_msg(LOG_INFO, "=== Node Rotation: Announcement Phase ===");
-            log_msg(LOG_INFO, "  New ID generated: %.16s...", new_id_hex);
-            log_msg(LOG_INFO, "  Announcing to network for %d seconds...", mgr->rotation_phase_duration_sec);
+            log_msg(LOG_DEBUG, "=== Node Rotation: Announcement Phase ===");
+            log_msg(LOG_DEBUG, "  New ID generated: %.16s...", new_id_hex);
+            log_msg(LOG_DEBUG, "  Announcing to network for %d seconds...", mgr->rotation_phase_duration_sec);
 
             /* Schedule transition (handled by timer callback) */
             return 0;
@@ -1379,11 +1367,11 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             int good = 0, dubious = 0;
             wbpxre_dht_nodes(mgr->dht, &good, &dubious);
 
-            log_msg(LOG_INFO, "=== Node Rotation: Transition Phase ===");
-            log_msg(LOG_INFO, "  Now using new ID for queries");
-            log_msg(LOG_INFO, "  Routing table preserved: %d nodes (%d good, %d dubious)",
+            log_msg(LOG_DEBUG, "=== Node Rotation: Transition Phase ===");
+            log_msg(LOG_DEBUG, "  Now using new ID for queries");
+            log_msg(LOG_DEBUG, "  Routing table preserved: %d nodes (%d good, %d dubious)",
                     good + dubious, good, dubious);
-            log_msg(LOG_INFO, "  Transitioning for %d seconds...", mgr->rotation_phase_duration_sec);
+            log_msg(LOG_DEBUG, "  Transitioning for %d seconds...", mgr->rotation_phase_duration_sec);
 
             /* Update statistics */
             if (mgr->stats.last_rotation_time > 0) {
@@ -1403,15 +1391,15 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             mgr->rotation_state = ROTATION_STATE_STABLE;
             mgr->stats.last_rotation_time = now;
 
-            log_msg(LOG_INFO, "=== Node Rotation: Complete ===");
-            log_msg(LOG_INFO, "  Fully migrated to new keyspace position");
-            log_msg(LOG_INFO, "  No downtime - all workers kept running!");
-            log_msg(LOG_INFO, "  Pruning now handled by periodic timer");
+            log_msg(LOG_DEBUG, "=== Node Rotation: Complete ===");
+            log_msg(LOG_DEBUG, "  Fully migrated to new keyspace position");
+            log_msg(LOG_DEBUG, "  No downtime - all workers kept running!");
+            log_msg(LOG_DEBUG, "  Pruning now handled by periodic timer");
 
             /* Optionally clear sample_infohashes queue after rotation */
             crawler_config_t *crawler_cfg = (crawler_config_t *)mgr->crawler_config;
             if (crawler_cfg && crawler_cfg->clear_sample_queue_on_rotation && mgr->dht) {
-                log_msg(LOG_INFO, "=== Post-Rotation Sample Queue Clearing ===");
+                log_msg(LOG_DEBUG, "=== Post-Rotation Sample Queue Clearing ===");
 
                 /* Get queue size before clearing */
                 int queue_size_before = 0;
@@ -1419,9 +1407,9 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
                 queue_size_before = mgr->dht->nodes_for_sample_infohashes->size;
                 pthread_mutex_unlock(&mgr->dht->nodes_for_sample_infohashes->mutex);
 
-                log_msg(LOG_INFO, "  Clearing sample_infohashes queue: %d nodes", queue_size_before);
+                log_msg(LOG_DEBUG, "  Clearing sample_infohashes queue: %d nodes", queue_size_before);
                 wbpxre_queue_clear(mgr->dht->nodes_for_sample_infohashes);
-                log_msg(LOG_INFO, "  Queue cleared - feeder will repopulate with new keyspace nodes");
+                log_msg(LOG_DEBUG, "  Queue cleared - feeder will repopulate with new keyspace nodes");
             }
 
             return 0;
@@ -1551,8 +1539,8 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
 
     int nodes_to_remove = current_nodes - cfg->async_pruning_target_nodes;
 
-    log_msg(LOG_INFO, "=== Periodic Async Pruning Started ===");
-    log_msg(LOG_INFO, "  Current nodes: %d (%.1f%% capacity), Target: %d, To remove: %d",
+    log_msg(LOG_DEBUG, "=== Periodic Async Pruning Started ===");
+    log_msg(LOG_DEBUG, "  Current nodes: %d (%.1f%% capacity), Target: %d, To remove: %d",
             current_nodes, capacity_percent, cfg->async_pruning_target_nodes, nodes_to_remove);
 
     /* Mark pruning as active */
@@ -1751,7 +1739,7 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
         mgr->pruning_status.coordination = NULL;
         atomic_store(&mgr->pruning_status.pruning_in_progress, false);
     } else {
-        log_msg(LOG_INFO, "  Submitted %d work items to %d-thread worker pool",
+        log_msg(LOG_DEBUG, "  Submitted %d work items to %d-thread worker pool",
                 submitted, num_workers);
     }
 }

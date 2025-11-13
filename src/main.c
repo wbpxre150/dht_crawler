@@ -136,8 +136,6 @@ int main(int argc, char *argv[]) {
 
                 if (loaded_capacity == config.bloom_capacity &&
                     loaded_error_rate == config.bloom_error_rate) {
-                    log_msg(LOG_INFO, "Loaded existing bloom filter from %s (capacity: %lu)",
-                            config.bloom_path, loaded_capacity);
                     bloom_filter_cleanup(g_bloom);
                     g_bloom = loaded_bloom;
                 } else {
@@ -150,8 +148,6 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
-    } else {
-        log_msg(LOG_INFO, "Bloom filter disabled in config");
     }
 
     /* Initialize database */
@@ -305,24 +301,21 @@ int main(int argc, char *argv[]) {
     log_msg(LOG_DEBUG, "Main event loop exited");
 
     /* Cleanup */
-    log_msg(LOG_INFO, "=== Beginning graceful shutdown sequence ===");
+    log_msg(LOG_DEBUG, "=== Beginning graceful shutdown sequence ===");
 
-    log_msg(LOG_INFO, "Step 1: Stopping HTTP API...");
+    log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
     http_api_stop(&g_http_api);
 
-    log_msg(LOG_INFO, "Step 2: Stopping metadata fetcher (joins all worker threads)...");
+    log_msg(LOG_DEBUG, "Step 2: Stopping metadata fetcher (joins all worker threads)...");
     metadata_fetcher_stop(&g_fetcher);
 
-    log_msg(LOG_INFO, "Step 3: Stopping DHT manager (stops DHT network participation)...");
+    log_msg(LOG_DEBUG, "Step 3: Stopping DHT manager (stops DHT network participation)...");
     dht_manager_stop(&g_dht_mgr);
 
-    log_msg(LOG_INFO, "=== Shutdown sequence complete, beginning cleanup ===");
+    log_msg(LOG_DEBUG, "=== Shutdown sequence complete, beginning cleanup ===");
 
     /* Save bloom filter statistics and persist to disk */
     if (g_bloom) {
-        uint64_t duplicates = infohash_queue_get_duplicates(&g_queue);
-        log_msg(LOG_INFO, "Bloom filter statistics: %lu duplicates filtered (90%% DB query reduction)", duplicates);
-
         /* Save bloom filter to disk if persistence is enabled */
         if (config.bloom_persist) {
             log_msg(LOG_DEBUG, "Saving bloom filter to %s...", config.bloom_path);
