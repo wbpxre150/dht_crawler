@@ -15,12 +15,7 @@ void config_init_defaults(crawler_config_t *config) {
     
     /* DHT defaults */
     config->dht_port = 6881;
-    
-    /* Cache defaults */
-    config->cache_enabled = 1;
-    config->cache_max_peers = 200;
-    config->cache_save_interval_sec = 300;
-    
+
     /* Discovery defaults */
     config->targeted_search_percentage = 30;
     
@@ -149,12 +144,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Parse settings */
         if (strcmp(key, "dht_port") == 0) {
             config->dht_port = atoi(value);
-        } else if (strcmp(key, "cache_enabled") == 0) {
-            config->cache_enabled = atoi(value);
-        } else if (strcmp(key, "cache_max_peers") == 0) {
-            config->cache_max_peers = atoi(value);
-        } else if (strcmp(key, "cache_save_interval_sec") == 0) {
-            config->cache_save_interval_sec = atoi(value);
         } else if (strcmp(key, "targeted_search_percentage") == 0) {
             config->targeted_search_percentage = atoi(value);
         } else if (strcmp(key, "http_port") == 0) {
@@ -372,10 +361,6 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
     log_msg(LOG_DEBUG, "DHT Settings:");
     log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
-    log_msg(LOG_DEBUG, "Cache Settings:");
-    log_msg(LOG_DEBUG, "  Enabled: %s", config->cache_enabled ? "yes" : "no");
-    log_msg(LOG_DEBUG, "  Max Peers: %d", config->cache_max_peers);
-    log_msg(LOG_DEBUG, "  Save Interval: %ds", config->cache_save_interval_sec);
     log_msg(LOG_DEBUG, "Discovery Settings:");
     log_msg(LOG_DEBUG, "  Targeted Search Percentage: %d%%", config->targeted_search_percentage);
     log_msg(LOG_DEBUG, "HTTP API Settings:");

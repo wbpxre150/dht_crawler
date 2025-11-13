@@ -7,12 +7,7 @@
 typedef struct {
     /* DHT settings */
     int dht_port;
-    
-    /* Cache settings */
-    int cache_enabled;
-    int cache_max_peers;
-    int cache_save_interval_sec;
-    
+
     /* Discovery settings */
     int targeted_search_percentage;  /* 0-100 */
     

@@ -2,7 +2,6 @@
 #define DHT_MANAGER_H
 
 #include "dht_crawler.h"
-#include "dht_cache.h"
 #include "peer_store.h"
 #include "discovered_nodes.h"
 #include "wbpxre_dht.h"
@@ -27,7 +26,6 @@ typedef struct {
     uint64_t ping_received;
     uint64_t infohashes_discovered;
     uint64_t active_searches;
-    uint64_t cached_peers_pinged;     /* Number of cached peers pinged on bootstrap */
     uint64_t bucket_refreshes_sent;   /* Bucket refresh searches */
     uint64_t neighbourhood_searches_sent; /* Neighbourhood maintenance searches */
     uint64_t wandering_searches_sent; /* Random keyspace exploration searches */
@@ -149,7 +147,6 @@ typedef struct {
     dht_stats_t stats;
     dht_config_t config;              /* Configuration parameters */
     void *infohash_queue;  /* Pointer to global queue */
-    dht_cache_t cache;                /* Peer cache */
     int active_search_count;          /* Number of active searches */
     time_t last_bucket_refresh;       /* Last bucket refresh time */
     time_t last_neighbourhood_search; /* Last neighbourhood search time */

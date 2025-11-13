@@ -3,7 +3,6 @@
 #include "dht_crawler.h"
 #include "config.h"
 #include "infohash_queue.h"
-#include "dht_cache.h"
 #include "peer_store.h"
 #include "metadata_fetcher.h"
 #include "worker_pool.h"
@@ -371,14 +370,6 @@ static void stats_timer_cb(uv_timer_t *handle) {
         }
     }
 
-    /* Save cache periodically (every 300 seconds) */
-    static int cache_save_counter = 0;
-    cache_save_counter++;
-    if (cache_save_counter >= 300 && mgr->cache.count > 0) {
-        dht_cache_save(&mgr->cache);
-        cache_save_counter = 0;
-    }
-
     /* Peer store cleanup (every 300 seconds / 5 minutes) */
     static int cleanup_counter = 0;
     cleanup_counter += 10;  /* Timer fires every 10 seconds */
@@ -452,20 +443,6 @@ static int bootstrap_dht(dht_manager_t *mgr) {
     double total_elapsed = (end_time.tv_sec - start_time.tv_sec) +
                           (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
-    /* Insert cached peers into routing table */
-    if (mgr->cache.count > 0) {
-        log_msg(LOG_DEBUG, "Inserting %zu cached peers into routing table...", mgr->cache.count);
-
-        for (size_t i = 0; i < mgr->cache.count; i++) {
-            dht_cached_peer_t *peer = &mgr->cache.peers[i];
-            wbpxre_dht_insert_node(mgr->dht, peer->node_id,
-                                   (struct sockaddr_in *)&peer->addr);
-            mgr->stats.cached_peers_pinged++;
-        }
-
-        log_msg(LOG_DEBUG, "Inserted %zu cached peers", mgr->cache.count);
-    }
-
     /* Phase 3: Detailed bootstrap summary */
     if (bootstrapped > 0) {
         log_msg(LOG_DEBUG, "═══════════════════════════════════════════════════");
@@ -486,13 +463,7 @@ static int bootstrap_dht(dht_manager_t *mgr) {
         log_msg(LOG_ERROR, "Bootstrap Failed!");
         log_msg(LOG_ERROR, "  ✗ Failed to contact any of %d bootstrap routers", NUM_BOOTSTRAP_NODES);
         log_msg(LOG_ERROR, "  ✗ Total time spent: %.2fs", total_elapsed);
-
-        if (mgr->cache.count == 0) {
-            log_msg(LOG_ERROR, "  ✗ No cached peers available");
-            log_msg(LOG_ERROR, "  ✗ DHT will not function without bootstrap!");
-        } else {
-            log_msg(LOG_WARN, "  ⚠ Falling back to %zu cached peers", mgr->cache.count);
-        }
+        log_msg(LOG_ERROR, "  ✗ DHT will not function without bootstrap!");
         log_msg(LOG_ERROR, "═══════════════════════════════════════════════════");
     }
 
@@ -565,16 +536,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
                 mgr->node_rotation_drain_timeout_sec, mgr->rotation_phase_duration_sec);
     } else {
         log_msg(LOG_WARN, "No config provided to dht_manager_init - rotation disabled");
-    }
-
-    /* Initialize peer cache */
-    if (dht_cache_init(&mgr->cache, DHT_CACHE_FILE) != 0) {
-        log_msg(LOG_WARN, "Failed to initialize DHT cache, continuing without cache");
-    } else {
-        if (dht_cache_load(&mgr->cache) == 0 && mgr->cache.count > 0) {
-            log_msg(LOG_DEBUG, "Loaded %zu cached DHT peers from %s",
-                   mgr->cache.count, DHT_CACHE_FILE);
-        }
     }
 
     /* Initialize peer store */
@@ -772,17 +733,10 @@ int dht_manager_start(dht_manager_t *mgr) {
     }
 
     if (!bootstrap_success) {
-        /* Check if we have cached peers */
-        if (mgr->cache.count > 0) {
-            log_msg(LOG_WARN, "All bootstrap attempts failed, but %zu cached peers were loaded",
-                   mgr->cache.count);
-            log_msg(LOG_WARN, "DHT will attempt to function using cached peers");
-        } else {
-            log_msg(LOG_ERROR, "Bootstrap failed after %d attempts and no cached peers available!",
-                   max_bootstrap_attempts);
-            log_msg(LOG_ERROR, "DHT will not function properly without bootstrap nodes");
-            return -1;
-        }
+        log_msg(LOG_ERROR, "Bootstrap failed after %d attempts!",
+               max_bootstrap_attempts);
+        log_msg(LOG_ERROR, "DHT will not function properly without bootstrap nodes");
+        return -1;
     }
 
     /* Start statistics timer (1 second interval) */
@@ -905,12 +859,6 @@ void dht_manager_stop(dht_manager_t *mgr) {
      * after metadata_fetcher_stop has joined all threads */
     log_msg(LOG_DEBUG, "DHT manager stopped (peer_store will be cleaned up later)");
 
-    /* Save cache */
-    if (mgr->cache.count > 0) {
-        dht_cache_save(&mgr->cache);
-        log_msg(LOG_DEBUG, "Saved %zu peers to DHT cache", mgr->cache.count);
-    }
-
     log_msg(LOG_DEBUG, "DHT manager stopped");
 }
 
@@ -1008,9 +956,6 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
         peer_store_cleanup(mgr->peer_store);
         mgr->peer_store = NULL;
     }
-
-    /* Cleanup cache */
-    dht_cache_cleanup(&mgr->cache);
 
     /* Cleanup refresh query store */
     if (mgr->refresh_query_store) {
