@@ -106,8 +106,9 @@ typedef struct {
     int bep51_pruning_interval_sec;      /* How often to check and prune (default: 30) */
     double bep51_pruning_min_capacity;   /* Min capacity ratio (0.0-1.0) before pruning (default: 0.0) */
 
-    /* Async node pruning settings (triggered by rotation) */
-    int async_pruning_enabled;           /* Enable async pruning after rotation */
+    /* Async node pruning settings (timer-based) */
+    int async_pruning_enabled;           /* Enable async pruning */
+    int async_pruning_interval_sec;      /* How often to run pruning (seconds) */
     int async_pruning_target_nodes;      /* Target final node count after pruning */
     double async_pruning_distant_percent; /* Percentage of distant nodes to remove (0.0-100.0) */
     double async_pruning_old_percent;    /* Percentage of old nodes to remove (0.0-100.0) */

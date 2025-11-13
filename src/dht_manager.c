@@ -36,6 +36,7 @@ static dht_manager_t *g_dht_manager = NULL;
 static int bootstrap_dht(dht_manager_t *mgr);
 static void node_rotation_timer_cb(uv_timer_t *handle);
 static void peer_retry_timer_cb(uv_timer_t *handle);
+static void async_pruning_timer_cb(uv_timer_t *handle);
 
 /* Async pruning forward declarations */
 static pruning_queue_t *pruning_queue_create(int capacity);
@@ -880,6 +881,32 @@ int dht_manager_start(dht_manager_t *mgr) {
         log_msg(LOG_DEBUG, "Peer retry timer started (checks every 100ms)");
     }
 
+    /* Initialize and start async pruning timer if enabled */
+    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+    if (cfg && cfg->async_pruning_enabled && cfg->async_pruning_interval_sec > 0) {
+        log_msg(LOG_DEBUG, "Initializing async pruning timer (interval: %d sec)...",
+                cfg->async_pruning_interval_sec);
+        rc = uv_timer_init(mgr->app_ctx->loop, &mgr->async_pruning_timer);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "Failed to initialize async pruning timer: %s", uv_strerror(rc));
+            return -1;
+        }
+        mgr->async_pruning_timer.data = mgr;
+
+        /* Start timer (check every X seconds based on config) */
+        uint64_t interval_ms = cfg->async_pruning_interval_sec * 1000;
+        rc = uv_timer_start(&mgr->async_pruning_timer, async_pruning_timer_cb,
+                            interval_ms, interval_ms);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "Failed to start async pruning timer: %s", uv_strerror(rc));
+            return -1;
+        }
+        log_msg(LOG_INFO, "✓ Async pruning timer started (interval: %d seconds)",
+                cfg->async_pruning_interval_sec);
+    } else {
+        log_msg(LOG_INFO, "✗ Async pruning timer DISABLED");
+    }
+
     log_msg(LOG_DEBUG, "DHT manager started successfully");
     return 0;
 }
@@ -903,6 +930,13 @@ void dht_manager_stop(dht_manager_t *mgr) {
     /* Stop peer retry timer if enabled */
     if (mgr->peer_retry_tracker) {
         uv_timer_stop(&mgr->peer_retry_timer);
+    }
+
+    /* Stop async pruning timer if active */
+    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+    if (cfg && cfg->async_pruning_enabled && cfg->async_pruning_interval_sec > 0) {
+        uv_timer_stop(&mgr->async_pruning_timer);
+        log_msg(LOG_DEBUG, "Async pruning timer stopped");
     }
 
     /* Step 1: Set peer_store shutdown flag FIRST
@@ -967,6 +1001,16 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
             close_tracker.pending_closes++;
             uv_close((uv_handle_t *)&mgr->peer_retry_timer, timer_close_cb);
             log_msg(LOG_DEBUG, "Closing peer_retry_timer");
+        }
+
+        /* Close async_pruning_timer (only if async pruning was enabled) */
+        crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+        if (cfg && cfg->async_pruning_enabled && cfg->async_pruning_interval_sec > 0 &&
+            !uv_is_closing((uv_handle_t *)&mgr->async_pruning_timer)) {
+            mgr->async_pruning_timer.data = &close_tracker;
+            close_tracker.pending_closes++;
+            uv_close((uv_handle_t *)&mgr->async_pruning_timer, timer_close_cb);
+            log_msg(LOG_DEBUG, "Closing async_pruning_timer");
         }
 
         /* Close node_rotation_timer (only if node rotation was enabled) */
@@ -1739,34 +1783,7 @@ int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
             log_msg(LOG_INFO, "=== Node Rotation: Complete ===");
             log_msg(LOG_INFO, "  Fully migrated to new keyspace position");
             log_msg(LOG_INFO, "  No downtime - all workers kept running!");
-
-            /* Post-rotation cleanup: Configurable async pruning */
-            crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-            if (cfg && cfg->async_pruning_enabled) {
-                /* Check if pruning is already in progress - prevent overlap */
-                bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
-                if (pruning_active) {
-                    log_msg(LOG_WARN, "  Skipping pruning - previous pruning still in progress");
-                    log_msg(LOG_WARN, "  Consider increasing node_rotation_interval_sec or investigating pruning performance");
-                } else {
-                    /* Get current node ID */
-                    uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
-                    pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
-                    memcpy(current_node_id, mgr->app_ctx->node_id, WBPXRE_NODE_ID_LEN);
-                    pthread_rwlock_unlock(&mgr->dht->node_id_lock);
-
-                    /* Call configurable pruning function */
-                    prune_nodes_to_target(
-                        mgr,
-                        current_node_id,
-                        cfg->async_pruning_target_nodes,
-                        cfg->async_pruning_distant_percent / 100.0,  /* convert to 0.0-1.0 */
-                        cfg->async_pruning_old_percent / 100.0
-                    );
-                }
-            } else {
-                log_msg(LOG_INFO, "  Async pruning disabled in config");
-            }
+            log_msg(LOG_INFO, "  Pruning now handled by periodic timer");
 
             /* Optionally clear sample_infohashes queue after rotation */
             crawler_config_t *crawler_cfg = (crawler_config_t *)mgr->crawler_config;
@@ -1855,6 +1872,43 @@ static void peer_retry_timer_cb(uv_timer_t *handle) {
             dht_manager_query_peers(mgr, ready_infohashes[i], false);
         }
     }
+}
+
+/* Async pruning timer callback - periodically prunes routing table */
+static void async_pruning_timer_cb(uv_timer_t *handle) {
+    dht_manager_t *mgr = (dht_manager_t *)handle->data;
+    if (!mgr || !mgr->dht) {
+        return;
+    }
+
+    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+    if (!cfg || !cfg->async_pruning_enabled) {
+        return;
+    }
+
+    /* Check if pruning is already in progress - prevent overlap */
+    bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
+    if (pruning_active) {
+        log_msg(LOG_WARN, "Skipping periodic pruning - previous pruning still in progress");
+        return;
+    }
+
+    /* Get current node ID */
+    uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
+    pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
+    memcpy(current_node_id, mgr->dht->config.node_id, WBPXRE_NODE_ID_LEN);
+    pthread_rwlock_unlock(&mgr->dht->node_id_lock);
+
+    log_msg(LOG_INFO, "=== Periodic Async Pruning Started ===");
+
+    /* Call configurable pruning function */
+    prune_nodes_to_target(
+        mgr,
+        current_node_id,
+        cfg->async_pruning_target_nodes,
+        cfg->async_pruning_distant_percent / 100.0,  /* convert to 0.0-1.0 */
+        cfg->async_pruning_old_percent / 100.0
+    );
 }
 
 /* Print DHT statistics */

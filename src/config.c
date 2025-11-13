@@ -116,6 +116,7 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Async node pruning defaults */
     config->async_pruning_enabled = 1;              /* Enabled by default */
+    config->async_pruning_interval_sec = 120;       /* Run every 2 minutes */
     config->async_pruning_target_nodes = 60000;     /* Target 60K nodes after pruning */
     config->async_pruning_distant_percent = 50.0;   /* Remove 50% of distant nodes */
     config->async_pruning_old_percent = 30.0;       /* Remove 30% of old nodes */
@@ -346,6 +347,8 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Async node pruning settings */
         else if (strcmp(key, "async_pruning_enabled") == 0) {
             config->async_pruning_enabled = atoi(value);
+        } else if (strcmp(key, "async_pruning_interval_sec") == 0) {
+            config->async_pruning_interval_sec = atoi(value);
         } else if (strcmp(key, "async_pruning_target_nodes") == 0) {
             config->async_pruning_target_nodes = atoi(value);
         } else if (strcmp(key, "async_pruning_distant_percent") == 0) {

@@ -209,6 +209,8 @@ typedef struct {
     /* Peer retry tracking */
     peer_retry_tracker_t *peer_retry_tracker;
     uv_timer_t peer_retry_timer;      /* Timer for periodic retry checking */
+    /* Async pruning timer */
+    uv_timer_t async_pruning_timer;   /* Timer for periodic async pruning */
     /* Close tracker for safe shutdown */
     close_tracker_t close_tracker;
     /* Initialization state flags */
