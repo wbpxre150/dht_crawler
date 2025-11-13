@@ -100,8 +100,8 @@ typedef struct peer_connection {
 } peer_connection_t;
 
 /* Forward declarations */
-typedef struct worker_pool worker_pool_t;
-typedef struct batch_writer batch_writer_t;
+struct worker_pool;
+struct batch_writer;
 
 /* Infohash attempt tracking - aggregates per-connection failures to per-infohash outcomes */
 typedef struct infohash_attempt {
@@ -148,7 +148,7 @@ typedef struct {
     struct dht_manager *dht_manager; /* DHT manager for re-querying peers on retry */
 
     /* Worker pool for concurrent fetching */
-    worker_pool_t *worker_pool;
+    struct worker_pool *worker_pool;
     uv_thread_t feeder_thread;
     int num_workers;
     uv_mutex_t mutex;
@@ -160,7 +160,7 @@ typedef struct {
     int max_connection_lifetime_ms;   /* Max total connection time (0=unlimited) */
 
     /* Batch writer for high-throughput database writes */
-    batch_writer_t *batch_writer;
+    struct batch_writer *batch_writer;
 
     /* Async handle for cross-thread communication */
     uv_async_t async_handle;
