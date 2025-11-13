@@ -1091,6 +1091,12 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
         worker_pool_cleanup((worker_pool_t *)mgr->pruning_worker_pool);
         mgr->pruning_worker_pool = NULL;
 
+        /* Free coordination structure if still allocated */
+        if (mgr->pruning_status.coordination) {
+            free(mgr->pruning_status.coordination);
+            mgr->pruning_status.coordination = NULL;
+        }
+
         /* Log final statistics */
         int total_submitted = atomic_load(&mgr->pruning_status.total_submitted);
         int total_processed = atomic_load(&mgr->pruning_status.total_processed);
@@ -1323,12 +1329,13 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
  * Async Pruning Infrastructure
  * ============================================================================ */
 
-
 /* Multi-threaded pruning worker function - runs in worker pool thread
  * Each worker independently selects and deletes nodes using:
  * 1. RCU lock-free reads for node collection (parallel)
  * 2. CPU-bound deduplication (parallel)
  * 3. Small-chunk deletion with mutex (serialized but yielding)
+ *
+ * Multiple workers coordinate via shared atomic counter
  */
 static void pruning_worker_fn(void *task, void *closure) {
     dht_manager_t *mgr = (dht_manager_t *)closure;
@@ -1345,15 +1352,26 @@ static void pruning_worker_fn(void *task, void *closure) {
     crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
     if (!cfg) {
         atomic_fetch_sub(&mgr->pruning_status.active_workers, 1);
+
+        /* Decrement workers_remaining before cleanup */
+        if (work->workers_remaining) {
+            atomic_fetch_sub(work->workers_remaining, 1);
+        }
         free(work);
         return;
     }
+
+    log_msg(LOG_DEBUG, "Pruning worker %d/%d starting",
+            work->worker_id + 1, work->total_workers);
 
     /* PHASE 1: Collect distant nodes (RCU read - lock-free) */
     int max_distant = work->target_nodes * 2;
     wbpxre_routing_node_t **distant_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_distant);
     if (!distant_nodes) {
         atomic_fetch_sub(&mgr->pruning_status.active_workers, 1);
+        if (work->workers_remaining) {
+            atomic_fetch_sub(work->workers_remaining, 1);
+        }
         free(work);
         return;
     }
@@ -1373,6 +1391,9 @@ static void pruning_worker_fn(void *task, void *closure) {
         for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
         free(distant_nodes);
         atomic_fetch_sub(&mgr->pruning_status.active_workers, 1);
+        if (work->workers_remaining) {
+            atomic_fetch_sub(work->workers_remaining, 1);
+        }
         free(work);
         return;
     }
@@ -1402,6 +1423,9 @@ static void pruning_worker_fn(void *task, void *closure) {
         free(distant_nodes);
         free(old_nodes);
         atomic_fetch_sub(&mgr->pruning_status.active_workers, 1);
+        if (work->workers_remaining) {
+            atomic_fetch_sub(work->workers_remaining, 1);
+        }
         free(work);
         return;
     }
@@ -1438,6 +1462,10 @@ static void pruning_worker_fn(void *task, void *closure) {
     int nodes_to_remove = current_nodes - work->target_nodes;
     int final_count = unique_count < nodes_to_remove ? unique_count : nodes_to_remove;
 
+    log_msg(LOG_DEBUG, "Worker %d/%d: collected %d distant, %d old, %d unique, deleting %d",
+            work->worker_id + 1, work->total_workers,
+            distant_count, old_count, unique_count, final_count);
+
     /* PHASE 4: Delete nodes in small chunks (mutex-protected but yielding) */
     const int DELETE_CHUNK_SIZE = cfg->async_pruning_delete_chunk_size;
     int total_dropped = 0;
@@ -1468,6 +1496,10 @@ static void pruning_worker_fn(void *task, void *closure) {
         }
     }
 
+    log_msg(LOG_DEBUG, "Worker %d/%d: dropped %d/%d nodes",
+            work->worker_id + 1, work->total_workers,
+            total_dropped, final_count);
+
     /* Update statistics */
     atomic_fetch_add(&mgr->pruning_status.total_submitted, final_count);
     atomic_fetch_add(&mgr->pruning_status.total_processed, total_dropped);
@@ -1478,23 +1510,40 @@ static void pruning_worker_fn(void *task, void *closure) {
     free(distant_nodes);
     free(old_nodes);
     free(combined);
-    free(work);
 
     /* Mark worker as inactive */
     atomic_fetch_sub(&mgr->pruning_status.active_workers, 1);
 
-    /* If this was the last worker, update completion time */
-    if (atomic_load(&mgr->pruning_status.active_workers) == 0) {
+    /* Decrement workers_remaining and check if last worker */
+    int remaining = atomic_fetch_sub(work->workers_remaining, 1) - 1;
+
+    if (remaining == 0) {
+        /* Last worker - log completion and cleanup */
         mgr->pruning_status.completed_at = time(NULL);
         atomic_store(&mgr->pruning_status.pruning_in_progress, false);
 
         wbpxre_dht_nodes(mgr->dht, &good, &dubious);
+
+        int total_submitted = atomic_load(&mgr->pruning_status.total_submitted);
+        int total_processed = atomic_load(&mgr->pruning_status.total_processed);
+
         log_msg(LOG_INFO, "=== Async Pruning Completed ===");
-        log_msg(LOG_INFO, "  Nodes dropped: %d", total_dropped);
+        log_msg(LOG_INFO, "  Workers: %d", work->total_workers);
+        log_msg(LOG_INFO, "  Nodes submitted: %d", total_submitted);
+        log_msg(LOG_INFO, "  Nodes dropped: %d", total_processed);
         log_msg(LOG_INFO, "  Duration: %ld seconds",
                 mgr->pruning_status.completed_at - mgr->pruning_status.started_at);
-        log_msg(LOG_INFO, "  Routing table now: %d nodes", good + dubious);
+        log_msg(LOG_INFO, "  Routing table now: %d nodes (%d good, %d dubious)",
+                good + dubious, good, dubious);
+
+        /* Free coordination structure */
+        if (mgr->pruning_status.coordination) {
+            free(mgr->pruning_status.coordination);
+            mgr->pruning_status.coordination = NULL;
+        }
     }
+
+    free(work);
 }
 
 
@@ -1704,27 +1753,61 @@ static void async_pruning_timer_cb(uv_timer_t *handle) {
     atomic_store(&mgr->pruning_status.active_workers, 0);
     mgr->pruning_status.started_at = time(NULL);
 
-    /* Create work item */
-    pruning_work_t *work = malloc(sizeof(pruning_work_t));
-    if (!work) {
-        log_msg(LOG_ERROR, "Failed to allocate pruning work item");
+    /* Allocate coordination structure shared across all workers */
+    pruning_coordination_t *coord = calloc(1, sizeof(pruning_coordination_t));
+    if (!coord) {
+        log_msg(LOG_ERROR, "Failed to allocate pruning coordination structure");
         atomic_store(&mgr->pruning_status.pruning_in_progress, false);
         return;
     }
 
-    memcpy(work->current_node_id, current_node_id, WBPXRE_NODE_ID_LEN);
-    work->target_nodes = cfg->async_pruning_target_nodes;
-    work->distant_percent = cfg->async_pruning_distant_percent / 100.0;
-    work->old_percent = cfg->async_pruning_old_percent / 100.0;
+    int num_workers = cfg->async_pruning_workers;
+    atomic_init(&coord->workers_remaining, num_workers);
+    atomic_init(&coord->total_submitted, 0);
+    atomic_init(&coord->total_processed, 0);
+    coord->started_at = time(NULL);
 
-    /* Submit to worker pool - distributes across N workers */
-    if (worker_pool_try_submit((worker_pool_t *)mgr->pruning_worker_pool, work) != 0) {
-        log_msg(LOG_ERROR, "Failed to submit pruning work to worker pool");
-        free(work);
+    mgr->pruning_status.coordination = coord;
+
+    /* Submit N work items (one per worker) */
+    int submitted = 0;
+    for (int i = 0; i < num_workers; i++) {
+        pruning_work_t *work = malloc(sizeof(pruning_work_t));
+        if (!work) {
+            log_msg(LOG_ERROR, "Failed to allocate pruning work item %d/%d", i+1, num_workers);
+            continue;
+        }
+
+        memcpy(work->current_node_id, current_node_id, WBPXRE_NODE_ID_LEN);
+        work->target_nodes = cfg->async_pruning_target_nodes;
+        work->distant_percent = cfg->async_pruning_distant_percent / 100.0;
+        work->old_percent = cfg->async_pruning_old_percent / 100.0;
+
+        /* Worker coordination fields */
+        work->worker_id = i;
+        work->total_workers = num_workers;
+        work->workers_remaining = &coord->workers_remaining;
+
+        /* Submit to worker pool */
+        if (worker_pool_try_submit((worker_pool_t *)mgr->pruning_worker_pool, work) != 0) {
+            log_msg(LOG_ERROR, "Failed to submit pruning work item %d/%d to worker pool", i+1, num_workers);
+            free(work);
+
+            /* Decrement workers_remaining to prevent deadlock */
+            atomic_fetch_sub(&coord->workers_remaining, 1);
+        } else {
+            submitted++;
+        }
+    }
+
+    if (submitted == 0) {
+        log_msg(LOG_ERROR, "Failed to submit any pruning work items");
+        free(coord);
+        mgr->pruning_status.coordination = NULL;
         atomic_store(&mgr->pruning_status.pruning_in_progress, false);
     } else {
-        log_msg(LOG_INFO, "  Submitted pruning work to %d-thread worker pool",
-                cfg->async_pruning_workers);
+        log_msg(LOG_INFO, "  Submitted %d work items to %d-thread worker pool",
+                submitted, num_workers);
     }
 }
 

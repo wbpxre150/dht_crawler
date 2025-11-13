@@ -137,16 +137,32 @@ typedef struct {
     int target_nodes;                              /* Target routing table size */
     double distant_percent;                        /* % of distant nodes to prune */
     double old_percent;                            /* % of old nodes to prune */
+
+    /* Worker coordination fields */
+    int worker_id;                                 /* Worker identifier (0 to N-1) */
+    int total_workers;                             /* Total number of workers (N) */
+    atomic_int *workers_remaining;                 /* Shared counter for completion tracking */
 } pruning_work_t;
+
+/* Shared state for coordinating multiple pruning workers */
+typedef struct {
+    atomic_int workers_remaining;    /* Counts down from N to 0 */
+    atomic_int total_submitted;      /* Aggregated across all workers */
+    atomic_int total_processed;      /* Aggregated across all workers */
+    time_t started_at;               /* When pruning began */
+} pruning_coordination_t;
 
 /* Pruning status tracking */
 typedef struct {
-    atomic_bool pruning_in_progress;    /* Is pruning active? */
-    atomic_int active_workers;          /* Workers currently processing */
-    atomic_int total_submitted;         /* Total nodes submitted */
-    atomic_int total_processed;         /* Total nodes dropped */
-    time_t started_at;                  /* When pruning batch started */
-    time_t completed_at;                /* When last batch completed */
+    atomic_bool pruning_in_progress;       /* Is pruning active? */
+    atomic_int active_workers;             /* Workers currently processing */
+    atomic_int total_submitted;            /* Total nodes submitted */
+    atomic_int total_processed;            /* Total nodes dropped */
+    time_t started_at;                     /* When pruning batch started */
+    time_t completed_at;                   /* When last batch completed */
+
+    /* Coordination structure (allocated per pruning operation) */
+    pruning_coordination_t *coordination;  /* Shared across all workers */
 } pruning_status_t;
 
 /* DHT manager context */
