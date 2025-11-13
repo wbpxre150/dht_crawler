@@ -209,17 +209,6 @@ static int create_udp_socket(int port) {
     return sock;
 }
 
-static int send_udp_packet(int sock, const struct sockaddr_in *addr,
-                           const uint8_t *buf, int len) {
-    int sent = sendto(sock, buf, len, 0,
-                      (struct sockaddr *)addr, sizeof(*addr));
-    if (sent < 0) {
-        // Silently ignore sendto errors (socket may be closed during shutdown)
-        return -1;
-    }
-    return 0;
-}
-
 /* ============================================================================
  * UDP Reader Thread
  * ============================================================================ */

@@ -59,7 +59,7 @@ int bencode_encode_int(char *buf, size_t *offset, size_t buf_size, int64_t val) 
     }
 
     char int_str[64];
-    int len = snprintf(int_str, sizeof(int_str), "i%lde", (long long)val);
+    int len = snprintf(int_str, sizeof(int_str), "i%llde", (long long)val);
 
     if (*offset + len > buf_size) {
         return -1;

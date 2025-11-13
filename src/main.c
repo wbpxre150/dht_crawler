@@ -82,6 +82,8 @@ void cleanup_app_context(app_context_t *ctx) {
 }
 
 int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
     int rc;
 
     log_msg(LOG_DEBUG, "DHT Crawler v%s starting...", DHT_CRAWLER_VERSION);

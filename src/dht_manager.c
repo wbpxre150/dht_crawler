@@ -501,9 +501,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     }
 
     /* Initialize configuration with defaults */
-    mgr->config.routing_table_log_interval_sec = 60;
-    mgr->config.min_good_nodes_threshold = 50;
-
     /* BEP 51 configuration */
     mgr->config.bep51_enabled = 1;
     mgr->config.bep51_query_rate = 60;

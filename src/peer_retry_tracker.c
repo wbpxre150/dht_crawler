@@ -17,15 +17,6 @@ static int hash_equal(const uint8_t *h1, const uint8_t *h2) {
     return memcmp(h1, h2, 20) == 0;
 }
 
-/* Format info_hash as hex string for logging */
-static void format_infohash(const uint8_t *info_hash, char *out, size_t out_len) {
-    if (out_len < 41) return;
-    for (int i = 0; i < 20; i++) {
-        snprintf(out + i * 2, 3, "%02x", info_hash[i]);
-    }
-    out[40] = '\0';
-}
-
 /* Initialize retry tracker */
 peer_retry_tracker_t* peer_retry_tracker_init(size_t bucket_count,
                                                int max_attempts,

@@ -70,8 +70,6 @@ typedef struct {
 
 /* DHT configuration */
 typedef struct {
-    int routing_table_log_interval_sec;   /* How often to log routing table health */
-    int min_good_nodes_threshold;         /* Alert if good nodes drop below this */
     /* BEP 51 configuration */
     int bep51_enabled;                    /* Enable BEP 51 sample_infohashes queries */
     int bep51_query_rate;                 /* Queries per second (nodes to query) */

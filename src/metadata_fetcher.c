@@ -51,7 +51,6 @@ static infohash_attempt_t* create_or_get_attempt_with_peers(metadata_fetcher_t *
 static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt);
 static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash);
 static void update_attempt_statistics(infohash_attempt_t *attempt, peer_connection_t *peer, const char *close_reason);
-static failure_classification_t classify_failure(infohash_attempt_t *attempt);
 static void handle_infohash_failure(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt);
 
 static int send_handshake(peer_connection_t *peer);
@@ -1206,18 +1205,6 @@ static int process_message(peer_connection_t *peer, const uint8_t *data, size_t 
     return 0;
 }
 
-/* Find next missing metadata piece */
-static int find_next_missing_piece(peer_connection_t *peer) {
-    for (int i = 0; i < peer->total_pieces; i++) {
-        int byte_idx = i / 8;
-        int bit_idx = i % 8;
-        if (!(peer->pieces_received[byte_idx] & (1 << bit_idx))) {
-            return i;
-        }
-    }
-    return -1;  /* All pieces received */
-}
-
 /* Parse metadata piece */
 static int parse_metadata_piece(peer_connection_t *peer, const uint8_t *data, size_t len) {
     if (peer->closed) {
@@ -2206,41 +2193,6 @@ static void update_attempt_statistics(infohash_attempt_t *attempt, peer_connecti
     } else if (strstr(close_reason, "hash")) {
         attempt->hash_mismatch++;
     }
-}
-
-/* Classify failure for retry decision */
-static failure_classification_t classify_failure(infohash_attempt_t *attempt) {
-    if (!attempt) {
-        return FAILURE_PERMANENT;
-    }
-
-    /* No peers at all: discard */
-    if (attempt->peer_count_at_start == 0) {
-        return FAILURE_NO_PEERS;
-    }
-
-    /* All peers rejected or don't support metadata: permanent */
-    if (attempt->no_metadata_support >= attempt->total_connections_tried) {
-        return FAILURE_PERMANENT;
-    }
-
-    /* Hash mismatch: permanent (corrupted data) */
-    if (attempt->hash_mismatch > 0) {
-        return FAILURE_PERMANENT;
-    }
-
-    /* Timeouts or connection failures: retriable */
-    if (attempt->connections_timeout > 0 || attempt->connections_failed > 0) {
-        return FAILURE_RETRIABLE;
-    }
-
-    /* Handshake failures: retriable (might be temporary peer issues) */
-    if (attempt->handshake_failed > 0) {
-        return FAILURE_RETRIABLE;
-    }
-
-    /* Default: don't retry */
-    return FAILURE_PERMANENT;
 }
 
 /* Handle infohash-level failure (discard - no retry) */
