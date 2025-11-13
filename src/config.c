@@ -15,9 +15,6 @@ void config_init_defaults(crawler_config_t *config) {
     
     /* DHT defaults */
     config->dht_port = 6881;
-    config->max_concurrent_searches = 100;
-    config->searches_per_batch = 10;
-    config->search_interval_ms = 200;
     
     /* Cache defaults */
     config->cache_enabled = 1;
@@ -42,12 +39,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->bloom_error_rate = 0.001;
     config->bloom_persist = 1;
     strncpy(config->bloom_path, "data/bloom.dat", sizeof(config->bloom_path) - 1);
-    
-    /* Phase 3: Active Exploration defaults */
-    config->exploration_enabled = 1;
-    config->target_rotation_interval = 10;
-    config->find_node_rate = 10;
-    
+
     /* Phase 4: Worker Pool defaults */
     config->scaling_factor = 10;
     config->metadata_workers = 100;
@@ -66,13 +58,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->batch_writes_enabled = 1;
     config->batch_size = 1000;
     config->flush_interval = 60;
-    
-    /* Phase 6: Shadow Table defaults */
-    config->shadow_table_enabled = 1;
-    config->shadow_table_capacity = 10000;
-    config->shadow_table_prune_interval = 600;
-    config->shadow_table_persist = 1;
-    strncpy(config->shadow_table_path, "data/shadow_table.dat", sizeof(config->shadow_table_path) - 1);
 
     /* wbpxre-dht defaults */
     config->wbpxre_ping_workers = 10;
@@ -81,14 +66,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->wbpxre_get_peers_workers = 100;
     config->wbpxre_query_timeout = 5;
     config->max_routing_table_nodes = 10000;  /* Default: 10000 nodes */
-
-    /* Node health and pruning defaults */
-    config->maintenance_thread_enabled = 1;            /* Enabled by default */
-    config->max_node_age_sec = 120;                    /* 2 minutes */
-    config->node_verification_batch_size = 100;        /* 100 nodes per cycle */
-    config->node_cleanup_interval_sec = 30;            /* 30 seconds */
-    config->min_node_response_rate = 0.20;             /* 20% minimum response rate */
-    config->node_quality_min_queries = 5;              /* 5 queries minimum */
 
     /* Node ID rotation defaults */
     config->node_rotation_enabled = 1;
@@ -102,11 +79,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->peer_retry_max_attempts = 3;
     config->peer_retry_min_threshold = 10;
     config->peer_retry_delay_ms = 500;
-
-    /* BEP51-focused pruning defaults */
-    config->bep51_pruning_enabled = 1;          /* Enabled by default */
-    config->bep51_pruning_interval_sec = 30;    /* Check every 30 seconds */
-    config->bep51_pruning_min_capacity = 0.0;   /* Prune immediately (proactive) */
 
     /* Async node pruning defaults */
     config->async_pruning_enabled = 1;              /* Enabled by default */
@@ -178,12 +150,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Parse settings */
         if (strcmp(key, "dht_port") == 0) {
             config->dht_port = atoi(value);
-        } else if (strcmp(key, "max_concurrent_searches") == 0) {
-            config->max_concurrent_searches = atoi(value);
-        } else if (strcmp(key, "searches_per_batch") == 0) {
-            config->searches_per_batch = atoi(value);
-        } else if (strcmp(key, "search_interval_ms") == 0) {
-            config->search_interval_ms = atoi(value);
         } else if (strcmp(key, "cache_enabled") == 0) {
             config->cache_enabled = atoi(value);
         } else if (strcmp(key, "cache_max_peers") == 0) {
@@ -219,14 +185,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "bloom_path") == 0) {
             strncpy(config->bloom_path, value, sizeof(config->bloom_path) - 1);
         }
-        /* Phase 3: Active Exploration settings */
-        else if (strcmp(key, "exploration_enabled") == 0) {
-            config->exploration_enabled = atoi(value);
-        } else if (strcmp(key, "target_rotation_interval") == 0) {
-            config->target_rotation_interval = atoi(value);
-        } else if (strcmp(key, "find_node_rate") == 0) {
-            config->find_node_rate = atoi(value);
-        }
         /* Phase 4: Worker Pool settings */
         else if (strcmp(key, "scaling_factor") == 0) {
             config->scaling_factor = atoi(value);
@@ -240,18 +198,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->batch_size = atoi(value);
         } else if (strcmp(key, "flush_interval") == 0) {
             config->flush_interval = atoi(value);
-        }
-        /* Phase 6: Shadow Table settings */
-        else if (strcmp(key, "shadow_table_enabled") == 0) {
-            config->shadow_table_enabled = atoi(value);
-        } else if (strcmp(key, "shadow_table_capacity") == 0) {
-            config->shadow_table_capacity = atoi(value);
-        } else if (strcmp(key, "shadow_table_prune_interval") == 0) {
-            config->shadow_table_prune_interval = atoi(value);
-        } else if (strcmp(key, "shadow_table_persist") == 0) {
-            config->shadow_table_persist = atoi(value);
-        } else if (strcmp(key, "shadow_table_path") == 0) {
-            strncpy(config->shadow_table_path, value, sizeof(config->shadow_table_path) - 1);
         }
         /* Metadata fetcher settings */
         else if (strcmp(key, "concurrent_peers_per_torrent") == 0) {
@@ -285,20 +231,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "max_routing_table_nodes") == 0) {
             config->max_routing_table_nodes = atoi(value);
         }
-        /* Node health and pruning settings */
-        else if (strcmp(key, "maintenance_thread_enabled") == 0) {
-            config->maintenance_thread_enabled = atoi(value);
-        } else if (strcmp(key, "max_node_age_sec") == 0) {
-            config->max_node_age_sec = atoi(value);
-        } else if (strcmp(key, "node_verification_batch_size") == 0) {
-            config->node_verification_batch_size = atoi(value);
-        } else if (strcmp(key, "node_cleanup_interval_sec") == 0) {
-            config->node_cleanup_interval_sec = atoi(value);
-        } else if (strcmp(key, "min_node_response_rate") == 0) {
-            config->min_node_response_rate = atof(value);
-        } else if (strcmp(key, "node_quality_min_queries") == 0) {
-            config->node_quality_min_queries = atoi(value);
-        }
         /* Node ID rotation settings */
         else if (strcmp(key, "node_rotation_enabled") == 0) {
             config->node_rotation_enabled = atoi(value);
@@ -320,17 +252,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->peer_retry_min_threshold = atoi(value);
         } else if (strcmp(key, "peer_retry_delay_ms") == 0) {
             config->peer_retry_delay_ms = atoi(value);
-        }
-        /* BEP51-focused pruning settings */
-        else if (strcmp(key, "bep51_pruning_enabled") == 0) {
-            config->bep51_pruning_enabled = atoi(value);
-        } else if (strcmp(key, "bep51_pruning_interval_sec") == 0) {
-            config->bep51_pruning_interval_sec = atoi(value);
-        } else if (strcmp(key, "bep51_pruning_min_capacity") == 0) {
-            config->bep51_pruning_min_capacity = atof(value);
-            /* Clamp to valid range [0.0, 1.0] */
-            if (config->bep51_pruning_min_capacity < 0.0) config->bep51_pruning_min_capacity = 0.0;
-            if (config->bep51_pruning_min_capacity > 1.0) config->bep51_pruning_min_capacity = 1.0;
         }
         /* Async node pruning settings */
         else if (strcmp(key, "async_pruning_enabled") == 0) {
@@ -422,11 +343,8 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
                 /* Config file is loaded separately */
                 break;
             case 'a':
-                /* Aggressive mode: more searches */
-                config->searches_per_batch = 20;
-                config->search_interval_ms = 100;
-                config->max_concurrent_searches = 200;
-                log_msg(LOG_DEBUG, "Aggressive mode enabled");
+                /* Aggressive mode (placeholder - no longer used) */
+                log_msg(LOG_DEBUG, "Aggressive mode flag ignored (deprecated)");
                 break;
             case '?':
             default:
@@ -457,9 +375,6 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
     log_msg(LOG_DEBUG, "DHT Settings:");
     log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
-    log_msg(LOG_DEBUG, "  Max Concurrent Searches: %d", config->max_concurrent_searches);
-    log_msg(LOG_DEBUG, "  Searches Per Batch: %d", config->searches_per_batch);
-    log_msg(LOG_DEBUG, "  Search Interval: %dms", config->search_interval_ms);
     log_msg(LOG_DEBUG, "Cache Settings:");
     log_msg(LOG_DEBUG, "  Enabled: %s", config->cache_enabled ? "yes" : "no");
     log_msg(LOG_DEBUG, "  Max Peers: %d", config->cache_max_peers);

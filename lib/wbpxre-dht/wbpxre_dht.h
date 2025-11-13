@@ -106,7 +106,6 @@ typedef struct {
     uint64_t get_peers_responses_received;
     /* Node health statistics */
     uint64_t nodes_dropped;
-    uint64_t nodes_dropped_bep51_pruning;
     uint64_t nodes_dropped_unresponsive;
     uint64_t aggressive_prune_triggers;
 } wbpxre_stats_t;
@@ -270,19 +269,6 @@ typedef struct {
     /* Routing table configuration */
     int max_routing_table_nodes;  /* Maximum nodes in routing table (default: 10000) */
 
-    /* Node health and verification */
-    int maintenance_thread_enabled;    /* Enable maintenance thread (0=disabled, 1=enabled, default: 1) */
-    int node_verification_batch_size;  /* Nodes to verify per maintenance cycle (default: 100) */
-    int max_node_age_sec;              /* Consider nodes old after this many seconds (default: 120) */
-    int node_cleanup_interval_sec;     /* Clean dropped nodes every N seconds (default: 30) */
-    double min_node_response_rate;     /* Evict nodes with response rate below this (default: 0.20) */
-    int node_quality_min_queries;      /* Minimum queries before judging quality (default: 5) */
-
-    /* BEP51-focused pruning */
-    int bep51_pruning_enabled;         /* Enable BEP51-focused node pruning (default: 1) */
-    int bep51_pruning_interval_sec;    /* How often to check and prune (default: 30) */
-    double bep51_pruning_min_capacity; /* Min capacity ratio to trigger pruning (default: 0.0) */
-
     /* Callbacks */
     wbpxre_callback_t callback;
     void *callback_closure;
@@ -326,7 +312,6 @@ typedef struct {
     pthread_t find_node_feeder_thread;
     pthread_t ping_feeder_thread;
     pthread_t get_peers_feeder_thread;
-    pthread_t maintenance_thread;
 
     /* Shared state */
     uint8_t sought_node_id[WBPXRE_NODE_ID_LEN];
@@ -359,7 +344,6 @@ typedef struct {
         uint64_t get_peers_responses_received;
         /* Node health statistics */
         uint64_t nodes_dropped;
-        uint64_t nodes_dropped_bep51_pruning;
         uint64_t nodes_dropped_unresponsive;
         uint64_t aggressive_prune_triggers;
     } stats;
@@ -509,13 +493,6 @@ int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
                                                  wbpxre_routing_node_t **nodes_out,
                                                  int n, double min_rate, int min_queries);
 
-/* Get nodes that don't support BEP51 (for prioritized eviction)
- * Returns copies of nodes (caller must free each node in nodes_out array)
- * Selects nodes where bep51_support == NO or UNKNOWN after min_queries */
-int wbpxre_routing_table_get_non_bep51_nodes(wbpxre_routing_table_t *table,
-                                               wbpxre_routing_node_t **nodes_out,
-                                               int n, int min_queries);
-
 /* Get oldest nodes (sorted by last_responded_at, oldest first)
  * Returns copies of nodes (caller must free each node in nodes_out array)
  * Used for capacity-based eviction when table is full */
@@ -566,10 +543,6 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
                                                   int discovered_num,
                                                   int total_num,
                                                   int interval);
-
-/* Mark node as not supporting BEP51 (for instant pruning on first error) */
-void wbpxre_routing_table_mark_non_bep51(wbpxre_routing_table_t *table,
-                                          const uint8_t *node_id);
 
 /* Drop node from routing table */
 void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,

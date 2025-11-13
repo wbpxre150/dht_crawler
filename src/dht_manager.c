@@ -4,7 +4,6 @@
 #include "config.h"
 #include "infohash_queue.h"
 #include "dht_cache.h"
-#include "shadow_routing_table.h"
 #include "peer_store.h"
 #include "metadata_fetcher.h"
 #include "worker_pool.h"
@@ -282,12 +281,6 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 mgr->stats.bep51_samples_received += num_samples;
                 mgr->samples_since_rotation += num_samples;
 
-                /* Mark node as responded in shadow table if we have node info */
-                if (mgr->shadow_table && info_hash) {
-                    shadow_table_mark_responded(mgr->shadow_table, info_hash,
-                                               num_samples, 60);
-                }
-
                 /* Trigger peer queries for all samples */
                 for (int i = 0; i < num_samples; i++) {
                     const uint8_t *hash = samples + (i * 20);
@@ -537,11 +530,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     }
 
     /* Initialize configuration with defaults */
-    mgr->config.bucket_refresh_interval_sec = 90;
-    mgr->config.neighbourhood_refresh_interval_sec = 60;
-    mgr->config.wandering_search_interval_sec = 30;
-    mgr->config.wandering_searches_per_cycle = 3;
-    mgr->config.max_concurrent_searches = 15;
     mgr->config.routing_table_log_interval_sec = 60;
     mgr->config.min_good_nodes_threshold = 50;
 
@@ -559,9 +547,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
 
     /* Node discovery configuration */
     mgr->config.node_discovery_enabled = 1;
-    mgr->config.find_node_workers = 100;
-    mgr->config.discovered_queue_capacity = 10000;
-    mgr->config.bootstrap_reseed_interval_sec = 120;
 
     /* Node ID rotation configuration */
     mgr->node_rotation_enabled = 0;  /* Default: disabled */
@@ -600,19 +585,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     }
     log_msg(LOG_DEBUG, "Peer store created at address: %p", (void*)mgr->peer_store);
 
-    /* Initialize shadow routing table for BEP 51 */
-    if (cfg && cfg->shadow_table_enabled) {
-        mgr->shadow_table = shadow_table_init(cfg->shadow_table_capacity,
-                                               cfg->shadow_table_prune_interval,
-                                               app_ctx->loop);
-        if (!mgr->shadow_table) {
-            log_msg(LOG_WARN, "Failed to create shadow routing table");
-        } else {
-            log_msg(LOG_DEBUG, "Created shadow routing table (capacity: %d)",
-                   cfg->shadow_table_capacity);
-        }
-    }
-
     /* Build wbpxre-dht configuration */
     wbpxre_config_t dht_config = {0};
     dht_config.port = app_ctx->dht_port;
@@ -626,15 +598,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.get_peers_workers = cfg->wbpxre_get_peers_workers;
         dht_config.query_timeout = cfg->wbpxre_query_timeout;
         dht_config.max_routing_table_nodes = cfg->max_routing_table_nodes;
-        dht_config.maintenance_thread_enabled = cfg->maintenance_thread_enabled;
-        dht_config.node_verification_batch_size = cfg->node_verification_batch_size;
-        dht_config.max_node_age_sec = cfg->max_node_age_sec;
-        dht_config.node_cleanup_interval_sec = cfg->node_cleanup_interval_sec;
-        dht_config.min_node_response_rate = cfg->min_node_response_rate;
-        dht_config.node_quality_min_queries = cfg->node_quality_min_queries;
-        dht_config.bep51_pruning_enabled = cfg->bep51_pruning_enabled;
-        dht_config.bep51_pruning_interval_sec = cfg->bep51_pruning_interval_sec;
-        dht_config.bep51_pruning_min_capacity = cfg->bep51_pruning_min_capacity;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -643,15 +606,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.get_peers_workers = 100;
         dht_config.query_timeout = 5;
         dht_config.max_routing_table_nodes = 10000;
-        dht_config.maintenance_thread_enabled = 1;
-        dht_config.node_verification_batch_size = 100;
-        dht_config.max_node_age_sec = 120;
-        dht_config.node_cleanup_interval_sec = 30;
-        dht_config.min_node_response_rate = 0.20;
-        dht_config.node_quality_min_queries = 5;
-        dht_config.bep51_pruning_enabled = 1;
-        dht_config.bep51_pruning_interval_sec = 30;
-        dht_config.bep51_pruning_min_capacity = 0.0;
     }
 
     /* Callback setup */
@@ -669,7 +623,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     if (!mgr->dht) {
         log_msg(LOG_ERROR, "Failed to initialize wbpxre-dht");
         peer_store_cleanup(mgr->peer_store);
-        if (mgr->shadow_table) shadow_table_cleanup(mgr->shadow_table);
         return -1;
     }
     log_msg(LOG_DEBUG, "Initialized wbpxre-dht:");
@@ -679,7 +632,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     log_msg(LOG_DEBUG, "  - Sample infohashes workers: %d", dht_config.sample_infohashes_workers);
     log_msg(LOG_DEBUG, "  - Get peers workers: %d", dht_config.get_peers_workers);
     log_msg(LOG_DEBUG, "  - Query timeout: %d seconds", dht_config.query_timeout);
-    log_msg(LOG_DEBUG, "  - Node verification batch size: %d", dht_config.node_verification_batch_size);
 
     /* Start wbpxre-dht (spawns worker threads) */
     int rc = wbpxre_dht_start(mgr->dht);
@@ -688,7 +640,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         wbpxre_dht_cleanup(mgr->dht);
         mgr->dht = NULL;
         peer_store_cleanup(mgr->peer_store);
-        if (mgr->shadow_table) shadow_table_cleanup(mgr->shadow_table);
         return -1;
     }
     log_msg(LOG_DEBUG, "Started wbpxre-dht worker threads");
@@ -701,7 +652,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         wbpxre_dht_cleanup(mgr->dht);
         mgr->dht = NULL;
         peer_store_cleanup(mgr->peer_store);
-        if (mgr->shadow_table) shadow_table_cleanup(mgr->shadow_table);
         return -1;
     }
     mgr->bootstrap_reseed_timer.data = mgr;
@@ -1059,13 +1009,6 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
         mgr->peer_store = NULL;
     }
 
-    /* Cleanup shadow table with NULL check */
-    if (mgr->shadow_table) {
-        log_msg(LOG_DEBUG, "Cleaning up shadow table...");
-        shadow_table_cleanup(mgr->shadow_table);
-        mgr->shadow_table = NULL;
-    }
-
     /* Cleanup cache */
     dht_cache_cleanup(&mgr->cache);
 
@@ -1239,14 +1182,6 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.get_peers_workers = cfg->wbpxre_get_peers_workers;
         dht_config.query_timeout = cfg->wbpxre_query_timeout;
         dht_config.max_routing_table_nodes = cfg->max_routing_table_nodes;
-        dht_config.node_verification_batch_size = cfg->node_verification_batch_size;
-        dht_config.max_node_age_sec = cfg->max_node_age_sec;
-        dht_config.node_cleanup_interval_sec = cfg->node_cleanup_interval_sec;
-        dht_config.min_node_response_rate = cfg->min_node_response_rate;
-        dht_config.node_quality_min_queries = cfg->node_quality_min_queries;
-        dht_config.bep51_pruning_enabled = cfg->bep51_pruning_enabled;
-        dht_config.bep51_pruning_interval_sec = cfg->bep51_pruning_interval_sec;
-        dht_config.bep51_pruning_min_capacity = cfg->bep51_pruning_min_capacity;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -1255,15 +1190,6 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
         dht_config.get_peers_workers = 100;
         dht_config.query_timeout = 5;
         dht_config.max_routing_table_nodes = 10000;
-        dht_config.maintenance_thread_enabled = 1;
-        dht_config.node_verification_batch_size = 100;
-        dht_config.max_node_age_sec = 120;
-        dht_config.node_cleanup_interval_sec = 30;
-        dht_config.min_node_response_rate = 0.20;
-        dht_config.node_quality_min_queries = 5;
-        dht_config.bep51_pruning_enabled = 1;
-        dht_config.bep51_pruning_interval_sec = 30;
-        dht_config.bep51_pruning_min_capacity = 0.0;
     }
 
     /* Callback setup */
@@ -1950,14 +1876,10 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             /* Calculate and display nodes dropped in last interval */
             uint64_t current_dropped = wbpxre_stats.nodes_dropped;
             uint64_t dropped_delta = current_dropped - mgr->stats.last_nodes_dropped;
-            uint64_t current_bep51_dropped = wbpxre_stats.nodes_dropped_bep51_pruning;
-            uint64_t bep51_dropped_delta = current_bep51_dropped - mgr->stats.last_nodes_dropped_bep51;
-            log_msg(LOG_INFO, "  Nodes dropped: last_10s=%llu (bep51=%llu) total=%llu",
+            log_msg(LOG_INFO, "  Nodes dropped: last_10s=%llu total=%llu",
                     (unsigned long long)dropped_delta,
-                    (unsigned long long)bep51_dropped_delta,
                     (unsigned long long)current_dropped);
             mgr->stats.last_nodes_dropped = current_dropped;
-            mgr->stats.last_nodes_dropped_bep51 = current_bep51_dropped;
         }
     }
 

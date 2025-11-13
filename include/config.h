@@ -7,9 +7,6 @@
 typedef struct {
     /* DHT settings */
     int dht_port;
-    int max_concurrent_searches;
-    int searches_per_batch;
-    int search_interval_ms;
     
     /* Cache settings */
     int cache_enabled;
@@ -35,11 +32,6 @@ typedef struct {
     int bloom_persist;
     char bloom_path[512];
     
-    /* Phase 3: Active Exploration settings */
-    int exploration_enabled;
-    int target_rotation_interval;    /* seconds */
-    int find_node_rate;              /* queries per second */
-    
     /* Phase 4: Worker Pool settings */
     int scaling_factor;
     int metadata_workers;
@@ -58,13 +50,6 @@ typedef struct {
     int batch_writes_enabled;
     int batch_size;
     int flush_interval;              /* seconds */
-    
-    /* Phase 6: Shadow Routing Table settings */
-    int shadow_table_enabled;
-    int shadow_table_capacity;
-    int shadow_table_prune_interval; /* seconds */
-    int shadow_table_persist;
-    char shadow_table_path[512];
 
     /* wbpxre-dht settings */
     int wbpxre_ping_workers;
@@ -73,14 +58,6 @@ typedef struct {
     int wbpxre_get_peers_workers;
     int wbpxre_query_timeout;
     int max_routing_table_nodes;         /* Maximum nodes in routing table */
-
-    /* Node health and pruning settings */
-    int maintenance_thread_enabled;      /* Enable maintenance thread (0=disabled, 1=enabled) */
-    int max_node_age_sec;                /* Consider nodes old after this many seconds */
-    int node_verification_batch_size;    /* Verify this many old nodes per cycle */
-    int node_cleanup_interval_sec;       /* Clean dropped nodes every N seconds */
-    double min_node_response_rate;       /* Evict nodes with response rate below this */
-    int node_quality_min_queries;        /* Minimum queries before judging quality */
 
     /* Node ID rotation settings */
     int node_rotation_enabled;           /* Enable periodic node ID rotation */
@@ -94,11 +71,6 @@ typedef struct {
     int peer_retry_max_attempts;         /* Max get_peers retries (1-5, default: 3) */
     int peer_retry_min_threshold;        /* Min peers before stopping retries (default: 10) */
     int peer_retry_delay_ms;             /* Delay between retries in ms (default: 500) */
-
-    /* BEP51-focused pruning settings */
-    int bep51_pruning_enabled;           /* Enable BEP51-focused node pruning */
-    int bep51_pruning_interval_sec;      /* How often to check and prune (default: 30) */
-    double bep51_pruning_min_capacity;   /* Min capacity ratio (0.0-1.0) before pruning (default: 0.0) */
 
     /* Async node pruning settings (timer-based) */
     int async_pruning_enabled;           /* Enable async pruning */

@@ -679,83 +679,6 @@ int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
     return count;
 }
 
-/* ============================================================================
- * Get Non-BEP51 Nodes (for BEP51-focused pruning)
- * ============================================================================ */
-
-static void collect_non_bep51_nodes_recursive(wbpxre_routing_node_t *root,
-                                                wbpxre_routing_node_t **array,
-                                                int *count, int n,
-                                                int min_queries) {
-    if (!root || *count >= n) return;
-
-    /* Skip dropped nodes */
-    if (root->dropped) {
-        collect_non_bep51_nodes_recursive(root->left, array, count, n, min_queries);
-        collect_non_bep51_nodes_recursive(root->right, array, count, n, min_queries);
-        return;
-    }
-
-    /* Check if node is non-BEP51:
-     * 1. Confirmed NO support (prune immediately, no min_queries check)
-     * 2. UNKNOWN after sufficient queries (probably doesn't support it)
-     * 3. UNKNOWN and old (>3 minutes) - aged out before being queried */
-    bool is_non_bep51 = false;
-
-    if (root->bep51_support == WBPXRE_PROTOCOL_NO) {
-        /* Node explicitly rejected BEP51 - prune regardless of query count */
-        is_non_bep51 = true;
-    } else if (root->bep51_support == WBPXRE_PROTOCOL_UNKNOWN) {
-        /* If node was never queried or has few queries, assume no BEP51 support
-         * This catches nodes that aged out of sample candidate pool without being queried */
-        if (root->queries_sent < min_queries) {
-            /* Prune immediately - no age check needed */
-            is_non_bep51 = true;
-        } else {
-            /* Node has been queried enough times without BEP51 response */
-            is_non_bep51 = true;
-        }
-    }
-
-    if (is_non_bep51) {
-        array[(*count)++] = root;
-    }
-
-    /* Recursively collect from subtrees */
-    if (*count < n) {
-        collect_non_bep51_nodes_recursive(root->left, array, count, n, min_queries);
-    }
-    if (*count < n) {
-        collect_non_bep51_nodes_recursive(root->right, array, count, n, min_queries);
-    }
-}
-
-int wbpxre_routing_table_get_non_bep51_nodes(wbpxre_routing_table_t *table,
-                                               wbpxre_routing_node_t **nodes_out,
-                                               int n, int min_queries) {
-    if (!table || !nodes_out || n <= 0) return 0;
-
-    rcu_read_lock();
-
-    /* Collect non-BEP51 node pointers */
-    wbpxre_routing_node_t *candidates[n];
-    int count = 0;
-    collect_non_bep51_nodes_recursive(table->root, candidates, &count, n, min_queries);
-
-    /* Copy nodes to avoid data races after lock release */
-    for (int i = 0; i < count; i++) {
-        wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
-        memcpy(node_copy, candidates[i], sizeof(wbpxre_routing_node_t));
-        /* Clear tree pointers since this is a standalone copy */
-        node_copy->left = NULL;
-        node_copy->right = NULL;
-        nodes_out[i] = node_copy;
-    }
-
-    rcu_read_unlock();
-
-    return count;
-}
 
 /* ============================================================================
  * Get Oldest Nodes (for capacity-based eviction)
@@ -1174,21 +1097,6 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
             }
             node->next_sample_time = now + interval;
         }
-    }
-
-    pthread_mutex_unlock(&table->update_lock);
-}
-
-/* Mark node as not supporting BEP51 (for instant pruning on first error) */
-void wbpxre_routing_table_mark_non_bep51(wbpxre_routing_table_t *table,
-                                          const uint8_t *node_id) {
-    if (!table || !node_id) return;
-
-    pthread_mutex_lock(&table->update_lock);
-
-    wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
-    if (node) {
-        node->bep51_support = WBPXRE_PROTOCOL_NO;
     }
 
     pthread_mutex_unlock(&table->update_lock);

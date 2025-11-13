@@ -3,7 +3,6 @@
 
 #include "dht_crawler.h"
 #include "dht_cache.h"
-#include "shadow_routing_table.h"
 #include "peer_store.h"
 #include "discovered_nodes.h"
 #include "wbpxre_dht.h"
@@ -58,7 +57,6 @@ typedef struct {
     uint64_t find_node_sent;          /* find_node queries sent */
     uint64_t find_node_success;       /* find_node successful responses */
     uint64_t find_node_timeout;       /* find_node query timeouts */
-    uint64_t nodes_in_shadow_table;   /* Current nodes in shadow table */
     uint64_t nodes_in_jech_table;     /* Current nodes in jech/dht table */
     uint64_t nodes_expired;           /* Nodes expired due to inactivity */
     uint64_t nodes_pruned;            /* Nodes pruned from tables */
@@ -68,18 +66,12 @@ typedef struct {
     time_t last_rotation_time;           /* Last rotation timestamp */
     /* Node pruning statistics */
     uint64_t last_nodes_dropped;         /* Nodes dropped at last stats print (for delta calculation) */
-    uint64_t last_nodes_dropped_bep51;   /* BEP51 pruning drops at last stats print (for delta calculation) */
     /* Peer retry statistics */
     uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
 } dht_stats_t;
 
 /* DHT configuration */
 typedef struct {
-    int bucket_refresh_interval_sec;      /* How often to refresh stale buckets */
-    int neighbourhood_refresh_interval_sec; /* How often to search near our ID */
-    int wandering_search_interval_sec;    /* How often to do random searches */
-    int wandering_searches_per_cycle;     /* Number of random searches per cycle */
-    int max_concurrent_searches;          /* Maximum concurrent active searches */
     int routing_table_log_interval_sec;   /* How often to log routing table health */
     int min_good_nodes_threshold;         /* Alert if good nodes drop below this */
     /* BEP 51 configuration */
@@ -93,9 +85,6 @@ typedef struct {
     int peer_query_timeout_sec;           /* Timeout for get_peers queries */
     /* Node discovery configuration */
     int node_discovery_enabled;           /* Enable aggressive node discovery */
-    int find_node_workers;                /* Number of find_node worker threads */
-    int discovered_queue_capacity;        /* Discovered nodes queue capacity */
-    int bootstrap_reseed_interval_sec;    /* How often to reseed bootstrap nodes */
     int old_node_check_interval_sec;      /* How often to check for old nodes */
     int old_node_threshold_sec;           /* Age threshold for old nodes */
     int max_routing_table_nodes;          /* Maximum nodes in routing table */
@@ -169,8 +158,6 @@ typedef struct {
     unsigned char bep51_target[20];   /* Current target ID for sample_infohashes */
     time_t last_target_rotation;      /* Last time we rotated the target */
     time_t last_bep51_query;          /* Last time we sent BEP 51 queries */
-    /* Shadow routing table */
-    shadow_routing_table_t *shadow_table; /* Enhanced node tracking for BEP 51 */
     /* Peer discovery state */
     peer_store_t *peer_store;         /* Storage for discovered peers */
     int active_peer_queries;          /* Current number of active get_peers queries */
