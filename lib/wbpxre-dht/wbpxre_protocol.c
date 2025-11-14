@@ -426,38 +426,45 @@ static int send_query(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
 static wbpxre_message_t *wait_for_response_msg(wbpxre_dht_t *dht,
                                                  const uint8_t *transaction_id,
                                                  int timeout_sec) {
-    /* Create pending query */
+    /* Create pending query - starts with ref_count = 1 */
     wbpxre_pending_query_t *pq = wbpxre_create_pending_query(transaction_id, timeout_sec);
     if (!pq) return NULL;
 
-    /* Register it */
+    /* Register it - increments ref_count to 2 (our reference + hash table reference) */
     wbpxre_register_pending_query(dht, pq);
 
     /* Wait for response */
     if (wbpxre_wait_for_response(pq) < 0) {
         /* Timeout or error - try to remove from pending queries hash table */
         wbpxre_pending_query_t *removed = wbpxre_find_and_remove_pending_query(dht, transaction_id);
-        /* Only free if WE successfully removed it (not already removed by UDP reader) */
+
         if (removed == pq) {
-            /* We removed our query - we own it, we free it */
-            wbpxre_free_pending_query(pq);
+            /* We successfully removed it from hash table
+             * Need to release BOTH references: hash table's + our original */
+            wbpxre_free_pending_query(pq);  /* Release hash table's reference */
+            wbpxre_free_pending_query(pq);  /* Release our original reference */
         } else if (removed == NULL) {
-            /* Race condition: UDP reader already removed and signaled it, but we timed out anyway.
-             * Since UDP reader has already removed it from the hash table and we have the pointer,
-             * we are the only owner. We must free it to prevent the leak. */
+            /* UDP reader already removed it from hash table
+             * Hash table's reference already released by UDP reader
+             * We only need to release our original reference */
             wbpxre_free_pending_query(pq);
         } else {
-            /* Got different pq - transaction ID collision in hash bucket (very rare).
-             * This means we removed the wrong query. Put it back and free our own. */
+            /* Got different query - transaction ID collision (very rare)
+             * Put removed query back (adds reference, then releases it when we free)
+             * Then release our original reference to our query */
             wbpxre_register_pending_query(dht, removed);
-            wbpxre_free_pending_query(pq);
+            wbpxre_free_pending_query(removed);  /* Release the reference we just added */
+            wbpxre_free_pending_query(pq);       /* Release our original reference */
         }
         return NULL;
     }
 
-    /* Get response data */
+    /* Success - get response data */
     wbpxre_message_t *response = (wbpxre_message_t *)pq->response_data;
     pq->response_data = NULL;  /* Prevent double-free */
+
+    /* Release our original reference
+     * Note: UDP reader already removed query from hash table and released that reference */
     wbpxre_free_pending_query(pq);
 
     return response;

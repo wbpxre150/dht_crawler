@@ -195,6 +195,9 @@ typedef struct wbpxre_pending_query {
     bool error;
     time_t deadline;
     struct wbpxre_pending_query *next;
+    /* Reference counting for safe cleanup */
+    _Atomic int ref_count;
+    _Atomic bool freed;
 } wbpxre_pending_query_t;
 
 /* Work queue for pipeline */

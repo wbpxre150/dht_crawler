@@ -13,6 +13,7 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <stdatomic.h>
 #include <urcu.h>
 #include <urcu/rculist.h>
 
@@ -77,6 +78,9 @@ wbpxre_pending_query_t *wbpxre_create_pending_query(const uint8_t *transaction_i
     pq->deadline = time(NULL) + timeout_sec;
     pq->response_data = NULL;
     pq->next = NULL;
+    /* Initialize reference counting */
+    atomic_init(&pq->ref_count, 1);
+    atomic_init(&pq->freed, false);
 
     return pq;
 }
@@ -115,6 +119,22 @@ static void free_message_fields(wbpxre_message_t *msg) {
 
 void wbpxre_free_pending_query(wbpxre_pending_query_t *pq) {
     if (!pq) return;
+
+    /* Decrement reference count - only free if we're the last reference */
+    int old_count = atomic_fetch_sub(&pq->ref_count, 1);
+    if (old_count != 1) {
+        /* Still other references, don't free yet */
+        return;
+    }
+
+    /* Check if already freed (double-free protection) */
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&pq->freed, &expected, true)) {
+        /* Already freed by another thread */
+        return;
+    }
+
+    /* We're the last reference and we marked it as freed - safe to free now */
     pthread_mutex_destroy(&pq->mutex);
     pthread_cond_destroy(&pq->cond);
 
@@ -132,6 +152,9 @@ int wbpxre_register_pending_query(wbpxre_dht_t *dht, wbpxre_pending_query_t *pq)
     uint8_t hash = pq->transaction_id[0];
 
     pthread_mutex_lock(&dht->pending_queries_mutex);
+
+    /* Increment reference count - hash table now holds a reference */
+    atomic_fetch_add(&pq->ref_count, 1);
 
     /* Add to hash bucket */
     pq->next = dht->pending_queries[hash];
@@ -368,7 +391,9 @@ static void *udp_reader_thread_func(void *arg) {
                 if (msg.token_len == 0) response_copy->token = NULL;
 
                 signal_pending_query(pq, response_copy, false);
-                /* Note: pq will be freed by the waiting thread, not here */
+
+                /* Release hash table's reference (removed from hash table above) */
+                wbpxre_free_pending_query(pq);
 
                 pthread_mutex_lock(&dht->stats_mutex);
                 dht->stats.responses_received++;
@@ -379,7 +404,9 @@ static void *udp_reader_thread_func(void *arg) {
             wbpxre_pending_query_t *pq = wbpxre_find_and_remove_pending_query(dht, msg.transaction_id);
             if (pq) {
                 signal_pending_query(pq, NULL, true);
-                /* Note: pq will be freed by the waiting thread, not here */
+
+                /* Release hash table's reference (removed from hash table above) */
+                wbpxre_free_pending_query(pq);
 
                 pthread_mutex_lock(&dht->stats_mutex);
                 dht->stats.errors_received++;
