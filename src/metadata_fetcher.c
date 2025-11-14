@@ -899,6 +899,9 @@ static void on_tcp_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
     }
 
     if (nread == 0) {
+        /* No data available right now (EAGAIN/EWOULDBLOCK) - this is normal
+         * for async I/O. Reset timeout to show connection is still alive. */
+        reset_timeout_timer(peer);
         return;
     }
 
