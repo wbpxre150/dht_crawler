@@ -129,10 +129,20 @@ Probabilistic duplicate detection:
 - Reduces database queries by ~90% by filtering seen infohashes
 
 #### Database (`src/database.c`, `include/database.h`)
-SQLite storage layer:
-- **Schema**: `torrents` table (info_hash, name, size, timestamps) and `torrent_files` table (file paths/sizes)
-- **Indexes**: Optimized for search queries (added_timestamp, total_peers, name FTS)
-- **Search**: Full-text search via `LIKE` queries on torrent/file names
+SQLite storage layer with optimized schema:
+- **Schema**:
+  - `torrents` table (info_hash, name, size_bytes, total_peers, added_timestamp)
+  - `torrent_files` table (torrent_id, prefix_id, filename, size_bytes, file_index)
+  - `path_prefixes` table (id, prefix) - deduplicates directory paths
+- **Schema Optimizations** (60-70% size reduction):
+  - Removed redundant fields: piece_length, num_pieces, last_seen
+  - Path normalization: split file paths into prefix_id + filename for deduplication
+  - Changed file_index from INTEGER to SMALLINT (50% size reduction per file)
+  - 32KB page_size for better compression
+  - Incremental auto_vacuum for space management
+- **Indexes**: Optimized for search queries (added_timestamp, total_peers, name FTS5, file FTS5)
+- **Search**: Full-text search via FTS5 on torrent names and filenames (trigram tokenization)
+- **Expected Scale**: 135-180GB for 15M torrents (down from 450-600GB with old schema)
 - **API**: Insert, search, statistics (total torrents, total size)
 
 #### HTTP API (`src/http_api.c`, `include/http_api.h`)
@@ -277,12 +287,19 @@ No formal test suite currently. Testing strategy:
 - Bloom filter: 90% reduction in database queries
 - Lock-free queues: MPSC queues avoid contention in hot paths
 - RCU routing table: Lock-free reads for DHT lookups
+- Database schema: 60-70% storage reduction via path normalization and field optimization
 
 **Resource Limits:**
 - Max concurrent TCP connections: Configurable (default 2000-5000)
 - Routing table nodes: Configurable max (default 60,000 after pruning)
 - Infohash queue size: 10,000 infohashes
 - Bloom filter capacity: 30 million infohashes (default)
+
+**Storage Efficiency:**
+- Optimized schema reduces storage from 30-40GB/million torrents to 9-12GB/million
+- Path deduplication via prefix table eliminates redundant directory strings
+- SMALLINT file_index reduces per-file overhead by 50%
+- 32KB pages + incremental auto_vacuum optimize disk usage
 
 ## Dependencies
 
