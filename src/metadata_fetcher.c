@@ -61,6 +61,26 @@ static int process_message(peer_connection_t *peer, const uint8_t *data, size_t 
 static int parse_metadata_piece(peer_connection_t *peer, const uint8_t *data, size_t len);
 static int verify_and_parse_metadata(peer_connection_t *peer);
 
+/**
+ * Free an infohash_attempt_t and all its dynamically allocated members
+ */
+static void free_infohash_attempt(infohash_attempt_t *attempt) {
+    if (!attempt) return;
+
+    /* Free dynamically allocated peer arrays */
+    if (attempt->available_peers) {
+        free(attempt->available_peers);
+        attempt->available_peers = NULL;
+    }
+    if (attempt->available_peer_lens) {
+        free(attempt->available_peer_lens);
+        attempt->available_peer_lens = NULL;
+    }
+
+    /* Free the attempt structure itself */
+    free(attempt);
+}
+
 /* Helper: format info_hash as hex */
 static void format_infohash_hex(const uint8_t *hash, char *out) {
     for (int i = 0; i < 20; i++) {
@@ -443,7 +463,7 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
         infohash_attempt_t *attempt = fetcher->attempt_table[i];
         while (attempt) {
             infohash_attempt_t *next = attempt->next;
-            free(attempt);
+            free_infohash_attempt(attempt);
             attempt = next;
         }
         fetcher->attempt_table[i] = NULL;
@@ -2123,15 +2143,7 @@ static void remove_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash
     while (attempt) {
         if (memcmp(attempt->info_hash, info_hash, 20) == 0) {
             *prev_ptr = attempt->next;
-
-            /* Free peer queue arrays if allocated */
-            if (attempt->available_peers) {
-                free(attempt->available_peers);
-            }
-            if (attempt->available_peer_lens) {
-                free(attempt->available_peer_lens);
-            }
-            free(attempt);
+            free_infohash_attempt(attempt);
             uv_mutex_unlock(&fetcher->attempt_table_mutex);
             return;
         }
