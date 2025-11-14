@@ -441,10 +441,13 @@ static wbpxre_message_t *wait_for_response_msg(wbpxre_dht_t *dht,
         if (removed == pq) {
             /* We own it, we free it */
             wbpxre_free_pending_query(pq);
+        } else if (removed == NULL) {
+            /* Race condition: UDP reader already removed and signaled it, but we timed out anyway.
+             * Since UDP reader has already removed it from the hash table and we have the pointer,
+             * we are the only owner. We must free it to prevent the leak. */
+            wbpxre_free_pending_query(pq);
         }
-        /* If removed is NULL, UDP reader already removed and signaled it, but we timed out anyway.
-         * In that case, pq is still valid but we shouldn't free it - let it leak rather than crash.
-         * This is a race condition edge case that should be rare. */
+        /* If removed is some other pq (highly unlikely), don't free our pq */
         return NULL;
     }
 
