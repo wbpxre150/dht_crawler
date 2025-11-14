@@ -98,6 +98,12 @@ static int compare_node_ids(const uint8_t *id1, const uint8_t *id2) {
     return memcmp(id1, id2, WBPXRE_NODE_ID_LEN);
 }
 
+/* RCU callback to free routing node after grace period */
+static void free_routing_node_rcu(struct rcu_head *head) {
+    wbpxre_routing_node_t *node = caa_container_of(head, wbpxre_routing_node_t, rcu_head);
+    free(node);
+}
+
 /* Forward declaration */
 static wbpxre_routing_node_t *find_node_recursive(wbpxre_routing_node_t *root,
                                                    const uint8_t *node_id);
@@ -131,11 +137,11 @@ static wbpxre_routing_node_t *remove_node_recursive(wbpxre_routing_node_t *root,
         /* Node with only one child or no child */
         if (root->left == NULL) {
             wbpxre_routing_node_t *temp = root->right;
-            free(root);
+            call_rcu(&root->rcu_head, free_routing_node_rcu);
             return temp;
         } else if (root->right == NULL) {
             wbpxre_routing_node_t *temp = root->left;
-            free(root);
+            call_rcu(&root->rcu_head, free_routing_node_rcu);
             return temp;
         }
 
@@ -271,8 +277,11 @@ static void free_routing_tree(wbpxre_routing_node_t *node) {
 void wbpxre_routing_table_destroy(wbpxre_routing_table_t *table) {
     if (!table) return;
 
-    /* Wait for all readers to finish (CRITICAL for RCU safety) */
+    /* Wait for all RCU readers to finish */
     synchronize_rcu();
+
+    /* Wait for all pending call_rcu() callbacks to complete */
+    rcu_barrier();
 
     /* Free hash map entries */
     node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;

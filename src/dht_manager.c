@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <time.h>
+#include <urcu.h>
 
 /* Bootstrap nodes - reliable DHT routers (Phase 5: Added more fallbacks) */
 static const bootstrap_node_t bootstrap_nodes[] = {
@@ -475,6 +476,9 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     if (!mgr || !app_ctx) {
         return -1;
     }
+
+    /* Register main thread with RCU (REQUIRED before rcu_read_lock) */
+    rcu_register_thread();
 
     crawler_config_t *cfg = (crawler_config_t *)config;
 
@@ -981,6 +985,9 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
     /* Cleanup close tracker synchronization primitives */
     pthread_cond_destroy(&mgr->close_tracker.cond);
     pthread_mutex_destroy(&mgr->close_tracker.mutex);
+
+    /* Unregister main thread from RCU (REQUIRED before exit) */
+    rcu_unregister_thread();
 
     log_msg(LOG_DEBUG, "DHT manager cleanup complete");
 }
