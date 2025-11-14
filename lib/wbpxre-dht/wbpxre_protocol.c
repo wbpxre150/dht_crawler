@@ -463,6 +463,20 @@ static wbpxre_message_t *wait_for_response_msg(wbpxre_dht_t *dht,
  * DHT Protocol Methods
  * ============================================================================ */
 
+/**
+ * Free all dynamically allocated fields in a response message.
+ * Safe to call with NULL pointers.
+ */
+static void free_response_message(wbpxre_message_t *response) {
+    if (!response) return;
+
+    if (response->nodes) free(response->nodes);
+    if (response->values) free(response->values);
+    if (response->samples) free(response->samples);
+    if (response->token) free(response->token);
+    free(response);
+}
+
 int wbpxre_protocol_ping(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
                          uint8_t *node_id_out) {
     /* Build ping message */
@@ -516,7 +530,7 @@ int wbpxre_protocol_ping(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
         memcpy(node_id_out, response->id, WBPXRE_NODE_ID_LEN);
     }
 
-    free(response);
+    free_response_message(response);
     return 0;
 }
 
@@ -558,8 +572,7 @@ int wbpxre_protocol_find_node(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
 
     if (count_out) *count_out = count;
 
-    if (response->nodes) free(response->nodes);
-    free(response);
+    free_response_message(response);
     return 0;
 }
 
@@ -615,10 +628,7 @@ int wbpxre_protocol_get_peers(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
         *token_len = response->token_len;
     }
 
-    if (response->nodes) free(response->nodes);
-    if (response->values) free(response->values);
-    if (response->token) free(response->token);
-    free(response);
+    free_response_message(response);
     return 0;
 }
 
@@ -676,8 +686,7 @@ int wbpxre_protocol_sample_infohashes(wbpxre_dht_t *dht,
     if (total_num_out) *total_num_out = response->total_num;
     if (interval_out) *interval_out = response->interval;
 
-    if (response->samples) free(response->samples);
-    free(response);
+    free_response_message(response);
     return 0;
 }
 
