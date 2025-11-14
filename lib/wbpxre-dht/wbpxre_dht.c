@@ -81,11 +81,40 @@ wbpxre_pending_query_t *wbpxre_create_pending_query(const uint8_t *transaction_i
     return pq;
 }
 
+/* Free dynamically allocated fields within a wbpxre_message_t */
+static void free_message_fields(wbpxre_message_t *msg) {
+    if (!msg) return;
+
+    if (msg->nodes) {
+        free(msg->nodes);
+        msg->nodes = NULL;
+    }
+    if (msg->values) {
+        free(msg->values);
+        msg->values = NULL;
+    }
+    if (msg->samples) {
+        free(msg->samples);
+        msg->samples = NULL;
+    }
+    if (msg->token) {
+        free(msg->token);
+        msg->token = NULL;
+    }
+}
+
 void wbpxre_free_pending_query(wbpxre_pending_query_t *pq) {
     if (!pq) return;
     pthread_mutex_destroy(&pq->mutex);
     pthread_cond_destroy(&pq->cond);
-    if (pq->response_data) free(pq->response_data);
+
+    /* Free nested dynamic fields before freeing response_data */
+    if (pq->response_data) {
+        wbpxre_message_t *msg = (wbpxre_message_t *)pq->response_data;
+        free_message_fields(msg);
+        free(pq->response_data);
+    }
+
     free(pq);
 }
 
