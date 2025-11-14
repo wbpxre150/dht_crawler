@@ -14,7 +14,7 @@
 /* Configuration constants */
 #define DHT_PORT 6881
 #define MAX_WORKERS 10
-#define INFOHASH_QUEUE_SIZE 10000
+#define INFOHASH_QUEUE_SIZE 1000
 #define BATCH_SIZE 500
 #define UDP_RECV_BUFFER_SIZE 65536
 #define SHA1_DIGEST_LENGTH 20

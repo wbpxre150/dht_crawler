@@ -540,7 +540,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     }
 
     /* Initialize peer store */
-    mgr->peer_store = peer_store_init(10000, 500, 3600);
+    mgr->peer_store = peer_store_init(1000, 500, 3600);
     if (!mgr->peer_store) {
         log_msg(LOG_ERROR, "Failed to create peer store");
         return -1;
