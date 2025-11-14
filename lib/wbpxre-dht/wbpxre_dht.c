@@ -85,6 +85,16 @@ wbpxre_pending_query_t *wbpxre_create_pending_query(const uint8_t *transaction_i
 static void free_message_fields(wbpxre_message_t *msg) {
     if (!msg) return;
 
+    /* VALIDATE MAGIC NUMBER to detect corrupted pointers */
+    if (msg->magic != WBPXRE_MESSAGE_MAGIC) {
+        /* Corrupted or invalid message pointer - skip freeing fields
+         * This prevents crashes from garbage pointers during shutdown */
+        return;
+    }
+
+    /* Clear magic to prevent double-free */
+    msg->magic = 0;
+
     if (msg->nodes) {
         free(msg->nodes);
         msg->nodes = NULL;
@@ -328,6 +338,9 @@ static void *udp_reader_thread_func(void *arg) {
                 /* Copy response data */
                 wbpxre_message_t *response_copy = malloc(sizeof(wbpxre_message_t));
                 memcpy(response_copy, &msg, sizeof(wbpxre_message_t));
+
+                /* SET MAGIC NUMBER to mark as valid heap-allocated message */
+                response_copy->magic = WBPXRE_MESSAGE_MAGIC;
 
                 /* Allocate copies of dynamic data */
                 if (msg.nodes && msg.nodes_len > 0) {
@@ -1142,7 +1155,18 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
     /* Wait for all pending RCU callbacks to complete (CRITICAL!) */
     rcu_barrier();
 
-    /* Destroy routing table */
+    /* FREE PENDING QUERIES FIRST (before routing table/other memory is freed)
+     * This prevents linked list corruption from memory reuse */
+    for (int i = 0; i < 256; i++) {
+        wbpxre_pending_query_t *pq = dht->pending_queries[i];
+        while (pq) {
+            wbpxre_pending_query_t *next = pq->next;
+            wbpxre_free_pending_query(pq);
+            pq = next;
+        }
+    }
+
+    /* NOW destroy routing table (after pending queries are freed) */
     if (dht->routing_table) {
         wbpxre_routing_table_destroy(dht->routing_table);
     }
@@ -1154,7 +1178,7 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
     if (dht->nodes_for_sample_infohashes) wbpxre_queue_destroy(dht->nodes_for_sample_infohashes);
     if (dht->infohashes_for_get_peers) wbpxre_queue_destroy(dht->infohashes_for_get_peers);
 
-    /* Destroy mutexes and locks */
+    /* Destroy mutexes and locks LAST */
     pthread_rwlock_destroy(&dht->node_id_lock);
     pthread_mutex_destroy(&dht->pending_queries_mutex);
     pthread_mutex_destroy(&dht->sought_node_id_mutex);
@@ -1162,16 +1186,6 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
     pthread_mutex_destroy(&dht->stats_mutex);
     pthread_mutex_destroy(&dht->udp_reader_ready_mutex);
     pthread_cond_destroy(&dht->udp_reader_ready_cond);
-
-    /* Free pending queries */
-    for (int i = 0; i < 256; i++) {
-        wbpxre_pending_query_t *pq = dht->pending_queries[i];
-        while (pq) {
-            wbpxre_pending_query_t *next = pq->next;
-            wbpxre_free_pending_query(pq);
-            pq = next;
-        }
-    }
 
     free(dht);
 }

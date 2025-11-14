@@ -33,6 +33,9 @@ extern "C" {
 #define WBPXRE_COMPACT_PEER_LEN 6        /* 4 bytes IPv4 + 2 bytes port */
 #define WBPXRE_METADATA_PIECE_SIZE 16384 /* 16 KiB */
 
+/* Magic number for validating wbpxre_message_t structures */
+#define WBPXRE_MESSAGE_MAGIC 0x57425058  /* "WBPX" in hex */
+
 /* Default configuration values */
 #define WBPXRE_DEFAULT_QUERY_TIMEOUT 5
 #define WBPXRE_DEFAULT_TARGET_ROTATION_INTERVAL 10
@@ -209,6 +212,7 @@ typedef struct {
 
 /* DHT message structure */
 typedef struct {
+    uint32_t magic;              /* Magic number for validation (0 for stack-allocated, WBPXRE_MESSAGE_MAGIC for heap) */
     wbpxre_msg_type_t type;
     uint8_t transaction_id[WBPXRE_TRANSACTION_ID_LEN];
 
