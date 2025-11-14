@@ -4,8 +4,9 @@
 #include "dht_crawler.h"
 #include "database.h"
 #include "dht_manager.h"
+#include "metadata_fetcher.h"
 
-/* Forward declaration */
+/* Forward declarations */
 struct batch_writer;
 
 /* HTTP server configuration */
@@ -19,6 +20,7 @@ typedef struct {
     database_t *database;
     dht_manager_t *dht_manager;
     struct batch_writer *batch_writer;
+    metadata_fetcher_t *metadata_fetcher;
     int port;
     int running;
 } http_api_t;
@@ -37,7 +39,8 @@ typedef struct {
 
 /* Function declarations */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  dht_manager_t *dht_manager, struct batch_writer *batch_writer, int port);
+                  dht_manager_t *dht_manager, struct batch_writer *batch_writer,
+                  metadata_fetcher_t *metadata_fetcher, int port);
 int http_api_start(http_api_t *api);
 void http_api_stop(http_api_t *api);
 void http_api_cleanup(http_api_t *api);

@@ -3,6 +3,7 @@
 #include "dht_manager.h"
 #include "refresh_query.h"
 #include "batch_writer.h"
+#include "metadata_fetcher.h"
 #include <civetweb.h>
 #include <cJSON.h>
 #include <string.h>
@@ -40,7 +41,8 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
 
 /* Initialize HTTP API */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  dht_manager_t *dht_manager, batch_writer_t *batch_writer, int port) {
+                  dht_manager_t *dht_manager, batch_writer_t *batch_writer,
+                  metadata_fetcher_t *metadata_fetcher, int port) {
     if (!api || !app_ctx || !database || !dht_manager) {
         return -1;
     }
@@ -50,6 +52,7 @@ int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
     api->database = database;
     api->dht_manager = dht_manager;
     api->batch_writer = batch_writer;
+    api->metadata_fetcher = metadata_fetcher;
     api->port = port;
     api->running = 0;
 
@@ -328,6 +331,12 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         hourly_count = batch_writer_get_hourly_count(api->batch_writer);
     }
 
+    /* Get metadata fetcher statistics */
+    metadata_fetcher_stats_t metadata_stats = {0};
+    if (api->metadata_fetcher) {
+        metadata_fetcher_get_stats(api->metadata_fetcher, &metadata_stats);
+    }
+
     /* Build JSON response */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "version", DHT_CRAWLER_VERSION);
@@ -335,6 +344,38 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "files_indexed", file_count);
     cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    /* Add metadata fetcher statistics */
+    if (api->metadata_fetcher) {
+        cJSON *metadata = cJSON_CreateObject();
+        cJSON_AddNumberToObject(metadata, "total_attempts", (double)metadata_stats.total_attempts);
+        cJSON_AddNumberToObject(metadata, "no_peers_found", (double)metadata_stats.no_peers_found);
+        cJSON_AddNumberToObject(metadata, "connections_initiated", (double)metadata_stats.connection_initiated);
+        cJSON_AddNumberToObject(metadata, "connections_failed", (double)metadata_stats.connection_failed);
+        cJSON_AddNumberToObject(metadata, "connections_timeout", (double)metadata_stats.connection_timeout);
+        cJSON_AddNumberToObject(metadata, "handshake_failed", (double)metadata_stats.handshake_failed);
+        cJSON_AddNumberToObject(metadata, "no_metadata_support", (double)metadata_stats.no_metadata_support);
+        cJSON_AddNumberToObject(metadata, "metadata_rejected", (double)metadata_stats.metadata_rejected);
+        cJSON_AddNumberToObject(metadata, "hash_mismatch", (double)metadata_stats.hash_mismatch);
+        cJSON_AddNumberToObject(metadata, "fetched", (double)metadata_stats.total_fetched);
+        cJSON_AddNumberToObject(metadata, "active_connections", metadata_stats.active_count);
+
+        /* Calculate success rate */
+        double success_rate = 0.0;
+        if (metadata_stats.total_attempts > 0) {
+            success_rate = (metadata_stats.total_fetched * 100.0) / metadata_stats.total_attempts;
+        }
+        cJSON_AddNumberToObject(metadata, "success_rate_percent", success_rate);
+
+        /* Calculate timeout rate */
+        double timeout_rate = 0.0;
+        if (metadata_stats.connection_initiated > 0) {
+            timeout_rate = (metadata_stats.connection_timeout * 100.0) / metadata_stats.connection_initiated;
+        }
+        cJSON_AddNumberToObject(metadata, "timeout_rate_percent", timeout_rate);
+
+        cJSON_AddItemToObject(root, "metadata_fetcher", metadata);
+    }
 
     char *json = cJSON_Print(root);
     cJSON_Delete(root);

@@ -507,6 +507,30 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
     log_msg(LOG_INFO, "===================================");
 }
 
+/* Get thread-safe snapshot of metadata fetcher statistics */
+void metadata_fetcher_get_stats(metadata_fetcher_t *fetcher, metadata_fetcher_stats_t *stats) {
+    if (!fetcher || !stats) {
+        return;
+    }
+
+    /* Lock mutex to get consistent snapshot of all statistics */
+    uv_mutex_lock(&fetcher->mutex);
+
+    stats->total_attempts = fetcher->total_attempts;
+    stats->no_peers_found = fetcher->no_peers_found;
+    stats->connection_initiated = fetcher->connection_initiated;
+    stats->connection_failed = fetcher->connection_failed;
+    stats->connection_timeout = fetcher->connection_timeout;
+    stats->handshake_failed = fetcher->handshake_failed;
+    stats->no_metadata_support = fetcher->no_metadata_support;
+    stats->metadata_rejected = fetcher->metadata_rejected;
+    stats->hash_mismatch = fetcher->hash_mismatch;
+    stats->total_fetched = fetcher->total_fetched;
+    stats->active_count = fetcher->active_count;
+
+    uv_mutex_unlock(&fetcher->mutex);
+}
+
 /* Create a new peer connection */
 static peer_connection_t* create_peer_connection(metadata_fetcher_t *fetcher,
                                                   const uint8_t *info_hash,

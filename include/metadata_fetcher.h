@@ -207,6 +207,21 @@ typedef struct {
     int32_t num_pieces;
 } metadata_result_t;
 
+/* Metadata fetcher statistics snapshot */
+typedef struct {
+    uint64_t total_attempts;
+    uint64_t no_peers_found;
+    uint64_t connection_initiated;
+    uint64_t connection_failed;
+    uint64_t connection_timeout;
+    uint64_t handshake_failed;
+    uint64_t no_metadata_support;
+    uint64_t metadata_rejected;
+    uint64_t hash_mismatch;
+    uint64_t total_fetched;
+    int active_count;
+} metadata_fetcher_stats_t;
+
 /* Function declarations */
 int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
                           infohash_queue_t *queue, database_t *database,
@@ -216,6 +231,7 @@ void metadata_fetcher_stop(metadata_fetcher_t *fetcher);
 void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher);
 void metadata_fetcher_set_dht_manager(metadata_fetcher_t *fetcher, struct dht_manager *dht_manager);
 void metadata_fetcher_set_bloom_filter(metadata_fetcher_t *fetcher, bloom_filter_t *bloom, const char *bloom_path);
+void metadata_fetcher_get_stats(metadata_fetcher_t *fetcher, metadata_fetcher_stats_t *stats);
 
 /* Internal functions */
 void metadata_worker_thread(void *arg);
