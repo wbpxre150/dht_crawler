@@ -186,9 +186,15 @@ int wbpxre_wait_for_response(wbpxre_pending_query_t *pq) {
 
 static void signal_pending_query(wbpxre_pending_query_t *pq, void *response_data, bool error) {
     pthread_mutex_lock(&pq->mutex);
+
+    /* Set response_data BEFORE signaling to ensure visibility */
     pq->response_data = response_data;
     pq->received = true;
     pq->error = error;
+
+    /* Memory barrier to ensure writes are visible before signal */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
     pthread_cond_signal(&pq->cond);
     pthread_mutex_unlock(&pq->mutex);
 }

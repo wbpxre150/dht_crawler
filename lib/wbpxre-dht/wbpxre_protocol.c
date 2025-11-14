@@ -439,15 +439,19 @@ static wbpxre_message_t *wait_for_response_msg(wbpxre_dht_t *dht,
         wbpxre_pending_query_t *removed = wbpxre_find_and_remove_pending_query(dht, transaction_id);
         /* Only free if WE successfully removed it (not already removed by UDP reader) */
         if (removed == pq) {
-            /* We own it, we free it */
+            /* We removed our query - we own it, we free it */
             wbpxre_free_pending_query(pq);
         } else if (removed == NULL) {
             /* Race condition: UDP reader already removed and signaled it, but we timed out anyway.
              * Since UDP reader has already removed it from the hash table and we have the pointer,
              * we are the only owner. We must free it to prevent the leak. */
             wbpxre_free_pending_query(pq);
+        } else {
+            /* Got different pq - transaction ID collision in hash bucket (very rare).
+             * This means we removed the wrong query. Put it back and free our own. */
+            wbpxre_register_pending_query(dht, removed);
+            wbpxre_free_pending_query(pq);
         }
-        /* If removed is some other pq (highly unlikely), don't free our pq */
         return NULL;
     }
 

@@ -1529,8 +1529,11 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
             torrent.files = file_info;
             torrent.num_files = 1;
         } else {
-            torrent.files = NULL;
-            torrent.num_files = 0;
+            /* Allocation failed - clean up name */
+            free(name);
+            log_msg(LOG_ERROR, "Failed to allocate file_info for single file");
+            close_peer_connection(peer, "allocation failed");
+            return -1;
         }
     } else if (num_files > 0) {
         /* Multi-file mode - convert temp_file_t to file_info_t */
@@ -1546,12 +1549,15 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
             torrent.files = file_info;
             torrent.num_files = num_files;
         } else {
-            /* Allocation failed - clean up temp files */
+            /* Allocation failed - clean up temp files AND name */
             for (int i = 0; i < num_files; i++) {
                 free(files[i].path);
             }
-            torrent.files = NULL;
-            torrent.num_files = 0;
+            free(files);
+            free(name);
+            log_msg(LOG_ERROR, "Failed to allocate file_info array");
+            close_peer_connection(peer, "allocation failed");
+            return -1;
         }
         free(files);  /* Free the temp array (paths transferred to file_info) */
         files = NULL;  /* Prevent double-free below */
