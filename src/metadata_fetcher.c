@@ -198,6 +198,7 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     /* Load config values from provided config */
     fetcher->max_concurrent_per_infohash = config->concurrent_peers_per_torrent;
     fetcher->max_global_connections = config->max_concurrent_connections;
+    fetcher->tcp_connect_timeout_ms = config->tcp_connect_timeout_sec * 1000;  /* Convert seconds to ms */
     fetcher->connection_timeout_ms = config->connection_timeout_sec * 1000;  /* Convert seconds to ms */
     fetcher->max_connection_lifetime_ms = config->max_connection_lifetime_sec * 1000;  /* Convert seconds to ms */
 
@@ -577,8 +578,8 @@ static peer_connection_t* create_peer_connection(metadata_fetcher_t *fetcher,
     peer->timeout_timer.data = peer;
     peer->timer_initialized = 1;
 
-    /* Start timeout timer using configured timeout */
-    uv_timer_start(&peer->timeout_timer, on_timeout, fetcher->connection_timeout_ms, 0);
+    /* Start timeout timer using TCP connect timeout (shorter timeout for connection phase) */
+    uv_timer_start(&peer->timeout_timer, on_timeout, fetcher->tcp_connect_timeout_ms, 0);
 
     /* Initialize TCP handle (deferred until after timer to minimize FD lifetime) */
     if (uv_tcp_init(fetcher->app_ctx->loop, &peer->tcp) != 0) {
@@ -924,12 +925,12 @@ static void on_tcp_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
 
     if (nread == 0) {
         /* No data available right now (EAGAIN/EWOULDBLOCK) - this is normal
-         * for async I/O. Reset timeout to show connection is still alive. */
-        reset_timeout_timer(peer);
+         * for async I/O, but should NOT reset timeout. Only actual data
+         * reception should reset the idle timeout timer. */
         return;
     }
 
-    /* Reset timeout timer on any data reception (activity-based timeout) */
+    /* Reset timeout timer on actual data reception (activity-based timeout) */
     reset_timeout_timer(peer);
 
     /* Validate that nread doesn't exceed buffer capacity */

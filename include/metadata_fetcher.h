@@ -156,6 +156,7 @@ typedef struct {
     /* Configuration */
     int max_concurrent_per_infohash;  /* Max connections per infohash (default: 5) */
     int max_global_connections;       /* Max global connections (default: 2000) */
+    int tcp_connect_timeout_ms;       /* TCP connection timeout (default: 10000ms) */
     int connection_timeout_ms;        /* Idle timeout in milliseconds - resets on activity */
     int max_connection_lifetime_ms;   /* Max total connection time (0=unlimited) */
 
