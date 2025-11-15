@@ -1614,10 +1614,6 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
     /* Check porn filter if enabled */
     if (fetcher->config->porn_filter_enabled) {
         if (porn_filter_check(&torrent)) {
-            char hex[41];
-            format_infohash_hex(peer->info_hash, hex);
-            log_msg(LOG_INFO, "Filtered pornographic content: %s (torrent: %s)", hex, name);
-
             /* Update filtered count statistics */
             __atomic_fetch_add(&fetcher->filtered_count, 1, __ATOMIC_RELAXED);
 
