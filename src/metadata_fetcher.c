@@ -7,6 +7,7 @@
 #include "worker_pool.h"
 #include "batch_writer.h"
 #include "connection_request_queue.h"
+#include "porn_filter.h"
 #include <openssl/sha.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -189,6 +190,7 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->queue = queue;
     fetcher->database = database;
     fetcher->peer_store = peer_store;
+    fetcher->config = config;
     fetcher->max_concurrent = 5;  /* Kept for backward compatibility */
     fetcher->running = 0;
 
@@ -505,6 +507,9 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
     log_msg(LOG_INFO, "  Successfully fetched: %llu (%.1f%%)",
             (unsigned long long)fetcher->total_fetched,
             fetcher->total_attempts > 0 ? (fetcher->total_fetched * 100.0 / fetcher->total_attempts) : 0.0);
+    log_msg(LOG_INFO, "  Filtered by porn filter: %llu (%.1f%%)",
+            (unsigned long long)fetcher->filtered_count,
+            fetcher->total_attempts > 0 ? (fetcher->filtered_count * 100.0 / fetcher->total_attempts) : 0.0);
     log_msg(LOG_INFO, "===================================");
 }
 
@@ -527,6 +532,7 @@ void metadata_fetcher_get_stats(metadata_fetcher_t *fetcher, metadata_fetcher_st
     stats->metadata_rejected = fetcher->metadata_rejected;
     stats->hash_mismatch = fetcher->hash_mismatch;
     stats->total_fetched = fetcher->total_fetched;
+    stats->filtered_count = fetcher->filtered_count;
     stats->active_count = fetcher->active_count;
 
     uv_mutex_unlock(&fetcher->mutex);
@@ -1604,6 +1610,33 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
 
     log_msg(LOG_DEBUG, "Parsed torrent: %s (%lld bytes, %d files)",
            name, (long long)torrent.size_bytes, torrent.num_files);
+
+    /* Check porn filter if enabled */
+    if (fetcher->config->porn_filter_enabled) {
+        if (porn_filter_check(&torrent)) {
+            char hex[41];
+            format_infohash_hex(peer->info_hash, hex);
+            log_msg(LOG_INFO, "Filtered pornographic content: %s (torrent: %s)", hex, name);
+
+            /* Update filtered count statistics */
+            __atomic_fetch_add(&fetcher->filtered_count, 1, __ATOMIC_RELAXED);
+
+            /* Cleanup - free the torrent structure fields */
+            free(name);
+            if (torrent.files) {
+                for (int32_t i = 0; i < torrent.num_files; i++) {
+                    if (torrent.files[i].path) {
+                        free(torrent.files[i].path);
+                    }
+                }
+                free(torrent.files);
+            }
+
+            /* Close connection - content filtered */
+            close_peer_connection(peer, "filtered_porn");
+            return 0;  /* Success but filtered */
+        }
+    }
 
     /* Add to batch writer - batch writer will make deep copies */
     int rc = batch_writer_add(fetcher->batch_writer, &torrent);

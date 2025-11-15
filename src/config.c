@@ -87,6 +87,9 @@ void config_init_defaults(crawler_config_t *config) {
     config->async_pruning_delete_chunk_size = 100;  /* 100 nodes per delete chunk */
     config->async_pruning_min_capacity_percent = 70.0; /* Activate pruning at 70% capacity */
     config->async_pruning_hash_rebuild_cycles = 10; /* Rebuild hash index every 10 pruning cycles */
+
+    /* Content filtering defaults */
+    config->porn_filter_enabled = 0;                /* Disabled by default */
 }
 
 /* Load config from INI-style file */
@@ -276,6 +279,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->async_pruning_hash_rebuild_cycles = atoi(value);
             /* Ensure minimum of 1 */
             if (config->async_pruning_hash_rebuild_cycles < 1) config->async_pruning_hash_rebuild_cycles = 1;
+        }
+        /* Content filtering settings */
+        else if (strcmp(key, "porn_filter_enabled") == 0) {
+            config->porn_filter_enabled = atoi(value);
         }
     }
 

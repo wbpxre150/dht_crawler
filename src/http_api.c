@@ -358,6 +358,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(metadata, "metadata_rejected", (double)metadata_stats.metadata_rejected);
         cJSON_AddNumberToObject(metadata, "hash_mismatch", (double)metadata_stats.hash_mismatch);
         cJSON_AddNumberToObject(metadata, "fetched", (double)metadata_stats.total_fetched);
+        cJSON_AddNumberToObject(metadata, "filtered", (double)metadata_stats.filtered_count);
         cJSON_AddNumberToObject(metadata, "active_connections", metadata_stats.active_count);
 
         /* Calculate success rate */
@@ -366,6 +367,13 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
             success_rate = (metadata_stats.total_fetched * 100.0) / metadata_stats.total_attempts;
         }
         cJSON_AddNumberToObject(metadata, "success_rate_percent", success_rate);
+
+        /* Calculate filter rate */
+        double filter_rate = 0.0;
+        if (metadata_stats.total_attempts > 0) {
+            filter_rate = (metadata_stats.filtered_count * 100.0) / metadata_stats.total_attempts;
+        }
+        cJSON_AddNumberToObject(metadata, "filter_rate_percent", filter_rate);
 
         /* Calculate timeout rate */
         double timeout_rate = 0.0;

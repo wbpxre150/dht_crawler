@@ -12,7 +12,7 @@ LIB_DIR = lib
 BUILD_DIR = build
 DATA_DIR = data
 
-# Source files
+# Source files (wildcard will automatically pick up porn_filter.c)
 SRCS = $(wildcard $(SRC_DIR)/*.c)
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 

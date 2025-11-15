@@ -193,6 +193,10 @@ typedef struct {
     uint64_t hash_mismatch;            /* SHA-1 verification failures */
     uint64_t total_fetched;            /* Successfully fetched */
     uint64_t total_failed;             /* Total failures (legacy, may be removed) */
+    uint64_t filtered_count;           /* Filtered by porn filter */
+
+    /* Configuration reference */
+    crawler_config_t *config;
 
     int running;
 } metadata_fetcher_t;
@@ -220,6 +224,7 @@ typedef struct {
     uint64_t metadata_rejected;
     uint64_t hash_mismatch;
     uint64_t total_fetched;
+    uint64_t filtered_count;
     int active_count;
 } metadata_fetcher_stats_t;
 
