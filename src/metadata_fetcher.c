@@ -509,7 +509,7 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
             fetcher->total_attempts > 0 ? (fetcher->total_fetched * 100.0 / fetcher->total_attempts) : 0.0);
     log_msg(LOG_INFO, "  Filtered by porn filter: %llu (%.1f%%)",
             (unsigned long long)fetcher->filtered_count,
-            fetcher->total_attempts > 0 ? (fetcher->filtered_count * 100.0 / fetcher->total_attempts) : 0.0);
+            fetcher->total_fetched > 0 ? (fetcher->filtered_count * 100.0 / fetcher->total_fetched) : 0.0);
     log_msg(LOG_INFO, "===================================");
 }
 
