@@ -1,0 +1,180 @@
+# Pornography Content Filter Keywords
+# Format: keyword[:weight]
+# Weight: 1-10 (higher = more severe, default=5)
+# Lines starting with # are comments
+#
+# This file allows customization of the pornography content filter.
+# Add or remove keywords as needed for your use case.
+#
+# Note: Keywords are case-insensitive and matched as substrings
+
+# ============================================================================
+# Explicit Terms (High Confidence) - Weight 8-10
+# ============================================================================
+porn:10
+porno:10
+pornography:10
+xxx:9
+xxxx:9
+adult:8
+nsfw:8
+nude:8
+nudes:8
+naked:8
+sex:8
+sexy:8
+erotic:8
+hentai:9
+hardcore:9
+softcore:8
+fetish:8
+bdsm:8
+lesbian:8
+gay porn:10
+anal:8
+blowjob:9
+handjob:8
+cumshot:9
+orgasm:8
+masturbation:8
+masturbate:8
+
+# ============================================================================
+# Adult Industry Terms (Studios, Sites) - Weight 7-10
+# ============================================================================
+pornhub:10
+xvideos:10
+xhamster:10
+xnxx:10
+redtube:10
+youporn:10
+brazzers:10
+bangbros:10
+realitykings:10
+naughtyamerica:10
+mofos:9
+digitalplayground:9
+evilangel:9
+vivid:9
+wickedpictures:9
+onlyfans:9
+manyvids:9
+chaturbate:9
+stripchat:9
+cam4:9
+livejasmin:9
+myfreecams:9
+
+# ============================================================================
+# Common Euphemisms and Code Words - Weight 5-7
+# ============================================================================
+18+:7
+21+:7
+adults only:7
+mature content:6
+explicit content:7
+uncensored:6
+uncut:6
+r-rated:5
+x-rated:8
+rated x:8
+not safe for work:7
+for adults:6
+adult entertainment:8
+
+# ============================================================================
+# Content Type Indicators - Weight 6-8
+# ============================================================================
+amateur:6
+homemade:6
+compilation:6
+collection:6
+full length:5
+unrated:6
+behind the scenes:5
+bonus scenes:5
+
+# ============================================================================
+# Video/Image Collection Indicators - Weight 5-7
+# ============================================================================
+pack:5
+megapack:6
+siterip:7
+photoset:6
+video set:6
+scene:5
+
+# ============================================================================
+# Platform/Network Identifiers - Weight 7-9
+# ============================================================================
+onlyfans leak:9
+patreon leak:9
+premium leak:8
+leaked:6
+private:5
+
+# ============================================================================
+# Body Part Terms (Context Dependent) - Weight 5-7
+# ============================================================================
+boobs:7
+tits:8
+ass:6
+pussy:9
+dick:7
+cock:8
+penis:6
+vagina:6
+breasts:5
+
+# ============================================================================
+# Category/Genre Terms - Weight 6-9
+# ============================================================================
+milf:7
+teen:6
+ebony:5
+asian:5
+latina:5
+blonde:5
+brunette:5
+redhead:5
+threesome:8
+foursome:8
+orgy:9
+gangbang:9
+creampie:9
+facial:7
+pov:6
+
+# ============================================================================
+# Additional Explicit Terms - Weight 7-10
+# ============================================================================
+dildo:8
+vibrator:7
+sex toy:7
+lingerie:5
+bikini:4
+swimsuit:4
+striptease:8
+stripper:7
+escort:7
+prostitute:7
+hooker:8
+webcam:5
+camgirl:8
+camboy:7
+
+# ============================================================================
+# International Terms (Common) - Weight 7-9
+# ============================================================================
+jav:8
+av idol:8
+gravure:6
+ero:7
+
+# ============================================================================
+# False Positive Mitigation
+# ============================================================================
+# Note: To prevent false positives, consider multi-word phrases
+# The filter also uses heuristics to reduce false positives
+# For example: "adult education" should not trigger the filter
+# due to the heuristic scoring system

@@ -5,6 +5,7 @@
 #include "metadata_fetcher.h"
 #include "http_api.h"
 #include "bloom_filter.h"
+#include "porn_filter.h"
 #include "config.h"
 #include <signal.h>
 #include <unistd.h>
@@ -150,11 +151,32 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Initialize pornography content filter (if enabled) */
+    if (config.porn_filter_enabled) {
+        log_msg(LOG_DEBUG, "Initializing porn filter (keyword file: %s)...", config.porn_filter_keyword_file);
+        rc = porn_filter_init(config.porn_filter_keyword_file);
+        if (rc != 0) {
+            log_msg(LOG_WARN, "Failed to initialize porn filter, continuing without filtering");
+        } else {
+            /* Set thresholds from config */
+            porn_filter_set_thresholds(config.porn_filter_keyword_threshold,
+                                      config.porn_filter_regex_threshold,
+                                      config.porn_filter_heuristic_threshold);
+            log_msg(LOG_INFO, "Porn filter enabled (thresholds: keyword=%d, regex=%d, heuristic=%d)",
+                    config.porn_filter_keyword_threshold,
+                    config.porn_filter_regex_threshold,
+                    config.porn_filter_heuristic_threshold);
+        }
+    } else {
+        log_msg(LOG_DEBUG, "Porn filter disabled");
+    }
+
     /* Initialize database */
     log_msg(LOG_DEBUG, "Initializing database: %s", g_app_ctx.db_path);
     rc = database_init(&g_database, g_app_ctx.db_path, &g_app_ctx);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize database: %d", rc);
+        porn_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
         infohash_queue_cleanup(&g_queue);
         return 1;
@@ -332,6 +354,7 @@ int main(int argc, char *argv[]) {
     dht_manager_cleanup(&g_dht_mgr);
     metadata_fetcher_cleanup(&g_fetcher);
     database_cleanup(&g_database);
+    porn_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
     infohash_queue_cleanup(&g_queue);
     cleanup_app_context(&g_app_ctx);

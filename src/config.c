@@ -88,8 +88,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->async_pruning_min_capacity_percent = 70.0; /* Activate pruning at 70% capacity */
     config->async_pruning_hash_rebuild_cycles = 10; /* Rebuild hash index every 10 pruning cycles */
 
-    /* Content filtering defaults */
+    /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
+    strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
+    config->porn_filter_keyword_threshold = 8;      /* Min weight for keyword match */
+    config->porn_filter_regex_threshold = 9;        /* Min weight for regex match */
+    config->porn_filter_heuristic_threshold = 5;    /* Min score for heuristic match */
 }
 
 /* Load config from INI-style file */
@@ -280,9 +284,23 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             /* Ensure minimum of 1 */
             if (config->async_pruning_hash_rebuild_cycles < 1) config->async_pruning_hash_rebuild_cycles = 1;
         }
-        /* Content filtering settings */
+        /* Pornography content filter settings */
         else if (strcmp(key, "porn_filter_enabled") == 0) {
             config->porn_filter_enabled = atoi(value);
+        } else if (strcmp(key, "porn_filter_keyword_file") == 0) {
+            strncpy(config->porn_filter_keyword_file, value, sizeof(config->porn_filter_keyword_file) - 1);
+        } else if (strcmp(key, "porn_filter_keyword_threshold") == 0) {
+            config->porn_filter_keyword_threshold = atoi(value);
+            if (config->porn_filter_keyword_threshold < 1) config->porn_filter_keyword_threshold = 1;
+            if (config->porn_filter_keyword_threshold > 10) config->porn_filter_keyword_threshold = 10;
+        } else if (strcmp(key, "porn_filter_regex_threshold") == 0) {
+            config->porn_filter_regex_threshold = atoi(value);
+            if (config->porn_filter_regex_threshold < 1) config->porn_filter_regex_threshold = 1;
+            if (config->porn_filter_regex_threshold > 10) config->porn_filter_regex_threshold = 10;
+        } else if (strcmp(key, "porn_filter_heuristic_threshold") == 0) {
+            config->porn_filter_heuristic_threshold = atoi(value);
+            if (config->porn_filter_heuristic_threshold < 0) config->porn_filter_heuristic_threshold = 0;
+            if (config->porn_filter_heuristic_threshold > 20) config->porn_filter_heuristic_threshold = 20;
         }
     }
 

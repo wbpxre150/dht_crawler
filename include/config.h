@@ -80,8 +80,12 @@ typedef struct {
     double async_pruning_min_capacity_percent; /* Min capacity % before pruning activates (0.0-100.0) */
     int async_pruning_hash_rebuild_cycles; /* Rebuild hash index every N pruning cycles (default: 10) */
 
-    /* Content filtering settings */
+    /* Pornography content filter settings */
     int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */
+    char porn_filter_keyword_file[512];  /* Path to keyword file */
+    int porn_filter_keyword_threshold;   /* Min weight for keyword match (1-10, default: 8) */
+    int porn_filter_regex_threshold;     /* Min weight for regex match (1-10, default: 9) */
+    int porn_filter_heuristic_threshold; /* Min score for heuristic match (0-20, default: 5) */
 } crawler_config_t;
 
 /* Initialize config with default values */
