@@ -150,12 +150,13 @@ typedef struct wbpxre_routing_node {
 
 /* Routing table */
 typedef struct {
-    wbpxre_routing_node_t *root;         /* RCU-protected AVL tree root */
-    pthread_mutex_t update_lock;         /* Serializes writers (RCU allows lock-free reads) */
+    wbpxre_routing_node_t *root;         /* AVL tree root */
+    pthread_rwlock_t tree_rwlock;        /* Protects tree structure (replaces RCU for structure) */
+    pthread_mutex_t update_lock;         /* Serializes flat array and hash map updates */
     int node_count;                      /* Updated atomically */
     int max_nodes;
     /* Flat array for uniform iteration (eliminates BST traversal bias) */
-    wbpxre_routing_node_t **all_nodes;  /* RCU-protected array of pointers to all nodes */
+    wbpxre_routing_node_t **all_nodes;  /* Array of pointers to all nodes */
     int all_nodes_capacity;              /* Capacity of all_nodes array */
     int iteration_offset;                /* Rotating offset for fair iteration */
 
