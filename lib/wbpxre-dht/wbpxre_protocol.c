@@ -677,7 +677,7 @@ int wbpxre_protocol_sample_infohashes(wbpxre_dht_t *dht,
 
     /* Check if samples field exists (BEP 51 support indicator) */
     if (!response->samples) {
-        free(response);
+        free_response_message(response);
         return -1;
     }
 
