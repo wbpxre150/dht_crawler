@@ -1438,6 +1438,10 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
                 b.stack[b.size - 1].keylen == 4 &&
                 memcmp(b.stack[b.size - 1].key, "name", 4) == 0) {
                 /* Torrent name */
+                /* Free previous allocation if name appears multiple times */
+                if (name) {
+                    free(name);
+                }
                 name = (char *)malloc(b.toklen + 1);
                 if (name) {
                     memcpy(name, b.tok, b.toklen);
