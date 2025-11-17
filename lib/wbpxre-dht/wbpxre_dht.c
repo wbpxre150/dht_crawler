@@ -894,8 +894,7 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
         if (!node) break;  /* Queue shutdown */
 
         /* Check if already in routing table */
-        wbpxre_routing_node_t *existing = wbpxre_routing_table_find(dht->routing_table, node->id);
-        if (existing) {
+        if (wbpxre_routing_table_exists(dht->routing_table, node->id)) {
             free(node);
             continue;  /* Already known */
         }

@@ -488,6 +488,24 @@ wbpxre_routing_node_t *wbpxre_routing_table_find(wbpxre_routing_table_t *table,
     return node_copy;
 }
 
+bool wbpxre_routing_table_exists(wbpxre_routing_table_t *table,
+                                  const uint8_t *node_id) {
+    if (!table || !node_id) return false;
+
+    rcu_read_lock();
+
+    /* Load root pointer with RCU semantics */
+    wbpxre_routing_node_t *root = rcu_dereference(table->root);
+    wbpxre_routing_node_t *node = find_node_recursive(root, node_id);
+
+    /* Check existence without allocating */
+    bool exists = (node != NULL);
+
+    rcu_read_unlock();
+
+    return exists;
+}
+
 /* ============================================================================
  * K-Closest Nodes Query
  * ============================================================================ */

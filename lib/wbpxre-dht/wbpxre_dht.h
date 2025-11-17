@@ -474,6 +474,10 @@ int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
 wbpxre_routing_node_t *wbpxre_routing_table_find(wbpxre_routing_table_t *table,
                                                   const uint8_t *node_id);
 
+/* Check if node exists by ID (without allocating memory) */
+bool wbpxre_routing_table_exists(wbpxre_routing_table_t *table,
+                                  const uint8_t *node_id);
+
 /* Get K closest nodes to target
  * Returns copies of nodes (caller must free each node in nodes_out array) */
 int wbpxre_routing_table_get_closest(wbpxre_routing_table_t *table,
