@@ -229,7 +229,7 @@ void refresh_query_complete(refresh_query_store_t *store, const uint8_t *info_ha
     pthread_mutex_unlock(&store->mutex);
 }
 
-/* Remove query from store and decrement ref count */
+/* Remove query from store by info_hash and decrement ref count */
 void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash) {
     if (!store || !info_hash) return;
 
@@ -250,6 +250,32 @@ void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash
         }
         prev = &query->next;
         query = query->next;
+    }
+
+    pthread_mutex_unlock(&store->mutex);
+}
+
+/* Remove specific query from store by pointer and decrement ref count */
+void refresh_query_remove_ptr(refresh_query_store_t *store, refresh_query_t *query) {
+    if (!store || !query) return;
+
+    pthread_mutex_lock(&store->mutex);
+
+    size_t bucket_idx = hash_info_hash(query->info_hash, store->bucket_count);
+    refresh_query_t **prev = &store->buckets[bucket_idx];
+    refresh_query_t *curr = store->buckets[bucket_idx];
+
+    while (curr) {
+        if (curr == query) {  /* Compare pointers, not info_hash */
+            *prev = curr->next;
+            pthread_mutex_unlock(&store->mutex);
+
+            /* Decrement ref count - will free if count reaches zero */
+            refresh_query_unref(query);
+            return;
+        }
+        prev = &curr->next;
+        curr = curr->next;
     }
 
     pthread_mutex_unlock(&store->mutex);

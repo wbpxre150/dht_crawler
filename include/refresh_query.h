@@ -51,8 +51,13 @@ void refresh_query_add_peers(refresh_query_store_t *store, const uint8_t *info_h
 /* Mark query as complete (called from DHT callback on SEARCH_DONE) */
 void refresh_query_complete(refresh_query_store_t *store, const uint8_t *info_hash);
 
-/* Remove query from store and decrement ref count */
+/* Remove query from store by info_hash and decrement ref count
+ * WARNING: If multiple queries exist for same info_hash, removes first match */
 void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash);
+
+/* Remove specific query from store by pointer and decrement ref count
+ * This is the safe version - removes exactly the query you created */
+void refresh_query_remove_ptr(refresh_query_store_t *store, refresh_query_t *query);
 
 /* Cleanup old timed-out queries */
 void refresh_query_cleanup_old(refresh_query_store_t *store, int max_age_sec);

@@ -535,8 +535,8 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     if (peer_count == 0) {
         log_msg(LOG_DEBUG, "First query returned 0 peers for %s, retrying...", hash_buf);
 
-        /* Remove old query from store (decrements ref count) */
-        refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
+        /* Remove old query from store by pointer (critical for thread safety) */
+        refresh_query_remove_ptr(api->dht_manager->refresh_query_store, query);
 
         /* Create new query for retry */
         query = refresh_query_create(api->dht_manager->refresh_query_store, info_hash);
@@ -557,8 +557,8 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         }
     }
 
-    /* Remove query from store (decrements ref count, frees if no other refs) */
-    refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
+    /* Remove query from store by pointer (critical for thread safety) */
+    refresh_query_remove_ptr(api->dht_manager->refresh_query_store, query);
 
     /* Build JSON response */
     cJSON *root = cJSON_CreateObject();
