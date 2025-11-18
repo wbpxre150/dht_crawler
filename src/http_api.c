@@ -5,6 +5,7 @@
 #include "batch_writer.h"
 #include "metadata_fetcher.h"
 #include "porn_filter.h"
+#include "torrent_search.h"
 #include <civetweb.h>
 #include <cJSON.h>
 #include <string.h>
@@ -1157,6 +1158,13 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "      color: #1a73e8;\n"
            "      word-wrap: break-word;\n"
            "    }\n"
+           "    .torrent-name a {\n"
+           "      color: inherit;\n"
+           "      text-decoration: none;\n"
+           "    }\n"
+           "    .torrent-name a:hover {\n"
+           "      text-decoration: underline;\n"
+           "    }\n"
            "    .torrent-meta {\n"
            "      display: flex;\n"
            "      gap: 12px;\n"
@@ -1316,9 +1324,26 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         if (results[i].total_peers > 100) peer_class = "";
         else if (results[i].total_peers > 10) peer_class = "medium";
 
+        /* Extract media title for IMDB search */
+        char *media_title = extract_media_title(results[i].name);
+        char *encoded_imdb_query = media_title ? url_encode(media_title) : NULL;
+        free(media_title);
+
         APPEND("    <div class='torrent-card'>\n"
                "      <div class='torrent-header' onclick='toggleFiles(\"%s\")'>\n"
-               "        <div class='torrent-name'>%s</div>\n"
+               "        <div class='torrent-name'>",
+               hex);
+
+        /* Add IMDB link if we have a valid encoded query */
+        if (encoded_imdb_query) {
+            APPEND("<a href='https://www.imdb.com/find/?q=%s' target='_blank' rel='noopener noreferrer' onclick='event.stopPropagation()'>%s</a>",
+                   encoded_imdb_query, results[i].name);
+            free(encoded_imdb_query);
+        } else {
+            APPEND("%s", results[i].name);
+        }
+
+        APPEND("</div>\n"
                "        <div class='torrent-meta'>\n"
                "          <span class='peer-count %s' id='peers-%s'>%d peer%s</span>\n"
                "          <button class='refresh-btn' onclick='refreshPeers(event, \"%s\")' title='Refresh peer count'>↻</button>\n"
@@ -1327,7 +1352,7 @@ static char* generate_search_results_html(search_result_t *results, int count, c
                "          <span>%d file%s</span>\n"
                "        </div>\n"
                "      </div>\n",
-               hex, results[i].name, peer_class, hex,
+               peer_class, hex,
                results[i].total_peers, results[i].total_peers == 1 ? "" : "s",
                hex, hex, encoded_name, size_str, results[i].num_files, results[i].num_files == 1 ? "" : "s");
 

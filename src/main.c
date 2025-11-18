@@ -6,6 +6,7 @@
 #include "http_api.h"
 #include "bloom_filter.h"
 #include "porn_filter.h"
+#include "torrent_search.h"
 #include "config.h"
 #include <signal.h>
 #include <unistd.h>
@@ -170,6 +171,13 @@ int main(int argc, char *argv[]) {
         }
     } else {
         log_msg(LOG_DEBUG, "Porn filter disabled");
+    }
+
+    /* Initialize torrent search module for title extraction */
+    log_msg(LOG_DEBUG, "Initializing torrent search module...");
+    rc = torrent_search_init("torrent_search_keywords.txt");
+    if (rc != 0) {
+        log_msg(LOG_WARN, "Failed to initialize torrent search module, title extraction will be basic");
     }
 
     /* Initialize database */
@@ -355,6 +363,7 @@ int main(int argc, char *argv[]) {
     dht_manager_cleanup(&g_dht_mgr);
     metadata_fetcher_cleanup(&g_fetcher);
     database_cleanup(&g_database);
+    torrent_search_cleanup();
     porn_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
     infohash_queue_cleanup(&g_queue);
