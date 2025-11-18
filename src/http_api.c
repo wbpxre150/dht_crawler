@@ -17,7 +17,8 @@ static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int root_handler(struct mg_connection *conn, void *cbdata);
 static int refresh_handler(struct mg_connection *conn, void *cbdata);
 static char* url_decode(const char *str);
-static char* generate_search_results_html(search_result_t *results, int count, const char *query);
+static char* url_encode(const char *str);
+static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
 
 /* Helper: Format info_hash as hex */
 static void format_hex(const uint8_t *data, size_t len, char *out) {
@@ -605,6 +606,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     /* Get query parameter */
     char query_buf[256] = {0};
     char format_buf[16] = {0};
+    char page_buf[16] = {0};
     const struct mg_request_info *ri = mg_get_request_info(conn);
 
     int query_len = mg_get_var(ri->query_string, strlen(ri->query_string ? ri->query_string : ""),
@@ -614,7 +616,19 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     mg_get_var(ri->query_string, strlen(ri->query_string ? ri->query_string : ""),
                "format", format_buf, sizeof(format_buf));
 
+    /* Get page parameter (default: 1) */
+    mg_get_var(ri->query_string, strlen(ri->query_string ? ri->query_string : ""),
+               "page", page_buf, sizeof(page_buf));
+
     int want_html = (strcmp(format_buf, "html") == 0);
+
+    /* Parse page number (1-indexed, default to 1) */
+    int page = 1;
+    if (strlen(page_buf) > 0) {
+        page = atoi(page_buf);
+        if (page < 1) page = 1;
+    }
+    int offset = (page - 1) * HTTP_API_MAX_RESULTS;
 
     if (query_len <= 0 || strlen(query_buf) == 0) {
         const char *error = "{\"error\":\"Missing query parameter 'q'\"}";
@@ -629,12 +643,13 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     char *query = url_decode(query_buf);
-    log_msg(LOG_DEBUG, "Search query: %s (format: %s)", query, want_html ? "html" : "json");
+    log_msg(LOG_DEBUG, "Search query: %s (format: %s, page: %d)", query, want_html ? "html" : "json", page);
 
     /* Search database */
     search_result_t *results = NULL;
     int count = 0;
-    int rc = search_torrents(api->database, query, &results, &count);
+    int total_count = 0;
+    int rc = search_torrents(api->database, query, offset, &results, &count, &total_count);
     free(query);
 
     if (rc != 0) {
@@ -654,25 +669,50 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
         if (count == 0) {
             /* No results - show empty state */
             char empty_html[2048];
-            snprintf(empty_html, sizeof(empty_html),
-                "<!DOCTYPE html>\n"
-                "<html>\n"
-                "<head>\n"
-                "  <meta charset='UTF-8'>\n"
-                "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
-                "  <title>No Results</title>\n"
-                "  <style>\n"
-                "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
-                "    .message { margin: 50px 0; color: #666; }\n"
-                "    a { color: #1a73e8; text-decoration: none; }\n"
-                "  </style>\n"
-                "</head>\n"
-                "<body>\n"
-                "  <h1>No Results Found</h1>\n"
-                "  <p class='message'>No torrents matched your query: \"%s\"</p>\n"
-                "  <a href='/'>← Back to Search</a>\n"
-                "</body>\n"
-                "</html>", query_buf);
+            if (total_count > 0 && page > 1) {
+                /* Page beyond results - offer to go back */
+                char *encoded_query = url_encode(query_buf);
+                snprintf(empty_html, sizeof(empty_html),
+                    "<!DOCTYPE html>\n"
+                    "<html>\n"
+                    "<head>\n"
+                    "  <meta charset='UTF-8'>\n"
+                    "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+                    "  <title>No More Results</title>\n"
+                    "  <style>\n"
+                    "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
+                    "    .message { margin: 50px 0; color: #666; }\n"
+                    "    a { color: #1a73e8; text-decoration: none; }\n"
+                    "  </style>\n"
+                    "</head>\n"
+                    "<body>\n"
+                    "  <h1>No More Results</h1>\n"
+                    "  <p class='message'>Page %d is beyond the available results (%d total)</p>\n"
+                    "  <a href='/search?q=%s&format=html&page=1'>Back to First Page</a>\n"
+                    "</body>\n"
+                    "</html>", page, total_count, encoded_query);
+                free(encoded_query);
+            } else {
+                snprintf(empty_html, sizeof(empty_html),
+                    "<!DOCTYPE html>\n"
+                    "<html>\n"
+                    "<head>\n"
+                    "  <meta charset='UTF-8'>\n"
+                    "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+                    "  <title>No Results</title>\n"
+                    "  <style>\n"
+                    "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
+                    "    .message { margin: 50px 0; color: #666; }\n"
+                    "    a { color: #1a73e8; text-decoration: none; }\n"
+                    "  </style>\n"
+                    "</head>\n"
+                    "<body>\n"
+                    "  <h1>No Results Found</h1>\n"
+                    "  <p class='message'>No torrents matched your query: \"%s\"</p>\n"
+                    "  <a href='/'>Back to Search</a>\n"
+                    "</body>\n"
+                    "</html>", query_buf);
+            }
 
             mg_printf(conn,
                       "HTTP/1.1 200 OK\r\n"
@@ -686,7 +726,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
             return 200;
         }
 
-        char *html = generate_search_results_html(results, count, query_buf);
+        char *html = generate_search_results_html(results, count, query_buf, page, total_count);
         if (!html) {
             const char *error = "{\"error\":\"Failed to generate HTML\"}";
             mg_printf(conn,
@@ -716,6 +756,10 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     /* Build JSON response */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "count", count);
+    cJSON_AddNumberToObject(root, "total_count", total_count);
+    cJSON_AddNumberToObject(root, "page", page);
+    cJSON_AddNumberToObject(root, "limit", HTTP_API_MAX_RESULTS);
+    cJSON_AddBoolToObject(root, "has_more", (offset + count) < total_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
 
     cJSON *results_array = cJSON_CreateArray();
@@ -775,13 +819,40 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
 }
 
 /* Search torrents using FTS5 */
-int search_torrents(database_t *db, const char *query, search_result_t **results, int *count) {
-    if (!db || !query || !results || !count) {
+int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {
+    if (!db || !query || !results || !count || !total_count) {
         return -1;
     }
 
     *results = NULL;
     *count = 0;
+    *total_count = 0;
+
+    /* First, get total count of matching results */
+    const char *count_sql =
+        "SELECT COUNT(DISTINCT t.id) "
+        "FROM torrents t "
+        "WHERE t.id IN ("
+        "    SELECT rowid FROM torrent_search WHERE name MATCH ?"
+        "    UNION"
+        "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+        "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?)"
+        ")";
+
+    sqlite3_stmt *count_stmt;
+    int rc = sqlite3_prepare_v2(db->db, count_sql, -1, &count_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    sqlite3_bind_text(count_stmt, 1, query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(count_stmt, 2, query, -1, SQLITE_STATIC);
+
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+        *total_count = sqlite3_column_int(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
 
     /* Build FTS5 search query - searches both torrent names and file names
      * Uses subqueries to properly utilize FTS5 MATCH function, then UNION to combine results */
@@ -798,10 +869,10 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
         ") "
         "GROUP BY t.id "
         "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
-        "LIMIT ?";
+        "LIMIT ? OFFSET ?";
 
     sqlite3_stmt *stmt;
-    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(db->db));
         return -1;
@@ -811,6 +882,7 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
     sqlite3_bind_text(stmt, 1, query, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, query, -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
+    sqlite3_bind_int(stmt, 4, offset);
 
     /* Allocate results array */
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
@@ -865,7 +937,7 @@ int search_torrents(database_t *db, const char *query, search_result_t **results
     *results = res;
     *count = i;
 
-    log_msg(LOG_DEBUG, "Search found %d results for query: %s", i, query);
+    log_msg(LOG_DEBUG, "Search found %d results (offset %d, total %d) for query: %s", i, offset, *total_count, query);
     return 0;
 }
 
@@ -954,10 +1026,15 @@ static char* url_encode(const char *str) {
 }
 
 /* Generate HTML page for search results */
-static char* generate_search_results_html(search_result_t *results, int count, const char *query) {
+static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count) {
     if (!results || count <= 0) {
         return NULL;
     }
+
+    /* Calculate pagination info */
+    int total_pages = (total_count + HTTP_API_MAX_RESULTS - 1) / HTTP_API_MAX_RESULTS;
+    int has_prev = page > 1;
+    int has_next = page < total_pages;
 
     /* Build HTML dynamically */
     size_t capacity = 1024 * 100;  /* Start with 100KB */
@@ -1159,6 +1236,42 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "        font-size: 20px;\n"
            "      }\n"
            "    }\n"
+           "    .pagination {\n"
+           "      display: flex;\n"
+           "      justify-content: center;\n"
+           "      align-items: center;\n"
+           "      gap: 16px;\n"
+           "      margin: 24px 0;\n"
+           "      padding: 16px;\n"
+           "      background: white;\n"
+           "      border-radius: 8px;\n"
+           "      box-shadow: 0 1px 3px rgba(0,0,0,0.1);\n"
+           "    }\n"
+           "    .pagination a, .pagination span {\n"
+           "      padding: 10px 20px;\n"
+           "      border-radius: 6px;\n"
+           "      text-decoration: none;\n"
+           "      font-weight: 500;\n"
+           "      min-height: 44px;\n"
+           "      display: flex;\n"
+           "      align-items: center;\n"
+           "    }\n"
+           "    .pagination a {\n"
+           "      background: #1a73e8;\n"
+           "      color: white;\n"
+           "    }\n"
+           "    .pagination a:hover {\n"
+           "      background: #1557b0;\n"
+           "    }\n"
+           "    .pagination .disabled {\n"
+           "      background: #e0e0e0;\n"
+           "      color: #999;\n"
+           "      cursor: not-allowed;\n"
+           "    }\n"
+           "    .pagination .page-info {\n"
+           "      color: #5f6368;\n"
+           "      font-size: 14px;\n"
+           "    }\n"
            "  </style>\n"
            "</head>\n"
            "<body>\n"
@@ -1170,9 +1283,19 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "        <input type='hidden' name='format' value='html'>\n"
            "        <button type='submit' class='btn'>Search</button>\n"
            "      </form>\n"
-           "    </div>\n"
-           "    <div class='results-info'>Found %d result%s</div>\n",
-           query, query, count, count == 1 ? "" : "s");
+           "    </div>\n",
+           query, query);
+
+    /* Show results info with pagination context */
+    int start_result = (page - 1) * HTTP_API_MAX_RESULTS + 1;
+    int end_result = start_result + count - 1;
+    if (total_pages > 1) {
+        APPEND("    <div class='results-info'>Showing %d-%d of %d results (page %d of %d)</div>\n",
+               start_result, end_result, total_count, page, total_pages);
+    } else {
+        APPEND("    <div class='results-info'>Found %d result%s</div>\n",
+               count, count == 1 ? "" : "s");
+    }
 
     /* Generate torrent cards */
     for (int i = 0; i < count; i++) {
@@ -1388,8 +1511,39 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "        btn.classList.remove('copied');\n"
            "      }, 2000);\n"
            "    }\n"
-           "  </script>\n"
-           "</body>\n"
+           "  </script>\n");
+
+    /* Add pagination controls if needed */
+    if (total_pages > 1) {
+        char *encoded_query = url_encode(query);
+        if (encoded_query) {
+            APPEND("  <div class='pagination'>\n");
+
+            /* Previous button */
+            if (has_prev) {
+                APPEND("    <a href='/search?q=%s&format=html&page=%d'>Previous</a>\n",
+                       encoded_query, page - 1);
+            } else {
+                APPEND("    <span class='disabled'>Previous</span>\n");
+            }
+
+            /* Page info */
+            APPEND("    <span class='page-info'>Page %d of %d</span>\n", page, total_pages);
+
+            /* Next button */
+            if (has_next) {
+                APPEND("    <a href='/search?q=%s&format=html&page=%d'>Next</a>\n",
+                       encoded_query, page + 1);
+            } else {
+                APPEND("    <span class='disabled'>Next</span>\n");
+            }
+
+            APPEND("  </div>\n");
+            free(encoded_query);
+        }
+    }
+
+    APPEND("</body>\n"
            "</html>");
 
     #undef APPEND

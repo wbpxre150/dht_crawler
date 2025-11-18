@@ -46,7 +46,7 @@ void http_api_stop(http_api_t *api);
 void http_api_cleanup(http_api_t *api);
 
 /* Search functions */
-int search_torrents(database_t *db, const char *query, search_result_t **results, int *count);
+int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count);
 void free_search_results(search_result_t *results, int count);
 
 #endif /* HTTP_API_H */
