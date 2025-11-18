@@ -1335,9 +1335,9 @@ static char* generate_search_results_html(search_result_t *results, int count, c
                hex);
 
         /* Add IMDB link if we have a valid encoded query */
-        /* Use Android intent URI scheme to open in external browser instead of WebView */
+        /* Use onclick handler to open in external browser on Android WebView */
         if (encoded_imdb_query) {
-            APPEND("<a href='intent://www.imdb.com/find/?q=%s#Intent;scheme=https;action=android.intent.action.VIEW;end' onclick='event.stopPropagation()'>%s</a>",
+            APPEND("<a href='https://www.imdb.com/find/?q=%s' onclick='return openExternal(event, this.href)'>%s</a>",
                    encoded_imdb_query, results[i].name);
             free(encoded_imdb_query);
         } else {
@@ -1390,6 +1390,18 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     /* JavaScript for interactivity */
     APPEND("  </div>\n"
            "  <script>\n"
+           "    function openExternal(event, url) {\n"
+           "      event.stopPropagation();\n"
+           "      // Try to open in external browser for Android WebView\n"
+           "      // Using window.open with _system target, then falling back to direct navigation\n"
+           "      var win = window.open(url, '_system');\n"
+           "      if (!win || win.closed || typeof win.closed === 'undefined') {\n"
+           "        // Fallback: use location change which some WebViews intercept\n"
+           "        window.location.href = url;\n"
+           "      }\n"
+           "      return false;\n"
+           "    }\n"
+           "\n"
            "    function toggleFiles(hash) {\n"
            "      const fileList = document.getElementById('files-' + hash);\n"
            "      if (fileList.classList.contains('show')) {\n"
