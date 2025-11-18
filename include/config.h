@@ -67,18 +67,10 @@ typedef struct {
     int peer_retry_min_threshold;        /* Min peers before stopping retries (default: 10) */
     int peer_retry_delay_ms;             /* Delay between retries in ms (default: 500) */
 
-    /* Async node pruning settings (timer-based) */
-    int async_pruning_enabled;           /* Enable async pruning */
-    int async_pruning_interval_sec;      /* How often to run pruning (seconds) */
-    int async_pruning_target_nodes;      /* Target final node count after pruning */
-    double async_pruning_distant_percent; /* Percentage of distant nodes to remove (0.0-100.0) */
-    double async_pruning_old_percent;    /* Percentage of old nodes to remove (0.0-100.0) */
-    int async_pruning_batch_size;        /* Nodes per batch for drop operations */
-    int async_pruning_log_interval;      /* Log progress every N nodes */
-    int async_pruning_workers;           /* Number of worker threads (default: 4) */
-    int async_pruning_delete_chunk_size; /* Nodes per delete chunk (default: 100) */
-    double async_pruning_min_capacity_percent; /* Min capacity % before pruning activates (0.0-100.0) */
-    int async_pruning_hash_rebuild_cycles; /* Rebuild hash index every N pruning cycles (default: 10) */
+    /* Dual routing table settings */
+    double dual_routing_fill_threshold;   /* When to start filling secondary table (0.0-1.0, default: 0.80) */
+    double dual_routing_switch_threshold; /* When to switch to secondary table (0.0-1.0, default: 0.20) */
+    int dual_routing_check_interval_sec;  /* How often to check for rotation (default: 5) */
 
     /* Pornography content filter settings */
     int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */

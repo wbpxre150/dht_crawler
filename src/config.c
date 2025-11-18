@@ -75,18 +75,10 @@ void config_init_defaults(crawler_config_t *config) {
     config->peer_retry_min_threshold = 10;
     config->peer_retry_delay_ms = 500;
 
-    /* Async node pruning defaults */
-    config->async_pruning_enabled = 1;              /* Enabled by default */
-    config->async_pruning_interval_sec = 120;       /* Run every 2 minutes */
-    config->async_pruning_target_nodes = 60000;     /* Target 60K nodes after pruning */
-    config->async_pruning_distant_percent = 50.0;   /* Remove 50% of distant nodes */
-    config->async_pruning_old_percent = 30.0;       /* Remove 30% of old nodes */
-    config->async_pruning_batch_size = 1000;        /* 1000 nodes per batch */
-    config->async_pruning_log_interval = 5000;      /* Log every 5000 nodes */
-    config->async_pruning_workers = 4;              /* 4 worker threads */
-    config->async_pruning_delete_chunk_size = 100;  /* 100 nodes per delete chunk */
-    config->async_pruning_min_capacity_percent = 70.0; /* Activate pruning at 70% capacity */
-    config->async_pruning_hash_rebuild_cycles = 10; /* Rebuild hash index every 10 pruning cycles */
+    /* Dual routing table defaults */
+    config->dual_routing_fill_threshold = 0.80;     /* Start filling secondary at 80% */
+    config->dual_routing_switch_threshold = 0.20;   /* Switch when secondary reaches 20% */
+    config->dual_routing_check_interval_sec = 5;    /* Check every 5 seconds */
 
     /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
@@ -249,40 +241,20 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "peer_retry_delay_ms") == 0) {
             config->peer_retry_delay_ms = atoi(value);
         }
-        /* Async node pruning settings */
-        else if (strcmp(key, "async_pruning_enabled") == 0) {
-            config->async_pruning_enabled = atoi(value);
-        } else if (strcmp(key, "async_pruning_interval_sec") == 0) {
-            config->async_pruning_interval_sec = atoi(value);
-        } else if (strcmp(key, "async_pruning_target_nodes") == 0) {
-            config->async_pruning_target_nodes = atoi(value);
-        } else if (strcmp(key, "async_pruning_distant_percent") == 0) {
-            config->async_pruning_distant_percent = atof(value);
-            /* Clamp to valid range [0.0, 100.0] */
-            if (config->async_pruning_distant_percent < 0.0) config->async_pruning_distant_percent = 0.0;
-            if (config->async_pruning_distant_percent > 100.0) config->async_pruning_distant_percent = 100.0;
-        } else if (strcmp(key, "async_pruning_old_percent") == 0) {
-            config->async_pruning_old_percent = atof(value);
-            /* Clamp to valid range [0.0, 100.0] */
-            if (config->async_pruning_old_percent < 0.0) config->async_pruning_old_percent = 0.0;
-            if (config->async_pruning_old_percent > 100.0) config->async_pruning_old_percent = 100.0;
-        } else if (strcmp(key, "async_pruning_batch_size") == 0) {
-            config->async_pruning_batch_size = atoi(value);
-        } else if (strcmp(key, "async_pruning_log_interval") == 0) {
-            config->async_pruning_log_interval = atoi(value);
-        } else if (strcmp(key, "async_pruning_workers") == 0) {
-            config->async_pruning_workers = atoi(value);
-        } else if (strcmp(key, "async_pruning_delete_chunk_size") == 0) {
-            config->async_pruning_delete_chunk_size = atoi(value);
-        } else if (strcmp(key, "async_pruning_min_capacity_percent") == 0) {
-            config->async_pruning_min_capacity_percent = atof(value);
-            /* Clamp to valid range [0.0, 100.0] */
-            if (config->async_pruning_min_capacity_percent < 0.0) config->async_pruning_min_capacity_percent = 0.0;
-            if (config->async_pruning_min_capacity_percent > 100.0) config->async_pruning_min_capacity_percent = 100.0;
-        } else if (strcmp(key, "async_pruning_hash_rebuild_cycles") == 0) {
-            config->async_pruning_hash_rebuild_cycles = atoi(value);
-            /* Ensure minimum of 1 */
-            if (config->async_pruning_hash_rebuild_cycles < 1) config->async_pruning_hash_rebuild_cycles = 1;
+        /* Dual routing table settings */
+        else if (strcmp(key, "dual_routing_fill_threshold") == 0) {
+            config->dual_routing_fill_threshold = atof(value);
+            /* Clamp to valid range [0.0, 1.0] */
+            if (config->dual_routing_fill_threshold < 0.0) config->dual_routing_fill_threshold = 0.0;
+            if (config->dual_routing_fill_threshold > 1.0) config->dual_routing_fill_threshold = 1.0;
+        } else if (strcmp(key, "dual_routing_switch_threshold") == 0) {
+            config->dual_routing_switch_threshold = atof(value);
+            /* Clamp to valid range [0.0, 1.0] */
+            if (config->dual_routing_switch_threshold < 0.0) config->dual_routing_switch_threshold = 0.0;
+            if (config->dual_routing_switch_threshold > 1.0) config->dual_routing_switch_threshold = 1.0;
+        } else if (strcmp(key, "dual_routing_check_interval_sec") == 0) {
+            config->dual_routing_check_interval_sec = atoi(value);
+            if (config->dual_routing_check_interval_sec < 1) config->dual_routing_check_interval_sec = 1;
         }
         /* Pornography content filter settings */
         else if (strcmp(key, "porn_filter_enabled") == 0) {

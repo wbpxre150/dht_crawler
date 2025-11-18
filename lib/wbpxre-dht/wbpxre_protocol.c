@@ -809,7 +809,8 @@ void wbpxre_handle_find_node(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                               const struct sockaddr_in *from) {
     /* Get closest nodes to target */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    int nodes_len = encode_compact_nodes(dht->routing_table, query->target,
+    wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
+    int nodes_len = encode_compact_nodes(active_table, query->target,
                                          compact_nodes, sizeof(compact_nodes), 8);
 
     /* Read node ID with lock protection */
@@ -828,7 +829,8 @@ void wbpxre_handle_get_peers(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                               const struct sockaddr_in *from) {
     /* In crawler mode, we don't store peers - just return nodes */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    int nodes_len = encode_compact_nodes(dht->routing_table, query->info_hash,
+    wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
+    int nodes_len = encode_compact_nodes(active_table, query->info_hash,
                                          compact_nodes, sizeof(compact_nodes), 8);
 
     /* Read node ID with lock protection */
@@ -887,7 +889,8 @@ void wbpxre_handle_incoming_query(wbpxre_dht_t *dht, wbpxre_message_t *query,
 
     /* Always send a valid response to keep us in routing tables */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    int nodes_len = encode_compact_nodes(dht->routing_table, local_node_id,
+    wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
+    int nodes_len = encode_compact_nodes(active_table, local_node_id,
                                          compact_nodes, sizeof(compact_nodes), 8);
 
     send_response(dht, from, query->transaction_id, local_node_id,

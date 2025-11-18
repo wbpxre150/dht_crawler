@@ -56,14 +56,10 @@ typedef struct {
     uint64_t find_node_success;       /* find_node successful responses */
     uint64_t find_node_timeout;       /* find_node query timeouts */
     uint64_t nodes_in_jech_table;     /* Current nodes in jech/dht table */
-    uint64_t nodes_expired;           /* Nodes expired due to inactivity */
-    uint64_t nodes_pruned;            /* Nodes pruned from tables */
     /* Node ID rotation statistics */
     uint64_t node_rotations_performed;   /* Total rotations performed */
     uint64_t samples_per_rotation;       /* Average samples per rotation period */
     time_t last_rotation_time;           /* Last rotation timestamp */
-    /* Node pruning statistics */
-    uint64_t last_nodes_dropped;         /* Nodes dropped at last stats print (for delta calculation) */
     /* Peer retry statistics */
     uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
 } dht_stats_t;
@@ -81,8 +77,6 @@ typedef struct {
     int peer_query_timeout_sec;           /* Timeout for get_peers queries */
     /* Node discovery configuration */
     int node_discovery_enabled;           /* Enable aggressive node discovery */
-    int old_node_check_interval_sec;      /* How often to check for old nodes */
-    int old_node_threshold_sec;           /* Age threshold for old nodes */
     int max_routing_table_nodes;          /* Maximum nodes in routing table */
 } dht_config_t;
 
@@ -99,44 +93,6 @@ typedef enum {
     ROTATION_STATE_ANNOUNCING,      // Telling network about new ID
     ROTATION_STATE_TRANSITIONING    // Using new ID
 } rotation_state_t;
-
-/* Async pruning infrastructure - Multi-threaded worker pool */
-
-/* Pruning work item - contains pre-computed node IDs to delete */
-typedef struct {
-    uint8_t (*node_ids)[WBPXRE_NODE_ID_LEN];  /* Array of node IDs to delete */
-    int node_count;                            /* Number of nodes in this chunk */
-
-    /* Worker coordination fields */
-    int worker_id;                             /* Worker identifier (0 to N-1) */
-    int total_workers;                         /* Total number of workers (N) */
-    atomic_int *workers_remaining;             /* Shared counter for completion tracking */
-} pruning_work_t;
-
-/* Shared state for coordinating multiple pruning workers */
-typedef struct {
-    atomic_int workers_remaining;    /* Counts down from N to 0 */
-    atomic_int total_submitted;      /* Aggregated across all workers */
-    atomic_int total_processed;      /* Aggregated across all workers */
-    time_t started_at;               /* When pruning began */
-} pruning_coordination_t;
-
-/* Pruning status tracking */
-typedef struct {
-    atomic_bool pruning_in_progress;       /* Is pruning active? */
-    atomic_int active_workers;             /* Workers currently processing */
-    atomic_int total_submitted;            /* Total nodes submitted */
-    atomic_int total_processed;            /* Total nodes dropped */
-    time_t started_at;                     /* When pruning batch started */
-    time_t completed_at;                   /* When last batch completed */
-
-    /* Coordination structure (allocated per pruning operation) */
-    pruning_coordination_t *coordination;  /* Shared across all workers */
-
-    /* Hash table rebuild tracking */
-    uint64_t pruning_cycles_completed;     /* Total pruning cycles completed */
-    time_t last_hash_rebuild;              /* Last hash table rebuild time */
-} pruning_status_t;
 
 /* DHT manager context */
 typedef struct {
@@ -160,7 +116,6 @@ typedef struct {
     discovered_nodes_queue_t discovered_nodes; /* Queue for discovered nodes */
     void *find_node_worker_pool;      /* Worker pool for find_node queries */
     uv_timer_t bootstrap_reseed_timer; /* Timer for bootstrap reseeding */
-    uv_timer_t old_node_timer;        /* Timer for old node maintenance */
     /* Node ID rotation state */
     uv_timer_t node_rotation_timer;   /* Timer for periodic node ID rotation */
     int node_rotation_enabled;        /* Is rotation enabled? */
@@ -180,15 +135,12 @@ typedef struct {
     /* Peer retry tracking */
     peer_retry_tracker_t *peer_retry_tracker;
     uv_timer_t peer_retry_timer;      /* Timer for periodic retry checking */
-    /* Async pruning timer */
-    uv_timer_t async_pruning_timer;   /* Timer for periodic async pruning */
+    /* Dual routing table rotation check timer */
+    uv_timer_t dual_routing_timer;    /* Timer for periodic dual_routing_check_rotation */
     /* Close tracker for safe shutdown */
     close_tracker_t close_tracker;
     /* Initialization state flags */
     bool timers_initialized;          /* Track if timers were initialized */
-    /* Async pruning infrastructure - Multi-threaded */
-    void *pruning_worker_pool;        /* worker_pool_t* for pruning operations */
-    pruning_status_t pruning_status;
 } dht_manager_t;
 
 /* Bootstrap nodes */

@@ -8,7 +8,6 @@
 #include "worker_pool.h"
 #include "wbpxre_dht.h"
 #include <unistd.h>
-#include <sched.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -35,10 +34,7 @@ static dht_manager_t *g_dht_manager = NULL;
 static int bootstrap_dht(dht_manager_t *mgr);
 static void node_rotation_timer_cb(uv_timer_t *handle);
 static void peer_retry_timer_cb(uv_timer_t *handle);
-static void async_pruning_timer_cb(uv_timer_t *handle);
-
-/* Async pruning forward declarations */
-static void pruning_worker_fn(void *task, void *closure);
+static void dual_routing_timer_cb(uv_timer_t *handle);
 
 /* Structure to track pending timer closes */
 typedef struct {
@@ -658,35 +654,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         log_msg(LOG_DEBUG, "Peer retry disabled");
     }
 
-    /* Initialize async pruning infrastructure - Multi-threaded worker pool */
-    if (cfg->async_pruning_enabled) {
-        int num_workers = cfg->async_pruning_workers > 0 ? cfg->async_pruning_workers : 4;
-
-        mgr->pruning_worker_pool = worker_pool_init(
-            num_workers,
-            20,  /* Queue capacity - small queue, fast processing */
-            pruning_worker_fn,
-            mgr  /* Closure passed to worker function */
-        );
-
-        if (!mgr->pruning_worker_pool) {
-            log_msg(LOG_ERROR, "Failed to create pruning worker pool");
-            /* Non-fatal - continue without async pruning */
-        } else {
-            /* Initialize pruning status */
-            atomic_init(&mgr->pruning_status.pruning_in_progress, false);
-            atomic_init(&mgr->pruning_status.active_workers, 0);
-            atomic_init(&mgr->pruning_status.total_submitted, 0);
-            atomic_init(&mgr->pruning_status.total_processed, 0);
-            mgr->pruning_status.started_at = 0;
-            mgr->pruning_status.completed_at = 0;
-
-            log_msg(LOG_DEBUG, "Initialized pruning worker pool with %d workers", num_workers);
-        }
-    } else {
-        mgr->pruning_worker_pool = NULL;
-    }
-
     log_msg(LOG_DEBUG, "DHT manager initialized successfully");
     return 0;
 }
@@ -781,31 +748,22 @@ int dht_manager_start(dht_manager_t *mgr) {
         log_msg(LOG_DEBUG, "Peer retry timer started (checks every 100ms)");
     }
 
-    /* Initialize and start async pruning timer if enabled */
-    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-    if (cfg && cfg->async_pruning_enabled && cfg->async_pruning_interval_sec > 0) {
-        log_msg(LOG_DEBUG, "Initializing async pruning timer (interval: %d sec)...",
-                cfg->async_pruning_interval_sec);
-        rc = uv_timer_init(mgr->app_ctx->loop, &mgr->async_pruning_timer);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to initialize async pruning timer: %s", uv_strerror(rc));
-            return -1;
-        }
-        mgr->async_pruning_timer.data = mgr;
-
-        /* Start timer (check every X seconds based on config) */
-        uint64_t interval_ms = cfg->async_pruning_interval_sec * 1000;
-        rc = uv_timer_start(&mgr->async_pruning_timer, async_pruning_timer_cb,
-                            interval_ms, interval_ms);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to start async pruning timer: %s", uv_strerror(rc));
-            return -1;
-        }
-        log_msg(LOG_DEBUG, "Async pruning timer started (interval: %d seconds)",
-                cfg->async_pruning_interval_sec);
-    } else {
-        log_msg(LOG_DEBUG, "Async pruning timer DISABLED");
+    /* Initialize and start dual routing check timer (every 5 seconds) */
+    log_msg(LOG_DEBUG, "Initializing dual routing check timer...");
+    rc = uv_timer_init(mgr->app_ctx->loop, &mgr->dual_routing_timer);
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "Failed to initialize dual routing timer: %s", uv_strerror(rc));
+        return -1;
     }
+    mgr->dual_routing_timer.data = mgr;
+
+    /* Start timer (check every 5 seconds) */
+    rc = uv_timer_start(&mgr->dual_routing_timer, dual_routing_timer_cb, 5000, 5000);
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "Failed to start dual routing timer: %s", uv_strerror(rc));
+        return -1;
+    }
+    log_msg(LOG_DEBUG, "Dual routing timer started (checks every 5 seconds)");
 
     log_msg(LOG_DEBUG, "DHT manager started successfully");
     return 0;
@@ -832,12 +790,9 @@ void dht_manager_stop(dht_manager_t *mgr) {
         uv_timer_stop(&mgr->peer_retry_timer);
     }
 
-    /* Stop async pruning timer if active */
-    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-    if (cfg && cfg->async_pruning_enabled && cfg->async_pruning_interval_sec > 0) {
-        uv_timer_stop(&mgr->async_pruning_timer);
-        log_msg(LOG_DEBUG, "Async pruning timer stopped");
-    }
+    /* Stop dual routing timer */
+    uv_timer_stop(&mgr->dual_routing_timer);
+    log_msg(LOG_DEBUG, "Dual routing timer stopped");
 
     /* Step 1: Set peer_store shutdown flag FIRST
      * This causes DHT callbacks to exit early (see wbpxre_callback_wrapper)
@@ -893,14 +848,12 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
             log_msg(LOG_DEBUG, "Closing peer_retry_timer");
         }
 
-        /* Close async_pruning_timer (only if async pruning was enabled) */
-        crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-        if (cfg && cfg->async_pruning_enabled && cfg->async_pruning_interval_sec > 0 &&
-            !uv_is_closing((uv_handle_t *)&mgr->async_pruning_timer)) {
-            mgr->async_pruning_timer.data = &close_tracker;
+        /* Close dual_routing_timer */
+        if (!uv_is_closing((uv_handle_t *)&mgr->dual_routing_timer)) {
+            mgr->dual_routing_timer.data = &close_tracker;
             close_tracker.pending_closes++;
-            uv_close((uv_handle_t *)&mgr->async_pruning_timer, timer_close_cb);
-            log_msg(LOG_DEBUG, "Closing async_pruning_timer");
+            uv_close((uv_handle_t *)&mgr->dual_routing_timer, timer_close_cb);
+            log_msg(LOG_DEBUG, "Closing dual_routing_timer");
         }
 
         /* Close node_rotation_timer (only if node rotation was enabled) */
@@ -967,19 +920,6 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
         peer_retry_print_stats(mgr->peer_retry_tracker);
         peer_retry_tracker_cleanup(mgr->peer_retry_tracker);
         mgr->peer_retry_tracker = NULL;
-    }
-
-    /* Shutdown pruning worker pool */
-    if (mgr->pruning_worker_pool) {
-        worker_pool_shutdown((worker_pool_t *)mgr->pruning_worker_pool);
-        worker_pool_cleanup((worker_pool_t *)mgr->pruning_worker_pool);
-        mgr->pruning_worker_pool = NULL;
-
-        /* Free coordination structure if still allocated */
-        if (mgr->pruning_status.coordination) {
-            free(mgr->pruning_status.coordination);
-            mgr->pruning_status.coordination = NULL;
-        }
     }
 
     /* Cleanup close tracker synchronization primitives */
@@ -1188,151 +1128,6 @@ int dht_manager_rotate_node_id(dht_manager_t *mgr) {
     return 0;
 }
 
-/* ============================================================================
- * Async Pruning Infrastructure
- * ============================================================================ */
-
-/* Multi-threaded pruning worker function - runs in worker pool thread
- * V2: Sequential collection + parallel deletion approach
- *
- * Timer callback (single-threaded):
- * 1. Collects all nodes to prune (distant + old)
- * 2. Deduplicates and partitions into chunks
- * 3. Distributes pre-computed node ID lists to N workers
- *
- * Worker threads (parallel):
- * 1. Receive pre-computed list of node IDs to delete
- * 2. Delete nodes in small chunks (mutex-protected)
- * 3. Yield between chunks for fairness
- * 4. Last worker cleans up coordination structure
- */
-static void pruning_worker_fn(void *task, void *closure) {
-    dht_manager_t *mgr = (dht_manager_t *)closure;
-    pruning_work_t *work = (pruning_work_t *)task;
-
-    if (!mgr || !work) {
-        if (work) {
-            free(work->node_ids);
-            free(work);
-        }
-        return;
-    }
-
-    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-    if (!cfg) {
-        free(work->node_ids);
-        if (work->workers_remaining) {
-            atomic_fetch_sub(work->workers_remaining, 1);
-        }
-        free(work);
-        return;
-    }
-
-    atomic_fetch_add(&mgr->pruning_status.active_workers, 1);
-
-    log_msg(LOG_DEBUG, "Pruning worker %d/%d deleting %d nodes",
-            work->worker_id + 1, work->total_workers, work->node_count);
-
-    /* Delete nodes in small chunks with yielding */
-    const int DELETE_CHUNK_SIZE = cfg->async_pruning_delete_chunk_size;
-    int total_dropped = 0;
-
-    for (int chunk_start = 0; chunk_start < work->node_count; chunk_start += DELETE_CHUNK_SIZE) {
-        int chunk_end = chunk_start + DELETE_CHUNK_SIZE;
-        if (chunk_end > work->node_count) {
-            chunk_end = work->node_count;
-        }
-        int chunk_size = chunk_end - chunk_start;
-
-        int dropped = wbpxre_routing_table_drop_nodes_batch(
-            mgr->dht->routing_table,
-            (const uint8_t (*)[WBPXRE_NODE_ID_LEN])&work->node_ids[chunk_start],
-            chunk_size
-        );
-
-        total_dropped += dropped;
-
-        if (chunk_end < work->node_count) {
-            sched_yield();
-        }
-    }
-
-    log_msg(LOG_DEBUG, "Worker %d/%d: dropped %d/%d nodes",
-            work->worker_id + 1, work->total_workers,
-            total_dropped, work->node_count);
-
-    /* Update statistics */
-    atomic_fetch_add(&mgr->pruning_status.total_submitted, work->node_count);
-    atomic_fetch_add(&mgr->pruning_status.total_processed, total_dropped);
-
-    /* Cleanup */
-    free(work->node_ids);
-    atomic_fetch_sub(&mgr->pruning_status.active_workers, 1);
-
-    /* Check if last worker */
-    int remaining = atomic_fetch_sub(work->workers_remaining, 1) - 1;
-
-    if (remaining == 0) {
-        /* Last worker - log completion and cleanup coordination */
-        mgr->pruning_status.completed_at = time(NULL);
-        atomic_store(&mgr->pruning_status.pruning_in_progress, false);
-
-        int good = 0, dubious = 0;
-        wbpxre_dht_nodes(mgr->dht, &good, &dubious);
-
-        int total_submitted = atomic_load(&mgr->pruning_status.total_submitted);
-        int total_processed = atomic_load(&mgr->pruning_status.total_processed);
-
-        /* Increment pruning cycle counter */
-        mgr->pruning_status.pruning_cycles_completed++;
-
-        log_msg(LOG_DEBUG, "=== Async Pruning Completed ===");
-        log_msg(LOG_DEBUG, "  Cycle: %llu", (unsigned long long)mgr->pruning_status.pruning_cycles_completed);
-        log_msg(LOG_DEBUG, "  Workers: %d", work->total_workers);
-        log_msg(LOG_DEBUG, "  Nodes submitted: %d", total_submitted);
-        log_msg(LOG_DEBUG, "  Nodes dropped: %d", total_processed);
-        log_msg(LOG_DEBUG, "  Duration: %ld seconds",
-                mgr->pruning_status.completed_at - mgr->pruning_status.started_at);
-        log_msg(LOG_DEBUG, "  Routing table now: %d nodes (%d good, %d dubious)",
-                good + dubious, good, dubious);
-
-        log_msg(LOG_DEBUG, "Pruning cycle %llu completed (rebuild every %d cycles)",
-                (unsigned long long)mgr->pruning_status.pruning_cycles_completed,
-                cfg ? cfg->async_pruning_hash_rebuild_cycles : 0);
-
-        /* Check if we should rebuild hash index */
-        if (cfg && cfg->async_pruning_hash_rebuild_cycles > 0) {
-            if (mgr->pruning_status.pruning_cycles_completed % cfg->async_pruning_hash_rebuild_cycles == 0) {
-                log_msg(LOG_DEBUG, "=== Hash Index Rebuild Triggered ===");
-                log_msg(LOG_DEBUG, "  Cycle: %llu (rebuild every %d cycles)",
-                        (unsigned long long)mgr->pruning_status.pruning_cycles_completed,
-                        cfg->async_pruning_hash_rebuild_cycles);
-
-                time_t rebuild_start = time(NULL);
-                int reindexed = wbpxre_routing_table_rebuild_hash_index(mgr->dht->routing_table);
-                time_t rebuild_duration = time(NULL) - rebuild_start;
-
-                if (reindexed >= 0) {
-                    mgr->pruning_status.last_hash_rebuild = time(NULL);
-                    log_msg(LOG_DEBUG, "  Nodes re-indexed: %d", reindexed);
-                    log_msg(LOG_DEBUG, "  Duration: %ld seconds", rebuild_duration);
-                    log_msg(LOG_DEBUG, "  Hash table bucket array reset to optimal size");
-                } else {
-                    log_msg(LOG_ERROR, "  Hash index rebuild failed!");
-                }
-            }
-        }
-
-        if (mgr->pruning_status.coordination) {
-            free(mgr->pruning_status.coordination);
-            mgr->pruning_status.coordination = NULL;
-        }
-    }
-
-    free(work);
-}
-
-
 /* Hot rotation - preserves routing table and keeps workers running */
 int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
     if (!mgr || !mgr->dht) {
@@ -1492,263 +1287,15 @@ static void peer_retry_timer_cb(uv_timer_t *handle) {
     }
 }
 
-/* Async pruning timer callback - periodically prunes routing table */
-static void async_pruning_timer_cb(uv_timer_t *handle) {
+/* Dual routing timer callback - periodically checks for table rotation */
+static void dual_routing_timer_cb(uv_timer_t *handle) {
     dht_manager_t *mgr = (dht_manager_t *)handle->data;
-    if (!mgr || !mgr->dht) {
+    if (!mgr || !mgr->dht || !mgr->dht->routing_controller) {
         return;
     }
 
-    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-    if (!cfg || !cfg->async_pruning_enabled) {
-        return;
-    }
-
-    /* Check if pruning is already in progress */
-    bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
-    if (pruning_active) {
-        log_msg(LOG_WARN, "Skipping periodic pruning - previous pruning still in progress");
-        return;
-    }
-
-    /* Get current node ID */
-    uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
-    pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
-    memcpy(current_node_id, mgr->dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&mgr->dht->node_id_lock);
-
-    /* Get current routing table size */
-    int current_good = 0, current_dubious = 0;
-    wbpxre_dht_nodes(mgr->dht, &current_good, &current_dubious);
-    int current_nodes = current_good + current_dubious;
-
-    /* Edge case: target >= current (nothing to prune) */
-    if (cfg->async_pruning_target_nodes >= current_nodes) {
-        log_msg(LOG_DEBUG, "Target nodes (%d) >= current nodes (%d), skipping pruning",
-                cfg->async_pruning_target_nodes, current_nodes);
-        return;
-    }
-
-    /* Calculate current capacity percentage */
-    double capacity_percent = (current_nodes * 100.0) / cfg->max_routing_table_nodes;
-
-    /* Skip pruning if below minimum capacity threshold */
-    if (capacity_percent < cfg->async_pruning_min_capacity_percent) {
-        log_msg(LOG_DEBUG, "Routing table at %.1f%% capacity (%d/%d nodes), below threshold %.1f%% - skipping pruning",
-                capacity_percent, current_nodes, cfg->max_routing_table_nodes,
-                cfg->async_pruning_min_capacity_percent);
-        return;
-    }
-
-    log_msg(LOG_DEBUG, "Routing table at %.1f%% capacity (%d/%d nodes), above threshold %.1f%% - proceeding with pruning",
-            capacity_percent, current_nodes, cfg->max_routing_table_nodes,
-            cfg->async_pruning_min_capacity_percent);
-
-    int nodes_to_remove = current_nodes - cfg->async_pruning_target_nodes;
-
-    log_msg(LOG_DEBUG, "=== Periodic Async Pruning Started ===");
-    log_msg(LOG_DEBUG, "  Current nodes: %d (%.1f%% capacity), Target: %d, To remove: %d",
-            current_nodes, capacity_percent, cfg->async_pruning_target_nodes, nodes_to_remove);
-
-    /* Mark pruning as active */
-    atomic_store(&mgr->pruning_status.pruning_in_progress, true);
-    atomic_store(&mgr->pruning_status.active_workers, 0);
-    mgr->pruning_status.started_at = time(NULL);
-
-    /* PHASE 1: SINGLE-THREADED COLLECTION */
-
-    /* Collect distant nodes */
-    /* Scale buffer size with routing table size, cap at 100K to prevent excessive memory */
-    int max_distant = current_nodes < 100000 ? current_nodes : 100000;
-    wbpxre_routing_node_t **distant_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_distant);
-    if (!distant_nodes) {
-        log_msg(LOG_ERROR, "Failed to allocate distant nodes array");
-        atomic_store(&mgr->pruning_status.pruning_in_progress, false);
-        return;
-    }
-
-    double distant_percent = cfg->async_pruning_distant_percent / 100.0;
-    int distant_count = wbpxre_routing_table_get_distant_nodes_fast(
-        mgr->dht->routing_table,
-        current_node_id,
-        distant_percent,
-        distant_nodes,
-        max_distant
-    );
-
-    /* Collect old nodes */
-    /* Scale buffer size with routing table size, cap at 100K to prevent excessive memory */
-    int max_old = current_nodes < 100000 ? current_nodes : 100000;
-    wbpxre_routing_node_t **old_nodes = malloc(sizeof(wbpxre_routing_node_t *) * max_old);
-    if (!old_nodes) {
-        log_msg(LOG_ERROR, "Failed to allocate old nodes array");
-        for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
-        free(distant_nodes);
-        atomic_store(&mgr->pruning_status.pruning_in_progress, false);
-        return;
-    }
-
-    double old_percent = cfg->async_pruning_old_percent / 100.0;
-    int old_count = wbpxre_routing_table_get_oldest_nodes(
-        mgr->dht->routing_table,
-        old_nodes,
-        (int)(current_nodes * old_percent)
-    );
-
-    log_msg(LOG_DEBUG, "Collected %d distant nodes and %d old nodes", distant_count, old_count);
-
-    /* Defensive validation - detect buffer overruns */
-    if (distant_count > max_distant) {
-        log_msg(LOG_ERROR, "BUG: distant_count (%d) exceeds max_distant (%d) - clamping",
-                distant_count, max_distant);
-        distant_count = max_distant;
-    }
-
-    if (old_count > max_old) {
-        log_msg(LOG_ERROR, "BUG: old_count (%d) exceeds max_old (%d) - clamping",
-                old_count, max_old);
-        old_count = max_old;
-    }
-
-    /* Deduplicate nodes */
-    uint8_t (*combined_ids)[WBPXRE_NODE_ID_LEN] = malloc(sizeof(uint8_t[WBPXRE_NODE_ID_LEN]) * (distant_count + old_count));
-    if (!combined_ids) {
-        log_msg(LOG_ERROR, "Failed to allocate combined IDs array");
-        for (int i = 0; i < distant_count; i++) free(distant_nodes[i]);
-        for (int i = 0; i < old_count; i++) free(old_nodes[i]);
-        free(distant_nodes);
-        free(old_nodes);
-        atomic_store(&mgr->pruning_status.pruning_in_progress, false);
-        return;
-    }
-
-    int unique_count = 0;
-
-    /* Add distant nodes */
-    for (int i = 0; i < distant_count; i++) {
-        memcpy(combined_ids[unique_count], distant_nodes[i]->id, WBPXRE_NODE_ID_LEN);
-        unique_count++;
-    }
-
-    /* Add old nodes, checking for duplicates */
-    for (int i = 0; i < old_count; i++) {
-        bool is_duplicate = false;
-        for (int j = 0; j < unique_count; j++) {
-            if (memcmp(combined_ids[j], old_nodes[i]->id, WBPXRE_NODE_ID_LEN) == 0) {
-                is_duplicate = true;
-                break;
-            }
-        }
-        if (!is_duplicate) {
-            memcpy(combined_ids[unique_count], old_nodes[i]->id, WBPXRE_NODE_ID_LEN);
-            unique_count++;
-        }
-    }
-
-    /* Free routing node structures - we only need IDs now */
-    /* Each node is an independent allocation from the collection functions */
-    /* No double-free is possible because deduplication happens via node IDs above */
-    for (int i = 0; i < distant_count; i++) {
-        free(distant_nodes[i]);
-    }
-
-    for (int i = 0; i < old_count; i++) {
-        free(old_nodes[i]);
-    }
-
-    free(distant_nodes);
-    free(old_nodes);
-
-    /* Adjust to target */
-    int final_count = unique_count < nodes_to_remove ? unique_count : nodes_to_remove;
-
-    log_msg(LOG_DEBUG, "After deduplication: %d unique nodes, will delete %d", unique_count, final_count);
-
-    /* PHASE 2: PARALLEL DISTRIBUTION */
-
-    /* Allocate coordination structure shared across all workers */
-    pruning_coordination_t *coord = calloc(1, sizeof(pruning_coordination_t));
-    if (!coord) {
-        log_msg(LOG_ERROR, "Failed to allocate pruning coordination structure");
-        free(combined_ids);
-        atomic_store(&mgr->pruning_status.pruning_in_progress, false);
-        return;
-    }
-
-    int num_workers = cfg->async_pruning_workers;
-    atomic_init(&coord->workers_remaining, num_workers);
-    atomic_init(&coord->total_submitted, 0);
-    atomic_init(&coord->total_processed, 0);
-    coord->started_at = time(NULL);
-
-    mgr->pruning_status.coordination = coord;
-
-    /* Partition work across N workers */
-    int chunk_size = (final_count + num_workers - 1) / num_workers;
-    int submitted = 0;
-
-    for (int i = 0; i < num_workers; i++) {
-        int start_idx = i * chunk_size;
-        int end_idx = start_idx + chunk_size;
-        if (end_idx > final_count) {
-            end_idx = final_count;
-        }
-        int worker_node_count = end_idx - start_idx;
-
-        if (worker_node_count <= 0) {
-            /* No more work to distribute */
-            atomic_fetch_sub(&coord->workers_remaining, 1);
-            break;
-        }
-
-        pruning_work_t *work = malloc(sizeof(pruning_work_t));
-        if (!work) {
-            log_msg(LOG_ERROR, "Failed to allocate pruning work item %d/%d", i+1, num_workers);
-            atomic_fetch_sub(&coord->workers_remaining, 1);
-            continue;
-        }
-
-        /* Allocate and copy node IDs for this worker */
-        work->node_ids = malloc(sizeof(uint8_t[WBPXRE_NODE_ID_LEN]) * worker_node_count);
-        if (!work->node_ids) {
-            log_msg(LOG_ERROR, "Failed to allocate node IDs for worker %d/%d", i+1, num_workers);
-            free(work);
-            atomic_fetch_sub(&coord->workers_remaining, 1);
-            continue;
-        }
-
-        memcpy(work->node_ids, &combined_ids[start_idx],
-               sizeof(uint8_t[WBPXRE_NODE_ID_LEN]) * worker_node_count);
-        work->node_count = worker_node_count;
-
-        /* Worker coordination fields */
-        work->worker_id = i;
-        work->total_workers = num_workers;
-        work->workers_remaining = &coord->workers_remaining;
-
-        /* Submit to worker pool */
-        if (worker_pool_try_submit((worker_pool_t *)mgr->pruning_worker_pool, work) != 0) {
-            log_msg(LOG_ERROR, "Failed to submit pruning work item %d/%d to worker pool", i+1, num_workers);
-            free(work->node_ids);
-            free(work);
-            atomic_fetch_sub(&coord->workers_remaining, 1);
-        } else {
-            submitted++;
-        }
-    }
-
-    /* Free collection buffers */
-    free(combined_ids);
-
-    if (submitted == 0) {
-        log_msg(LOG_ERROR, "Failed to submit any pruning work items");
-        free(coord);
-        mgr->pruning_status.coordination = NULL;
-        atomic_store(&mgr->pruning_status.pruning_in_progress, false);
-    } else {
-        log_msg(LOG_DEBUG, "  Submitted %d work items to %d-thread worker pool",
-                submitted, num_workers);
-    }
+    /* Check if it's time to rotate routing tables */
+    dual_routing_check_rotation(mgr->dht->routing_controller);
 }
 
 /* Print DHT statistics */
@@ -1798,10 +1345,13 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             pthread_rwlock_unlock(&mgr->dht->node_id_lock);
 
             int close_nodes = 0, distant_nodes = 0;
-            wbpxre_routing_table_get_keyspace_distribution(mgr->dht->routing_table,
-                                                             current_node_id,
-                                                             &close_nodes,
-                                                             &distant_nodes);
+            wbpxre_routing_table_t *active_table = dual_routing_get_active(mgr->dht->routing_controller);
+            if (active_table) {
+                wbpxre_routing_table_get_keyspace_distribution(active_table,
+                                                                 current_node_id,
+                                                                 &close_nodes,
+                                                                 &distant_nodes);
+            }
 
             int total_nodes = close_nodes + distant_nodes;
             if (total_nodes > 0) {
@@ -1809,14 +1359,6 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                         close_nodes, (close_nodes * 100.0) / total_nodes,
                         distant_nodes, (distant_nodes * 100.0) / total_nodes);
             }
-
-            /* Calculate and display nodes dropped in last interval */
-            uint64_t current_dropped = wbpxre_stats.nodes_dropped;
-            uint64_t dropped_delta = current_dropped - mgr->stats.last_nodes_dropped;
-            log_msg(LOG_INFO, "  Nodes dropped: last_10s=%llu total=%llu",
-                    (unsigned long long)dropped_delta,
-                    (unsigned long long)current_dropped);
-            mgr->stats.last_nodes_dropped = current_dropped;
         }
     }
 
@@ -1871,40 +1413,6 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                     mgr->node_rotation_interval_sec, time_until_first);
             log_msg(LOG_INFO, "    Samples: %llu",
                     (unsigned long long)mgr->samples_since_rotation);
-        }
-    }
-
-    /* Print async pruning statistics */
-    if (mgr->pruning_worker_pool) {
-        bool pruning_active = atomic_load(&mgr->pruning_status.pruning_in_progress);
-        int active_workers = atomic_load(&mgr->pruning_status.active_workers);
-        int total_submitted = atomic_load(&mgr->pruning_status.total_submitted);
-        int total_processed = atomic_load(&mgr->pruning_status.total_processed);
-
-        size_t num_workers, queue_size, queue_capacity, idle_workers;
-        uint64_t tasks_processed;
-        worker_pool_stats((worker_pool_t *)mgr->pruning_worker_pool,
-                         &num_workers, &queue_size, &queue_capacity,
-                         &tasks_processed, NULL, &idle_workers);
-
-        log_msg(LOG_INFO, "  Async Pruning: %s (workers=%d/%zu active, queue=%zu/%zu)",
-                pruning_active ? "ACTIVE" : "idle", active_workers,
-                num_workers, queue_size, queue_capacity);
-
-        if (total_submitted > 0) {
-            log_msg(LOG_INFO, "    Lifetime: submitted=%d processed=%d (%.1f%%)",
-                    total_submitted, total_processed,
-                    (total_processed * 100.0) / total_submitted);
-        }
-
-        if (pruning_active && mgr->pruning_status.started_at > 0) {
-            log_msg(LOG_INFO, "    Current batch: running for %ld seconds",
-                    now - mgr->pruning_status.started_at);
-        }
-
-        if (mgr->pruning_status.completed_at > 0) {
-            log_msg(LOG_INFO, "    Last completed: %ld seconds ago",
-                    now - mgr->pruning_status.completed_at);
         }
     }
 

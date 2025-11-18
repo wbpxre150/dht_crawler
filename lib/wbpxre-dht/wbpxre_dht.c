@@ -471,7 +471,7 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
             node.discovered_at = time(NULL);
             node.last_responded_at = time(NULL);
 
-            wbpxre_routing_table_insert(dht->routing_table, &node);
+            dual_routing_insert(dht->routing_controller, &node);
 
             /* Read node ID with lock protection */
             uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
@@ -488,7 +488,7 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
                 for (int i = 0; i < found_count; i++) {
                     /* Make a copy to avoid use-after-free if insert holds reference */
                     wbpxre_routing_node_t node_copy = found_nodes[i];
-                    wbpxre_routing_table_insert(dht->routing_table, &node_copy);
+                    dual_routing_insert(dht->routing_controller, &node_copy);
                 }
                 if (found_count > 0) {
                     fprintf(stderr, "Bootstrap: Discovered %d nodes from %s:%d\n",
@@ -530,10 +530,11 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
         return NULL;
     }
 
-    /* Initialize routing table */
+    /* Initialize dual routing controller */
     int max_nodes = config->max_routing_table_nodes > 0 ? config->max_routing_table_nodes : 10000;
-    dht->routing_table = wbpxre_routing_table_create(max_nodes);
-    if (!dht->routing_table) {
+    /* Split max nodes between two tables, with default thresholds */
+    dht->routing_controller = dual_routing_controller_create(max_nodes / 2, 0.80, 0.20);
+    if (!dht->routing_controller) {
         close(dht->udp_socket);
         free(dht);
         return NULL;
@@ -556,7 +557,6 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
 
     /* Create work queues */
     dht->discovered_nodes = wbpxre_queue_create(config->discovered_nodes_capacity);
-    dht->nodes_for_ping = wbpxre_queue_create(config->ping_queue_capacity);
     dht->nodes_for_find_node = wbpxre_queue_create(config->find_node_queue_capacity);
     dht->nodes_for_sample_infohashes = wbpxre_queue_create(config->sample_infohashes_capacity);
     dht->infohashes_for_get_peers = wbpxre_queue_create(WBPXRE_GET_PEERS_CAPACITY);
@@ -594,43 +594,6 @@ static void *target_rotation_thread_func(void *arg) {
     return NULL;
 }
 
-/* Ping worker thread */
-static void *ping_worker_func(void *arg) {
-    wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
-
-    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
-    rcu_register_thread();
-
-    while (dht->running) {
-        /* Pop node from ping queue (blocking) */
-        wbpxre_routing_node_t *node = (wbpxre_routing_node_t *)wbpxre_queue_pop(dht->nodes_for_ping);
-        if (!node) break;  /* Queue shutdown */
-
-        /* Send ping */
-        uint8_t response_id[WBPXRE_NODE_ID_LEN];
-        int rc = wbpxre_protocol_ping(dht, &node->addr.addr, response_id);
-
-        if (rc == 0) {
-            /* Success -> update lastRespondedAt */
-            wbpxre_routing_table_update_node_responded(dht->routing_table, node->id);
-        } else {
-            /* Failed -> drop node */
-            wbpxre_routing_table_drop_node(dht->routing_table, node->id);
-
-            /* Update dropped nodes statistics */
-            pthread_mutex_lock(&dht->stats_mutex);
-            dht->stats.nodes_dropped++;
-            pthread_mutex_unlock(&dht->stats_mutex);
-        }
-
-        free(node);
-    }
-
-    /* Unregister thread before exit (REQUIRED) */
-    rcu_unregister_thread();
-    return NULL;
-}
-
 /* Find node worker thread */
 static void *find_node_worker_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
@@ -657,13 +620,13 @@ static void *find_node_worker_func(void *arg) {
 
         if (rc == 0) {
             /* Success -> update lastRespondedAt */
-            wbpxre_routing_table_update_node_responded(dht->routing_table, node->id);
+            dual_routing_update_node_responded(dht->routing_controller, node->id);
 
             /* Insert discovered nodes into routing table and discovered_nodes queue */
             for (int i = 0; i < found_count; i++) {
                 /* Insert into routing table */
                 wbpxre_routing_node_t node_copy = found_nodes[i];
-                wbpxre_routing_table_insert(dht->routing_table, &node_copy);
+                dual_routing_insert(dht->routing_controller, &node_copy);
 
                 /* Try to push to discovered_nodes queue (non-blocking) */
                 wbpxre_routing_node_t *discovered_copy = malloc(sizeof(wbpxre_routing_node_t));
@@ -678,10 +641,8 @@ static void *find_node_worker_func(void *arg) {
             }
 
             if (found_nodes) free(found_nodes);
-        } else {
-            /* Failed -> drop node */
-            wbpxre_routing_table_drop_node(dht->routing_table, node->id);
         }
+        /* Note: Failed find_node queries no longer drop nodes - cleanup is handled by dual routing table rotation */
 
         free(node);
     }
@@ -717,7 +678,7 @@ static void *sample_infohashes_worker_func(void *arg) {
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
         /* Track query attempt BEFORE sending (so failed nodes have queries_sent > 0) */
-        wbpxre_routing_table_update_node_queried(dht->routing_table, node->id);
+        dual_routing_update_node_queried(dht->routing_controller, node->id);
 
         /* Send sample_infohashes query */
         uint8_t *hashes = NULL;
@@ -733,8 +694,8 @@ static void *sample_infohashes_worker_func(void *arg) {
 
         if (rc == 0) {
             /* Success -> update node metadata */
-            wbpxre_routing_table_update_node_responded(dht->routing_table, node->id);
-            wbpxre_routing_table_update_sample_response(dht->routing_table, node->id,
+            dual_routing_update_node_responded(dht->routing_controller, node->id);
+            dual_routing_update_sample_response(dht->routing_controller, node->id,
                                                         hash_count, total_num, interval);
 
             /* Update stats */
@@ -775,7 +736,8 @@ static void *get_peers_worker_func(void *arg) {
 
         /* Get K=8 closest nodes from routing table */
         wbpxre_routing_node_t *nodes[8];
-        int node_count = wbpxre_routing_table_get_closest(dht->routing_table, work->info_hash, nodes, 8);
+        wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
+        int node_count = wbpxre_routing_table_get_closest(active_table, work->info_hash, nodes, 8);
 
         if (node_count > 0) {
             /* Query each node for peers */
@@ -808,7 +770,7 @@ static void *get_peers_worker_func(void *arg) {
 
                 if (rc == 0) {
                     /* Success -> update node as responsive */
-                    wbpxre_routing_table_update_node_responded(dht->routing_table, nodes[i]->id);
+                    dual_routing_update_node_responded(dht->routing_controller, nodes[i]->id);
 
                     /* Update stats */
                     pthread_mutex_lock(&dht->stats_mutex);
@@ -823,7 +785,7 @@ static void *get_peers_worker_func(void *arg) {
 
                     /* Add returned nodes to routing table */
                     for (int j = 0; j < returned_node_count; j++) {
-                        wbpxre_routing_table_insert(dht->routing_table, &returned_nodes[j]);
+                        dual_routing_insert(dht->routing_controller, &returned_nodes[j]);
                     }
 
                     /* Free the arrays (not individual elements, they're stack-allocated structs in the array) */
@@ -837,10 +799,8 @@ static void *get_peers_worker_func(void *arg) {
                      * Old behavior: Stop after finding 1 peer → ~1-3 peers per query
                      * New behavior: Query all nodes → ~3-8 peers per query
                      */
-                } else {
-                    /* Failed -> drop node */
-                    wbpxre_routing_table_drop_node(dht->routing_table, nodes[i]->id);
                 }
+                /* Note: Failed get_peers queries no longer drop nodes - cleanup is handled by dual routing table rotation */
 
                 /* Free current node */
                 free(nodes[i]);
@@ -893,8 +853,8 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
         wbpxre_routing_node_t *node = (wbpxre_routing_node_t *)wbpxre_queue_pop(dht->discovered_nodes);
         if (!node) break;  /* Queue shutdown */
 
-        /* Check if already in routing table */
-        if (wbpxre_routing_table_exists(dht->routing_table, node->id)) {
+        /* Check if already in either routing table */
+        if (dual_routing_exists(dht->routing_controller, node->id)) {
             free(node);
             continue;  /* Already known */
         }
@@ -903,8 +863,6 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
         if (wbpxre_queue_try_push(dht->nodes_for_find_node, node)) {
             continue;
         } else if (wbpxre_queue_try_push(dht->nodes_for_sample_infohashes, node)) {
-            continue;
-        } else if (wbpxre_queue_try_push(dht->nodes_for_ping, node)) {
             continue;
         } else {
             free(node);  /* All queues full, discard */
@@ -934,7 +892,8 @@ static void *sample_infohashes_feeder_func(void *arg) {
 
         /* Get up to 200 nodes suitable for sample_infohashes (increased from 60) */
         wbpxre_routing_node_t *candidates[200];
-        int count = wbpxre_routing_table_get_sample_candidates(dht->routing_table, current_node_id, candidates, 200);
+        wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
+        int count = wbpxre_routing_table_get_sample_candidates(active_table, current_node_id, candidates, 200);
 
         /* Feed them to worker queue */
         int dropped = 0;
@@ -971,43 +930,6 @@ static void *sample_infohashes_feeder_func(void *arg) {
     return NULL;
 }
 
-/* Ping feeder thread - continuously feeds old nodes for verification */
-static void *ping_feeder_func(void *arg) {
-    wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
-
-    /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
-    rcu_register_thread();
-
-    while (dht->running) {
-        /* Get old nodes that haven't responded in last 60 seconds (or never) */
-        time_t threshold = time(NULL) - 60;
-        wbpxre_routing_node_t *candidates[20];
-        int count = wbpxre_routing_table_get_old_nodes(dht->routing_table, candidates, 20, threshold);
-
-        /* Feed them to worker queue */
-        for (int i = 0; i < count; i++) {
-            if (!dht->running) {
-                /* Free remaining candidates */
-                for (int j = i; j < count; j++) {
-                    free(candidates[j]);
-                }
-                break;
-            }
-
-            /* Try to push (non-blocking) */
-            if (!wbpxre_queue_try_push(dht->nodes_for_ping, candidates[i])) {
-                free(candidates[i]);  /* Queue full, discard */
-            }
-        }
-
-        sleep(10);  /* Run every 10 seconds */
-    }
-
-    /* Unregister thread before exit (REQUIRED) */
-    rcu_unregister_thread();
-    return NULL;
-}
-
 /* Find node feeder thread - continuously feeds nodes for find_node queries */
 static void *find_node_feeder_func(void *arg) {
     wbpxre_dht_t *dht = (wbpxre_dht_t *)arg;
@@ -1024,7 +946,8 @@ static void *find_node_feeder_func(void *arg) {
 
         /* Get up to 10 nodes closest to target */
         wbpxre_routing_node_t *candidates[10];
-        int count = wbpxre_routing_table_get_closest(dht->routing_table, target, candidates, 10);
+        wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
+        int count = wbpxre_routing_table_get_closest(active_table, target, candidates, 10);
 
         /* Feed them to worker queue */
         for (int i = 0; i < count; i++) {
@@ -1062,15 +985,9 @@ int wbpxre_dht_start(wbpxre_dht_t *dht) {
     pthread_create(&dht->target_rotation_thread, NULL, target_rotation_thread_func, dht);
 
     /* Allocate worker thread arrays */
-    dht->ping_worker_threads = calloc(dht->config.ping_workers, sizeof(pthread_t));
     dht->find_node_worker_threads = calloc(dht->config.find_node_workers, sizeof(pthread_t));
     dht->sample_infohashes_worker_threads = calloc(dht->config.sample_infohashes_workers, sizeof(pthread_t));
     dht->get_peers_worker_threads = calloc(dht->config.get_peers_workers, sizeof(pthread_t));
-
-    /* Start ping workers */
-    for (int i = 0; i < dht->config.ping_workers; i++) {
-        pthread_create(&dht->ping_worker_threads[i], NULL, ping_worker_func, dht);
-    }
 
     /* Start find_node workers */
     for (int i = 0; i < dht->config.find_node_workers; i++) {
@@ -1093,7 +1010,6 @@ int wbpxre_dht_start(wbpxre_dht_t *dht) {
     /* Start feeder threads */
     pthread_create(&dht->sample_infohashes_feeder_thread, NULL, sample_infohashes_feeder_func, dht);
     pthread_create(&dht->find_node_feeder_thread, NULL, find_node_feeder_func, dht);
-    pthread_create(&dht->ping_feeder_thread, NULL, ping_feeder_func, dht);
     pthread_create(&dht->get_peers_feeder_thread, NULL, get_peers_feeder_func, dht);
 
     return 0;
@@ -1108,20 +1024,11 @@ int wbpxre_dht_stop(wbpxre_dht_t *dht) {
 
     /* Shutdown queues to wake up blocking workers */
     wbpxre_queue_shutdown(dht->discovered_nodes);
-    wbpxre_queue_shutdown(dht->nodes_for_ping);
     wbpxre_queue_shutdown(dht->nodes_for_find_node);
     wbpxre_queue_shutdown(dht->nodes_for_sample_infohashes);
     wbpxre_queue_shutdown(dht->infohashes_for_get_peers);
 
     /* Wait for worker threads */
-    if (dht->ping_worker_threads) {
-        for (int i = 0; i < dht->config.ping_workers; i++) {
-            pthread_join(dht->ping_worker_threads[i], NULL);
-        }
-        free(dht->ping_worker_threads);
-        dht->ping_worker_threads = NULL;
-    }
-
     if (dht->find_node_worker_threads) {
         for (int i = 0; i < dht->config.find_node_workers; i++) {
             pthread_join(dht->find_node_worker_threads[i], NULL);
@@ -1150,7 +1057,6 @@ int wbpxre_dht_stop(wbpxre_dht_t *dht) {
     pthread_join(dht->discovered_nodes_dispatcher_thread, NULL);
     pthread_join(dht->sample_infohashes_feeder_thread, NULL);
     pthread_join(dht->find_node_feeder_thread, NULL);
-    pthread_join(dht->ping_feeder_thread, NULL);
     pthread_join(dht->get_peers_feeder_thread, NULL);
 
     /* Close socket BEFORE joining UDP reader thread to unblock recvfrom()
@@ -1192,14 +1098,13 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
         }
     }
 
-    /* NOW destroy routing table (after pending queries are freed) */
-    if (dht->routing_table) {
-        wbpxre_routing_table_destroy(dht->routing_table);
+    /* NOW destroy routing controller (after pending queries are freed) */
+    if (dht->routing_controller) {
+        dual_routing_controller_destroy(dht->routing_controller);
     }
 
     /* Destroy queues */
     if (dht->discovered_nodes) wbpxre_queue_destroy(dht->discovered_nodes);
-    if (dht->nodes_for_ping) wbpxre_queue_destroy(dht->nodes_for_ping);
     if (dht->nodes_for_find_node) wbpxre_queue_destroy(dht->nodes_for_find_node);
     if (dht->nodes_for_sample_infohashes) wbpxre_queue_destroy(dht->nodes_for_sample_infohashes);
     if (dht->infohashes_for_get_peers) wbpxre_queue_destroy(dht->infohashes_for_get_peers);
@@ -1244,7 +1149,7 @@ int wbpxre_dht_insert_node(wbpxre_dht_t *dht, const uint8_t *node_id,
     node.discovered_at = time(NULL);
     node.last_responded_at = time(NULL);
 
-    return wbpxre_routing_table_insert(dht->routing_table, &node);
+    return dual_routing_insert(dht->routing_controller, &node);
 }
 
 int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool priority) {
@@ -1274,10 +1179,10 @@ int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool pri
 }
 
 int wbpxre_dht_nodes(wbpxre_dht_t *dht, int *good_return, int *dubious_return) {
-    if (!dht || !dht->routing_table) return -1;
+    if (!dht || !dht->routing_controller) return -1;
 
-    /* With RCU, node_count is updated atomically and can be read without locks */
-    int total = dht->routing_table->node_count;
+    /* Get total nodes from dual routing controller */
+    int total = dual_routing_get_total_nodes(dht->routing_controller);
 
     if (good_return) *good_return = total;
     if (dubious_return) *dubious_return = 0;
@@ -1390,9 +1295,6 @@ int wbpxre_dht_get_stats(wbpxre_dht_t *dht, wbpxre_stats_t *stats_out) {
     stats_out->bep51_samples_received = dht->stats.bep51_samples_received;
     stats_out->get_peers_queries_sent = dht->stats.get_peers_queries_sent;
     stats_out->get_peers_responses_received = dht->stats.get_peers_responses_received;
-    stats_out->nodes_dropped = dht->stats.nodes_dropped;
-    stats_out->nodes_dropped_unresponsive = dht->stats.nodes_dropped_unresponsive;
-    stats_out->aggressive_prune_triggers = dht->stats.aggressive_prune_triggers;
     pthread_mutex_unlock(&dht->stats_mutex);
 
     return 0;

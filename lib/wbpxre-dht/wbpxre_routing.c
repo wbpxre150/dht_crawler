@@ -98,142 +98,9 @@ static int compare_node_ids(const uint8_t *id1, const uint8_t *id2) {
     return memcmp(id1, id2, WBPXRE_NODE_ID_LEN);
 }
 
-/* RCU callback to free routing node after grace period */
-static void free_routing_node_rcu(struct rcu_head *head) {
-    wbpxre_routing_node_t *node = caa_container_of(head, wbpxre_routing_node_t, rcu_head);
-    free(node);
-}
-
 /* Forward declaration */
 static wbpxre_routing_node_t *find_node_recursive(wbpxre_routing_node_t *root,
                                                    const uint8_t *node_id);
-
-/* ============================================================================
- * Node Removal from AVL Tree
- * ============================================================================ */
-
-static wbpxre_routing_node_t *find_min_node(wbpxre_routing_node_t *node) {
-    while (node->left != NULL) {
-        node = node->left;
-    }
-    return node;
-}
-
-static wbpxre_routing_node_t *remove_node_recursive(wbpxre_routing_node_t *root,
-                                                      const uint8_t *node_id,
-                                                      bool *removed) {
-    if (!root) return NULL;
-
-    int cmp = compare_node_ids(node_id, root->id);
-
-    if (cmp < 0) {
-        root->left = remove_node_recursive(root->left, node_id, removed);
-    } else if (cmp > 0) {
-        root->right = remove_node_recursive(root->right, node_id, removed);
-    } else {
-        /* Found the node to remove */
-        *removed = true;
-
-        /* Node with only one child or no child */
-        if (root->left == NULL) {
-            wbpxre_routing_node_t *temp = root->right;
-            call_rcu(&root->rcu_head, free_routing_node_rcu);
-            return temp;
-        } else if (root->right == NULL) {
-            wbpxre_routing_node_t *temp = root->left;
-            call_rcu(&root->rcu_head, free_routing_node_rcu);
-            return temp;
-        }
-
-        /* Node with two children: Get inorder successor (smallest in right subtree) */
-        wbpxre_routing_node_t *temp = find_min_node(root->right);
-
-        /* Copy successor's content to this node */
-        memcpy(root->id, temp->id, WBPXRE_NODE_ID_LEN);
-        memcpy(&root->addr, &temp->addr, sizeof(wbpxre_node_addr_t));
-        root->last_responded_at = temp->last_responded_at;
-        root->discovered_at = temp->discovered_at;
-        root->dropped = temp->dropped;
-        root->bep51_support = temp->bep51_support;
-        root->sampled_num = temp->sampled_num;
-        root->last_discovered_num = temp->last_discovered_num;
-        root->total_num = temp->total_num;
-        root->next_sample_time = temp->next_sample_time;
-        root->queries_sent = temp->queries_sent;
-        root->responses_received = temp->responses_received;
-
-        /* Delete the inorder successor */
-        root->right = remove_node_recursive(root->right, temp->id, removed);
-    }
-
-    if (!root) return NULL;
-
-    /* Balance the tree */
-    return balance_tree(root);
-}
-
-/* ============================================================================
- * LRU Node Finding (Phase 4: Quality-Based Eviction)
- * ============================================================================ */
-
-static void find_lru_node_recursive(wbpxre_routing_node_t *root,
-                                     wbpxre_routing_node_t **lru_node,
-                                     time_t *oldest_time,
-                                     double *worst_quality) {
-    if (!root) return;
-
-    /* Skip dropped nodes */
-    if (!root->dropped) {
-        bool should_evict = false;
-
-        /* Priority 1: Low response rate (after at least 5 queries) */
-        if (root->queries_sent >= 5) {
-            double response_rate = (double)root->responses_received / root->queries_sent;
-            if (response_rate < 0.20) {
-                should_evict = true;
-                if (response_rate < *worst_quality) {
-                    *worst_quality = response_rate;
-                    *oldest_time = root->last_responded_at;
-                    *lru_node = root;
-                }
-            }
-        }
-
-        /* Priority 2: Old nodes (haven't responded in 5+ minutes) */
-        if (!should_evict && *lru_node == NULL) {
-            time_t now = time(NULL);
-            if (root->last_responded_at > 0 && (now - root->last_responded_at) > 300) {
-                should_evict = true;
-                if (root->last_responded_at < *oldest_time) {
-                    *oldest_time = root->last_responded_at;
-                    *lru_node = root;
-                }
-            }
-        }
-
-        /* Priority 3: Oldest by last_responded_at (fallback) */
-        if (!should_evict && *lru_node == NULL) {
-            if (root->last_responded_at < *oldest_time) {
-                *oldest_time = root->last_responded_at;
-                *lru_node = root;
-            }
-        }
-    }
-
-    /* Recurse through tree */
-    find_lru_node_recursive(root->left, lru_node, oldest_time, worst_quality);
-    find_lru_node_recursive(root->right, lru_node, oldest_time, worst_quality);
-}
-
-static wbpxre_routing_node_t *find_lru_node(wbpxre_routing_table_t *table) {
-    wbpxre_routing_node_t *lru_node = NULL;
-    time_t oldest_time = time(NULL) + 1; /* Start with future time */
-    double worst_quality = 1.0; /* Start with perfect quality */
-
-    find_lru_node_recursive(table->root, &lru_node, &oldest_time, &worst_quality);
-
-    return lru_node;
-}
 
 /* ============================================================================
  * Routing Table Operations
@@ -364,30 +231,6 @@ static void add_node_to_flat_array(wbpxre_routing_table_t *table, wbpxre_routing
     }
 }
 
-/* Helper: Remove node pointer from flat array (must be called with update_lock held) */
-static void remove_node_from_flat_array(wbpxre_routing_table_t *table, const uint8_t *node_id) {
-    if (!table || !node_id || !table->all_nodes) return;
-
-    /* O(1) hash lookup */
-    node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;
-    node_index_map_entry_t *entry = NULL;
-
-    HASH_FIND(hh, hash_table, node_id, WBPXRE_NODE_ID_LEN, entry);
-
-    if (entry) {
-        /* Remove from flat array - use rcu_assign_pointer for safe NULL assignment */
-        int index = entry->flat_array_index;
-        if (index >= 0 && index < table->all_nodes_capacity) {
-            rcu_assign_pointer(table->all_nodes[index], NULL);
-        }
-
-        /* Remove from hash table */
-        HASH_DEL(hash_table, entry);
-        table->node_index_map = hash_table;
-        free(entry);
-    }
-}
-
 int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
                                  const wbpxre_routing_node_t *node) {
     if (!table || !node) return -1;
@@ -398,28 +241,10 @@ int wbpxre_routing_table_insert(wbpxre_routing_table_t *table,
     wbpxre_routing_node_t *existing = find_node_recursive(table->root, node->id);
 
     if (!existing && table->max_nodes > 0 && table->node_count >= table->max_nodes) {
-        /* At capacity and this is a new node - implement LRU eviction */
-        wbpxre_routing_node_t *lru = find_lru_node(table);
-
-        if (lru) {
-            /* Save LRU node ID before removal */
-            uint8_t lru_id[WBPXRE_NODE_ID_LEN];
-            memcpy(lru_id, lru->id, WBPXRE_NODE_ID_LEN);
-
-            /* Remove from flat array first */
-            remove_node_from_flat_array(table, lru_id);
-
-            /* Remove LRU node from tree */
-            bool removed = false;
-            wbpxre_routing_node_t *new_root = remove_node_recursive(table->root, lru_id, &removed);
-
-            /* Update root pointer with RCU semantics */
-            rcu_assign_pointer(table->root, new_root);
-
-            if (removed) {
-                table->node_count--;
-            }
-        }
+        /* At capacity and this is a new node - reject insert
+         * Node cleanup is handled by dual routing table rotation */
+        pthread_mutex_unlock(&table->update_lock);
+        return -1;
     }
 
     bool inserted = false;
@@ -1162,128 +987,6 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
     pthread_mutex_unlock(&table->update_lock);
 }
 
-void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
-                                     const uint8_t *node_id) {
-    if (!table || !node_id) return;
-
-    pthread_mutex_lock(&table->update_lock);
-
-    /* Mark as dropped first, then remove */
-    wbpxre_routing_node_t *node = find_node_recursive(table->root, node_id);
-    if (node) {
-        node->dropped = true;
-
-        /* Remove from flat array */
-        remove_node_from_flat_array(table, node_id);
-
-        /* Actually remove the node from the tree */
-        bool removed = false;
-        wbpxre_routing_node_t *new_root = remove_node_recursive(table->root, node_id, &removed);
-
-        /* Update root pointer with RCU semantics */
-        rcu_assign_pointer(table->root, new_root);
-
-        if (removed) {
-            table->node_count--;
-        }
-    }
-
-    pthread_mutex_unlock(&table->update_lock);
-}
-
-/* Drop multiple nodes in a single operation (batch API)
- * More efficient than calling drop_node multiple times
- * Returns number of nodes actually dropped */
-int wbpxre_routing_table_drop_nodes_batch(wbpxre_routing_table_t *table,
-                                           const uint8_t node_ids[][WBPXRE_NODE_ID_LEN],
-                                           int count) {
-    if (!table || !node_ids || count <= 0) return 0;
-
-    pthread_mutex_lock(&table->update_lock);
-
-    int dropped = 0;
-
-    for (int i = 0; i < count; i++) {
-        /* Find and mark as dropped */
-        wbpxre_routing_node_t *node = find_node_recursive(table->root, node_ids[i]);
-        if (!node) continue;
-
-        node->dropped = true;
-
-        /* Remove from flat array */
-        remove_node_from_flat_array(table, node_ids[i]);
-
-        /* Remove from tree */
-        bool removed = false;
-        wbpxre_routing_node_t *new_root = remove_node_recursive(table->root, node_ids[i], &removed);
-
-        /* Update root pointer with RCU semantics */
-        rcu_assign_pointer(table->root, new_root);
-
-        if (removed) {
-            table->node_count--;
-            dropped++;
-        }
-    }
-
-    pthread_mutex_unlock(&table->update_lock);
-
-    return dropped;
-}
-
-/* ============================================================================
- * Batch Cleanup of Dropped Nodes (Phase 3)
- * ============================================================================ */
-
-static void collect_dropped_nodes_recursive(wbpxre_routing_node_t *root,
-                                             uint8_t dropped_ids[][WBPXRE_NODE_ID_LEN],
-                                             int *count, int max_count) {
-    if (!root || *count >= max_count) return;
-
-    /* Check if this node is dropped */
-    if (root->dropped) {
-        memcpy(dropped_ids[*count], root->id, WBPXRE_NODE_ID_LEN);
-        (*count)++;
-    }
-
-    /* Recurse */
-    collect_dropped_nodes_recursive(root->left, dropped_ids, count, max_count);
-    collect_dropped_nodes_recursive(root->right, dropped_ids, count, max_count);
-}
-
-int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table) {
-    if (!table) return 0;
-
-    pthread_mutex_lock(&table->update_lock);
-
-    /* Collect dropped node IDs (up to 1000 at a time) */
-    uint8_t dropped_ids[1000][WBPXRE_NODE_ID_LEN];
-    int dropped_count = 0;
-
-    collect_dropped_nodes_recursive(table->root, dropped_ids, &dropped_count, 1000);
-
-    /* Remove all dropped nodes */
-    int removed_count = 0;
-    for (int i = 0; i < dropped_count; i++) {
-        /* Remove from flat array */
-        remove_node_from_flat_array(table, dropped_ids[i]);
-
-        bool removed = false;
-        wbpxre_routing_node_t *new_root = remove_node_recursive(table->root, dropped_ids[i], &removed);
-
-        /* Update root pointer with RCU semantics */
-        rcu_assign_pointer(table->root, new_root);
-
-        if (removed) {
-            table->node_count--;
-            removed_count++;
-        }
-    }
-
-    pthread_mutex_unlock(&table->update_lock);
-
-    return removed_count;
-}
 
 /* ============================================================================
  * Hash Index Rebuild (Performance Optimization)
@@ -1385,58 +1088,362 @@ int wbpxre_routing_table_rebuild_hash_index(wbpxre_routing_table_t *table) {
 }
 
 /* ============================================================================
- * Get Old Nodes for Verification
+ * Dual Routing Controller Implementation
  * ============================================================================ */
 
-static void collect_old_nodes_recursive(wbpxre_routing_node_t *root,
-                                         wbpxre_routing_node_t **array,
-                                         int *count, int n, time_t threshold) {
-    if (!root || *count >= n) return;
+/* Forward declaration for logging */
+extern void log_msg(int level, const char *fmt, ...);
+#define LOG_INFO 1
+#define LOG_WARN 2
 
-    /* Skip dropped nodes */
-    if (root->dropped) {
-        collect_old_nodes_recursive(root->left, array, count, n, threshold);
-        collect_old_nodes_recursive(root->right, array, count, n, threshold);
+/* Helper: Clear a routing table completely (for rotation) */
+static void clear_routing_table_internal(wbpxre_routing_table_t *table) {
+    if (!table) return;
+
+    pthread_mutex_lock(&table->update_lock);
+
+    /* Free all hash map entries */
+    node_index_map_entry_t *hash_table = (node_index_map_entry_t *)table->node_index_map;
+    node_index_map_entry_t *entry, *tmp;
+
+    HASH_ITER(hh, hash_table, entry, tmp) {
+        HASH_DEL(hash_table, entry);
+        free(entry);
+    }
+    table->node_index_map = NULL;
+
+    /* Clear flat array */
+    if (table->all_nodes) {
+        memset(table->all_nodes, 0, table->all_nodes_capacity * sizeof(wbpxre_routing_node_t *));
+    }
+
+    /* Free all nodes in tree */
+    free_routing_tree(table->root);
+    table->root = NULL;
+
+    /* Reset counters */
+    table->node_count = 0;
+    table->iteration_offset = 0;
+
+    pthread_mutex_unlock(&table->update_lock);
+}
+
+dual_routing_controller_t *dual_routing_controller_create(int max_nodes_per_table,
+                                                           double fill_start_threshold,
+                                                           double switch_threshold) {
+    dual_routing_controller_t *controller = calloc(1, sizeof(dual_routing_controller_t));
+    if (!controller) return NULL;
+
+    /* Create the two routing tables */
+    controller->table_a = wbpxre_routing_table_create(max_nodes_per_table);
+    controller->table_b = wbpxre_routing_table_create(max_nodes_per_table);
+
+    if (!controller->table_a || !controller->table_b) {
+        if (controller->table_a) wbpxre_routing_table_destroy(controller->table_a);
+        if (controller->table_b) wbpxre_routing_table_destroy(controller->table_b);
+        free(controller);
+        return NULL;
+    }
+
+    /* Initial state: Table A is both active and filling */
+    controller->table_a_state = TABLE_STATE_ACTIVE;
+    controller->table_b_state = TABLE_STATE_READY;
+    controller->rotation_state = ROTATION_STABLE;
+
+    controller->active_table = controller->table_a;
+    controller->filling_table = controller->table_a;
+
+    /* Set thresholds */
+    controller->max_nodes_per_table = max_nodes_per_table;
+    controller->fill_start_threshold = fill_start_threshold;
+    controller->switch_threshold = switch_threshold;
+
+    /* Initialize synchronization */
+    pthread_mutex_init(&controller->rotation_lock, NULL);
+    pthread_rwlock_init(&controller->active_table_lock, NULL);
+
+    /* Initialize statistics */
+    controller->total_rotations = 0;
+    controller->total_nodes_cleared = 0;
+    controller->last_rotation_time = 0;
+
+    log_msg(LOG_INFO, "Dual routing controller created: %d nodes per table, "
+            "fill_threshold=%.0f%%, switch_threshold=%.0f%%",
+            max_nodes_per_table, fill_start_threshold * 100, switch_threshold * 100);
+
+    return controller;
+}
+
+void dual_routing_controller_destroy(dual_routing_controller_t *controller) {
+    if (!controller) return;
+
+    /* Wait for any pending RCU operations */
+    synchronize_rcu();
+    rcu_barrier();
+
+    /* Destroy both tables */
+    if (controller->table_a) {
+        wbpxre_routing_table_destroy(controller->table_a);
+    }
+    if (controller->table_b) {
+        wbpxre_routing_table_destroy(controller->table_b);
+    }
+
+    /* Destroy synchronization primitives */
+    pthread_mutex_destroy(&controller->rotation_lock);
+    pthread_rwlock_destroy(&controller->active_table_lock);
+
+    free(controller);
+}
+
+/* Perform rotation from current active to filling table */
+static void perform_rotation(dual_routing_controller_t *controller) {
+    controller->rotation_state = ROTATION_TRANSITIONING;
+
+    /* Identify old and new tables */
+    wbpxre_routing_table_t *old_active = controller->active_table;
+    wbpxre_routing_table_t *new_active = controller->filling_table;
+    int old_node_count = old_active->node_count;
+
+    log_msg(LOG_INFO, "Dual routing: Starting rotation. "
+            "Old active: %d nodes, New active: %d nodes",
+            old_node_count, new_active->node_count);
+
+    /* Atomic pointer swap for readers */
+    pthread_rwlock_wrlock(&controller->active_table_lock);
+    rcu_assign_pointer(controller->active_table, new_active);
+    pthread_rwlock_unlock(&controller->active_table_lock);
+
+    /* Update states */
+    if (new_active == controller->table_a) {
+        controller->table_a_state = TABLE_STATE_ACTIVE;
+        controller->table_b_state = TABLE_STATE_CLEARING;
+    } else {
+        controller->table_b_state = TABLE_STATE_ACTIVE;
+        controller->table_a_state = TABLE_STATE_CLEARING;
+    }
+
+    /* The filling table is now also the active table (continues filling to 80%) */
+    controller->filling_table = new_active;
+
+    /* Clear old table */
+    controller->rotation_state = ROTATION_CLEARING;
+
+    /* Wait for RCU grace period - ensures all readers have finished */
+    synchronize_rcu();
+    rcu_barrier();
+
+    /* Now safe to clear the old table */
+    clear_routing_table_internal(old_active);
+
+    /* Mark old table as ready */
+    if (old_active == controller->table_a) {
+        controller->table_a_state = TABLE_STATE_READY;
+    } else {
+        controller->table_b_state = TABLE_STATE_READY;
+    }
+
+    /* Update statistics */
+    controller->total_rotations++;
+    controller->total_nodes_cleared += old_node_count;
+    controller->last_rotation_time = time(NULL);
+
+    controller->rotation_state = ROTATION_STABLE;
+
+    log_msg(LOG_INFO, "Dual routing: Rotation complete. "
+            "Active table now has %d nodes. Total rotations: %lu",
+            new_active->node_count, controller->total_rotations);
+}
+
+int dual_routing_insert(dual_routing_controller_t *controller,
+                        const wbpxre_routing_node_t *node) {
+    if (!controller || !node) return -1;
+
+    pthread_mutex_lock(&controller->rotation_lock);
+
+    wbpxre_routing_table_t *target = controller->filling_table;
+
+    /* Check capacity thresholds */
+    double fill_ratio = (double)target->node_count / target->max_nodes;
+
+    /* Phase 1: If filling == active and at 80%, start filling the other table */
+    if (fill_ratio >= controller->fill_start_threshold &&
+        controller->filling_table == controller->active_table) {
+
+        /* Determine which table to start filling */
+        wbpxre_routing_table_t *other_table = (target == controller->table_a)
+            ? controller->table_b : controller->table_a;
+
+        /* Only switch if other table is ready */
+        table_state_t other_state = (other_table == controller->table_a)
+            ? controller->table_a_state : controller->table_b_state;
+
+        if (other_state == TABLE_STATE_READY) {
+            controller->filling_table = other_table;
+
+            if (other_table == controller->table_a) {
+                controller->table_a_state = TABLE_STATE_FILLING;
+            } else {
+                controller->table_b_state = TABLE_STATE_FILLING;
+            }
+
+            target = controller->filling_table;
+
+            log_msg(LOG_INFO, "Dual routing: Active table at %.0f%% capacity. "
+                    "Now filling secondary table.",
+                    fill_ratio * 100);
+        }
+    }
+
+    pthread_mutex_unlock(&controller->rotation_lock);
+
+    /* Insert into target table */
+    return wbpxre_routing_table_insert(target, node);
+}
+
+wbpxre_routing_table_t *dual_routing_get_active(dual_routing_controller_t *controller) {
+    if (!controller) return NULL;
+
+    /* RCU-protected read */
+    return rcu_dereference(controller->active_table);
+}
+
+bool dual_routing_exists(dual_routing_controller_t *controller,
+                         const uint8_t *node_id) {
+    if (!controller || !node_id) return false;
+
+    /* Check active table first (most common case) */
+    if (wbpxre_routing_table_exists(controller->active_table, node_id)) {
+        return true;
+    }
+
+    /* Check filling table if different from active */
+    if (controller->filling_table != controller->active_table) {
+        if (wbpxre_routing_table_exists(controller->filling_table, node_id)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void dual_routing_check_rotation(dual_routing_controller_t *controller) {
+    if (!controller) return;
+
+    pthread_mutex_lock(&controller->rotation_lock);
+
+    /* Only check if we're in dual-table mode (filling != active) */
+    if (controller->filling_table == controller->active_table) {
+        pthread_mutex_unlock(&controller->rotation_lock);
         return;
     }
 
-    /* Check if node needs verification */
-    if (root->last_responded_at == 0 || root->last_responded_at < threshold) {
-        array[(*count)++] = root;
+    double fill_ratio = (double)controller->filling_table->node_count /
+                        controller->filling_table->max_nodes;
+
+    if (fill_ratio >= controller->switch_threshold) {
+        /* Time to rotate */
+        perform_rotation(controller);
     }
 
-    if (*count < n) {
-        collect_old_nodes_recursive(root->left, array, count, n, threshold);
+    pthread_mutex_unlock(&controller->rotation_lock);
+}
+
+void dual_routing_force_rotation(dual_routing_controller_t *controller) {
+    if (!controller) return;
+
+    pthread_mutex_lock(&controller->rotation_lock);
+
+    /* Determine which table to rotate to */
+    wbpxre_routing_table_t *other_table = (controller->active_table == controller->table_a)
+        ? controller->table_b : controller->table_a;
+
+    /* If other table is ready or filling, we can rotate */
+    table_state_t other_state = (other_table == controller->table_a)
+        ? controller->table_a_state : controller->table_b_state;
+
+    if (other_state == TABLE_STATE_READY || other_state == TABLE_STATE_FILLING) {
+        /* Set filling table to the other table if it's ready */
+        if (other_state == TABLE_STATE_READY) {
+            controller->filling_table = other_table;
+            if (other_table == controller->table_a) {
+                controller->table_a_state = TABLE_STATE_FILLING;
+            } else {
+                controller->table_b_state = TABLE_STATE_FILLING;
+            }
+        }
+
+        /* Perform rotation */
+        perform_rotation(controller);
     }
-    if (*count < n) {
-        collect_old_nodes_recursive(root->right, array, count, n, threshold);
+
+    pthread_mutex_unlock(&controller->rotation_lock);
+}
+
+void dual_routing_update_node_responded(dual_routing_controller_t *controller,
+                                         const uint8_t *node_id) {
+    if (!controller || !node_id) return;
+
+    /* Update in active table */
+    wbpxre_routing_table_update_node_responded(controller->active_table, node_id);
+
+    /* Also update in filling table if different */
+    if (controller->filling_table != controller->active_table) {
+        wbpxre_routing_table_update_node_responded(controller->filling_table, node_id);
     }
 }
 
-int wbpxre_routing_table_get_old_nodes(wbpxre_routing_table_t *table,
-                                        wbpxre_routing_node_t **nodes_out,
-                                        int n, time_t threshold) {
-    if (!table || !nodes_out || n <= 0) return 0;
+void dual_routing_update_node_queried(dual_routing_controller_t *controller,
+                                       const uint8_t *node_id) {
+    if (!controller || !node_id) return;
 
-    rcu_read_lock();
+    /* Update in active table */
+    wbpxre_routing_table_update_node_queried(controller->active_table, node_id);
 
-    /* Collect old node pointers */
-    wbpxre_routing_node_t *candidates[n];
-    int count = 0;
-    wbpxre_routing_node_t *root = rcu_dereference(table->root);
-    collect_old_nodes_recursive(root, candidates, &count, n, threshold);
-
-    /* Copy nodes to avoid data races after lock release */
-    for (int i = 0; i < count; i++) {
-        wbpxre_routing_node_t *node_copy = malloc(sizeof(wbpxre_routing_node_t));
-        memcpy(node_copy, candidates[i], sizeof(wbpxre_routing_node_t));
-        /* Clear tree pointers since this is a standalone copy */
-        node_copy->left = NULL;
-        node_copy->right = NULL;
-        nodes_out[i] = node_copy;
+    /* Also update in filling table if different */
+    if (controller->filling_table != controller->active_table) {
+        wbpxre_routing_table_update_node_queried(controller->filling_table, node_id);
     }
+}
 
-    rcu_read_unlock();
+void dual_routing_update_sample_response(dual_routing_controller_t *controller,
+                                          const uint8_t *node_id,
+                                          int discovered_num,
+                                          int total_num,
+                                          int interval) {
+    if (!controller || !node_id) return;
 
-    return count;
+    /* Update in active table */
+    wbpxre_routing_table_update_sample_response(controller->active_table, node_id,
+                                                  discovered_num, total_num, interval);
+
+    /* Also update in filling table if different */
+    if (controller->filling_table != controller->active_table) {
+        wbpxre_routing_table_update_sample_response(controller->filling_table, node_id,
+                                                      discovered_num, total_num, interval);
+    }
+}
+
+void dual_routing_get_stats(dual_routing_controller_t *controller,
+                            dual_routing_stats_t *stats_out) {
+    if (!controller || !stats_out) return;
+
+    pthread_mutex_lock(&controller->rotation_lock);
+
+    stats_out->total_rotations = controller->total_rotations;
+    stats_out->total_nodes_cleared = controller->total_nodes_cleared;
+    stats_out->last_rotation_time = controller->last_rotation_time;
+    stats_out->table_a_nodes = controller->table_a->node_count;
+    stats_out->table_b_nodes = controller->table_b->node_count;
+    stats_out->table_a_state = controller->table_a_state;
+    stats_out->table_b_state = controller->table_b_state;
+
+    pthread_mutex_unlock(&controller->rotation_lock);
+}
+
+int dual_routing_get_total_nodes(dual_routing_controller_t *controller) {
+    if (!controller) return 0;
+
+    /* Return count from active table primarily */
+    return controller->active_table->node_count;
 }

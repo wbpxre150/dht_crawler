@@ -107,10 +107,6 @@ typedef struct {
     /* Peer discovery statistics */
     uint64_t get_peers_queries_sent;
     uint64_t get_peers_responses_received;
-    /* Node health statistics */
-    uint64_t nodes_dropped;
-    uint64_t nodes_dropped_unresponsive;
-    uint64_t aggressive_prune_triggers;
 } wbpxre_stats_t;
 
 /* Node address */
@@ -162,6 +158,66 @@ typedef struct {
     /* Hash map for O(1) flat array index lookups */
     void *node_index_map;                /* node_index_map_entry_t* hash table (opaque to avoid exposing uthash) */
 } wbpxre_routing_table_t;
+
+/* ============================================================================
+ * Dual Routing Table System
+ * ============================================================================ */
+
+/* Table states for dual routing */
+typedef enum {
+    TABLE_STATE_ACTIVE,     /* Workers read from this table */
+    TABLE_STATE_FILLING,    /* New nodes inserted here */
+    TABLE_STATE_CLEARING,   /* Being cleared */
+    TABLE_STATE_READY       /* Cleared, waiting to become FILLING */
+} table_state_t;
+
+/* Rotation states for dual routing */
+typedef enum {
+    ROTATION_STABLE,        /* Normal operation */
+    ROTATION_TRANSITIONING, /* Switching active table */
+    ROTATION_CLEARING       /* Clearing old table */
+} dual_rotation_state_t;
+
+/* Statistics for dual routing */
+typedef struct {
+    uint64_t total_rotations;
+    uint64_t total_nodes_cleared;
+    time_t last_rotation_time;
+    int table_a_nodes;
+    int table_b_nodes;
+    table_state_t table_a_state;
+    table_state_t table_b_state;
+} dual_routing_stats_t;
+
+/* Dual routing table controller */
+typedef struct {
+    /* The two routing tables */
+    wbpxre_routing_table_t *table_a;
+    wbpxre_routing_table_t *table_b;
+
+    /* State tracking */
+    table_state_t table_a_state;
+    table_state_t table_b_state;
+    dual_rotation_state_t rotation_state;
+
+    /* Current active table (for workers to read) */
+    wbpxre_routing_table_t *active_table;    /* RCU-protected pointer */
+    wbpxre_routing_table_t *filling_table;   /* Current insert target */
+
+    /* Capacity thresholds */
+    int max_nodes_per_table;                 /* e.g., 30000 */
+    double fill_start_threshold;             /* 0.80 (80%) */
+    double switch_threshold;                 /* 0.20 (20%) */
+
+    /* Synchronization */
+    pthread_mutex_t rotation_lock;           /* Protects state transitions */
+    pthread_rwlock_t active_table_lock;      /* Protects active_table pointer */
+
+    /* Statistics */
+    uint64_t total_rotations;
+    uint64_t total_nodes_cleared;
+    time_t last_rotation_time;
+} dual_routing_controller_t;
 
 /* Peer info */
 typedef struct {
@@ -292,8 +348,8 @@ typedef struct {
     int udp_socket;
     struct sockaddr_in bind_addr;
 
-    /* Routing table */
-    wbpxre_routing_table_t *routing_table;
+    /* Dual routing table controller */
+    dual_routing_controller_t *routing_controller;
 
     /* Pending queries */
     wbpxre_pending_query_t *pending_queries[256];
@@ -301,14 +357,12 @@ typedef struct {
 
     /* Worker queues */
     wbpxre_work_queue_t *discovered_nodes;
-    wbpxre_work_queue_t *nodes_for_ping;
     wbpxre_work_queue_t *nodes_for_find_node;
     wbpxre_work_queue_t *nodes_for_sample_infohashes;
     wbpxre_work_queue_t *infohashes_for_get_peers;
 
     /* Worker threads */
     pthread_t udp_reader_thread;
-    pthread_t *ping_worker_threads;
     pthread_t *find_node_worker_threads;
     pthread_t *sample_infohashes_worker_threads;
     pthread_t *get_peers_worker_threads;
@@ -317,7 +371,6 @@ typedef struct {
     pthread_t bootstrap_thread;
     pthread_t sample_infohashes_feeder_thread;
     pthread_t find_node_feeder_thread;
-    pthread_t ping_feeder_thread;
     pthread_t get_peers_feeder_thread;
 
     /* Shared state */
@@ -349,10 +402,6 @@ typedef struct {
         /* Peer discovery statistics */
         uint64_t get_peers_queries_sent;
         uint64_t get_peers_responses_received;
-        /* Node health statistics */
-        uint64_t nodes_dropped;
-        uint64_t nodes_dropped_unresponsive;
-        uint64_t aggressive_prune_triggers;
     } stats;
     pthread_mutex_t stats_mutex;
 } wbpxre_dht_t;
@@ -492,12 +541,6 @@ int wbpxre_routing_table_get_sample_candidates(wbpxre_routing_table_t *table,
                                                 wbpxre_routing_node_t **nodes_out,
                                                 int n);
 
-/* Get old nodes that need verification (haven't responded recently)
- * Returns copies of nodes (caller must free each node in nodes_out array) */
-int wbpxre_routing_table_get_old_nodes(wbpxre_routing_table_t *table,
-                                        wbpxre_routing_node_t **nodes_out,
-                                        int n, time_t threshold);
-
 /* Get low-quality nodes (poor response rate)
  * Returns copies of nodes (caller must free each node in nodes_out array) */
 int wbpxre_routing_table_get_low_quality_nodes(wbpxre_routing_table_t *table,
@@ -555,25 +598,62 @@ void wbpxre_routing_table_update_sample_response(wbpxre_routing_table_t *table,
                                                   int total_num,
                                                   int interval);
 
-/* Drop node from routing table */
-void wbpxre_routing_table_drop_node(wbpxre_routing_table_t *table,
-                                     const uint8_t *node_id);
-
-/* Drop multiple nodes in a single operation (batch API)
- * Returns number of nodes actually dropped
- * More efficient than calling drop_node multiple times */
-int wbpxre_routing_table_drop_nodes_batch(wbpxre_routing_table_t *table,
-                                           const uint8_t node_ids[][WBPXRE_NODE_ID_LEN],
-                                           int count);
-
-/* Batch cleanup of dropped nodes (Phase 3)
- * Returns number of nodes removed */
-int wbpxre_routing_table_cleanup_dropped(wbpxre_routing_table_t *table);
-
 /* Rebuild hash index to prevent uthash bucket array bloat
  * Clears and rebuilds the node_index_map from the current routing table
  * Returns number of nodes re-indexed */
 int wbpxre_routing_table_rebuild_hash_index(wbpxre_routing_table_t *table);
+
+/* ============================================================================
+ * Dual Routing Controller Functions (implemented in wbpxre_routing.c)
+ * ============================================================================ */
+
+/* Create dual routing controller */
+dual_routing_controller_t *dual_routing_controller_create(int max_nodes_per_table,
+                                                           double fill_start_threshold,
+                                                           double switch_threshold);
+
+/* Destroy dual routing controller */
+void dual_routing_controller_destroy(dual_routing_controller_t *controller);
+
+/* Insert node (routes to filling table) */
+int dual_routing_insert(dual_routing_controller_t *controller,
+                        const wbpxre_routing_node_t *node);
+
+/* Get active table for reading (RCU-protected)
+ * Caller must be in RCU read-side critical section */
+wbpxre_routing_table_t *dual_routing_get_active(dual_routing_controller_t *controller);
+
+/* Check if node exists in either table */
+bool dual_routing_exists(dual_routing_controller_t *controller,
+                         const uint8_t *node_id);
+
+/* Check and trigger rotation if thresholds met */
+void dual_routing_check_rotation(dual_routing_controller_t *controller);
+
+/* Force rotation (for testing/manual control) */
+void dual_routing_force_rotation(dual_routing_controller_t *controller);
+
+/* Update node metadata in both tables */
+void dual_routing_update_node_responded(dual_routing_controller_t *controller,
+                                         const uint8_t *node_id);
+
+/* Update node as queried in both tables */
+void dual_routing_update_node_queried(dual_routing_controller_t *controller,
+                                       const uint8_t *node_id);
+
+/* Update sample response in both tables */
+void dual_routing_update_sample_response(dual_routing_controller_t *controller,
+                                          const uint8_t *node_id,
+                                          int discovered_num,
+                                          int total_num,
+                                          int interval);
+
+/* Get statistics */
+void dual_routing_get_stats(dual_routing_controller_t *controller,
+                            dual_routing_stats_t *stats_out);
+
+/* Get total node count across both tables */
+int dual_routing_get_total_nodes(dual_routing_controller_t *controller);
 
 /* ============================================================================
  * Worker Queue Functions (implemented in wbpxre_worker.c)
