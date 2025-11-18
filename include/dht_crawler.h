@@ -36,6 +36,7 @@ typedef struct {
     const char *db_path;
     int dht_port;                   /* DHT port (6881) */
     log_level_t log_level;
+    time_t start_time;              /* Application start timestamp */
 } app_context_t;
 
 /* Function declarations */

@@ -346,6 +346,14 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
 
+    /* Calculate and format uptime */
+    time_t uptime_seconds = time(NULL) - api->app_ctx->start_time;
+    int uptime_hours = (int)(uptime_seconds / 3600);
+    int uptime_minutes = (int)((uptime_seconds % 3600) / 60);
+    char uptime_str[32];
+    snprintf(uptime_str, sizeof(uptime_str), "%d:%02d", uptime_hours, uptime_minutes);
+    cJSON_AddStringToObject(root, "uptime", uptime_str);
+
     /* Add DHT/dual routing statistics */
     if (api->dht_manager) {
         cJSON *dht = cJSON_CreateObject();

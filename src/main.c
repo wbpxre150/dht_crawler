@@ -62,6 +62,7 @@ void init_app_context(app_context_t *ctx) {
     ctx->log_level = LOG_INFO;
     ctx->dht_port = DHT_PORT;
     ctx->db_path = "data/torrents.db";
+    ctx->start_time = time(NULL);
 
     /* Generate random node ID */
     FILE *urandom = fopen("/dev/urandom", "rb");
