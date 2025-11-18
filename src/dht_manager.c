@@ -1359,6 +1359,18 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                         close_nodes, (close_nodes * 100.0) / total_nodes,
                         distant_nodes, (distant_nodes * 100.0) / total_nodes);
             }
+
+            /* Get and print dual routing table statistics */
+            dual_routing_stats_t dual_stats;
+            dual_routing_get_stats(mgr->dht->routing_controller, &dual_stats);
+
+            /* Update mgr stats for HTTP API */
+            mgr->stats.dual_routing_rotations = dual_stats.total_rotations;
+            mgr->stats.dual_routing_nodes_cleared = dual_stats.total_nodes_cleared;
+
+            log_msg(LOG_INFO, "  Dual routing: rotations=%llu nodes_cleared=%llu",
+                    (unsigned long long)dual_stats.total_rotations,
+                    (unsigned long long)dual_stats.total_nodes_cleared);
         }
     }
 

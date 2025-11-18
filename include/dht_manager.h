@@ -62,6 +62,9 @@ typedef struct {
     time_t last_rotation_time;           /* Last rotation timestamp */
     /* Peer retry statistics */
     uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
+    /* Dual routing table statistics */
+    uint64_t dual_routing_rotations;     /* Total dual routing table rotations */
+    uint64_t dual_routing_nodes_cleared; /* Total nodes cleared during rotations */
 } dht_stats_t;
 
 /* DHT configuration */

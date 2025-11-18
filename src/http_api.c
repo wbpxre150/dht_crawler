@@ -346,6 +346,14 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
 
+    /* Add DHT/dual routing statistics */
+    if (api->dht_manager) {
+        cJSON *dht = cJSON_CreateObject();
+        cJSON_AddNumberToObject(dht, "dual_routing_rotations", (double)api->dht_manager->stats.dual_routing_rotations);
+        cJSON_AddNumberToObject(dht, "dual_routing_nodes_cleared", (double)api->dht_manager->stats.dual_routing_nodes_cleared);
+        cJSON_AddItemToObject(root, "dht", dht);
+    }
+
     /* Add metadata fetcher statistics */
     if (api->metadata_fetcher) {
         cJSON *metadata = cJSON_CreateObject();

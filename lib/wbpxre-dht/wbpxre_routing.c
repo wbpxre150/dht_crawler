@@ -1093,6 +1093,7 @@ int wbpxre_routing_table_rebuild_hash_index(wbpxre_routing_table_t *table) {
 
 /* Forward declaration for logging */
 extern void log_msg(int level, const char *fmt, ...);
+#define LOG_DEBUG 0
 #define LOG_INFO 1
 #define LOG_WARN 2
 
@@ -1167,7 +1168,7 @@ dual_routing_controller_t *dual_routing_controller_create(int max_nodes_per_tabl
     controller->total_nodes_cleared = 0;
     controller->last_rotation_time = 0;
 
-    log_msg(LOG_INFO, "Dual routing controller created: %d nodes per table, "
+    log_msg(LOG_DEBUG, "Dual routing controller created: %d nodes per table, "
             "fill_threshold=%.0f%%, switch_threshold=%.0f%%",
             max_nodes_per_table, fill_start_threshold * 100, switch_threshold * 100);
 
@@ -1205,7 +1206,7 @@ static void perform_rotation(dual_routing_controller_t *controller) {
     wbpxre_routing_table_t *new_active = controller->filling_table;
     int old_node_count = old_active->node_count;
 
-    log_msg(LOG_INFO, "Dual routing: Starting rotation. "
+    log_msg(LOG_DEBUG, "Dual routing: Starting rotation. "
             "Old active: %d nodes, New active: %d nodes",
             old_node_count, new_active->node_count);
 
@@ -1250,7 +1251,7 @@ static void perform_rotation(dual_routing_controller_t *controller) {
 
     controller->rotation_state = ROTATION_STABLE;
 
-    log_msg(LOG_INFO, "Dual routing: Rotation complete. "
+    log_msg(LOG_DEBUG, "Dual routing: Rotation complete. "
             "Active table now has %d nodes. Total rotations: %lu",
             new_active->node_count, controller->total_rotations);
 }
@@ -1289,7 +1290,7 @@ int dual_routing_insert(dual_routing_controller_t *controller,
 
             target = controller->filling_table;
 
-            log_msg(LOG_INFO, "Dual routing: Active table at %.0f%% capacity. "
+            log_msg(LOG_DEBUG, "Dual routing: Active table at %.0f%% capacity. "
                     "Now filling secondary table.",
                     fill_ratio * 100);
         }
