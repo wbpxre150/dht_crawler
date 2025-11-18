@@ -51,19 +51,23 @@ refresh_query_t* refresh_query_ref(refresh_query_t *query) {
     return query;
 }
 
-/* Decrement reference count and free if zero */
+/* Decrement reference count and free if zero
+ * IMPORTANT: Caller must ensure no other threads can access this query */
 void refresh_query_unref(refresh_query_t *query) {
     if (!query) return;
 
     pthread_mutex_lock(&query->mutex);
     query->ref_count--;
     int should_free = (query->ref_count <= 0);
-    pthread_mutex_unlock(&query->mutex);
 
     if (should_free) {
+        /* Destroy cond while holding mutex, then unlock and destroy mutex */
         pthread_cond_destroy(&query->cond);
+        pthread_mutex_unlock(&query->mutex);
         pthread_mutex_destroy(&query->mutex);
         free(query);
+    } else {
+        pthread_mutex_unlock(&query->mutex);
     }
 }
 
@@ -164,25 +168,65 @@ int refresh_query_wait(refresh_query_t *query, int timeout_sec, int *timed_out) 
     }
 }
 
-/* Update query with new peer count (called from DHT callback) */
+/* Update query with new peer count (called from DHT callback)
+ * Thread-safe: increments ref count while accessing query */
 void refresh_query_add_peers(refresh_query_store_t *store, const uint8_t *info_hash, int peer_count) {
-    refresh_query_t *query = refresh_query_find(store, info_hash);
-    if (!query) return;
+    if (!store || !info_hash) return;
 
-    pthread_mutex_lock(&query->mutex);
-    query->peer_count += peer_count;
-    pthread_mutex_unlock(&query->mutex);
+    /* Hold store lock while getting query and incrementing ref count */
+    pthread_mutex_lock(&store->mutex);
+
+    size_t bucket_idx = hash_info_hash(info_hash, store->bucket_count);
+    refresh_query_t *query = store->buckets[bucket_idx];
+
+    while (query) {
+        if (hash_equal(query->info_hash, info_hash)) {
+            /* Increment ref count while holding store lock */
+            pthread_mutex_lock(&query->mutex);
+            query->ref_count++;
+            query->peer_count += peer_count;
+            pthread_mutex_unlock(&query->mutex);
+            pthread_mutex_unlock(&store->mutex);
+
+            /* Decrement ref count (will free if we were the last ref) */
+            refresh_query_unref(query);
+            return;
+        }
+        query = query->next;
+    }
+
+    pthread_mutex_unlock(&store->mutex);
 }
 
-/* Mark query as complete (called from DHT callback on SEARCH_DONE) */
+/* Mark query as complete (called from DHT callback on SEARCH_DONE)
+ * Thread-safe: increments ref count while accessing query */
 void refresh_query_complete(refresh_query_store_t *store, const uint8_t *info_hash) {
-    refresh_query_t *query = refresh_query_find(store, info_hash);
-    if (!query) return;
+    if (!store || !info_hash) return;
 
-    pthread_mutex_lock(&query->mutex);
-    query->complete = 1;
-    pthread_cond_broadcast(&query->cond);  /* Wake up waiting thread */
-    pthread_mutex_unlock(&query->mutex);
+    /* Hold store lock while getting query and incrementing ref count */
+    pthread_mutex_lock(&store->mutex);
+
+    size_t bucket_idx = hash_info_hash(info_hash, store->bucket_count);
+    refresh_query_t *query = store->buckets[bucket_idx];
+
+    while (query) {
+        if (hash_equal(query->info_hash, info_hash)) {
+            /* Increment ref count while holding store lock */
+            pthread_mutex_lock(&query->mutex);
+            query->ref_count++;
+            query->complete = 1;
+            pthread_cond_broadcast(&query->cond);  /* Wake up waiting thread */
+            pthread_mutex_unlock(&query->mutex);
+            pthread_mutex_unlock(&store->mutex);
+
+            /* Decrement ref count (will free if we were the last ref) */
+            refresh_query_unref(query);
+            return;
+        }
+        query = query->next;
+    }
+
+    pthread_mutex_unlock(&store->mutex);
 }
 
 /* Remove query from store and decrement ref count */
@@ -215,6 +259,9 @@ void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash
 void refresh_query_cleanup_old(refresh_query_store_t *store, int max_age_sec) {
     if (!store) return;
 
+    /* Collect queries to remove first, then unref after releasing store lock */
+    refresh_query_t *to_unref_list = NULL;
+
     pthread_mutex_lock(&store->mutex);
     time_t now = time(NULL);
 
@@ -227,11 +274,12 @@ void refresh_query_cleanup_old(refresh_query_store_t *store, int max_age_sec) {
                 (now - query->created_at > max_age_sec)) {
                 /* Remove old completed query */
                 *prev = query->next;
-                refresh_query_t *to_unref = query;
+                refresh_query_t *removed = query;
                 query = query->next;
 
-                /* Use unref instead of direct free */
-                refresh_query_unref(to_unref);
+                /* Add to list for later unref */
+                removed->next = to_unref_list;
+                to_unref_list = removed;
             } else {
                 prev = &query->next;
                 query = query->next;
@@ -240,26 +288,46 @@ void refresh_query_cleanup_old(refresh_query_store_t *store, int max_age_sec) {
     }
 
     pthread_mutex_unlock(&store->mutex);
+
+    /* Now unref all collected queries without holding store lock */
+    while (to_unref_list) {
+        refresh_query_t *next = to_unref_list->next;
+        refresh_query_unref(to_unref_list);
+        to_unref_list = next;
+    }
 }
 
 /* Cleanup store */
 void refresh_query_store_cleanup(refresh_query_store_t *store) {
     if (!store) return;
 
+    /* Collect all queries first */
+    refresh_query_t *to_unref_list = NULL;
+
     pthread_mutex_lock(&store->mutex);
 
-    /* Free all queries using unref */
+    /* Collect all queries into a list */
     for (size_t i = 0; i < store->bucket_count; i++) {
         refresh_query_t *query = store->buckets[i];
         while (query) {
             refresh_query_t *next = query->next;
-            refresh_query_unref(query);
+            query->next = to_unref_list;
+            to_unref_list = query;
             query = next;
         }
+        store->buckets[i] = NULL;
     }
 
     free(store->buckets);
     pthread_mutex_unlock(&store->mutex);
     pthread_mutex_destroy(&store->mutex);
+
+    /* Now unref all queries without holding store lock */
+    while (to_unref_list) {
+        refresh_query_t *next = to_unref_list->next;
+        refresh_query_unref(to_unref_list);
+        to_unref_list = next;
+    }
+
     free(store);
 }
