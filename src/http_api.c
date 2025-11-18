@@ -1335,8 +1335,9 @@ static char* generate_search_results_html(search_result_t *results, int count, c
                hex);
 
         /* Add IMDB link if we have a valid encoded query */
+        /* Use Android intent URI scheme to open in external browser instead of WebView */
         if (encoded_imdb_query) {
-            APPEND("<a href='https://www.imdb.com/find/?q=%s' target='_blank' rel='noopener noreferrer' onclick='event.stopPropagation()'>%s</a>",
+            APPEND("<a href='intent://www.imdb.com/find/?q=%s#Intent;scheme=https;action=android.intent.action.VIEW;end' onclick='event.stopPropagation()'>%s</a>",
                    encoded_imdb_query, results[i].name);
             free(encoded_imdb_query);
         } else {
