@@ -1567,11 +1567,25 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
             torrent.files = file_info;
             torrent.num_files = 1;
         } else {
-            /* Allocation failed - clean up name */
+            /* Allocation failed - clean up name and files */
             free(name);
+            if (files) {
+                for (int i = 0; i < num_files; i++) {
+                    free(files[i].path);
+                }
+                free(files);
+            }
             log_msg(LOG_ERROR, "Failed to allocate file_info for single file");
             close_peer_connection(peer, "allocation failed");
             return -1;
+        }
+        /* Free any files array that was allocated during parsing (shouldn't happen for valid single-file torrents) */
+        if (files) {
+            for (int i = 0; i < num_files; i++) {
+                free(files[i].path);
+            }
+            free(files);
+            files = NULL;
         }
     } else if (num_files > 0) {
         /* Multi-file mode - convert temp_file_t to file_info_t */
