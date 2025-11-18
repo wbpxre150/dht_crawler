@@ -525,16 +525,17 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         log_msg(LOG_WARN, "Failed to trigger priority DHT query for refresh");
     }
 
-    /* Wait for DHT responses (blocks for up to 8 seconds) */
-    int peer_count = refresh_query_wait(query, 8);
-    int timed_out = query->timed_out;
+    /* Wait for DHT responses (blocks for up to 8 seconds)
+     * timed_out is returned safely via output parameter to avoid use-after-free */
+    int timed_out = 0;
+    int peer_count = refresh_query_wait(query, 8, &timed_out);
     int retry_attempted = 0;
 
     /* Retry logic: If zero peers found, try one more time immediately */
     if (peer_count == 0) {
         log_msg(LOG_DEBUG, "First query returned 0 peers for %s, retrying...", hash_buf);
 
-        /* Remove old query */
+        /* Remove old query from store (decrements ref count) */
         refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
 
         /* Create new query for retry */
@@ -544,8 +545,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
             rc = dht_manager_query_peers(api->dht_manager, info_hash, true);
             if (rc == 0) {
                 /* Wait for retry results (up to 8 seconds) */
-                peer_count = refresh_query_wait(query, 8);
-                timed_out = query->timed_out;
+                peer_count = refresh_query_wait(query, 8, &timed_out);
                 retry_attempted = 1;
 
                 if (peer_count > 0) {
@@ -557,7 +557,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         }
     }
 
-    /* Remove query from store */
+    /* Remove query from store (decrements ref count, frees if no other refs) */
     refresh_query_remove(api->dht_manager->refresh_query_store, info_hash);
 
     /* Build JSON response */

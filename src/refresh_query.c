@@ -40,6 +40,33 @@ refresh_query_store_t* refresh_query_store_init(size_t bucket_count, int timeout
     return store;
 }
 
+/* Increment reference count */
+refresh_query_t* refresh_query_ref(refresh_query_t *query) {
+    if (!query) return NULL;
+
+    pthread_mutex_lock(&query->mutex);
+    query->ref_count++;
+    pthread_mutex_unlock(&query->mutex);
+
+    return query;
+}
+
+/* Decrement reference count and free if zero */
+void refresh_query_unref(refresh_query_t *query) {
+    if (!query) return;
+
+    pthread_mutex_lock(&query->mutex);
+    query->ref_count--;
+    int should_free = (query->ref_count <= 0);
+    pthread_mutex_unlock(&query->mutex);
+
+    if (should_free) {
+        pthread_cond_destroy(&query->cond);
+        pthread_mutex_destroy(&query->mutex);
+        free(query);
+    }
+}
+
 /* Create and register a new pending query */
 refresh_query_t* refresh_query_create(refresh_query_store_t *store, const uint8_t *info_hash) {
     if (!store || !info_hash) return NULL;
@@ -51,6 +78,7 @@ refresh_query_t* refresh_query_create(refresh_query_store_t *store, const uint8_
     query->peer_count = 0;
     query->complete = 0;
     query->timed_out = 0;
+    query->ref_count = 1;  /* Initial reference for creator */
     query->created_at = time(NULL);
 
     if (pthread_mutex_init(&query->mutex, NULL) != 0) {
@@ -97,15 +125,18 @@ refresh_query_t* refresh_query_find(refresh_query_store_t *store, const uint8_t 
     return NULL;
 }
 
-/* Wait for query completion (blocks until complete or timeout) */
-int refresh_query_wait(refresh_query_t *query, int timeout_sec) {
+/* Wait for query completion (blocks until complete or timeout)
+ * Returns peer_count, sets *timed_out if provided */
+int refresh_query_wait(refresh_query_t *query, int timeout_sec, int *timed_out) {
     if (!query) return -1;
 
     pthread_mutex_lock(&query->mutex);
 
     if (query->complete) {
         int peer_count = query->peer_count;
+        int was_timed_out = query->timed_out;
         pthread_mutex_unlock(&query->mutex);
+        if (timed_out) *timed_out = was_timed_out;
         return peer_count;
     }
 
@@ -119,13 +150,16 @@ int refresh_query_wait(refresh_query_t *query, int timeout_sec) {
     if (rc == 0) {
         /* Signaled - query complete */
         int peer_count = query->peer_count;
+        int was_timed_out = query->timed_out;
         pthread_mutex_unlock(&query->mutex);
+        if (timed_out) *timed_out = was_timed_out;
         return peer_count;
     } else {
         /* Timeout */
         query->timed_out = 1;
         int peer_count = query->peer_count;  /* Return partial count */
         pthread_mutex_unlock(&query->mutex);
+        if (timed_out) *timed_out = 1;
         return peer_count;
     }
 }
@@ -151,7 +185,7 @@ void refresh_query_complete(refresh_query_store_t *store, const uint8_t *info_ha
     pthread_mutex_unlock(&query->mutex);
 }
 
-/* Remove and free a query */
+/* Remove query from store and decrement ref count */
 void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash) {
     if (!store || !info_hash) return;
 
@@ -166,10 +200,8 @@ void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash
             *prev = query->next;
             pthread_mutex_unlock(&store->mutex);
 
-            /* Free query */
-            pthread_cond_destroy(&query->cond);
-            pthread_mutex_destroy(&query->mutex);
-            free(query);
+            /* Decrement ref count - will free if count reaches zero */
+            refresh_query_unref(query);
             return;
         }
         prev = &query->next;
@@ -195,12 +227,11 @@ void refresh_query_cleanup_old(refresh_query_store_t *store, int max_age_sec) {
                 (now - query->created_at > max_age_sec)) {
                 /* Remove old completed query */
                 *prev = query->next;
-                refresh_query_t *to_free = query;
+                refresh_query_t *to_unref = query;
                 query = query->next;
 
-                pthread_cond_destroy(&to_free->cond);
-                pthread_mutex_destroy(&to_free->mutex);
-                free(to_free);
+                /* Use unref instead of direct free */
+                refresh_query_unref(to_unref);
             } else {
                 prev = &query->next;
                 query = query->next;
@@ -217,14 +248,12 @@ void refresh_query_store_cleanup(refresh_query_store_t *store) {
 
     pthread_mutex_lock(&store->mutex);
 
-    /* Free all queries */
+    /* Free all queries using unref */
     for (size_t i = 0; i < store->bucket_count; i++) {
         refresh_query_t *query = store->buckets[i];
         while (query) {
             refresh_query_t *next = query->next;
-            pthread_cond_destroy(&query->cond);
-            pthread_mutex_destroy(&query->mutex);
-            free(query);
+            refresh_query_unref(query);
             query = next;
         }
     }

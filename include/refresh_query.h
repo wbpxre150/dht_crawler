@@ -11,6 +11,7 @@ typedef struct refresh_query {
     int peer_count;              /* Accumulated peer count */
     int complete;                /* 1 when query finished */
     int timed_out;               /* 1 if query timed out */
+    int ref_count;               /* Reference count for safe cleanup */
     time_t created_at;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -34,8 +35,15 @@ refresh_query_t* refresh_query_create(refresh_query_store_t *store, const uint8_
 /* Find a pending query by info_hash */
 refresh_query_t* refresh_query_find(refresh_query_store_t *store, const uint8_t *info_hash);
 
-/* Wait for query completion (blocks until complete or timeout) */
-int refresh_query_wait(refresh_query_t *query, int timeout_sec);
+/* Increment reference count (returns query for convenience) */
+refresh_query_t* refresh_query_ref(refresh_query_t *query);
+
+/* Decrement reference count and free if zero (called instead of direct free) */
+void refresh_query_unref(refresh_query_t *query);
+
+/* Wait for query completion (blocks until complete or timeout)
+ * Returns peer_count, sets *timed_out if provided */
+int refresh_query_wait(refresh_query_t *query, int timeout_sec, int *timed_out);
 
 /* Update query with new peer count (called from DHT callback) */
 void refresh_query_add_peers(refresh_query_store_t *store, const uint8_t *info_hash, int peer_count);
@@ -43,7 +51,7 @@ void refresh_query_add_peers(refresh_query_store_t *store, const uint8_t *info_h
 /* Mark query as complete (called from DHT callback on SEARCH_DONE) */
 void refresh_query_complete(refresh_query_store_t *store, const uint8_t *info_hash);
 
-/* Remove and free a query */
+/* Remove query from store and decrement ref count */
 void refresh_query_remove(refresh_query_store_t *store, const uint8_t *info_hash);
 
 /* Cleanup old timed-out queries */
