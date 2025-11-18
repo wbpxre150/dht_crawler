@@ -248,6 +248,7 @@ Anthology
 Duology
 Pack
 PACK
+Remastered
 
 # ============================================================================
 # Language Tags
