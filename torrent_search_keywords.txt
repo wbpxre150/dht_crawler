@@ -1,0 +1,328 @@
+# Torrent Name Strip Keywords
+# Format: keyword (one per line)
+# Lines starting with # are comments
+#
+# This file contains patterns to strip from torrent names
+# to extract clean movie/TV show titles.
+#
+# Note: Keywords are case-insensitive
+
+# ============================================================================
+# Video Quality Indicators
+# ============================================================================
+720p
+1080p
+1080i
+2160p
+4K
+UHD
+HD
+SD
+FHD
+QHD
+HDR
+HDR10
+HDR10+
+Dolby Vision
+DV
+
+# ============================================================================
+# Video Sources
+# ============================================================================
+BluRay
+Blu-Ray
+BDRip
+BRRip
+DVDRip
+DVDScr
+DVDR
+DVD
+WEB-DL
+WEBDL
+WEBRip
+WEB
+HDTV
+PDTV
+DSR
+SDTV
+TVRip
+SATRip
+PPVRip
+CAM
+CAMRIP
+TS
+TELESYNC
+TC
+TELECINE
+R5
+SCR
+SCREENER
+WORKPRINT
+VHSRip
+REMUX
+
+# ============================================================================
+# Video Codecs
+# ============================================================================
+x264
+x265
+H264
+H.264
+H265
+H.265
+HEVC
+AVC
+XviD
+DivX
+VP9
+AV1
+MPEG
+MPEG2
+MPEG4
+
+# ============================================================================
+# Audio Codecs and Channels
+# ============================================================================
+DTS
+DTS-HD
+DTS-HD MA
+DTSHD
+TrueHD
+Atmos
+AC3
+EAC3
+E-AC3
+AAC
+AAC2
+AAC2.0
+FLAC
+MP3
+OGG
+OPUS
+PCM
+LPCM
+DD5.1
+DD+
+2.0
+5.1
+6.1
+7.1
+
+# ============================================================================
+# Release/Scene Tags
+# ============================================================================
+PROPER
+REPACK
+RERIP
+INTERNAL
+REAL
+RETAIL
+EXTENDED
+UNRATED
+UNCUT
+DIRECTORS CUT
+Director's Cut
+THEATRICAL
+FINAL
+LIMITED
+SUBBED
+DUBBED
+MULTI
+MULTi
+DUAL
+DL
+iNTERNAL
+
+# ============================================================================
+# Streaming Service Tags
+# ============================================================================
+NF
+AMZN
+ATVP
+DSNP
+HMAX
+PCOK
+PMTP
+HULU
+STAN
+IT
+RED
+CRAV
+MA
+CRITERION
+MUBI
+VUDU
+APTV
+
+# ============================================================================
+# Release Groups (Common)
+# ============================================================================
+RARBG
+YTS
+YIFY
+YTS.MX
+SPARKS
+AMIABLE
+GECKOS
+DEMAND
+ROVERS
+DRONES
+FGT
+EVO
+FLAME
+STUTTERSHIT
+NTb
+FLUX
+EDITH
+PECULATE
+CMRG
+NOGRP
+ION10
+RiGHTNOW
+ELiTE
+NTG
+PSA
+NVEnc
+QxR
+JYK
+BONE
+ETRG
+STUTTERSHIT
+GalaxyRG
+VETO
+SiGMA
+SADPANDA
+SUNSCREEN
+ViSiON
+DEFLATE
+LAZY
+CINEFILE
+PSYCHD
+FraMeSToR
+HiFi
+EPSiLON
+TEPES
+TrollHD
+DON
+KRaLiMaRKo
+D-Z0N3
+CtrlHD
+DUToiT
+NT
+ZmN
+TOMMY
+SWTYBLZ
+MeGusta
+SHORTBREHD
+
+# ============================================================================
+# File Extensions (to strip)
+# ============================================================================
+mkv
+mp4
+avi
+mov
+wmv
+flv
+webm
+m4v
+mpg
+mpeg
+
+# ============================================================================
+# Common Descriptors
+# ============================================================================
+Complete
+COMPLETE
+Season
+SEASON
+Series
+SERIES
+Episode
+EPISODE
+Collection
+COLLECTION
+Trilogy
+TRILOGY
+Anthology
+Duology
+Pack
+PACK
+
+# ============================================================================
+# Language Tags
+# ============================================================================
+English
+ENG
+Spanish
+SPA
+French
+FRA
+German
+GER
+Italian
+ITA
+Portuguese
+POR
+Russian
+RUS
+Japanese
+JPN
+Korean
+KOR
+Chinese
+CHI
+Hindi
+HIN
+Arabic
+ARA
+Nordic
+NORDIC
+
+# ============================================================================
+# Subtitle Indicators
+# ============================================================================
+SUBS
+SUB
+SUBBED
+SUBTITLES
+ENGSUB
+ENGSUBBED
+
+# ============================================================================
+# Miscellaneous Tags
+# ============================================================================
+10bit
+10-bit
+8bit
+8-bit
+HQ
+LQ
+Hi10P
+Hi10
+Hi444PP
+SDR
+WS
+FS
+IMAX
+3D
+HSBS
+HOU
+READ NFO
+NFO
+READNFO
+V2
+V3
+Sample
+SAMPLE
+Trailer
+TRAILER
+Extras
+EXTRAS
+Featurette
+Commentary
+Deleted Scenes
+Gag Reel
+Interview
+BTS
+Behind The Scenes
