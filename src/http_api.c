@@ -154,10 +154,16 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         hourly_count = batch_writer_get_hourly_count(api->batch_writer);
     }
 
+    /* Calculate uptime */
+    time_t uptime_seconds = time(NULL) - api->app_ctx->start_time;
+    int uptime_hours = (int)(uptime_seconds / 3600);
+    int uptime_minutes = (int)((uptime_seconds % 3600) / 60);
+
     /* Format numbers with commas */
     char torrent_count_str[32];
     char file_count_str[32];
     char hourly_count_str[32];
+    char uptime_str[32];
 
     if (torrent_count >= 1000000) {
         snprintf(torrent_count_str, sizeof(torrent_count_str), "%d,%03d,%03d",
@@ -188,6 +194,8 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
     } else {
         snprintf(hourly_count_str, sizeof(hourly_count_str), "%zu", hourly_count);
     }
+
+    snprintf(uptime_str, sizeof(uptime_str), "%d:%02d", uptime_hours, uptime_minutes);
 
     /* Build HTML */
     char html[4096];
@@ -286,11 +294,12 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "      <div>%s torrents indexed</div>\n"
         "      <div>%s files indexed</div>\n"
         "      <div>%s found in last hour</div>\n"
+        "      <div>Uptime: %s</div>\n"
         "    </div>\n"
         "  </div>\n"
         "</body>\n"
         "</html>",
-        torrent_count_str, file_count_str, hourly_count_str);
+        torrent_count_str, file_count_str, hourly_count_str, uptime_str);
 
     mg_printf(conn,
               "HTTP/1.1 200 OK\r\n"
