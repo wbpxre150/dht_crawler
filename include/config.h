@@ -66,6 +66,7 @@ typedef struct {
     int peer_retry_max_attempts;         /* Max get_peers retries (1-5, default: 3) */
     int peer_retry_min_threshold;        /* Min peers before stopping retries (default: 10) */
     int peer_retry_delay_ms;             /* Delay between retries in ms (default: 500) */
+    int peer_retry_cleanup_interval_sec; /* How often to cleanup old entries (default: 10) */
 
     /* Dual routing table settings */
     double dual_routing_fill_threshold;   /* When to start filling secondary table (0.0-1.0, default: 0.80) */

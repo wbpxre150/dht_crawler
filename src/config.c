@@ -74,6 +74,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->peer_retry_max_attempts = 3;
     config->peer_retry_min_threshold = 10;
     config->peer_retry_delay_ms = 500;
+    config->peer_retry_cleanup_interval_sec = 10;
 
     /* Dual routing table defaults */
     config->dual_routing_fill_threshold = 0.80;     /* Start filling secondary at 80% */
@@ -240,6 +241,9 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->peer_retry_min_threshold = atoi(value);
         } else if (strcmp(key, "peer_retry_delay_ms") == 0) {
             config->peer_retry_delay_ms = atoi(value);
+        } else if (strcmp(key, "peer_retry_cleanup_interval_sec") == 0) {
+            config->peer_retry_cleanup_interval_sec = atoi(value);
+            if (config->peer_retry_cleanup_interval_sec < 1) config->peer_retry_cleanup_interval_sec = 1;
         }
         /* Dual routing table settings */
         else if (strcmp(key, "dual_routing_fill_threshold") == 0) {

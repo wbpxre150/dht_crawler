@@ -369,7 +369,7 @@ static void stats_timer_cb(uv_timer_t *handle) {
 
     /* Peer store cleanup (every 300 seconds / 5 minutes) */
     static int cleanup_counter = 0;
-    cleanup_counter += 10;  /* Timer fires every 10 seconds */
+    cleanup_counter++;  /* Timer fires every 1 second */
 
     if (cleanup_counter >= 300) {  /* Every 5 minutes */
         if (mgr->peer_store) {
@@ -380,6 +380,21 @@ static void stats_timer_cb(uv_timer_t *handle) {
             }
         }
         cleanup_counter = 0;
+    }
+
+    /* Peer retry tracker cleanup (configurable interval) */
+    static int peer_retry_cleanup_counter = 0;
+    peer_retry_cleanup_counter++;  /* Timer fires every 1 second */
+
+    if (mgr->peer_retry_tracker && mgr->crawler_config) {
+        crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
+        if (peer_retry_cleanup_counter >= cfg->peer_retry_cleanup_interval_sec) {
+            int removed = peer_retry_cleanup_old(mgr->peer_retry_tracker);
+            if (removed > 0) {
+                log_msg(LOG_DEBUG, "Peer retry cleanup: %d stale entries removed", removed);
+            }
+            peer_retry_cleanup_counter = 0;
+        }
     }
 }
 
