@@ -14,13 +14,23 @@ typedef struct peer_retry_entry {
     time_t last_attempt_time;    /* Timestamp of last attempt */
     time_t target_retry_time;    /* When this entry should be retried (0 if not scheduled) */
     time_t created_at;           /* When entry was created */
-    struct peer_retry_entry *next; /* Hash table chaining */
+    size_t array_index;          /* Position in entries array */
+    int valid;                   /* 1 if entry is valid, 0 if evicted/empty */
+    struct peer_retry_entry *hash_next; /* Hash table chaining */
 } peer_retry_entry_t;
 
 /* Retry tracker store */
 typedef struct {
+    /* Hash table for O(1) lookups */
     peer_retry_entry_t **buckets;
     size_t bucket_count;
+
+    /* Circular buffer for O(1) eviction */
+    peer_retry_entry_t *entries;     /* Fixed-size array of entries */
+    size_t max_entries;              /* Maximum entries (e.g., 50000) */
+    size_t write_pos;                /* Next write position in circular buffer */
+    size_t current_count;            /* Current number of valid entries */
+
     pthread_mutex_t mutex;
 
     /* Configuration */
@@ -37,18 +47,21 @@ typedef struct {
     uint64_t success_third_try;
     uint64_t failed_all_attempts;
     uint64_t skipped_queue_full;
+    uint64_t evicted_for_space;      /* Entries evicted to make room */
 } peer_retry_tracker_t;
 
 /* Function declarations */
 
 /* Initialize retry tracker
  * bucket_count: Number of hash table buckets (recommended: 1009)
+ * max_entries: Maximum entries in circular buffer (e.g., 50000)
  * max_attempts: Maximum retry attempts per info_hash (1-5)
  * min_peer_threshold: Minimum peers before stopping retries
  * retry_delay_ms: Delay between retry attempts in milliseconds
  * max_age_sec: Maximum age before cleanup
  */
 peer_retry_tracker_t* peer_retry_tracker_init(size_t bucket_count,
+                                               size_t max_entries,
                                                int max_attempts,
                                                int min_peer_threshold,
                                                int retry_delay_ms,
@@ -56,6 +69,7 @@ peer_retry_tracker_t* peer_retry_tracker_init(size_t bucket_count,
 
 /* Create entry for new info_hash
  * Returns existing entry if already exists, new entry otherwise
+ * If at capacity, evicts oldest entry automatically
  */
 peer_retry_entry_t* peer_retry_entry_create(peer_retry_tracker_t *tracker,
                                              const uint8_t *info_hash);

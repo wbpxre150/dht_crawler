@@ -17,13 +17,37 @@ static int hash_equal(const uint8_t *h1, const uint8_t *h2) {
     return memcmp(h1, h2, 20) == 0;
 }
 
+/* Remove entry from hash table (internal helper) */
+static void remove_from_hash_table(peer_retry_tracker_t *tracker, peer_retry_entry_t *entry) {
+    if (!entry->valid) return;
+
+    size_t bucket_idx = hash_info_hash(entry->info_hash, tracker->bucket_count);
+    peer_retry_entry_t **prev = &tracker->buckets[bucket_idx];
+    peer_retry_entry_t *curr = tracker->buckets[bucket_idx];
+
+    while (curr) {
+        if (curr == entry) {
+            *prev = curr->hash_next;
+            entry->valid = 0;
+            entry->hash_next = NULL;
+            if (tracker->current_count > 0) {
+                tracker->current_count--;
+            }
+            return;
+        }
+        prev = &curr->hash_next;
+        curr = curr->hash_next;
+    }
+}
+
 /* Initialize retry tracker */
 peer_retry_tracker_t* peer_retry_tracker_init(size_t bucket_count,
+                                               size_t max_entries,
                                                int max_attempts,
                                                int min_peer_threshold,
                                                int retry_delay_ms,
                                                int max_age_sec) {
-    if (bucket_count == 0 || max_attempts <= 0) {
+    if (bucket_count == 0 || max_entries == 0 || max_attempts <= 0) {
         return NULL;
     }
 
@@ -32,19 +56,38 @@ peer_retry_tracker_t* peer_retry_tracker_init(size_t bucket_count,
         return NULL;
     }
 
+    /* Allocate hash table buckets */
     tracker->buckets = calloc(bucket_count, sizeof(peer_retry_entry_t*));
     if (!tracker->buckets) {
         free(tracker);
         return NULL;
     }
 
+    /* Allocate circular buffer */
+    tracker->entries = calloc(max_entries, sizeof(peer_retry_entry_t));
+    if (!tracker->entries) {
+        free(tracker->buckets);
+        free(tracker);
+        return NULL;
+    }
+
+    /* Initialize all entries as invalid */
+    for (size_t i = 0; i < max_entries; i++) {
+        tracker->entries[i].valid = 0;
+        tracker->entries[i].array_index = i;
+    }
+
     tracker->bucket_count = bucket_count;
+    tracker->max_entries = max_entries;
+    tracker->write_pos = 0;
+    tracker->current_count = 0;
     tracker->max_attempts = max_attempts;
     tracker->min_peer_threshold = min_peer_threshold;
     tracker->retry_delay_ms = retry_delay_ms;
     tracker->max_age_sec = max_age_sec;
 
     if (pthread_mutex_init(&tracker->mutex, NULL) != 0) {
+        free(tracker->entries);
         free(tracker->buckets);
         free(tracker);
         return NULL;
@@ -58,6 +101,7 @@ peer_retry_tracker_t* peer_retry_tracker_init(size_t bucket_count,
     tracker->success_third_try = 0;
     tracker->failed_all_attempts = 0;
     tracker->skipped_queue_full = 0;
+    tracker->evicted_for_space = 0;
 
     return tracker;
 }
@@ -71,25 +115,28 @@ peer_retry_entry_t* peer_retry_entry_create(peer_retry_tracker_t *tracker,
 
     pthread_mutex_lock(&tracker->mutex);
 
-    /* Check if entry already exists */
+    /* Check if entry already exists in hash table */
     size_t bucket_idx = hash_info_hash(info_hash, tracker->bucket_count);
     peer_retry_entry_t *existing = tracker->buckets[bucket_idx];
 
     while (existing) {
-        if (hash_equal(existing->info_hash, info_hash)) {
+        if (existing->valid && hash_equal(existing->info_hash, info_hash)) {
             pthread_mutex_unlock(&tracker->mutex);
             return existing;  /* Already exists */
         }
-        existing = existing->next;
+        existing = existing->hash_next;
     }
 
-    /* Create new entry */
-    peer_retry_entry_t *entry = calloc(1, sizeof(peer_retry_entry_t));
-    if (!entry) {
-        pthread_mutex_unlock(&tracker->mutex);
-        return NULL;
+    /* Get entry at current write position */
+    peer_retry_entry_t *entry = &tracker->entries[tracker->write_pos];
+
+    /* If entry at write_pos is valid, evict it first */
+    if (entry->valid) {
+        remove_from_hash_table(tracker, entry);
+        tracker->evicted_for_space++;
     }
 
+    /* Initialize new entry */
     memcpy(entry->info_hash, info_hash, 20);
     entry->attempts_made = 0;
     entry->peer_count = 0;
@@ -97,11 +144,17 @@ peer_retry_entry_t* peer_retry_entry_create(peer_retry_tracker_t *tracker,
     entry->last_attempt_time = time(NULL);
     entry->target_retry_time = 0;  /* Not scheduled for retry yet */
     entry->created_at = time(NULL);
+    entry->array_index = tracker->write_pos;
+    entry->valid = 1;
 
-    /* Add to bucket chain */
-    entry->next = tracker->buckets[bucket_idx];
+    /* Add to hash table */
+    entry->hash_next = tracker->buckets[bucket_idx];
     tracker->buckets[bucket_idx] = entry;
+    tracker->current_count++;
     tracker->total_entries++;
+
+    /* Advance write position */
+    tracker->write_pos = (tracker->write_pos + 1) % tracker->max_entries;
 
     pthread_mutex_unlock(&tracker->mutex);
 
@@ -121,11 +174,11 @@ peer_retry_entry_t* peer_retry_entry_find(peer_retry_tracker_t *tracker,
     peer_retry_entry_t *entry = tracker->buckets[bucket_idx];
 
     while (entry) {
-        if (hash_equal(entry->info_hash, info_hash)) {
+        if (entry->valid && hash_equal(entry->info_hash, info_hash)) {
             pthread_mutex_unlock(&tracker->mutex);
             return entry;
         }
-        entry = entry->next;
+        entry = entry->hash_next;
     }
 
     pthread_mutex_unlock(&tracker->mutex);
@@ -142,15 +195,15 @@ int peer_retry_should_retry(peer_retry_tracker_t *tracker,
 
     pthread_mutex_lock(&tracker->mutex);
 
-    /* Find entry */
+    /* Find entry in hash table */
     size_t bucket_idx = hash_info_hash(info_hash, tracker->bucket_count);
     peer_retry_entry_t *entry = tracker->buckets[bucket_idx];
 
     while (entry) {
-        if (hash_equal(entry->info_hash, info_hash)) {
+        if (entry->valid && hash_equal(entry->info_hash, info_hash)) {
             break;
         }
-        entry = entry->next;
+        entry = entry->hash_next;
     }
 
     if (!entry) {
@@ -192,13 +245,12 @@ void peer_retry_mark_complete(peer_retry_tracker_t *tracker,
 
     pthread_mutex_lock(&tracker->mutex);
 
-    /* Find and remove entry */
+    /* Find entry in hash table */
     size_t bucket_idx = hash_info_hash(info_hash, tracker->bucket_count);
-    peer_retry_entry_t **prev = &tracker->buckets[bucket_idx];
     peer_retry_entry_t *entry = tracker->buckets[bucket_idx];
 
     while (entry) {
-        if (hash_equal(entry->info_hash, info_hash)) {
+        if (entry->valid && hash_equal(entry->info_hash, info_hash)) {
             /* Update statistics based on attempt count */
             int attempts = entry->attempts_made + 1;  /* +1 for initial attempt */
 
@@ -212,16 +264,13 @@ void peer_retry_mark_complete(peer_retry_tracker_t *tracker,
                 tracker->success_third_try++;
             }
 
-            /* Remove from chain */
-            *prev = entry->next;
-            free(entry);
-            tracker->total_entries--;
+            /* Remove from hash table (marks as invalid) */
+            remove_from_hash_table(tracker, entry);
 
             pthread_mutex_unlock(&tracker->mutex);
             return;
         }
-        prev = &entry->next;
-        entry = entry->next;
+        entry = entry->hash_next;
     }
 
     pthread_mutex_unlock(&tracker->mutex);
@@ -238,24 +287,17 @@ int peer_retry_cleanup_old(peer_retry_tracker_t *tracker) {
 
     pthread_mutex_lock(&tracker->mutex);
 
-    for (size_t i = 0; i < tracker->bucket_count; i++) {
-        peer_retry_entry_t **prev = &tracker->buckets[i];
-        peer_retry_entry_t *entry = tracker->buckets[i];
+    /* Scan circular buffer for old entries */
+    for (size_t i = 0; i < tracker->max_entries; i++) {
+        peer_retry_entry_t *entry = &tracker->entries[i];
 
-        while (entry) {
+        if (entry->valid) {
             time_t age = now - entry->created_at;
 
             if (age > tracker->max_age_sec) {
-                /* Remove expired entry */
-                *prev = entry->next;
-                peer_retry_entry_t *to_free = entry;
-                entry = entry->next;
-                free(to_free);
-                tracker->total_entries--;
+                /* Remove from hash table */
+                remove_from_hash_table(tracker, entry);
                 removed++;
-            } else {
-                prev = &entry->next;
-                entry = entry->next;
             }
         }
     }
@@ -278,11 +320,11 @@ int peer_retry_get_ready_entries(peer_retry_tracker_t *tracker,
 
     pthread_mutex_lock(&tracker->mutex);
 
-    /* Scan all buckets for ready entries */
-    for (size_t i = 0; i < tracker->bucket_count && found < max_count; i++) {
-        peer_retry_entry_t *entry = tracker->buckets[i];
+    /* Scan circular buffer for ready entries */
+    for (size_t i = 0; i < tracker->max_entries && found < max_count; i++) {
+        peer_retry_entry_t *entry = &tracker->entries[i];
 
-        while (entry && found < max_count) {
+        if (entry->valid) {
             /* Check if this entry is ready for retry */
             if (entry->target_retry_time > 0 && entry->target_retry_time <= now) {
                 /* Copy info_hash to output array */
@@ -292,8 +334,6 @@ int peer_retry_get_ready_entries(peer_retry_tracker_t *tracker,
                 /* Clear target_retry_time so it won't be retried again until rescheduled */
                 entry->target_retry_time = 0;
             }
-
-            entry = entry->next;
         }
     }
 
@@ -316,8 +356,11 @@ void peer_retry_print_stats(peer_retry_tracker_t *tracker) {
                                 tracker->failed_all_attempts;
 
     log_msg(LOG_INFO, "  Peer Retry Statistics:");
-    log_msg(LOG_INFO, "    Active entries: %llu", (unsigned long long)tracker->total_entries);
+    log_msg(LOG_INFO, "    Active entries: %zu / %zu (%.1f%%)",
+            tracker->current_count, tracker->max_entries,
+            (100.0 * tracker->current_count) / tracker->max_entries);
     log_msg(LOG_INFO, "    Retries triggered: %llu", (unsigned long long)tracker->retries_triggered);
+    log_msg(LOG_INFO, "    Evicted for space: %llu", (unsigned long long)tracker->evicted_for_space);
 
     if (total_completed > 0) {
         log_msg(LOG_INFO, "    Success on 1st try: %llu (%.1f%%)",
@@ -346,8 +389,9 @@ void peer_retry_print_stats(peer_retry_tracker_t *tracker) {
                 (unsigned long long)tracker->skipped_queue_full);
     }
 
-    log_msg(LOG_INFO, "    Config: max_attempts=%d min_peers=%d delay=%dms",
-            tracker->max_attempts, tracker->min_peer_threshold, tracker->retry_delay_ms);
+    log_msg(LOG_INFO, "    Config: max_attempts=%d min_peers=%d delay=%dms max_entries=%zu",
+            tracker->max_attempts, tracker->min_peer_threshold, tracker->retry_delay_ms,
+            tracker->max_entries);
 
     pthread_mutex_unlock(&tracker->mutex);
 }
@@ -360,17 +404,12 @@ void peer_retry_tracker_cleanup(peer_retry_tracker_t *tracker) {
 
     pthread_mutex_lock(&tracker->mutex);
 
-    /* Free all entries */
-    for (size_t i = 0; i < tracker->bucket_count; i++) {
-        peer_retry_entry_t *entry = tracker->buckets[i];
-        while (entry) {
-            peer_retry_entry_t *next = entry->next;
-            free(entry);
-            entry = next;
-        }
-    }
+    /* Free circular buffer */
+    free(tracker->entries);
 
+    /* Free hash table buckets */
     free(tracker->buckets);
+
     pthread_mutex_unlock(&tracker->mutex);
     pthread_mutex_destroy(&tracker->mutex);
     free(tracker);

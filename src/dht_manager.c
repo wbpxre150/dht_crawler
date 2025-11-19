@@ -640,8 +640,11 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
 
     /* Initialize peer retry tracker */
     if (cfg && cfg->peer_retry_enabled) {
+        /* Use bucket count ~2x max_entries for O(1) average lookup (load factor 0.5) */
+        size_t bucket_count = (cfg->peer_retry_max_entries * 2) | 1;  /* Ensure odd for better distribution */
         mgr->peer_retry_tracker = peer_retry_tracker_init(
-            1009,  /* 1009 buckets */
+            bucket_count,  /* hash buckets sized for O(1) lookup */
+            cfg->peer_retry_max_entries,  /* max entries in circular buffer */
             cfg->peer_retry_max_attempts,
             cfg->peer_retry_min_threshold,
             cfg->peer_retry_delay_ms,
@@ -650,8 +653,8 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         if (!mgr->peer_retry_tracker) {
             log_msg(LOG_WARN, "Failed to initialize peer retry tracker");
         } else {
-            log_msg(LOG_DEBUG, "Peer retry tracker initialized (max_attempts=%d, threshold=%d, delay=%dms)",
-                    cfg->peer_retry_max_attempts, cfg->peer_retry_min_threshold, cfg->peer_retry_delay_ms);
+            log_msg(LOG_DEBUG, "Peer retry tracker initialized (max_entries=%d, max_attempts=%d, threshold=%d, delay=%dms)",
+                    cfg->peer_retry_max_entries, cfg->peer_retry_max_attempts, cfg->peer_retry_min_threshold, cfg->peer_retry_delay_ms);
 
             /* Initialize peer retry timer (checks every 100ms for ready retries) */
             rc = uv_timer_init(app_ctx->loop, &mgr->peer_retry_timer);
