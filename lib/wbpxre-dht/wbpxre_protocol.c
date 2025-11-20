@@ -809,9 +809,9 @@ void wbpxre_handle_find_node(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                               const struct sockaddr_in *from) {
     /* Get closest nodes to target */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
-    int nodes_len = encode_compact_nodes(active_table, query->target,
-                                         compact_nodes, sizeof(compact_nodes), 8);
+    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    int nodes_len = stable_table ? encode_compact_nodes(stable_table, query->target,
+                                         compact_nodes, sizeof(compact_nodes), 8) : 0;
 
     /* Read node ID with lock protection */
     uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
@@ -829,9 +829,9 @@ void wbpxre_handle_get_peers(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                               const struct sockaddr_in *from) {
     /* In crawler mode, we don't store peers - just return nodes */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
-    int nodes_len = encode_compact_nodes(active_table, query->info_hash,
-                                         compact_nodes, sizeof(compact_nodes), 8);
+    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    int nodes_len = stable_table ? encode_compact_nodes(stable_table, query->info_hash,
+                                         compact_nodes, sizeof(compact_nodes), 8) : 0;
 
     /* Read node ID with lock protection */
     uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
@@ -889,9 +889,9 @@ void wbpxre_handle_incoming_query(wbpxre_dht_t *dht, wbpxre_message_t *query,
 
     /* Always send a valid response to keep us in routing tables */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    wbpxre_routing_table_t *active_table = dual_routing_get_active(dht->routing_controller);
-    int nodes_len = encode_compact_nodes(active_table, local_node_id,
-                                         compact_nodes, sizeof(compact_nodes), 8);
+    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    int nodes_len = stable_table ? encode_compact_nodes(stable_table, local_node_id,
+                                         compact_nodes, sizeof(compact_nodes), 8) : 0;
 
     send_response(dht, from, query->transaction_id, local_node_id,
                  compact_nodes, nodes_len);

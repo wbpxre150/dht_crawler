@@ -331,6 +331,11 @@ bool wbpxre_routing_table_exists(wbpxre_routing_table_t *table,
     return exists;
 }
 
+uint32_t wbpxre_routing_table_count(wbpxre_routing_table_t *table) {
+    if (!table) return 0;
+    return (uint32_t)table->node_count;
+}
+
 /* ============================================================================
  * K-Closest Nodes Query
  * ============================================================================ */
@@ -1096,6 +1101,7 @@ extern void log_msg(int level, const char *fmt, ...);
 #define LOG_DEBUG 0
 #define LOG_INFO 1
 #define LOG_WARN 2
+#define LOG_ERROR 3
 
 /* Helper: Clear a routing table completely (for rotation) */
 static void clear_routing_table_internal(wbpxre_routing_table_t *table) {
@@ -1147,8 +1153,8 @@ dual_routing_controller_t *dual_routing_controller_create(int max_nodes_per_tabl
     }
 
     /* Initial state: Table A is both active and filling */
-    controller->table_a_state = TABLE_STATE_ACTIVE;
-    controller->table_b_state = TABLE_STATE_READY;
+    controller->table_a_state = DUAL_TABLE_STATE_ACTIVE;
+    controller->table_b_state = DUAL_TABLE_STATE_READY;
     controller->rotation_state = ROTATION_STABLE;
 
     controller->active_table = controller->table_a;
@@ -1217,11 +1223,11 @@ static void perform_rotation(dual_routing_controller_t *controller) {
 
     /* Update states */
     if (new_active == controller->table_a) {
-        controller->table_a_state = TABLE_STATE_ACTIVE;
-        controller->table_b_state = TABLE_STATE_CLEARING;
+        controller->table_a_state = DUAL_TABLE_STATE_ACTIVE;
+        controller->table_b_state = DUAL_TABLE_STATE_CLEARING;
     } else {
-        controller->table_b_state = TABLE_STATE_ACTIVE;
-        controller->table_a_state = TABLE_STATE_CLEARING;
+        controller->table_b_state = DUAL_TABLE_STATE_ACTIVE;
+        controller->table_a_state = DUAL_TABLE_STATE_CLEARING;
     }
 
     /* The filling table is now also the active table (continues filling to 80%) */
@@ -1239,9 +1245,9 @@ static void perform_rotation(dual_routing_controller_t *controller) {
 
     /* Mark old table as ready */
     if (old_active == controller->table_a) {
-        controller->table_a_state = TABLE_STATE_READY;
+        controller->table_a_state = DUAL_TABLE_STATE_READY;
     } else {
-        controller->table_b_state = TABLE_STATE_READY;
+        controller->table_b_state = DUAL_TABLE_STATE_READY;
     }
 
     /* Update statistics */
@@ -1276,16 +1282,16 @@ int dual_routing_insert(dual_routing_controller_t *controller,
             ? controller->table_b : controller->table_a;
 
         /* Only switch if other table is ready */
-        table_state_t other_state = (other_table == controller->table_a)
+        dual_table_state_t other_state = (other_table == controller->table_a)
             ? controller->table_a_state : controller->table_b_state;
 
-        if (other_state == TABLE_STATE_READY) {
+        if (other_state == DUAL_TABLE_STATE_READY) {
             controller->filling_table = other_table;
 
             if (other_table == controller->table_a) {
-                controller->table_a_state = TABLE_STATE_FILLING;
+                controller->table_a_state = DUAL_TABLE_STATE_FILLING;
             } else {
-                controller->table_b_state = TABLE_STATE_FILLING;
+                controller->table_b_state = DUAL_TABLE_STATE_FILLING;
             }
 
             target = controller->filling_table;
@@ -1360,17 +1366,17 @@ void dual_routing_force_rotation(dual_routing_controller_t *controller) {
         ? controller->table_b : controller->table_a;
 
     /* If other table is ready or filling, we can rotate */
-    table_state_t other_state = (other_table == controller->table_a)
+    dual_table_state_t other_state = (other_table == controller->table_a)
         ? controller->table_a_state : controller->table_b_state;
 
-    if (other_state == TABLE_STATE_READY || other_state == TABLE_STATE_FILLING) {
+    if (other_state == DUAL_TABLE_STATE_READY || other_state == DUAL_TABLE_STATE_FILLING) {
         /* Set filling table to the other table if it's ready */
-        if (other_state == TABLE_STATE_READY) {
+        if (other_state == DUAL_TABLE_STATE_READY) {
             controller->filling_table = other_table;
             if (other_table == controller->table_a) {
-                controller->table_a_state = TABLE_STATE_FILLING;
+                controller->table_a_state = DUAL_TABLE_STATE_FILLING;
             } else {
-                controller->table_b_state = TABLE_STATE_FILLING;
+                controller->table_b_state = DUAL_TABLE_STATE_FILLING;
             }
         }
 
@@ -1447,4 +1453,455 @@ int dual_routing_get_total_nodes(dual_routing_controller_t *controller) {
 
     /* Return count from active table primarily */
     return controller->active_table->node_count;
+}
+
+/* ============================================================================
+ * TRIPLE ROUTING TABLE CONTROLLER
+ *
+ * 3-table rotating architecture that separates read/write operations:
+ * - FILLING table: find_node workers write here
+ * - STABLE table: sample_infohashes and DHT queries read here
+ * - IDLE table: waiting to become FILLING
+ *
+ * Solves bootstrap problem: after first rotation, always have STABLE table
+ * ============================================================================ */
+
+/* Forward declaration for rotation */
+static void triple_routing_try_rotate(triple_routing_controller_t *ctrl);
+
+/**
+ * Create triple routing controller
+ *
+ * @param max_nodes_per_table  Maximum nodes in each table
+ * @param rotation_threshold   Node count to trigger rotation (e.g., 1000-2000)
+ * @return Allocated controller, or NULL on error
+ */
+triple_routing_controller_t* triple_routing_controller_create(
+    int max_nodes_per_table,
+    uint32_t rotation_threshold
+) {
+    triple_routing_controller_t *ctrl = calloc(1, sizeof(*ctrl));
+    if (!ctrl) {
+        log_msg(LOG_ERROR, "Failed to allocate triple routing controller");
+        return NULL;
+    }
+
+    /* Create 3 routing tables */
+    for (int i = 0; i < 3; i++) {
+        ctrl->tables[i] = wbpxre_routing_table_create(max_nodes_per_table);
+        if (!ctrl->tables[i]) {
+            log_msg(LOG_ERROR, "Failed to allocate routing table %d", i);
+            /* Cleanup already allocated tables */
+            for (int j = 0; j < i; j++) {
+                wbpxre_routing_table_destroy(ctrl->tables[j]);
+            }
+            free(ctrl);
+            return NULL;
+        }
+        ctrl->states[i] = TABLE_STATE_IDLE;
+    }
+
+    /* Initial state: table 0 is FILLING, others IDLE, no STABLE yet */
+    ctrl->filling_idx = 0;
+    ctrl->stable_idx = -1;  /* No stable table until first rotation */
+    ctrl->states[0] = TABLE_STATE_FILLING;
+
+    /* Configuration */
+    ctrl->rotation_threshold = rotation_threshold;
+    ctrl->max_nodes_per_table = max_nodes_per_table;
+
+    /* Bootstrap tracking */
+    __atomic_store_n(&ctrl->bootstrap_complete, false, __ATOMIC_RELAXED);
+    ctrl->bootstrap_start_time = time(NULL);
+    ctrl->first_rotation_time = 0;
+
+    /* Synchronization */
+    pthread_mutex_init(&ctrl->rotation_lock, NULL);
+
+    /* Statistics */
+    ctrl->rotation_count = 0;
+    ctrl->total_nodes_cleared = 0;
+    ctrl->last_rotation_time = 0;
+    memset(ctrl->nodes_at_rotation, 0, sizeof(ctrl->nodes_at_rotation));
+    memset(ctrl->rotation_duration_ms, 0, sizeof(ctrl->rotation_duration_ms));
+    memset(ctrl->stable_reads, 0, sizeof(ctrl->stable_reads));
+    ctrl->clearing_operations = 0;
+
+    log_msg(LOG_INFO, "Triple routing controller initialized: %d tables × %d max nodes, threshold=%u",
+            3, max_nodes_per_table, rotation_threshold);
+    log_msg(LOG_INFO, "Bootstrap in progress: stable table will be available after first rotation");
+
+    return ctrl;
+}
+
+/**
+ * Insert node into FILLING table
+ *
+ * Called by find_node workers to add discovered nodes.
+ * Thread-safe: only touches FILLING table, rotation_lock protects state changes.
+ *
+ * @param ctrl      Triple routing controller
+ * @param node      Node to insert (id, addr, addr_len)
+ * @return 0 on success, -1 on error
+ */
+int triple_routing_insert_node(
+    triple_routing_controller_t *ctrl,
+    const wbpxre_routing_node_t *node
+) {
+    if (!ctrl || !node) {
+        return -1;
+    }
+
+    /* Get filling table index (fast read, no lock) */
+    int filling_idx = ctrl->filling_idx;
+    wbpxre_routing_table_t *filling_table = ctrl->tables[filling_idx];
+
+    /* Insert into filling table (table has own lock) */
+    int result = wbpxre_routing_table_insert(filling_table, node);
+    if (result < 0) {
+        return -1;  /* Insert failed (duplicate or table full) */
+    }
+
+    /* Check if rotation threshold reached */
+    uint32_t node_count = wbpxre_routing_table_count(filling_table);
+    if (node_count >= ctrl->rotation_threshold) {
+        /* Trigger rotation (internally checks threshold again under lock) */
+        triple_routing_try_rotate(ctrl);
+    }
+
+    return 0;
+}
+
+/**
+ * Attempt rotation if threshold reached
+ *
+ * Thread-safe: uses rotation_lock for state transitions.
+ *
+ * @param ctrl  Triple routing controller
+ */
+static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
+    pthread_mutex_lock(&ctrl->rotation_lock);
+
+    int filling_idx = ctrl->filling_idx;
+    wbpxre_routing_table_t *filling_table = ctrl->tables[filling_idx];
+
+    /* Double-check threshold under lock (prevent spurious rotations) */
+    uint32_t node_count = wbpxre_routing_table_count(filling_table);
+    if (node_count < ctrl->rotation_threshold) {
+        pthread_mutex_unlock(&ctrl->rotation_lock);
+        return;
+    }
+
+    time_t rotation_start = time(NULL);
+
+    log_msg(LOG_INFO, "=== ROTATION %llu: Table %d reached threshold (%u nodes) ===",
+            (unsigned long long)ctrl->rotation_count, filling_idx, node_count);
+
+    /* Record metrics for this rotation */
+    ctrl->nodes_at_rotation[filling_idx] = node_count;
+    if (ctrl->rotation_count > 0) {
+        double duration_sec = difftime(rotation_start, ctrl->last_rotation_time);
+        ctrl->rotation_duration_ms[filling_idx] = duration_sec * 1000.0;
+    }
+
+    /* ──────────────────────────────────────────────────────────────
+     * STATE TRANSITIONS
+     * ────────────────────────────────────────────────────────────── */
+
+    /* Old STABLE table → IDLE */
+    if (ctrl->stable_idx >= 0) {
+        int old_stable_idx = ctrl->stable_idx;
+        uint32_t old_stable_nodes = wbpxre_routing_table_count(ctrl->tables[old_stable_idx]);
+
+        log_msg(LOG_INFO, "  Table %d: STABLE → IDLE (%u nodes will be cleared on reuse)",
+                old_stable_idx, old_stable_nodes);
+
+        ctrl->states[old_stable_idx] = TABLE_STATE_IDLE;
+    }
+
+    /* FILLING table → STABLE */
+    log_msg(LOG_INFO, "  Table %d: FILLING → STABLE (%u nodes ready for queries)",
+            filling_idx, node_count);
+
+    ctrl->states[filling_idx] = TABLE_STATE_STABLE;
+    int new_stable_idx = filling_idx;
+
+    /* Find next IDLE table for filling */
+    int next_filling_idx = (filling_idx + 1) % 3;
+    while (ctrl->states[next_filling_idx] != TABLE_STATE_IDLE) {
+        next_filling_idx = (next_filling_idx + 1) % 3;
+        /* Guaranteed to find one: we just set old stable to IDLE */
+    }
+
+    /* Clear the IDLE table if it has stale nodes */
+    wbpxre_routing_table_t *next_filling_table = ctrl->tables[next_filling_idx];
+    uint32_t stale_nodes = wbpxre_routing_table_count(next_filling_table);
+    if (stale_nodes > 0) {
+        log_msg(LOG_INFO, "  Table %d: IDLE → CLEARING (%u stale nodes)",
+                next_filling_idx, stale_nodes);
+
+        ctrl->states[next_filling_idx] = TABLE_STATE_CLEARING;
+
+        /* Release lock during clear (blocking operation) */
+        pthread_mutex_unlock(&ctrl->rotation_lock);
+
+        /* Clear table (this is a synchronous blocking operation) */
+        clear_routing_table_internal(next_filling_table);
+        ctrl->total_nodes_cleared += stale_nodes;
+        ctrl->clearing_operations++;
+
+        log_msg(LOG_INFO, "  Table %d: CLEARING → FILLING (cleared %u nodes)",
+                next_filling_idx, stale_nodes);
+
+        /* Re-acquire lock for final state update */
+        pthread_mutex_lock(&ctrl->rotation_lock);
+    }
+
+    /* IDLE/CLEARED table → FILLING */
+    ctrl->states[next_filling_idx] = TABLE_STATE_FILLING;
+    ctrl->filling_idx = next_filling_idx;
+    ctrl->stable_idx = new_stable_idx;
+    ctrl->rotation_count++;
+    ctrl->last_rotation_time = time(NULL);
+
+    log_msg(LOG_INFO, "  Table %d: FILLING (ready for inserts)", next_filling_idx);
+
+    /* Mark bootstrap complete after first rotation */
+    if (ctrl->rotation_count == 1) {
+        __atomic_store_n(&ctrl->bootstrap_complete, true, __ATOMIC_RELEASE);
+        ctrl->first_rotation_time = ctrl->last_rotation_time;
+        uint32_t bootstrap_duration = (uint32_t)difftime(ctrl->first_rotation_time, ctrl->bootstrap_start_time);
+
+        log_msg(LOG_INFO, "╔════════════════════════════════════════════════════════════╗");
+        log_msg(LOG_INFO, "║  DHT BOOTSTRAP COMPLETE!                                   ║");
+        log_msg(LOG_INFO, "║  Duration: %-5u seconds                                    ║", bootstrap_duration);
+        log_msg(LOG_INFO, "║  Stable table available: %-6u nodes                        ║", node_count);
+        log_msg(LOG_INFO, "║  sample_infohashes and DHT queries now operational         ║");
+        log_msg(LOG_INFO, "╚════════════════════════════════════════════════════════════╝");
+    }
+
+    log_msg(LOG_INFO, "=== ROTATION COMPLETE: STABLE=table_%d, FILLING=table_%d ===",
+            ctrl->stable_idx, ctrl->filling_idx);
+
+    pthread_mutex_unlock(&ctrl->rotation_lock);
+}
+
+/**
+ * Get stable table for reading
+ *
+ * Used by sample_infohashes workers and DHT query handlers.
+ * Returns NULL if bootstrap not complete yet.
+ *
+ * Thread-safe: RCU-protected pointer read (no lock needed after bootstrap).
+ *
+ * @param ctrl  Triple routing controller
+ * @return STABLE table, or NULL if bootstrap incomplete
+ */
+wbpxre_routing_table_t* triple_routing_get_stable_table(
+    triple_routing_controller_t *ctrl
+) {
+    if (!ctrl) {
+        return NULL;
+    }
+
+    /* Fast path: check if bootstrap complete (atomic read, no lock) */
+    if (!__atomic_load_n(&ctrl->bootstrap_complete, __ATOMIC_ACQUIRE)) {
+        return NULL;  /* No stable table yet, still bootstrapping */
+    }
+
+    /* Get stable table index (volatile read, no lock needed) */
+    int stable_idx = ctrl->stable_idx;
+    if (stable_idx < 0 || stable_idx >= 3) {
+        return NULL;  /* Should never happen after bootstrap */
+    }
+
+    wbpxre_routing_table_t *stable_table = ctrl->tables[stable_idx];
+
+    /* Increment read counter (statistics) */
+    __atomic_fetch_add(&ctrl->stable_reads[stable_idx], 1, __ATOMIC_RELAXED);
+
+    return stable_table;
+}
+
+/**
+ * Check if bootstrap is complete
+ *
+ * @param ctrl  Triple routing controller
+ * @return true if stable table available, false otherwise
+ */
+bool triple_routing_is_bootstrapped(triple_routing_controller_t *ctrl) {
+    if (!ctrl) {
+        return false;
+    }
+    return __atomic_load_n(&ctrl->bootstrap_complete, __ATOMIC_ACQUIRE);
+}
+
+/**
+ * Update node metadata (called when node responds to query)
+ *
+ * Updates node in STABLE table (if exists).
+ * Does NOT update FILLING table (separation of concerns).
+ *
+ * @param ctrl      Triple routing controller
+ * @param node_id   Node ID to update
+ * @return 0 on success, -1 if not found
+ */
+int triple_routing_update_node_responded(
+    triple_routing_controller_t *ctrl,
+    const uint8_t *node_id
+) {
+    if (!ctrl || !node_id) {
+        return -1;
+    }
+
+    /* Only update STABLE table (if available) */
+    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(ctrl);
+    if (!stable_table) {
+        return -1;  /* Bootstrap incomplete */
+    }
+
+    wbpxre_routing_table_update_node_responded(stable_table, node_id);
+    return 0;
+}
+
+/**
+ * Update node query metadata (called when we send query to node)
+ *
+ * @param ctrl      Triple routing controller
+ * @param node_id   Node ID to update
+ * @return 0 on success, -1 if not found
+ */
+int triple_routing_update_node_queried(
+    triple_routing_controller_t *ctrl,
+    const uint8_t *node_id
+) {
+    if (!ctrl || !node_id) {
+        return -1;
+    }
+
+    /* Only update STABLE table */
+    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(ctrl);
+    if (!stable_table) {
+        return -1;
+    }
+
+    wbpxre_routing_table_update_node_queried(stable_table, node_id);
+    return 0;
+}
+
+/**
+ * Update sample_infohashes metadata for node
+ *
+ * @param ctrl              Triple routing controller
+ * @param node_id           Node ID to update
+ * @param sampled_num       Number of infohashes in this sample
+ * @param total_num         Total infohashes node has
+ * @param next_sample_time  When to query again
+ * @return 0 on success, -1 if not found
+ */
+int triple_routing_update_sample_response(
+    triple_routing_controller_t *ctrl,
+    const uint8_t *node_id,
+    uint32_t sampled_num,
+    uint64_t total_num,
+    time_t next_sample_time
+) {
+    if (!ctrl || !node_id) {
+        return -1;
+    }
+
+    /* Only update STABLE table */
+    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(ctrl);
+    if (!stable_table) {
+        return -1;
+    }
+
+    wbpxre_routing_table_update_sample_response(
+        stable_table, node_id, sampled_num, total_num, next_sample_time
+    );
+    return 0;
+}
+
+/**
+ * Get statistics
+ *
+ * @param ctrl   Triple routing controller
+ * @param stats  Output statistics structure
+ */
+void triple_routing_get_stats(
+    triple_routing_controller_t *ctrl,
+    triple_routing_stats_t *stats
+) {
+    if (!ctrl || !stats) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctrl->rotation_lock);
+
+    stats->bootstrap_complete = __atomic_load_n(&ctrl->bootstrap_complete, __ATOMIC_ACQUIRE);
+    stats->bootstrap_duration_sec = 0;
+    if (stats->bootstrap_complete) {
+        stats->bootstrap_duration_sec = (uint32_t)difftime(
+            ctrl->first_rotation_time, ctrl->bootstrap_start_time
+        );
+    }
+
+    stats->total_rotations = ctrl->rotation_count;
+    stats->stable_idx = ctrl->stable_idx;
+    stats->filling_idx = ctrl->filling_idx;
+    stats->rotation_threshold = ctrl->rotation_threshold;
+
+    /* Table node counts */
+    if (ctrl->stable_idx >= 0) {
+        stats->stable_table_nodes = wbpxre_routing_table_count(ctrl->tables[ctrl->stable_idx]);
+    } else {
+        stats->stable_table_nodes = 0;
+    }
+    stats->filling_table_nodes = wbpxre_routing_table_count(ctrl->tables[ctrl->filling_idx]);
+
+    /* Fill progress percentage */
+    stats->fill_progress_pct = 0.0;
+    if (ctrl->rotation_threshold > 0) {
+        stats->fill_progress_pct = (double)stats->filling_table_nodes / ctrl->rotation_threshold * 100.0;
+    }
+
+    /* Copy detailed stats */
+    stats->total_nodes_cleared = ctrl->total_nodes_cleared;
+    stats->clearing_operations = ctrl->clearing_operations;
+    stats->last_rotation_time = ctrl->last_rotation_time;
+    memcpy(stats->nodes_at_rotation, ctrl->nodes_at_rotation, sizeof(ctrl->nodes_at_rotation));
+    memcpy(stats->rotation_duration_ms, ctrl->rotation_duration_ms, sizeof(ctrl->rotation_duration_ms));
+    memcpy(stats->stable_reads, ctrl->stable_reads, sizeof(ctrl->stable_reads));
+
+    /* Table states */
+    for (int i = 0; i < 3; i++) {
+        stats->table_states[i] = ctrl->states[i];
+        stats->table_node_counts[i] = wbpxre_routing_table_count(ctrl->tables[i]);
+    }
+
+    pthread_mutex_unlock(&ctrl->rotation_lock);
+}
+
+/**
+ * Destroy triple routing controller
+ *
+ * @param ctrl  Triple routing controller to free
+ */
+void triple_routing_controller_destroy(triple_routing_controller_t *ctrl) {
+    if (!ctrl) {
+        return;
+    }
+
+    log_msg(LOG_INFO, "Destroying triple routing controller (rotations=%llu, cleared=%llu nodes)",
+            (unsigned long long)ctrl->rotation_count, (unsigned long long)ctrl->total_nodes_cleared);
+
+    /* Free all three tables */
+    for (int i = 0; i < 3; i++) {
+        if (ctrl->tables[i]) {
+            wbpxre_routing_table_destroy(ctrl->tables[i]);
+        }
+    }
+
+    pthread_mutex_destroy(&ctrl->rotation_lock);
+    free(ctrl);
 }

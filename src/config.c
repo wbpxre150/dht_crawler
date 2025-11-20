@@ -77,10 +77,8 @@ void config_init_defaults(crawler_config_t *config) {
     config->peer_retry_cleanup_interval_sec = 10;
     config->peer_retry_max_entries = 50000;
 
-    /* Dual routing table defaults */
-    config->dual_routing_fill_threshold = 0.80;     /* Start filling secondary at 80% */
-    config->dual_routing_switch_threshold = 0.20;   /* Switch when secondary reaches 20% */
-    config->dual_routing_check_interval_sec = 5;    /* Check every 5 seconds */
+    /* Triple routing table defaults */
+    config->triple_routing_threshold = 1500;        /* Rotate when filling table reaches this count */
 
     /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
@@ -249,20 +247,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->peer_retry_max_entries = atoi(value);
             if (config->peer_retry_max_entries < 1000) config->peer_retry_max_entries = 1000;
         }
-        /* Dual routing table settings */
-        else if (strcmp(key, "dual_routing_fill_threshold") == 0) {
-            config->dual_routing_fill_threshold = atof(value);
-            /* Clamp to valid range [0.0, 1.0] */
-            if (config->dual_routing_fill_threshold < 0.0) config->dual_routing_fill_threshold = 0.0;
-            if (config->dual_routing_fill_threshold > 1.0) config->dual_routing_fill_threshold = 1.0;
-        } else if (strcmp(key, "dual_routing_switch_threshold") == 0) {
-            config->dual_routing_switch_threshold = atof(value);
-            /* Clamp to valid range [0.0, 1.0] */
-            if (config->dual_routing_switch_threshold < 0.0) config->dual_routing_switch_threshold = 0.0;
-            if (config->dual_routing_switch_threshold > 1.0) config->dual_routing_switch_threshold = 1.0;
-        } else if (strcmp(key, "dual_routing_check_interval_sec") == 0) {
-            config->dual_routing_check_interval_sec = atoi(value);
-            if (config->dual_routing_check_interval_sec < 1) config->dual_routing_check_interval_sec = 1;
+        /* Triple routing table settings */
+        else if (strcmp(key, "triple_routing_threshold") == 0) {
+            config->triple_routing_threshold = (uint32_t)atoi(value);
+            /* Minimum threshold of 100 nodes */
+            if (config->triple_routing_threshold < 100) config->triple_routing_threshold = 100;
         }
         /* Pornography content filter settings */
         else if (strcmp(key, "porn_filter_enabled") == 0) {

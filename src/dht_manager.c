@@ -1312,8 +1312,8 @@ static void dual_routing_timer_cb(uv_timer_t *handle) {
         return;
     }
 
-    /* Check if it's time to rotate routing tables */
-    dual_routing_check_rotation(mgr->dht->routing_controller);
+    /* Triple routing rotates automatically on insert - no periodic check needed */
+    (void)mgr;  /* Suppress unused parameter warning */
 }
 
 /* Print DHT statistics */
@@ -1363,9 +1363,9 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             pthread_rwlock_unlock(&mgr->dht->node_id_lock);
 
             int close_nodes = 0, distant_nodes = 0;
-            wbpxre_routing_table_t *active_table = dual_routing_get_active(mgr->dht->routing_controller);
-            if (active_table) {
-                wbpxre_routing_table_get_keyspace_distribution(active_table,
+            wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(mgr->dht->routing_controller);
+            if (stable_table) {
+                wbpxre_routing_table_get_keyspace_distribution(stable_table,
                                                                  current_node_id,
                                                                  &close_nodes,
                                                                  &distant_nodes);
@@ -1378,17 +1378,30 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                         distant_nodes, (distant_nodes * 100.0) / total_nodes);
             }
 
-            /* Get and print dual routing table statistics */
-            dual_routing_stats_t dual_stats;
-            dual_routing_get_stats(mgr->dht->routing_controller, &dual_stats);
+            /* Get and print triple routing table statistics */
+            triple_routing_stats_t triple_stats;
+            triple_routing_get_stats(mgr->dht->routing_controller, &triple_stats);
 
             /* Update mgr stats for HTTP API */
-            mgr->stats.dual_routing_rotations = dual_stats.total_rotations;
-            mgr->stats.dual_routing_nodes_cleared = dual_stats.total_nodes_cleared;
+            mgr->stats.dual_routing_rotations = triple_stats.total_rotations;
+            mgr->stats.dual_routing_nodes_cleared = triple_stats.total_nodes_cleared;
 
-            log_msg(LOG_INFO, "  Dual routing: rotations=%llu nodes_cleared=%llu",
-                    (unsigned long long)dual_stats.total_rotations,
-                    (unsigned long long)dual_stats.total_nodes_cleared);
+            if (!triple_stats.bootstrap_complete) {
+                log_msg(LOG_INFO, "  Triple routing: BOOTSTRAP IN PROGRESS (%.1f%% to first rotation)",
+                        triple_stats.fill_progress_pct);
+                log_msg(LOG_INFO, "    Filling table: table_%d (%u / %u nodes)",
+                        triple_stats.filling_idx, triple_stats.filling_table_nodes,
+                        triple_stats.rotation_threshold);
+            } else {
+                log_msg(LOG_INFO, "  Triple routing: rotations=%llu nodes_cleared=%llu bootstrap_time=%us",
+                        (unsigned long long)triple_stats.total_rotations,
+                        (unsigned long long)triple_stats.total_nodes_cleared,
+                        triple_stats.bootstrap_duration_sec);
+                log_msg(LOG_INFO, "    Stable table: table_%d (%u nodes) | Filling table: table_%d (%u nodes, %.1f%% full)",
+                        triple_stats.stable_idx, triple_stats.stable_table_nodes,
+                        triple_stats.filling_idx, triple_stats.filling_table_nodes,
+                        triple_stats.fill_progress_pct);
+            }
         }
     }
 
