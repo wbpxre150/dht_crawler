@@ -1474,11 +1474,13 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl);
  *
  * @param max_nodes_per_table  Maximum nodes in each table
  * @param rotation_threshold   Node count to trigger rotation (e.g., 1000-2000)
+ * @param rotation_time_sec    Minimum time between rotations in seconds (e.g., 60-600)
  * @return Allocated controller, or NULL on error
  */
 triple_routing_controller_t* triple_routing_controller_create(
     int max_nodes_per_table,
-    uint32_t rotation_threshold
+    uint32_t rotation_threshold,
+    int rotation_time_sec
 ) {
     triple_routing_controller_t *ctrl = calloc(1, sizeof(*ctrl));
     if (!ctrl) {
@@ -1517,6 +1519,7 @@ triple_routing_controller_t* triple_routing_controller_create(
     /* Configuration */
     ctrl->rotation_threshold = rotation_threshold;
     ctrl->max_nodes_per_table = max_nodes_per_table;
+    ctrl->rotation_time_sec = rotation_time_sec;
 
     /* Bootstrap tracking */
     __atomic_store_n(&ctrl->bootstrap_complete, false, __ATOMIC_RELAXED);
@@ -1537,11 +1540,29 @@ triple_routing_controller_t* triple_routing_controller_create(
     memset(ctrl->stable_reads, 0, sizeof(ctrl->stable_reads));
     __atomic_store_n(&ctrl->clearing_operations, 0, __ATOMIC_RELAXED);
 
+    /* Initialize DHT context to NULL (will be set later) */
+    ctrl->dht_context = NULL;
+
     log_msg(LOG_DEBUG, "Triple routing controller initialized: %d tables × %d max nodes, threshold=%u",
             3, max_nodes_per_table, rotation_threshold);
     log_msg(LOG_DEBUG, "Bootstrap in progress: stable table will be available after first rotation");
 
     return ctrl;
+}
+
+/**
+ * Set DHT context for queue clearing during rotation
+ *
+ * @param ctrl         Triple routing controller
+ * @param dht_context  DHT context (wbpxre_dht_t*)
+ */
+void triple_routing_set_dht_context(
+    triple_routing_controller_t *ctrl,
+    void *dht_context
+) {
+    if (ctrl) {
+        ctrl->dht_context = dht_context;
+    }
 }
 
 /**
@@ -1614,15 +1635,17 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         return;
     }
 
-    /* Rate limit: enforce minimum 10 seconds between rotations
+    /* Rate limit: enforce minimum time between rotations (configurable)
      * This prevents thrashing when tables fill rapidly after bootstrap
-     * (Once routing table is full, find_node queries return nodes much faster) */
+     * (Once routing table is full, find_node queries return nodes much faster)
+     * Also serves as node ID rotation interval for keyspace coverage */
     time_t now = time(NULL);
     if (ctrl->last_rotation_time > 0) {
         double seconds_since_last = difftime(now, ctrl->last_rotation_time);
-        if (seconds_since_last < 10.0) {
-            log_msg(LOG_DEBUG, "Rotation deferred: only %.1fs since last rotation (minimum 10s required)",
-                    seconds_since_last);
+        double min_rotation_time = (double)ctrl->rotation_time_sec;
+        if (seconds_since_last < min_rotation_time) {
+            log_msg(LOG_DEBUG, "Rotation deferred: only %.1fs since last rotation (minimum %.0fs required)",
+                    seconds_since_last, min_rotation_time);
             pthread_mutex_unlock(&ctrl->rotation_lock);
             return;
         }
@@ -1701,6 +1724,22 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
     ctrl->stable_idx = new_stable_idx;
     ctrl->rotation_count++;
     ctrl->last_rotation_time = time(NULL);
+
+    /* === CLEAR STALE QUEUES FOR NODE ID SYNCHRONIZATION === */
+    /* Clear sample_infohashes queue to prevent workers from using old node IDs
+     * This ensures sample_infohashes and get_peers workers always use the
+     * STABLE table's node ID for reliable DHT connections */
+    if (ctrl->dht_context) {
+        wbpxre_dht_t *dht = (wbpxre_dht_t *)ctrl->dht_context;
+
+        /* Clear sample_infohashes queue */
+        int sample_cleared = wbpxre_dht_clear_sample_queue(dht);
+        if (sample_cleared > 0) {
+            log_msg(LOG_DEBUG, "  Cleared %d stale entries from sample_infohashes queue", sample_cleared);
+        }
+
+        /* Note: Peer retry tracker clearing is handled in DHT manager layer via rotation detection */
+    }
 
     /* Find table that's been IDLE and needs clearing (if any)
      * Only clear tables that have been IDLE for at least one full rotation.

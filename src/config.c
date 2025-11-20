@@ -72,6 +72,7 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Triple routing table defaults */
     config->triple_routing_threshold = 1500;        /* Rotate when filling table reaches this count */
+    config->triple_routing_rotation_time = 60;      /* Minimum time between rotations (seconds) */
 
     /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
@@ -233,6 +234,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->triple_routing_threshold = (uint32_t)atoi(value);
             /* Minimum threshold of 100 nodes */
             if (config->triple_routing_threshold < 100) config->triple_routing_threshold = 100;
+        }
+        else if (strcmp(key, "triple_routing_rotation_time") == 0) {
+            config->triple_routing_rotation_time = atoi(value);
+            /* Minimum rotation time of 10 seconds */
+            if (config->triple_routing_rotation_time < 10) config->triple_routing_rotation_time = 10;
         }
         /* Pornography content filter settings */
         else if (strcmp(key, "porn_filter_enabled") == 0) {

@@ -535,16 +535,22 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
     uint32_t rotation_threshold = config->triple_routing_threshold > 0 ?
         config->triple_routing_threshold : 1500;
 
+    int rotation_time_sec = config->triple_routing_rotation_time > 0 ?
+        config->triple_routing_rotation_time : 60;
+
     /* Set max_nodes_per_table to threshold (table rotates when it hits threshold)
      * No need for excess capacity since we rotate at threshold */
     int max_nodes_per_table = rotation_threshold;
 
-    dht->routing_controller = triple_routing_controller_create(max_nodes_per_table, rotation_threshold);
+    dht->routing_controller = triple_routing_controller_create(max_nodes_per_table, rotation_threshold, rotation_time_sec);
     if (!dht->routing_controller) {
         close(dht->udp_socket);
         free(dht);
         return NULL;
     }
+
+    /* Set DHT context for queue clearing during rotation */
+    triple_routing_set_dht_context(dht->routing_controller, dht);
 
     /* Initialize mutexes and locks */
     pthread_mutex_init(&dht->pending_queries_mutex, NULL);
@@ -1293,6 +1299,27 @@ int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool pri
     }
 
     return 0;
+}
+
+/* Clear sample_infohashes queue (used during rotation to prevent stale queries)
+ * Returns number of items cleared
+ */
+int wbpxre_dht_clear_sample_queue(wbpxre_dht_t *dht) {
+    if (!dht || !dht->nodes_for_sample_infohashes) {
+        return 0;
+    }
+
+    /* Count items before clearing (for logging) */
+    int cleared = 0;
+
+    pthread_mutex_lock(&dht->nodes_for_sample_infohashes->mutex);
+    cleared = dht->nodes_for_sample_infohashes->size;
+    pthread_mutex_unlock(&dht->nodes_for_sample_infohashes->mutex);
+
+    /* Clear the queue */
+    wbpxre_queue_clear(dht->nodes_for_sample_infohashes);
+
+    return cleared;
 }
 
 int wbpxre_dht_nodes(wbpxre_dht_t *dht, int *good_return, int *dubious_return) {

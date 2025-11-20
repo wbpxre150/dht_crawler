@@ -550,6 +550,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.query_timeout = cfg->wbpxre_query_timeout;
         dht_config.max_routing_table_nodes = cfg->max_routing_table_nodes;
         dht_config.triple_routing_threshold = cfg->triple_routing_threshold;
+        dht_config.triple_routing_rotation_time = cfg->triple_routing_rotation_time;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -559,6 +560,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.query_timeout = 5;
         dht_config.max_routing_table_nodes = 10000;
         dht_config.triple_routing_threshold = 1500;
+        dht_config.triple_routing_rotation_time = 60;
     }
 
     /* Callback setup */
@@ -586,6 +588,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     log_msg(LOG_DEBUG, "  - Get peers workers: %d", dht_config.get_peers_workers);
     log_msg(LOG_DEBUG, "  - Query timeout: %d seconds", dht_config.query_timeout);
     log_msg(LOG_DEBUG, "  - Triple routing threshold: %u", dht_config.triple_routing_threshold);
+    log_msg(LOG_DEBUG, "  - Triple routing rotation time: %d seconds", dht_config.triple_routing_rotation_time);
 
     /* Start wbpxre-dht (spawns worker threads) */
     int rc = wbpxre_dht_start(mgr->dht);
@@ -990,8 +993,35 @@ static void dual_routing_timer_cb(uv_timer_t *handle) {
         return;
     }
 
-    /* Triple routing rotates automatically on insert - no periodic check needed */
-    (void)mgr;  /* Suppress unused parameter warning */
+    /* Triple routing rotates automatically on insert - but we need to detect
+     * rotations to clear peer retry tracker and synchronize queues */
+
+    /* Track last known rotation count */
+    static uint64_t last_rotation_count = 0;
+
+    /* Get current rotation count */
+    triple_routing_stats_t stats;
+    triple_routing_get_stats(mgr->dht->routing_controller, &stats);
+
+    /* Check if rotation occurred */
+    if (stats.total_rotations > last_rotation_count) {
+        log_msg(LOG_DEBUG, "DHT Manager: Detected rotation %llu -> %llu",
+                (unsigned long long)last_rotation_count,
+                (unsigned long long)stats.total_rotations);
+
+        /* Clear peer retry tracker to remove stale entries from old keyspace */
+        if (mgr->peer_retry_tracker) {
+            int cleared = peer_retry_tracker_clear_all(mgr->peer_retry_tracker);
+            if (cleared > 0) {
+                log_msg(LOG_DEBUG, "  Cleared %d active peer retry entries from old keyspace", cleared);
+                mgr->stats.peer_retry_entries_cleared += cleared;
+            }
+        }
+
+        /* Update last known rotation count */
+        last_rotation_count = stats.total_rotations;
+        mgr->stats.total_rotation_clears++;
+    }
 }
 
 /* Print DHT statistics */
@@ -1095,6 +1125,13 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
     /* Print retry statistics */
     if (mgr->peer_retry_tracker) {
         peer_retry_print_stats(mgr->peer_retry_tracker);
+
+        /* Print rotation synchronization statistics */
+        if (mgr->stats.total_rotation_clears > 0) {
+            log_msg(LOG_INFO, "    Rotation clears: total=%llu entries_cleared=%llu",
+                    (unsigned long long)mgr->stats.total_rotation_clears,
+                    (unsigned long long)mgr->stats.peer_retry_entries_cleared);
+        }
     }
 
     /* Print metadata fetcher statistics */

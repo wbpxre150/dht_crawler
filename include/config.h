@@ -64,6 +64,7 @@ typedef struct {
 
     /* Triple routing table settings */
     uint32_t triple_routing_threshold;    /* Node count to trigger rotation (default: 1500) */
+    int triple_routing_rotation_time;     /* Minimum time between rotations in seconds (default: 60) */
 
     /* Pornography content filter settings */
     int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */

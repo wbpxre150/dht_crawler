@@ -107,6 +107,11 @@ int peer_retry_get_ready_entries(peer_retry_tracker_t *tracker,
                                   uint8_t (*info_hashes)[20],
                                   int max_count);
 
+/* Clear all active retry entries (used during node ID rotation)
+ * Returns number of entries cleared
+ */
+int peer_retry_tracker_clear_all(peer_retry_tracker_t *tracker);
+
 /* Print statistics */
 void peer_retry_print_stats(peer_retry_tracker_t *tracker);
 

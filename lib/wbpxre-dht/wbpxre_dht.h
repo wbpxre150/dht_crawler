@@ -282,6 +282,7 @@ typedef struct {
     /* Rotation configuration */
     uint32_t rotation_threshold;  /* Node count to trigger rotation */
     int max_nodes_per_table;      /* Capacity per table */
+    int rotation_time_sec;        /* Minimum time between rotations (seconds) */
 
     /* Bootstrap tracking */
     _Atomic bool bootstrap_complete;  /* True after first rotation */
@@ -290,6 +291,9 @@ typedef struct {
 
     /* Per-table node IDs (one for each routing table) */
     uint8_t table_node_ids[3][WBPXRE_NODE_ID_LEN];
+
+    /* DHT context for queue clearing during rotation */
+    void *dht_context;  /* wbpxre_dht_t* (void* to avoid circular dependency) */
 
     /* Synchronization */
     pthread_mutex_t rotation_lock;  /* Protects state transitions */
@@ -419,6 +423,7 @@ typedef struct {
     /* Routing table configuration */
     int max_routing_table_nodes;     /* Maximum nodes in routing table (default: 90000) */
     uint32_t triple_routing_threshold;  /* Rotation threshold (default: 1500) */
+    int triple_routing_rotation_time;   /* Minimum time between rotations in seconds (default: 60) */
 
     /* Callbacks */
     wbpxre_callback_t callback;
@@ -543,6 +548,11 @@ int wbpxre_dht_get_stats(wbpxre_dht_t *dht, wbpxre_stats_t *stats_out);
 
 /* Print statistics */
 void wbpxre_dht_print_stats(wbpxre_dht_t *dht);
+
+/* Clear sample_infohashes queue (used during rotation to prevent stale queries)
+ * Returns number of items cleared
+ */
+int wbpxre_dht_clear_sample_queue(wbpxre_dht_t *dht);
 
 /* ============================================================================
  * Protocol Functions (implemented in wbpxre_protocol.c)
@@ -753,7 +763,8 @@ int dual_routing_get_total_nodes(dual_routing_controller_t *controller);
 /* Create triple routing controller */
 triple_routing_controller_t *triple_routing_controller_create(
     int max_nodes_per_table,
-    uint32_t rotation_threshold
+    uint32_t rotation_threshold,
+    int rotation_time_sec
 );
 
 /* Destroy triple routing controller */
@@ -816,6 +827,12 @@ const uint8_t* triple_routing_get_stable_node_id(
 /* Get node ID for filling table (used by find_node workers) */
 const uint8_t* triple_routing_get_filling_node_id(
     triple_routing_controller_t *ctrl
+);
+
+/* Set DHT context for queue clearing during rotation */
+void triple_routing_set_dht_context(
+    triple_routing_controller_t *ctrl,
+    void *dht_context
 );
 
 /* ============================================================================

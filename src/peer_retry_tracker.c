@@ -396,6 +396,41 @@ void peer_retry_print_stats(peer_retry_tracker_t *tracker) {
     pthread_mutex_unlock(&tracker->mutex);
 }
 
+/* Clear all active retry entries (used during node ID rotation)
+ * Returns number of entries cleared
+ */
+int peer_retry_tracker_clear_all(peer_retry_tracker_t *tracker) {
+    if (!tracker) {
+        return 0;
+    }
+
+    int cleared = 0;
+
+    pthread_mutex_lock(&tracker->mutex);
+
+    /* Clear all hash table buckets */
+    for (size_t i = 0; i < tracker->bucket_count; i++) {
+        tracker->buckets[i] = NULL;
+    }
+
+    /* Invalidate all entries in circular buffer */
+    for (size_t i = 0; i < tracker->max_entries; i++) {
+        if (tracker->entries[i].valid) {
+            tracker->entries[i].valid = 0;
+            tracker->entries[i].hash_next = NULL;
+            cleared++;
+        }
+    }
+
+    /* Reset counters */
+    tracker->current_count = 0;
+    tracker->write_pos = 0;
+
+    pthread_mutex_unlock(&tracker->mutex);
+
+    return cleared;
+}
+
 /* Cleanup and free tracker */
 void peer_retry_tracker_cleanup(peer_retry_tracker_t *tracker) {
     if (!tracker) {

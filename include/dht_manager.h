@@ -61,6 +61,9 @@ typedef struct {
     /* Dual routing table statistics */
     uint64_t dual_routing_rotations;     /* Total dual routing table rotations */
     uint64_t dual_routing_nodes_cleared; /* Total nodes cleared during rotations */
+    /* Queue clearing statistics (for rotation synchronization) */
+    uint64_t peer_retry_entries_cleared; /* Peer retry entries cleared on rotation */
+    uint64_t total_rotation_clears;      /* Total rotation clear events */
 } dht_stats_t;
 
 /* DHT configuration */
