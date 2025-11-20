@@ -28,9 +28,16 @@ LIB_OBJS = $(BUILD_DIR)/wbpxre_dht.o \
 # Target executable
 TARGET = dht_crawler
 
-.PHONY: all clean dirs install-deps libbloom
+.PHONY: all clean dirs install-deps libbloom patch-bencode
 
-all: dirs libbloom $(TARGET)
+all: dirs patch-bencode libbloom $(TARGET)
+
+# Apply patches to submodules
+patch-bencode:
+	@if ! grep -q "ctx->cap = newcap" $(LIB_DIR)/bencode-c/bencode.c 2>/dev/null; then \
+		echo "Applying bencode-c patch..."; \
+		patch -p1 -d . < patches/bencode-cap-fix.patch || true; \
+	fi
 
 dirs:
 	@mkdir -p $(BUILD_DIR)

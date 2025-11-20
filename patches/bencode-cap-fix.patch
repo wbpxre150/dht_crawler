@@ -1,0 +1,10 @@
+--- a/lib/bencode-c/bencode.c
++++ b/lib/bencode-c/bencode.c
+@@ -67,6 +67,7 @@ bencode_push(struct bencode *ctx)
+         newstack = realloc(ctx->stack, bytes);
+         if (!newstack) return -1;
+         ctx->stack = newstack;
++        ctx->cap = newcap;
+     }
+     return ctx->size++;
+ }
