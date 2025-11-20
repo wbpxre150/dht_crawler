@@ -1522,7 +1522,7 @@ triple_routing_controller_t* triple_routing_controller_create(
     ctrl->rotation_time_sec = rotation_time_sec;
 
     /* Bootstrap tracking */
-    __atomic_store_n(&ctrl->bootstrap_complete, false, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctrl->bootstrap_complete, 0, __ATOMIC_RELAXED);
     ctrl->bootstrap_start_time = time(NULL);
     ctrl->first_rotation_time = 0;
 
@@ -1533,12 +1533,12 @@ triple_routing_controller_t* triple_routing_controller_create(
 
     /* Statistics */
     ctrl->rotation_count = 0;
-    __atomic_store_n(&ctrl->total_nodes_cleared, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctrl->total_nodes_cleared, 0ULL, __ATOMIC_RELAXED);
     ctrl->last_rotation_time = 0;
     memset(ctrl->nodes_at_rotation, 0, sizeof(ctrl->nodes_at_rotation));
     memset(ctrl->rotation_duration_ms, 0, sizeof(ctrl->rotation_duration_ms));
     memset(ctrl->stable_reads, 0, sizeof(ctrl->stable_reads));
-    __atomic_store_n(&ctrl->clearing_operations, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctrl->clearing_operations, 0ULL, __ATOMIC_RELAXED);
 
     /* Initialize DHT context to NULL (will be set later) */
     ctrl->dht_context = NULL;
@@ -1598,7 +1598,7 @@ int triple_routing_insert_node(
     if (node_count >= ctrl->rotation_threshold) {
         /* ATOMIC GUARD: Only ONE thread performs rotation at a time
          * Other threads continue inserting (filling table remains valid) */
-        rotation_progress_state_t expected = ROTATION_PROGRESS_IDLE;
+        int expected = ROTATION_PROGRESS_IDLE;
         if (__atomic_compare_exchange_n(&ctrl->rotation_in_progress,
                                         &expected, ROTATION_PROGRESS_IN_PROGRESS,
                                         false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -1772,8 +1772,8 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         clear_routing_table_internal(ctrl->tables[to_clear_idx]);
 
         /* Update statistics (no lock needed for these counters) */
-        __atomic_fetch_add(&ctrl->total_nodes_cleared, stale_nodes, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&ctrl->clearing_operations, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ctrl->total_nodes_cleared, (unsigned long long)stale_nodes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ctrl->clearing_operations, 1ULL, __ATOMIC_RELAXED);
 
         log_msg(LOG_DEBUG, "  Table %d: Background clearing complete", to_clear_idx);
     }
@@ -1783,7 +1783,7 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
 
     /* Mark bootstrap complete after first rotation */
     if (ctrl->rotation_count == 1) {
-        __atomic_store_n(&ctrl->bootstrap_complete, true, __ATOMIC_RELEASE);
+        __atomic_store_n(&ctrl->bootstrap_complete, 1, __ATOMIC_RELEASE);
         ctrl->first_rotation_time = ctrl->last_rotation_time;
         uint32_t bootstrap_duration = (uint32_t)difftime(ctrl->first_rotation_time, ctrl->bootstrap_start_time);
 

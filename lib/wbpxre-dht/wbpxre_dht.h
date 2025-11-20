@@ -285,7 +285,7 @@ typedef struct {
     int rotation_time_sec;        /* Minimum time between rotations (seconds) */
 
     /* Bootstrap tracking */
-    _Atomic bool bootstrap_complete;  /* True after first rotation */
+    _Atomic int bootstrap_complete;   /* 1 after first rotation, 0 otherwise */
     time_t bootstrap_start_time;      /* When bootstrap started */
     time_t first_rotation_time;       /* When first rotation completed */
 
@@ -297,17 +297,17 @@ typedef struct {
 
     /* Synchronization */
     pthread_mutex_t rotation_lock;  /* Protects state transitions */
-    _Atomic rotation_progress_state_t rotation_in_progress;  /* Guard flag to prevent concurrent rotations */
+    _Atomic int rotation_in_progress;  /* Guard flag: ROTATION_PROGRESS_IDLE=0, ROTATION_PROGRESS_IN_PROGRESS=1 */
     time_t rotation_start_time;     /* When current rotation started (for monitoring) */
 
     /* Statistics */
     uint64_t rotation_count;          /* Total rotations performed */
-    _Atomic uint64_t total_nodes_cleared;     /* Total nodes freed (atomic for background clearing) */
+    _Atomic unsigned long long total_nodes_cleared;     /* Total nodes freed (atomic for background clearing) */
     time_t last_rotation_time;        /* Timestamp of last rotation */
     uint32_t nodes_at_rotation[3];    /* Node count at each rotation */
     double rotation_duration_ms[3];   /* Fill time for each table */
     uint64_t stable_reads[3];         /* Reads from each table while STABLE */
-    _Atomic uint64_t clearing_operations;     /* Total clear operations (atomic for background clearing) */
+    _Atomic unsigned long long clearing_operations;     /* Total clear operations (atomic for background clearing) */
 } triple_routing_controller_t;
 
 /* Peer info */
