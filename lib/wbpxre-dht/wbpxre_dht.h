@@ -231,6 +231,12 @@ typedef enum {
     TABLE_STATE_CLEARING   /* Being cleared before transitioning to FILLING */
 } triple_table_state_t;
 
+/* Rotation progress state (atomic guard to prevent concurrent rotations) */
+typedef enum {
+    ROTATION_PROGRESS_IDLE = 0,        /* No rotation in progress */
+    ROTATION_PROGRESS_IN_PROGRESS = 1  /* Rotation currently happening */
+} rotation_progress_state_t;
+
 /* Statistics for triple routing */
 typedef struct {
     /* Bootstrap status */
@@ -282,17 +288,22 @@ typedef struct {
     time_t bootstrap_start_time;      /* When bootstrap started */
     time_t first_rotation_time;       /* When first rotation completed */
 
+    /* Per-table node IDs (one for each routing table) */
+    uint8_t table_node_ids[3][WBPXRE_NODE_ID_LEN];
+
     /* Synchronization */
     pthread_mutex_t rotation_lock;  /* Protects state transitions */
+    _Atomic rotation_progress_state_t rotation_in_progress;  /* Guard flag to prevent concurrent rotations */
+    time_t rotation_start_time;     /* When current rotation started (for monitoring) */
 
     /* Statistics */
     uint64_t rotation_count;          /* Total rotations performed */
-    uint64_t total_nodes_cleared;     /* Total nodes freed */
+    _Atomic uint64_t total_nodes_cleared;     /* Total nodes freed (atomic for background clearing) */
     time_t last_rotation_time;        /* Timestamp of last rotation */
     uint32_t nodes_at_rotation[3];    /* Node count at each rotation */
     double rotation_duration_ms[3];   /* Fill time for each table */
     uint64_t stable_reads[3];         /* Reads from each table while STABLE */
-    uint64_t clearing_operations;     /* Total clear operations */
+    _Atomic uint64_t clearing_operations;     /* Total clear operations (atomic for background clearing) */
 } triple_routing_controller_t;
 
 /* Peer info */
@@ -418,9 +429,6 @@ typedef struct {
 typedef struct {
     wbpxre_config_t config;
 
-    /* Node ID protection (for hot rotation) */
-    pthread_rwlock_t node_id_lock;
-
     /* Network */
     int udp_socket;
     struct sockaddr_in bind_addr;
@@ -505,7 +513,6 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht);
  * Side effects: All subsequent queries/responses use new ID
  *               Routing table is NOT reorganized (performance optimization)
  */
-int wbpxre_dht_change_node_id(wbpxre_dht_t *dht, const uint8_t *new_node_id);
 
 /* Bootstrap from known nodes */
 int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port);
@@ -543,15 +550,18 @@ void wbpxre_dht_print_stats(wbpxre_dht_t *dht);
 
 /* Send ping query */
 int wbpxre_protocol_ping(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
+                         const uint8_t *my_node_id,
                          uint8_t *node_id_out);
 
 /* Send find_node query */
 int wbpxre_protocol_find_node(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
+                              const uint8_t *my_node_id,
                               const uint8_t *target_id,
                               wbpxre_routing_node_t **nodes_out, int *count_out);
 
 /* Send get_peers query */
 int wbpxre_protocol_get_peers(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
+                              const uint8_t *my_node_id,
                               const uint8_t *info_hash,
                               wbpxre_peer_t **peers_out, int *peer_count,
                               wbpxre_routing_node_t **nodes_out, int *node_count,
@@ -560,6 +570,7 @@ int wbpxre_protocol_get_peers(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
 /* Send sample_infohashes query (BEP 51) */
 int wbpxre_protocol_sample_infohashes(wbpxre_dht_t *dht,
                                        const struct sockaddr_in *addr,
+                                       const uint8_t *my_node_id,
                                        const uint8_t *target_id,
                                        uint8_t **hashes_out, int *hash_count,
                                        int *total_num_out, int *interval_out);
@@ -760,6 +771,12 @@ wbpxre_routing_table_t *triple_routing_get_stable_table(
     triple_routing_controller_t *ctrl
 );
 
+/* Get filling table for reading (bootstrap fallback)
+ * Returns NULL if controller is invalid */
+wbpxre_routing_table_t *triple_routing_get_filling_table(
+    triple_routing_controller_t *ctrl
+);
+
 /* Check if bootstrap is complete */
 bool triple_routing_is_bootstrapped(triple_routing_controller_t *ctrl);
 
@@ -788,6 +805,17 @@ int triple_routing_update_sample_response(
 void triple_routing_get_stats(
     triple_routing_controller_t *ctrl,
     triple_routing_stats_t *stats
+);
+
+/* Get node ID for stable table (used by sample/get_peers workers)
+ * Returns NULL if bootstrap incomplete */
+const uint8_t* triple_routing_get_stable_node_id(
+    triple_routing_controller_t *ctrl
+);
+
+/* Get node ID for filling table (used by find_node workers) */
+const uint8_t* triple_routing_get_filling_node_id(
+    triple_routing_controller_t *ctrl
 );
 
 /* ============================================================================

@@ -62,13 +62,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->wbpxre_query_timeout = 5;
     config->max_routing_table_nodes = 10000;  /* Default: 10000 nodes */
 
-    /* Node ID rotation defaults */
-    config->node_rotation_enabled = 1;
-    config->node_rotation_interval_sec = 300;  /* 5 minutes */
-    config->node_rotation_drain_timeout_sec = 10;
-    config->rotation_phase_duration_sec = 30;  /* 30 seconds for ANNOUNCING and TRANSITIONING */
-    config->clear_sample_queue_on_rotation = 0;  /* Disabled by default - preserve queue */
-
     /* Peer discovery retry defaults */
     config->peer_retry_enabled = 1;
     config->peer_retry_max_attempts = 3;
@@ -218,18 +211,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->wbpxre_query_timeout = atoi(value);
         } else if (strcmp(key, "max_routing_table_nodes") == 0) {
             config->max_routing_table_nodes = atoi(value);
-        }
-        /* Node ID rotation settings */
-        else if (strcmp(key, "node_rotation_enabled") == 0) {
-            config->node_rotation_enabled = atoi(value);
-        } else if (strcmp(key, "node_rotation_interval_sec") == 0) {
-            config->node_rotation_interval_sec = atoi(value);
-        } else if (strcmp(key, "node_rotation_drain_timeout_sec") == 0) {
-            config->node_rotation_drain_timeout_sec = atoi(value);
-        } else if (strcmp(key, "rotation_phase_duration_sec") == 0) {
-            config->rotation_phase_duration_sec = atoi(value);
-        } else if (strcmp(key, "clear_sample_queue_on_rotation") == 0) {
-            config->clear_sample_queue_on_rotation = atoi(value);
         }
         /* Peer discovery retry settings */
         else if (strcmp(key, "peer_retry_enabled") == 0) {

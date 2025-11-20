@@ -56,10 +56,6 @@ typedef struct {
     uint64_t find_node_success;       /* find_node successful responses */
     uint64_t find_node_timeout;       /* find_node query timeouts */
     uint64_t nodes_in_jech_table;     /* Current nodes in jech/dht table */
-    /* Node ID rotation statistics */
-    uint64_t node_rotations_performed;   /* Total rotations performed */
-    uint64_t samples_per_rotation;       /* Average samples per rotation period */
-    time_t last_rotation_time;           /* Last rotation timestamp */
     /* Peer retry statistics */
     uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
     /* Dual routing table statistics */
@@ -90,13 +86,6 @@ typedef struct {
     pthread_cond_t cond;
 } close_tracker_t;
 
-/* Rotation state machine */
-typedef enum {
-    ROTATION_STATE_STABLE,          // Normal operation
-    ROTATION_STATE_ANNOUNCING,      // Telling network about new ID
-    ROTATION_STATE_TRANSITIONING    // Using new ID
-} rotation_state_t;
-
 /* DHT manager context */
 typedef struct {
     app_context_t *app_ctx;
@@ -119,18 +108,6 @@ typedef struct {
     discovered_nodes_queue_t discovered_nodes; /* Queue for discovered nodes */
     void *find_node_worker_pool;      /* Worker pool for find_node queries */
     uv_timer_t bootstrap_reseed_timer; /* Timer for bootstrap reseeding */
-    /* Node ID rotation state */
-    uv_timer_t node_rotation_timer;   /* Timer for periodic node ID rotation */
-    int node_rotation_enabled;        /* Is rotation enabled? */
-    int node_rotation_interval_sec;   /* Rotation interval in seconds */
-    int node_rotation_drain_timeout_sec; /* Drain timeout in seconds */
-    int rotation_phase_duration_sec;  /* Duration of ANNOUNCING and TRANSITIONING phases */
-    uint64_t samples_since_rotation;  /* Samples collected since last rotation */
-    void *crawler_config;             /* Pointer to crawler_config_t for rotation */
-    /* Hot rotation state */
-    rotation_state_t rotation_state;  /* Current rotation state */
-    uint8_t next_node_id[20];         /* Next node ID (during rotation) */
-    time_t rotation_phase_start;      /* When current phase started */
     /* Metadata fetcher reference for statistics */
     void *metadata_fetcher;           /* Pointer to metadata_fetcher_t */
     /* Refresh query tracking for HTTP API */
@@ -164,9 +141,6 @@ void dht_manager_set_metadata_fetcher(dht_manager_t *mgr, void *metadata_fetcher
  * priority: if true, query is processed immediately (for /refresh API)
  *           if false, query is queued normally (for automatic discovery) */
 int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash, bool priority);
-
-/* Node ID rotation functions */
-int dht_manager_rotate_node_id(dht_manager_t *mgr);
 
 /* wbpxre-dht callback wrapper */
 void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,

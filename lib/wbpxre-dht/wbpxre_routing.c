@@ -1506,6 +1506,14 @@ triple_routing_controller_t* triple_routing_controller_create(
     ctrl->stable_idx = -1;  /* No stable table until first rotation */
     ctrl->states[0] = TABLE_STATE_FILLING;
 
+    /* Generate initial node ID for table 0 (first FILLING table) */
+    wbpxre_random_bytes(ctrl->table_node_ids[0], WBPXRE_NODE_ID_LEN);
+    /* Tables 1 and 2 will get their IDs when they become FILLING */
+    memset(ctrl->table_node_ids[1], 0, WBPXRE_NODE_ID_LEN);
+    memset(ctrl->table_node_ids[2], 0, WBPXRE_NODE_ID_LEN);
+
+    log_msg(LOG_INFO, "Initial node ID generated for table 0");
+
     /* Configuration */
     ctrl->rotation_threshold = rotation_threshold;
     ctrl->max_nodes_per_table = max_nodes_per_table;
@@ -1517,15 +1525,17 @@ triple_routing_controller_t* triple_routing_controller_create(
 
     /* Synchronization */
     pthread_mutex_init(&ctrl->rotation_lock, NULL);
+    __atomic_store_n(&ctrl->rotation_in_progress, ROTATION_PROGRESS_IDLE, __ATOMIC_RELAXED);
+    ctrl->rotation_start_time = 0;
 
     /* Statistics */
     ctrl->rotation_count = 0;
-    ctrl->total_nodes_cleared = 0;
+    __atomic_store_n(&ctrl->total_nodes_cleared, 0, __ATOMIC_RELAXED);
     ctrl->last_rotation_time = 0;
     memset(ctrl->nodes_at_rotation, 0, sizeof(ctrl->nodes_at_rotation));
     memset(ctrl->rotation_duration_ms, 0, sizeof(ctrl->rotation_duration_ms));
     memset(ctrl->stable_reads, 0, sizeof(ctrl->stable_reads));
-    ctrl->clearing_operations = 0;
+    __atomic_store_n(&ctrl->clearing_operations, 0, __ATOMIC_RELAXED);
 
     log_msg(LOG_INFO, "Triple routing controller initialized: %d tables × %d max nodes, threshold=%u",
             3, max_nodes_per_table, rotation_threshold);
@@ -1565,8 +1575,19 @@ int triple_routing_insert_node(
     /* Check if rotation threshold reached */
     uint32_t node_count = wbpxre_routing_table_count(filling_table);
     if (node_count >= ctrl->rotation_threshold) {
-        /* Trigger rotation (internally checks threshold again under lock) */
-        triple_routing_try_rotate(ctrl);
+        /* ATOMIC GUARD: Only ONE thread performs rotation at a time
+         * Other threads continue inserting (filling table remains valid) */
+        rotation_progress_state_t expected = ROTATION_PROGRESS_IDLE;
+        if (__atomic_compare_exchange_n(&ctrl->rotation_in_progress,
+                                        &expected, ROTATION_PROGRESS_IN_PROGRESS,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            /* This thread won the race - perform rotation */
+            triple_routing_try_rotate(ctrl);
+
+            /* Release guard flag after rotation completes */
+            __atomic_store_n(&ctrl->rotation_in_progress, ROTATION_PROGRESS_IDLE, __ATOMIC_RELEASE);
+        }
+        /* Other threads: rotation already in progress, skip and continue inserting */
     }
 
     return 0;
@@ -1576,6 +1597,7 @@ int triple_routing_insert_node(
  * Attempt rotation if threshold reached
  *
  * Thread-safe: uses rotation_lock for state transitions.
+ * IMPORTANT: Assumes rotation_in_progress guard is held by caller.
  *
  * @param ctrl  Triple routing controller
  */
@@ -1592,7 +1614,23 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         return;
     }
 
+    /* Rate limit: enforce minimum 10 seconds between rotations
+     * This prevents thrashing when tables fill rapidly after bootstrap
+     * (Once routing table is full, find_node queries return nodes much faster) */
+    time_t now = time(NULL);
+    if (ctrl->last_rotation_time > 0) {
+        double seconds_since_last = difftime(now, ctrl->last_rotation_time);
+        if (seconds_since_last < 10.0) {
+            log_msg(LOG_DEBUG, "Rotation deferred: only %.1fs since last rotation (minimum 10s required)",
+                    seconds_since_last);
+            pthread_mutex_unlock(&ctrl->rotation_lock);
+            return;
+        }
+    }
+
+    /* Record rotation start time for monitoring */
     time_t rotation_start = time(NULL);
+    ctrl->rotation_start_time = rotation_start;
 
     log_msg(LOG_INFO, "=== ROTATION %llu: Table %d reached threshold (%u nodes) ===",
             (unsigned long long)ctrl->rotation_count, filling_idx, node_count);
@@ -1626,45 +1664,83 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
     ctrl->states[filling_idx] = TABLE_STATE_STABLE;
     int new_stable_idx = filling_idx;
 
-    /* Find next IDLE table for filling */
-    int next_filling_idx = (filling_idx + 1) % 3;
-    while (ctrl->states[next_filling_idx] != TABLE_STATE_IDLE) {
-        next_filling_idx = (next_filling_idx + 1) % 3;
-        /* Guaranteed to find one: we just set old stable to IDLE */
+    /* Find next IDLE table for filling
+     * In a 3-table rotation, after FILLING→STABLE and old STABLE→IDLE,
+     * the remaining table is our next FILLING target */
+    int next_filling_idx = -1;
+    for (int i = 0; i < 3; i++) {
+        if (i != new_stable_idx && i != ctrl->stable_idx) {
+            next_filling_idx = i;
+            break;
+        }
     }
 
-    /* Clear the IDLE table if it has stale nodes */
-    wbpxre_routing_table_t *next_filling_table = ctrl->tables[next_filling_idx];
-    uint32_t stale_nodes = wbpxre_routing_table_count(next_filling_table);
-    if (stale_nodes > 0) {
-        log_msg(LOG_INFO, "  Table %d: IDLE → CLEARING (%u stale nodes)",
-                next_filling_idx, stale_nodes);
-
-        ctrl->states[next_filling_idx] = TABLE_STATE_CLEARING;
-
-        /* Release lock during clear (blocking operation) */
+    if (next_filling_idx < 0) {
+        log_msg(LOG_ERROR, "Failed to find next filling table - rotation state corrupted!");
         pthread_mutex_unlock(&ctrl->rotation_lock);
-
-        /* Clear table (this is a synchronous blocking operation) */
-        clear_routing_table_internal(next_filling_table);
-        ctrl->total_nodes_cleared += stale_nodes;
-        ctrl->clearing_operations++;
-
-        log_msg(LOG_INFO, "  Table %d: CLEARING → FILLING (cleared %u nodes)",
-                next_filling_idx, stale_nodes);
-
-        /* Re-acquire lock for final state update */
-        pthread_mutex_lock(&ctrl->rotation_lock);
+        return;
     }
 
-    /* IDLE/CLEARED table → FILLING */
+    /* Generate NEW node ID for the next FILLING table
+     * This node ID will be used by find_node workers to populate this table */
+    wbpxre_random_bytes(ctrl->table_node_ids[next_filling_idx], WBPXRE_NODE_ID_LEN);
+
+    log_msg(LOG_INFO, "  Table %d: New node ID generated", next_filling_idx);
+
+    /* Set next table to FILLING state (it may have stale nodes, but DON'T clear yet!)
+     * KEY INSIGHT: A table must sit IDLE for one full rotation before being cleared.
+     * This ensures no threads are reading from it when we clear. */
     ctrl->states[next_filling_idx] = TABLE_STATE_FILLING;
+
+    log_msg(LOG_INFO, "  Table %d: FILLING (ready for inserts, may have %u existing nodes)",
+            next_filling_idx, wbpxre_routing_table_count(ctrl->tables[next_filling_idx]));
+
+    /* Update indices BEFORE releasing lock
+     * This ensures insert threads immediately start writing to the correct table. */
     ctrl->filling_idx = next_filling_idx;
     ctrl->stable_idx = new_stable_idx;
     ctrl->rotation_count++;
     ctrl->last_rotation_time = time(NULL);
 
-    log_msg(LOG_INFO, "  Table %d: FILLING (ready for inserts)", next_filling_idx);
+    /* Find table that's been IDLE and needs clearing (if any)
+     * Only clear tables that have been IDLE for at least one full rotation.
+     * During first rotation, no table needs clearing yet. */
+    int to_clear_idx = -1;
+    uint32_t stale_nodes = 0;
+
+    if (ctrl->rotation_count > 1) {
+        /* After first rotation, look for IDLE table with stale nodes */
+        for (int i = 0; i < 3; i++) {
+            if (ctrl->states[i] == TABLE_STATE_IDLE) {
+                uint32_t count = wbpxre_routing_table_count(ctrl->tables[i]);
+                if (count > 0) {
+                    to_clear_idx = i;
+                    stale_nodes = count;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Release lock before clearing (blocking operation) */
+    pthread_mutex_unlock(&ctrl->rotation_lock);
+
+    /* Clear stale table in background if needed */
+    if (to_clear_idx >= 0) {
+        log_msg(LOG_INFO, "  Table %d: Background clearing %u stale nodes (has been IDLE)",
+                to_clear_idx, stale_nodes);
+
+        clear_routing_table_internal(ctrl->tables[to_clear_idx]);
+
+        /* Update statistics (no lock needed for these counters) */
+        __atomic_fetch_add(&ctrl->total_nodes_cleared, stale_nodes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ctrl->clearing_operations, 1, __ATOMIC_RELAXED);
+
+        log_msg(LOG_INFO, "  Table %d: Background clearing complete", to_clear_idx);
+    }
+
+    /* Re-acquire lock for bootstrap check */
+    pthread_mutex_lock(&ctrl->rotation_lock);
 
     /* Mark bootstrap complete after first rotation */
     if (ctrl->rotation_count == 1) {
@@ -1678,6 +1754,13 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         log_msg(LOG_INFO, "║  Stable table available: %-6u nodes                        ║", node_count);
         log_msg(LOG_INFO, "║  sample_infohashes and DHT queries now operational         ║");
         log_msg(LOG_INFO, "╚════════════════════════════════════════════════════════════╝");
+    }
+
+    /* Monitor rotation duration (detect potential issues) */
+    time_t rotation_end = time(NULL);
+    double rotation_duration_sec = difftime(rotation_end, rotation_start);
+    if (rotation_duration_sec > 10.0) {
+        log_msg(LOG_WARN, "Rotation took %.1f seconds (longer than expected)", rotation_duration_sec);
     }
 
     log_msg(LOG_INFO, "=== ROTATION COMPLETE: STABLE=table_%d, FILLING=table_%d ===",
@@ -1721,6 +1804,32 @@ wbpxre_routing_table_t* triple_routing_get_stable_table(
     __atomic_fetch_add(&ctrl->stable_reads[stable_idx], 1, __ATOMIC_RELAXED);
 
     return stable_table;
+}
+
+/**
+ * Get filling table for reading (bootstrap fallback)
+ *
+ * During bootstrap, this allows feeders to read from FILLING table
+ * when STABLE table doesn't exist yet. This enables the initial
+ * query loop that populates FILLING to reach rotation threshold.
+ *
+ * @param ctrl  Triple routing controller
+ * @return      Filling table pointer, or NULL on error
+ */
+wbpxre_routing_table_t* triple_routing_get_filling_table(
+    triple_routing_controller_t *ctrl
+) {
+    if (!ctrl) {
+        return NULL;
+    }
+
+    /* Get filling table index (volatile read) */
+    int filling_idx = ctrl->filling_idx;
+    if (filling_idx < 0 || filling_idx >= 3) {
+        return NULL;  /* Invalid state */
+    }
+
+    return ctrl->tables[filling_idx];
 }
 
 /**
@@ -1865,9 +1974,9 @@ void triple_routing_get_stats(
         stats->fill_progress_pct = (double)stats->filling_table_nodes / ctrl->rotation_threshold * 100.0;
     }
 
-    /* Copy detailed stats */
-    stats->total_nodes_cleared = ctrl->total_nodes_cleared;
-    stats->clearing_operations = ctrl->clearing_operations;
+    /* Copy detailed stats (use atomic loads for background-updated fields) */
+    stats->total_nodes_cleared = __atomic_load_n(&ctrl->total_nodes_cleared, __ATOMIC_RELAXED);
+    stats->clearing_operations = __atomic_load_n(&ctrl->clearing_operations, __ATOMIC_RELAXED);
     stats->last_rotation_time = ctrl->last_rotation_time;
     memcpy(stats->nodes_at_rotation, ctrl->nodes_at_rotation, sizeof(ctrl->nodes_at_rotation));
     memcpy(stats->rotation_duration_ms, ctrl->rotation_duration_ms, sizeof(ctrl->rotation_duration_ms));
@@ -1880,6 +1989,67 @@ void triple_routing_get_stats(
     }
 
     pthread_mutex_unlock(&ctrl->rotation_lock);
+}
+
+/**
+ * Get node ID for stable table
+ *
+ * Used by sample_infohashes and get_peers workers to query DHT nodes.
+ * Returns the node ID that was active when the stable table was filled.
+ *
+ * @param ctrl  Triple routing controller
+ * @return Node ID for stable table, or NULL if bootstrap incomplete
+ */
+const uint8_t* triple_routing_get_stable_node_id(
+    triple_routing_controller_t *ctrl
+) {
+    if (!ctrl) {
+        return NULL;
+    }
+
+    /* Fast path: check if bootstrap complete (atomic read, no lock) */
+    if (!__atomic_load_n(&ctrl->bootstrap_complete, __ATOMIC_ACQUIRE)) {
+        /* Bootstrap not complete yet - fall back to filling table's node ID
+         * This allows early queries during bootstrap phase */
+        int filling_idx = ctrl->filling_idx;
+        if (filling_idx < 0 || filling_idx >= 3) {
+            return NULL;
+        }
+        return ctrl->table_node_ids[filling_idx];
+    }
+
+    /* Get stable table index (volatile read, no lock needed after bootstrap) */
+    int stable_idx = ctrl->stable_idx;
+    if (stable_idx < 0 || stable_idx >= 3) {
+        return NULL;  /* Should never happen after bootstrap */
+    }
+
+    return ctrl->table_node_ids[stable_idx];
+}
+
+/**
+ * Get node ID for filling table
+ *
+ * Used by find_node workers to query DHT nodes and populate the filling table.
+ * Returns the node ID that should be used when discovering nodes for this table.
+ *
+ * @param ctrl  Triple routing controller
+ * @return Node ID for filling table, or NULL on error
+ */
+const uint8_t* triple_routing_get_filling_node_id(
+    triple_routing_controller_t *ctrl
+) {
+    if (!ctrl) {
+        return NULL;
+    }
+
+    /* Get filling table index (volatile read) */
+    int filling_idx = ctrl->filling_idx;
+    if (filling_idx < 0 || filling_idx >= 3) {
+        return NULL;  /* Invalid state */
+    }
+
+    return ctrl->table_node_ids[filling_idx];
 }
 
 /**

@@ -54,13 +54,6 @@ typedef struct {
     int wbpxre_query_timeout;
     int max_routing_table_nodes;         /* Maximum nodes in routing table */
 
-    /* Node ID rotation settings */
-    int node_rotation_enabled;           /* Enable periodic node ID rotation */
-    int node_rotation_interval_sec;      /* Rotation interval in seconds */
-    int node_rotation_drain_timeout_sec; /* Time to wait for in-flight operations */
-    int rotation_phase_duration_sec;     /* Duration of ANNOUNCING and TRANSITIONING phases */
-    int clear_sample_queue_on_rotation;  /* Clear sample_infohashes queue after rotation */
-
     /* Peer discovery retry settings */
     int peer_retry_enabled;              /* Enable multi-retry peer discovery */
     int peer_retry_max_attempts;         /* Max get_peers retries (1-5, default: 3) */

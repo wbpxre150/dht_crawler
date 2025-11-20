@@ -489,6 +489,7 @@ static void free_response_message(wbpxre_message_t *response) {
 }
 
 int wbpxre_protocol_ping(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
+                         const uint8_t *my_node_id,
                          uint8_t *node_id_out) {
     /* Build ping message */
     wbpxre_message_t msg;
@@ -498,10 +499,8 @@ int wbpxre_protocol_ping(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
     msg.method = WBPXRE_METHOD_PING;
     wbpxre_random_bytes(msg.transaction_id, WBPXRE_TRANSACTION_ID_LEN);
 
-    /* Read node ID with lock protection */
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(msg.id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use provided node ID */
+    memcpy(msg.id, my_node_id, WBPXRE_NODE_ID_LEN);
 
     #ifdef DEBUG_PROTOCOL
     fprintf(stderr, "DEBUG: Sending ping to %s:%d (transaction_id=%02x%02x)\n",
@@ -546,6 +545,7 @@ int wbpxre_protocol_ping(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
 }
 
 int wbpxre_protocol_find_node(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
+                               const uint8_t *my_node_id,
                                const uint8_t *target_id,
                                wbpxre_routing_node_t **nodes_out, int *count_out) {
     /* Build find_node message */
@@ -556,10 +556,8 @@ int wbpxre_protocol_find_node(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
     msg.method = WBPXRE_METHOD_FIND_NODE;
     wbpxre_random_bytes(msg.transaction_id, WBPXRE_TRANSACTION_ID_LEN);
 
-    /* Read node ID with lock protection */
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(msg.id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use provided node ID */
+    memcpy(msg.id, my_node_id, WBPXRE_NODE_ID_LEN);
 
     memcpy(msg.target, target_id, WBPXRE_NODE_ID_LEN);
 
@@ -588,6 +586,7 @@ int wbpxre_protocol_find_node(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
 }
 
 int wbpxre_protocol_get_peers(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
+                               const uint8_t *my_node_id,
                                const uint8_t *info_hash,
                                wbpxre_peer_t **peers_out, int *peer_count,
                                wbpxre_routing_node_t **nodes_out, int *node_count,
@@ -600,10 +599,8 @@ int wbpxre_protocol_get_peers(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
     msg.method = WBPXRE_METHOD_GET_PEERS;
     wbpxre_random_bytes(msg.transaction_id, WBPXRE_TRANSACTION_ID_LEN);
 
-    /* Read node ID with lock protection */
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(msg.id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use provided node ID */
+    memcpy(msg.id, my_node_id, WBPXRE_NODE_ID_LEN);
 
     memcpy(msg.info_hash, info_hash, WBPXRE_INFO_HASH_LEN);
 
@@ -645,6 +642,7 @@ int wbpxre_protocol_get_peers(wbpxre_dht_t *dht, const struct sockaddr_in *addr,
 
 int wbpxre_protocol_sample_infohashes(wbpxre_dht_t *dht,
                                        const struct sockaddr_in *addr,
+                                       const uint8_t *my_node_id,
                                        const uint8_t *target_id,
                                        uint8_t **hashes_out, int *hash_count,
                                        int *total_num_out, int *interval_out) {
@@ -656,10 +654,8 @@ int wbpxre_protocol_sample_infohashes(wbpxre_dht_t *dht,
     msg.method = WBPXRE_METHOD_SAMPLE_INFOHASHES;
     wbpxre_random_bytes(msg.transaction_id, WBPXRE_TRANSACTION_ID_LEN);
 
-    /* Read node ID with lock protection */
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(msg.id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use provided node ID */
+    memcpy(msg.id, my_node_id, WBPXRE_NODE_ID_LEN);
 
     memcpy(msg.target, target_id, WBPXRE_NODE_ID_LEN);
 
@@ -794,11 +790,15 @@ static int encode_compact_nodes(wbpxre_routing_table_t *table, const uint8_t *ta
 /* Handle incoming ping query */
 void wbpxre_handle_ping(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                         const struct sockaddr_in *from) {
-    /* Read node ID with lock protection */
-    uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(local_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use stable table's node ID for responses */
+    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    if (!local_node_id) {
+        /* Bootstrap not complete - use filling table's node ID as fallback */
+        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    }
+    if (!local_node_id) {
+        return;  /* No valid node ID yet */
+    }
 
     /* Send ping response with our node ID */
     send_response(dht, from, query->transaction_id, local_node_id, NULL, 0);
@@ -813,11 +813,14 @@ void wbpxre_handle_find_node(wbpxre_dht_t *dht, const wbpxre_message_t *query,
     int nodes_len = stable_table ? encode_compact_nodes(stable_table, query->target,
                                          compact_nodes, sizeof(compact_nodes), 8) : 0;
 
-    /* Read node ID with lock protection */
-    uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(local_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use stable table's node ID for responses */
+    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    if (!local_node_id) {
+        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    }
+    if (!local_node_id) {
+        return;  /* No valid node ID yet */
+    }
 
     /* Send find_node response */
     send_response(dht, from, query->transaction_id, local_node_id,
@@ -833,11 +836,14 @@ void wbpxre_handle_get_peers(wbpxre_dht_t *dht, const wbpxre_message_t *query,
     int nodes_len = stable_table ? encode_compact_nodes(stable_table, query->info_hash,
                                          compact_nodes, sizeof(compact_nodes), 8) : 0;
 
-    /* Read node ID with lock protection */
-    uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(local_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use stable table's node ID for responses */
+    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    if (!local_node_id) {
+        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    }
+    if (!local_node_id) {
+        return;  /* No valid node ID yet */
+    }
 
     /* Send get_peers response with nodes */
     send_response(dht, from, query->transaction_id, local_node_id,
@@ -853,11 +859,14 @@ void wbpxre_handle_announce_peer(wbpxre_dht_t *dht, const wbpxre_message_t *quer
                            query->info_hash, NULL, 0);
     }
 
-    /* Read node ID with lock protection */
-    uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(local_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use stable table's node ID for responses */
+    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    if (!local_node_id) {
+        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    }
+    if (!local_node_id) {
+        return;  /* No valid node ID yet */
+    }
 
     /* Send acknowledge response */
     send_response(dht, from, query->transaction_id, local_node_id, NULL, 0);
@@ -881,11 +890,14 @@ void wbpxre_handle_incoming_query(wbpxre_dht_t *dht, wbpxre_message_t *query,
     /* For bootstrap to work, we mainly need to respond to ping and find_node */
     /* Since decoder doesn't extract method yet, respond generically */
 
-    /* Read node ID with lock protection */
-    uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(local_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use stable table's node ID for responses */
+    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    if (!local_node_id) {
+        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    }
+    if (!local_node_id) {
+        return;  /* No valid node ID yet */
+    }
 
     /* Always send a valid response to keep us in routing tables */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];

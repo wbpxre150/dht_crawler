@@ -458,9 +458,15 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
 
         memcpy(&addr, rp->ai_addr, sizeof(addr));
 
+        /* Get FILLING table's node ID for bootstrap queries */
+        const uint8_t *filling_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        if (!filling_node_id) {
+            continue;  /* No valid node ID yet, try next address */
+        }
+
         /* Send ping to bootstrap node */
         uint8_t node_id[WBPXRE_NODE_ID_LEN];
-        if (wbpxre_protocol_ping(dht, &addr, node_id) == 0) {
+        if (wbpxre_protocol_ping(dht, &addr, filling_node_id, node_id) == 0) {
             /* Insert into routing table */
             wbpxre_routing_node_t node;
             memset(&node, 0, sizeof(node));
@@ -473,16 +479,11 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
 
             triple_routing_insert_node(dht->routing_controller, &node);
 
-            /* Read node ID with lock protection */
-            uint8_t local_node_id[WBPXRE_NODE_ID_LEN];
-            pthread_rwlock_rdlock(&dht->node_id_lock);
-            memcpy(local_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-            pthread_rwlock_unlock(&dht->node_id_lock);
-
-            /* Follow up with find_node to discover more nodes */
+            /* Follow up with find_node to discover more nodes
+             * Use filling table's node ID as the target (self-lookup) */
             wbpxre_routing_node_t *found_nodes = NULL;
             int found_count = 0;
-            if (wbpxre_protocol_find_node(dht, &addr, local_node_id,
+            if (wbpxre_protocol_find_node(dht, &addr, filling_node_id, filling_node_id,
                                          &found_nodes, &found_count) == 0) {
                 /* Insert all discovered nodes */
                 for (int i = 0; i < found_count; i++) {
@@ -531,12 +532,14 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
     }
 
     /* Initialize triple routing controller */
-    int max_nodes = config->max_routing_table_nodes > 0 ? config->max_routing_table_nodes : 90000;
-    /* Split max nodes among three tables */
     uint32_t rotation_threshold = config->triple_routing_threshold > 0 ?
         config->triple_routing_threshold : 1500;
 
-    dht->routing_controller = triple_routing_controller_create(max_nodes / 3, rotation_threshold);
+    /* Set max_nodes_per_table to threshold (table rotates when it hits threshold)
+     * No need for excess capacity since we rotate at threshold */
+    int max_nodes_per_table = rotation_threshold;
+
+    dht->routing_controller = triple_routing_controller_create(max_nodes_per_table, rotation_threshold);
     if (!dht->routing_controller) {
         close(dht->udp_socket);
         free(dht);
@@ -544,7 +547,6 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
     }
 
     /* Initialize mutexes and locks */
-    pthread_rwlock_init(&dht->node_id_lock, NULL);
     pthread_mutex_init(&dht->pending_queries_mutex, NULL);
     pthread_mutex_init(&dht->sought_node_id_mutex, NULL);
     pthread_mutex_init(&dht->running_mutex, NULL);
@@ -615,10 +617,17 @@ static void *find_node_worker_func(void *arg) {
         memcpy(target, dht->sought_node_id, WBPXRE_NODE_ID_LEN);
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
+        /* Get FILLING table's node ID (this is the node ID used to discover nodes) */
+        const uint8_t *filling_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        if (!filling_node_id) {
+            free(node);
+            continue;  /* No valid node ID yet */
+        }
+
         /* Send find_node query */
         wbpxre_routing_node_t *found_nodes = NULL;
         int found_count = 0;
-        int rc = wbpxre_protocol_find_node(dht, &node->addr.addr, target,
+        int rc = wbpxre_protocol_find_node(dht, &node->addr.addr, filling_node_id, target,
                                           &found_nodes, &found_count);
 
         if (rc == 0) {
@@ -680,6 +689,13 @@ static void *sample_infohashes_worker_func(void *arg) {
         memcpy(target, dht->sought_node_id, WBPXRE_NODE_ID_LEN);
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
+        /* Get STABLE table's node ID (this is the node ID used to query nodes from stable table) */
+        const uint8_t *stable_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+        if (!stable_node_id) {
+            free(node);
+            continue;  /* Bootstrap not complete */
+        }
+
         /* Track query attempt BEFORE sending (so failed nodes have queries_sent > 0) */
         triple_routing_update_node_queried(dht->routing_controller, node->id);
 
@@ -687,7 +703,7 @@ static void *sample_infohashes_worker_func(void *arg) {
         uint8_t *hashes = NULL;
         int hash_count = 0, total_num = 0, interval = 0;
 
-        int rc = wbpxre_protocol_sample_infohashes(dht, &node->addr.addr, target,
+        int rc = wbpxre_protocol_sample_infohashes(dht, &node->addr.addr, stable_node_id, target,
                                                     &hashes, &hash_count, &total_num, &interval);
 
         /* Count query attempt */
@@ -749,6 +765,17 @@ static void *get_peers_worker_func(void *arg) {
 
         int node_count = wbpxre_routing_table_get_closest(stable_table, work->info_hash, nodes, 8);
 
+        /* Get STABLE table's node ID (for get_peers queries) */
+        const uint8_t *stable_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+        if (!stable_node_id) {
+            /* Free nodes */
+            for (int i = 0; i < node_count; i++) {
+                free(nodes[i]);
+            }
+            free(work);
+            continue;  /* Bootstrap not complete */
+        }
+
         if (node_count > 0) {
             /* Query each node for peers */
             for (int i = 0; i < node_count; i++) {
@@ -768,7 +795,7 @@ static void *get_peers_worker_func(void *arg) {
                 uint8_t token[256];
                 int token_len = 0;
 
-                int rc = wbpxre_protocol_get_peers(dht, &nodes[i]->addr.addr, work->info_hash,
+                int rc = wbpxre_protocol_get_peers(dht, &nodes[i]->addr.addr, stable_node_id, work->info_hash,
                                                     &peers, &peer_count,
                                                     &returned_nodes, &returned_node_count,
                                                     token, &token_len);
@@ -868,11 +895,17 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
         /* Try to dispatch to one of the pipelines (non-blocking) */
         if (wbpxre_queue_try_push(dht->nodes_for_find_node, node)) {
             continue;
-        } else if (wbpxre_queue_try_push(dht->nodes_for_sample_infohashes, node)) {
-            continue;
-        } else {
-            free(node);  /* All queues full, discard */
         }
+
+        /* Only dispatch to sample_infohashes queue if bootstrap is complete
+         * This prevents BEP 51 queries during bootstrap phase */
+        wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+        if (stable_table && wbpxre_queue_try_push(dht->nodes_for_sample_infohashes, node)) {
+            continue;
+        }
+
+        /* Either bootstrap incomplete or both queues full - discard node */
+        free(node);
     }
 
     /* Unregister thread before exit (REQUIRED) */
@@ -888,24 +921,34 @@ static void *sample_infohashes_feeder_func(void *arg) {
     rcu_register_thread();
 
     static time_t last_queue_full_warn = 0;
+    static bool logged_waiting = false;
 
     while (dht->running) {
-        /* Get current node ID for keyspace-aware filtering */
-        uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
-        pthread_rwlock_rdlock(&dht->node_id_lock);
-        memcpy(current_node_id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-        pthread_rwlock_unlock(&dht->node_id_lock);
+        /* Get current node ID for keyspace-aware filtering (use STABLE table's node ID) */
+        const uint8_t *current_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
 
-        /* Get up to 200 nodes suitable for sample_infohashes (increased from 60) */
-        wbpxre_routing_node_t *candidates[200];
+        /* BEP 51 queries should ONLY run when STABLE table exists (bootstrap complete)
+         * Do NOT fall back to FILLING table - wait for first rotation to complete */
         wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
 
-        /* Wait for bootstrap to complete */
         if (!stable_table) {
+            /* Bootstrap not complete - wait for first rotation */
+            if (!logged_waiting) {
+                fprintf(stderr, "INFO: BEP 51 queries paused - waiting for bootstrap to complete\n");
+                logged_waiting = true;
+            }
             usleep(100000);  /* Sleep 100ms and retry */
             continue;
         }
 
+        /* Bootstrap complete - log once and resume normal operation */
+        if (logged_waiting) {
+            fprintf(stderr, "INFO: Bootstrap complete - BEP 51 queries resuming\n");
+            logged_waiting = false;
+        }
+
+        /* Get up to 200 nodes suitable for sample_infohashes (increased from 60) */
+        wbpxre_routing_node_t *candidates[200];
         int count = wbpxre_routing_table_get_sample_candidates(stable_table, current_node_id, candidates, 200);
 
         /* Feed them to worker queue */
@@ -950,42 +993,114 @@ static void *find_node_feeder_func(void *arg) {
     /* Register this thread with RCU (REQUIRED before rcu_read_lock) */
     rcu_register_thread();
 
+    static bool logged_bootstrap_mode = false;
+    static bool logged_steady_state = false;
+
     while (dht->running) {
+        /* Check if bootstrap is complete */
+        bool in_bootstrap = !triple_routing_is_bootstrapped(dht->routing_controller);
+
         /* Get current target */
         pthread_mutex_lock(&dht->sought_node_id_mutex);
         uint8_t target[WBPXRE_NODE_ID_LEN];
         memcpy(target, dht->sought_node_id, WBPXRE_NODE_ID_LEN);
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
-        /* Get up to 10 nodes closest to target */
-        wbpxre_routing_node_t *candidates[10];
+        /* Select table to read based on bootstrap status */
         wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+        wbpxre_routing_table_t *table_to_read = stable_table;
 
-        /* Wait for bootstrap to complete */
-        if (!stable_table) {
+        /* Bootstrap mode: fall back to FILLING table if STABLE doesn't exist */
+        if (!table_to_read) {
+            table_to_read = triple_routing_get_filling_table(dht->routing_controller);
+        }
+
+        /* Still no table available - very early in initialization */
+        if (!table_to_read) {
             usleep(100000);  /* Sleep 100ms and retry */
             continue;
         }
 
-        int count = wbpxre_routing_table_get_closest(stable_table, target, candidates, 10);
+        /* BOOTSTRAP MODE: Aggressive querying to rapidly fill routing table */
+        if (in_bootstrap) {
+            if (!logged_bootstrap_mode) {
+                fprintf(stderr, "INFO: find_node feeder entering BOOTSTRAP mode (aggressive querying)\n");
+                logged_bootstrap_mode = true;
+                logged_steady_state = false;
+            }
 
-        /* Feed them to worker queue */
-        for (int i = 0; i < count; i++) {
-            if (!dht->running) {
-                /* Free remaining candidates */
-                for (int j = i; j < count; j++) {
-                    free(candidates[j]);
+            /* Query ALL available nodes (not just closest 10)
+             * During bootstrap, we want to discover as many nodes as possible
+             * Use sample_candidates to get broad coverage across the keyspace */
+            const uint8_t *current_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+            if (!current_node_id) {
+                usleep(100000);  /* Sleep 100ms and retry */
+                continue;
+            }
+
+            /* Get ALL available nodes for aggressive bootstrap querying */
+            wbpxre_routing_node_t *candidates[200];
+            int count = wbpxre_routing_table_get_sample_candidates(table_to_read, current_node_id,
+                                                                     candidates, 200);
+
+            /* Feed all candidates to worker queue */
+            int fed = 0, dropped = 0;
+            for (int i = 0; i < count; i++) {
+                if (!dht->running) {
+                    for (int j = i; j < count; j++) {
+                        free(candidates[j]);
+                    }
+                    break;
                 }
-                break;
+
+                if (wbpxre_queue_try_push(dht->nodes_for_find_node, candidates[i])) {
+                    fed++;
+                } else {
+                    free(candidates[i]);
+                    dropped++;
+                }
             }
 
-            /* Try to push (non-blocking) */
-            if (!wbpxre_queue_try_push(dht->nodes_for_find_node, candidates[i])) {
-                free(candidates[i]);  /* Queue full, discard */
+            /* Log bootstrap progress every 2 cycles */
+            static int bootstrap_log_counter = 0;
+            if (++bootstrap_log_counter >= 2) {
+                fprintf(stderr, "INFO: Bootstrap progress: %d nodes in FILLING table, fed=%d/dropped=%d\n",
+                       table_to_read->node_count, fed, dropped);
+                bootstrap_log_counter = 0;
             }
+
+            usleep(500000);  /* Sleep 500ms between cycles */
+
+        /* STEADY STATE: Conservative querying for normal operation */
+        } else {
+            if (!logged_steady_state) {
+                fprintf(stderr, "INFO: find_node feeder entering STEADY STATE mode (normal querying)\n");
+                logged_steady_state = true;
+                logged_bootstrap_mode = false;
+            }
+
+            /* Get up to 10 nodes closest to target (original behavior) */
+            wbpxre_routing_node_t *candidates[10];
+            int count = wbpxre_routing_table_get_closest(table_to_read, target, candidates, 10);
+
+            /* Feed them to worker queue */
+            for (int i = 0; i < count; i++) {
+                if (!dht->running) {
+                    /* Free remaining candidates */
+                    for (int j = i; j < count; j++) {
+                        free(candidates[j]);
+                    }
+                    break;
+                }
+
+                /* Try to push (non-blocking) */
+                if (!wbpxre_queue_try_push(dht->nodes_for_find_node, candidates[i])) {
+                    free(candidates[i]);  /* Queue full, discard */
+                }
+            }
+
+            sleep(5);  /* Run every 5 seconds (original interval) */
         }
-
-        sleep(5);  /* Run every 5 seconds */
     }
 
     /* Unregister thread before exit (REQUIRED) */
@@ -1130,7 +1245,6 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
     if (dht->infohashes_for_get_peers) wbpxre_queue_destroy(dht->infohashes_for_get_peers);
 
     /* Destroy mutexes and locks LAST */
-    pthread_rwlock_destroy(&dht->node_id_lock);
     pthread_mutex_destroy(&dht->pending_queries_mutex);
     pthread_mutex_destroy(&dht->sought_node_id_mutex);
     pthread_mutex_destroy(&dht->running_mutex);
@@ -1139,23 +1253,6 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
     pthread_cond_destroy(&dht->udp_reader_ready_cond);
 
     free(dht);
-}
-
-int wbpxre_dht_change_node_id(wbpxre_dht_t *dht, const uint8_t *new_node_id) {
-    if (!dht || !new_node_id) {
-        return -1;
-    }
-
-    /* Acquire write lock (blocks until all readers finish) */
-    pthread_rwlock_wrlock(&dht->node_id_lock);
-
-    /* Atomic swap */
-    memcpy(dht->config.node_id, new_node_id, WBPXRE_NODE_ID_LEN);
-
-    /* Release lock */
-    pthread_rwlock_unlock(&dht->node_id_lock);
-
-    return 0;
 }
 
 int wbpxre_dht_insert_node(wbpxre_dht_t *dht, const uint8_t *node_id,
@@ -1201,10 +1298,22 @@ int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool pri
 int wbpxre_dht_nodes(wbpxre_dht_t *dht, int *good_return, int *dubious_return) {
     if (!dht || !dht->routing_controller) return -1;
 
-    /* Get total nodes from stable table (after bootstrap) */
+    /* Try stable table first (after bootstrap) */
     wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
-    int total = stable_table ? stable_table->node_count : 0;
 
+    /* Fallback to filling table during bootstrap
+     * This ensures accurate node counts before first rotation completes */
+    if (!stable_table) {
+        wbpxre_routing_table_t *filling_table = triple_routing_get_filling_table(dht->routing_controller);
+        int total = filling_table ? filling_table->node_count : 0;
+
+        if (good_return) *good_return = total;
+        if (dubious_return) *dubious_return = 0;
+        return 0;
+    }
+
+    /* Use stable table node count */
+    int total = stable_table->node_count;
     if (good_return) *good_return = total;
     if (dubious_return) *dubious_return = 0;
 
@@ -1264,10 +1373,13 @@ int wbpxre_dht_test_socket(wbpxre_dht_t *dht) {
     msg.method = WBPXRE_METHOD_PING;
     wbpxre_random_bytes(msg.transaction_id, WBPXRE_TRANSACTION_ID_LEN);
 
-    /* Read node ID with lock protection */
-    pthread_rwlock_rdlock(&dht->node_id_lock);
-    memcpy(msg.id, dht->config.node_id, WBPXRE_NODE_ID_LEN);
-    pthread_rwlock_unlock(&dht->node_id_lock);
+    /* Use filling table's node ID for test socket */
+    const uint8_t *filling_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    if (!filling_node_id) {
+        fprintf(stderr, "ERROR: No node ID available for test socket\n");
+        return -1;
+    }
+    memcpy(msg.id, filling_node_id, WBPXRE_NODE_ID_LEN);
 
     uint8_t buf[WBPXRE_MAX_UDP_PACKET];
     int len = wbpxre_encode_message(&msg, buf, sizeof(buf));

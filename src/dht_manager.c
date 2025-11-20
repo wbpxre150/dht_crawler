@@ -32,7 +32,6 @@ static dht_manager_t *g_dht_manager = NULL;
 
 /* Forward declarations */
 static int bootstrap_dht(dht_manager_t *mgr);
-static void node_rotation_timer_cb(uv_timer_t *handle);
 static void peer_retry_timer_cb(uv_timer_t *handle);
 static void dual_routing_timer_cb(uv_timer_t *handle);
 
@@ -275,7 +274,6 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 const uint8_t *samples = (const uint8_t *)data;
                 mgr->stats.bep51_responses_received++;
                 mgr->stats.bep51_samples_received += num_samples;
-                mgr->samples_since_rotation += num_samples;
 
                 /* Trigger peer queries for all samples */
                 for (int i = 0; i < num_samples; i++) {
@@ -386,9 +384,10 @@ static void stats_timer_cb(uv_timer_t *handle) {
     static int peer_retry_cleanup_counter = 0;
     peer_retry_cleanup_counter++;  /* Timer fires every 1 second */
 
-    if (mgr->peer_retry_tracker && mgr->crawler_config) {
-        crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-        if (peer_retry_cleanup_counter >= cfg->peer_retry_cleanup_interval_sec) {
+    if (mgr->peer_retry_tracker) {
+        /* Default cleanup interval: 30 seconds */
+        const int cleanup_interval_sec = 30;
+        if (peer_retry_cleanup_counter >= cleanup_interval_sec) {
             int removed = peer_retry_cleanup_old(mgr->peer_retry_tracker);
             if (removed > 0) {
                 log_msg(LOG_DEBUG, "Peer retry cleanup: %d stale entries removed", removed);
@@ -496,10 +495,8 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     memset(mgr, 0, sizeof(dht_manager_t));
     mgr->app_ctx = app_ctx;
     mgr->infohash_queue = infohash_queue;
-    mgr->crawler_config = config;  /* Store config pointer for rotation */
     mgr->stats.start_time = time(NULL);
     mgr->active_search_count = 0;
-    mgr->samples_since_rotation = 0;
     g_dht_manager = mgr;
 
     /* Initialize close tracker */
@@ -531,25 +528,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     /* Node discovery configuration */
     mgr->config.node_discovery_enabled = 1;
 
-    /* Node ID rotation configuration */
-    mgr->node_rotation_enabled = 0;  /* Default: disabled */
-    mgr->node_rotation_interval_sec = 300;
-    mgr->node_rotation_drain_timeout_sec = 10;
-    mgr->rotation_phase_duration_sec = 30;
-    mgr->rotation_state = ROTATION_STATE_STABLE;  /* Initialize rotation state */
-    mgr->rotation_phase_start = 0;
-    if (cfg) {
-        mgr->node_rotation_enabled = cfg->node_rotation_enabled;
-        mgr->node_rotation_interval_sec = cfg->node_rotation_interval_sec;
-        mgr->node_rotation_drain_timeout_sec = cfg->node_rotation_drain_timeout_sec;
-        mgr->rotation_phase_duration_sec = cfg->rotation_phase_duration_sec;
-        log_msg(LOG_DEBUG, "Node rotation config: enabled=%d interval=%d drain_timeout=%d phase_duration=%d",
-                mgr->node_rotation_enabled, mgr->node_rotation_interval_sec,
-                mgr->node_rotation_drain_timeout_sec, mgr->rotation_phase_duration_sec);
-    } else {
-        log_msg(LOG_WARN, "No config provided to dht_manager_init - rotation disabled");
-    }
-
     /* Initialize peer store */
     mgr->peer_store = peer_store_init(1000, 500, 3600);
     if (!mgr->peer_store) {
@@ -571,6 +549,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.get_peers_workers = cfg->wbpxre_get_peers_workers;
         dht_config.query_timeout = cfg->wbpxre_query_timeout;
         dht_config.max_routing_table_nodes = cfg->max_routing_table_nodes;
+        dht_config.triple_routing_threshold = cfg->triple_routing_threshold;
     } else {
         /* Fallback defaults */
         dht_config.ping_workers = 10;
@@ -579,6 +558,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         dht_config.get_peers_workers = 100;
         dht_config.query_timeout = 5;
         dht_config.max_routing_table_nodes = 10000;
+        dht_config.triple_routing_threshold = 1500;
     }
 
     /* Callback setup */
@@ -605,6 +585,7 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     log_msg(LOG_DEBUG, "  - Sample infohashes workers: %d", dht_config.sample_infohashes_workers);
     log_msg(LOG_DEBUG, "  - Get peers workers: %d", dht_config.get_peers_workers);
     log_msg(LOG_DEBUG, "  - Query timeout: %d seconds", dht_config.query_timeout);
+    log_msg(LOG_DEBUG, "  - Triple routing threshold: %u", dht_config.triple_routing_threshold);
 
     /* Start wbpxre-dht (spawns worker threads) */
     int rc = wbpxre_dht_start(mgr->dht);
@@ -732,30 +713,6 @@ int dht_manager_start(dht_manager_t *mgr) {
         return -1;
     }
 
-    /* Initialize and start node rotation timer if enabled */
-    log_msg(LOG_DEBUG, "Checking node rotation: enabled=%d", mgr->node_rotation_enabled);
-    if (mgr->node_rotation_enabled) {
-        log_msg(LOG_DEBUG, "Initializing node rotation timer...");
-        rc = uv_timer_init(mgr->app_ctx->loop, &mgr->node_rotation_timer);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to initialize node rotation timer: %s", uv_strerror(rc));
-            return -1;
-        }
-        mgr->node_rotation_timer.data = mgr;
-
-        /* Start rotation timer (check every 10 seconds) */
-        rc = uv_timer_start(&mgr->node_rotation_timer, node_rotation_timer_cb, 10000, 10000);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to start node rotation timer: %s", uv_strerror(rc));
-            return -1;
-        }
-
-        log_msg(LOG_DEBUG, "Node ID rotation ENABLED (interval: %d seconds)",
-                mgr->node_rotation_interval_sec);
-    } else {
-        log_msg(LOG_DEBUG, "Node ID rotation DISABLED");
-    }
-
     /* Start peer retry timer if enabled */
     if (mgr->peer_retry_tracker) {
         rc = uv_timer_start(&mgr->peer_retry_timer, peer_retry_timer_cb, 100, 100);
@@ -797,11 +754,6 @@ void dht_manager_stop(dht_manager_t *mgr) {
 
     /* Stop statistics timer */
     uv_timer_stop(&mgr->bootstrap_reseed_timer);
-
-    /* Stop node rotation timer if enabled */
-    if (mgr->node_rotation_enabled) {
-        uv_timer_stop(&mgr->node_rotation_timer);
-    }
 
     /* Stop peer retry timer if enabled */
     if (mgr->peer_retry_tracker) {
@@ -872,14 +824,6 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
             close_tracker.pending_closes++;
             uv_close((uv_handle_t *)&mgr->dual_routing_timer, timer_close_cb);
             log_msg(LOG_DEBUG, "Closing dual_routing_timer");
-        }
-
-        /* Close node_rotation_timer (only if node rotation was enabled) */
-        if (mgr->node_rotation_enabled && !uv_is_closing((uv_handle_t *)&mgr->node_rotation_timer)) {
-            mgr->node_rotation_timer.data = &close_tracker;
-            close_tracker.pending_closes++;
-            uv_close((uv_handle_t *)&mgr->node_rotation_timer, timer_close_cb);
-            log_msg(LOG_DEBUG, "Closing node_rotation_timer");
         }
 
         /* Wait for all timer closes to complete */
@@ -1012,272 +956,6 @@ int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash, bool p
     return rc;
 }
 
-/* Rotate node ID to explore different DHT keyspace */
-int dht_manager_rotate_node_id(dht_manager_t *mgr) {
-    if (!mgr || !mgr->dht) {
-        return -1;
-    }
-
-    time_t now = time(NULL);
-
-    /* Update statistics */
-    if (mgr->stats.last_rotation_time > 0) {
-        time_t time_since_rotation = now - mgr->stats.last_rotation_time;
-        if (time_since_rotation > 0) {
-            mgr->stats.samples_per_rotation = mgr->samples_since_rotation /
-                (mgr->stats.node_rotations_performed > 0 ? mgr->stats.node_rotations_performed : 1);
-        }
-    }
-
-    log_msg(LOG_DEBUG, "=== Node ID Rotation #%llu ===",
-            (unsigned long long)(mgr->stats.node_rotations_performed + 1));
-    log_msg(LOG_DEBUG, "  Samples collected since last rotation: %llu",
-            (unsigned long long)mgr->samples_since_rotation);
-
-    /* Generate new random node ID */
-    uint8_t new_node_id[20];
-    wbpxre_random_bytes(new_node_id, 20);
-
-    char old_id_hex[41], new_id_hex[41];
-    format_infohash((const uint8_t *)mgr->app_ctx->node_id, old_id_hex, sizeof(old_id_hex));
-    format_infohash(new_node_id, new_id_hex, sizeof(new_id_hex));
-
-    log_msg(LOG_DEBUG, "  Old node ID: %.16s...", old_id_hex);
-    log_msg(LOG_DEBUG, "  New node ID: %.16s...", new_id_hex);
-
-    /* Get routing table stats before rotation */
-    int good_before = 0, dubious_before = 0;
-    wbpxre_dht_nodes(mgr->dht, &good_before, &dubious_before);
-    log_msg(LOG_DEBUG, "  Routing table before: %d nodes (%d good, %d dubious)",
-            good_before + dubious_before, good_before, dubious_before);
-
-    /* Stop wbpxre-dht (gracefully shutdown workers) */
-    log_msg(LOG_DEBUG, "  Stopping DHT workers...");
-    wbpxre_dht_stop(mgr->dht);
-
-    /* Cleanup old DHT instance */
-    log_msg(LOG_DEBUG, "  Cleaning up old DHT instance...");
-    wbpxre_dht_cleanup(mgr->dht);
-    mgr->dht = NULL;
-
-    /* Update node ID in app context */
-    memcpy(mgr->app_ctx->node_id, new_node_id, 20);
-
-    /* Build new wbpxre-dht configuration with new node ID */
-    wbpxre_config_t dht_config = {0};
-    dht_config.port = mgr->app_ctx->dht_port;
-    memcpy(dht_config.node_id, new_node_id, WBPXRE_NODE_ID_LEN);
-
-    /* Worker counts from existing config */
-    crawler_config_t *cfg = (crawler_config_t *)mgr->crawler_config;
-    if (cfg) {
-        dht_config.ping_workers = cfg->wbpxre_ping_workers;
-        dht_config.find_node_workers = cfg->wbpxre_find_node_workers;
-        dht_config.sample_infohashes_workers = cfg->wbpxre_sample_infohashes_workers;
-        dht_config.get_peers_workers = cfg->wbpxre_get_peers_workers;
-        dht_config.query_timeout = cfg->wbpxre_query_timeout;
-        dht_config.max_routing_table_nodes = cfg->max_routing_table_nodes;
-    } else {
-        /* Fallback defaults */
-        dht_config.ping_workers = 10;
-        dht_config.find_node_workers = 20;
-        dht_config.sample_infohashes_workers = 50;
-        dht_config.get_peers_workers = 100;
-        dht_config.query_timeout = 5;
-        dht_config.max_routing_table_nodes = 10000;
-    }
-
-    /* Callback setup */
-    dht_config.callback = wbpxre_callback_wrapper;
-    dht_config.callback_closure = mgr;
-
-    /* Queue capacities */
-    dht_config.discovered_nodes_capacity = WBPXRE_DISCOVERED_NODES_CAPACITY;
-    dht_config.ping_queue_capacity = WBPXRE_PING_QUEUE_CAPACITY;
-    dht_config.find_node_queue_capacity = WBPXRE_FIND_NODE_QUEUE_CAPACITY;
-    dht_config.sample_infohashes_capacity = WBPXRE_SAMPLE_INFOHASHES_CAPACITY;
-
-    /* Initialize new wbpxre-dht instance */
-    log_msg(LOG_DEBUG, "  Initializing new DHT instance...");
-    mgr->dht = wbpxre_dht_init(&dht_config);
-    if (!mgr->dht) {
-        log_msg(LOG_ERROR, "  Failed to initialize new DHT instance!");
-        return -1;
-    }
-
-    /* Start new DHT instance */
-    log_msg(LOG_DEBUG, "  Starting new DHT instance...");
-    int rc = wbpxre_dht_start(mgr->dht);
-    if (rc < 0) {
-        log_msg(LOG_ERROR, "  Failed to start new DHT instance!");
-        wbpxre_dht_cleanup(mgr->dht);
-        mgr->dht = NULL;
-        return -1;
-    }
-
-    /* Wait for UDP reader to be ready */
-    log_msg(LOG_DEBUG, "  Waiting for UDP reader...");
-    if (wbpxre_dht_wait_ready(mgr->dht, 5) != 0) {
-        log_msg(LOG_ERROR, "  UDP reader failed to become ready!");
-        wbpxre_dht_stop(mgr->dht);
-        wbpxre_dht_cleanup(mgr->dht);
-        mgr->dht = NULL;
-        return -1;
-    }
-
-    /* Re-bootstrap DHT with cached peers */
-    log_msg(LOG_DEBUG, "  Re-bootstrapping DHT...");
-    if (bootstrap_dht(mgr) != 0) {
-        log_msg(LOG_WARN, "  Bootstrap failed after rotation (continuing anyway)");
-    }
-
-    /* Reset rotation counters */
-    mgr->samples_since_rotation = 0;
-    mgr->stats.last_rotation_time = now;
-    mgr->stats.node_rotations_performed++;
-
-    /* Get routing table stats after rotation */
-    int good_after = 0, dubious_after = 0;
-    wbpxre_dht_nodes(mgr->dht, &good_after, &dubious_after);
-    log_msg(LOG_DEBUG, "  Routing table after: %d nodes (%d good, %d dubious)",
-            good_after + dubious_after, good_after, dubious_after);
-    log_msg(LOG_DEBUG, "=== Node ID Rotation Complete ===");
-
-    return 0;
-}
-
-/* Hot rotation - preserves routing table and keeps workers running */
-int dht_manager_rotate_node_id_hot(dht_manager_t *mgr) {
-    if (!mgr || !mgr->dht) {
-        return -1;
-    }
-
-    time_t now = time(NULL);
-
-    switch (mgr->rotation_state) {
-        case ROTATION_STATE_STABLE:
-            /* Generate new ID and enter announcement phase */
-            wbpxre_random_bytes(mgr->next_node_id, 20);
-            mgr->rotation_state = ROTATION_STATE_ANNOUNCING;
-            mgr->rotation_phase_start = now;
-
-            char new_id_hex[41];
-            format_infohash(mgr->next_node_id, new_id_hex, sizeof(new_id_hex));
-            log_msg(LOG_DEBUG, "=== Node Rotation: Announcement Phase ===");
-            log_msg(LOG_DEBUG, "  New ID generated: %.16s...", new_id_hex);
-            log_msg(LOG_DEBUG, "  Announcing to network for %d seconds...", mgr->rotation_phase_duration_sec);
-
-            /* Schedule transition (handled by timer callback) */
-            return 0;
-
-        case ROTATION_STATE_ANNOUNCING:
-            /* Switch to using new ID */
-            if (wbpxre_dht_change_node_id(mgr->dht, mgr->next_node_id) != 0) {
-                log_msg(LOG_ERROR, "Failed to swap node ID!");
-                mgr->rotation_state = ROTATION_STATE_STABLE;
-                return -1;
-            }
-
-            /* Update app context */
-            memcpy(mgr->app_ctx->node_id, mgr->next_node_id, 20);
-            mgr->rotation_state = ROTATION_STATE_TRANSITIONING;
-            mgr->rotation_phase_start = now;
-
-            /* Get routing table stats */
-            int good = 0, dubious = 0;
-            wbpxre_dht_nodes(mgr->dht, &good, &dubious);
-
-            log_msg(LOG_DEBUG, "=== Node Rotation: Transition Phase ===");
-            log_msg(LOG_DEBUG, "  Now using new ID for queries");
-            log_msg(LOG_DEBUG, "  Routing table preserved: %d nodes (%d good, %d dubious)",
-                    good + dubious, good, dubious);
-            log_msg(LOG_DEBUG, "  Transitioning for %d seconds...", mgr->rotation_phase_duration_sec);
-
-            /* Update statistics */
-            if (mgr->stats.last_rotation_time > 0) {
-                time_t time_since_rotation = now - mgr->stats.last_rotation_time;
-                if (time_since_rotation > 0) {
-                    mgr->stats.samples_per_rotation = mgr->samples_since_rotation /
-                        (mgr->stats.node_rotations_performed > 0 ? mgr->stats.node_rotations_performed : 1);
-                }
-            }
-
-            mgr->stats.node_rotations_performed++;
-            mgr->samples_since_rotation = 0;
-            return 0;
-
-        case ROTATION_STATE_TRANSITIONING: {
-            /* Complete transition */
-            mgr->rotation_state = ROTATION_STATE_STABLE;
-            mgr->stats.last_rotation_time = now;
-
-            log_msg(LOG_DEBUG, "=== Node Rotation: Complete ===");
-            log_msg(LOG_DEBUG, "  Fully migrated to new keyspace position");
-            log_msg(LOG_DEBUG, "  No downtime - all workers kept running!");
-            log_msg(LOG_DEBUG, "  Pruning now handled by periodic timer");
-
-            /* Optionally clear sample_infohashes queue after rotation */
-            crawler_config_t *crawler_cfg = (crawler_config_t *)mgr->crawler_config;
-            if (crawler_cfg && crawler_cfg->clear_sample_queue_on_rotation && mgr->dht) {
-                log_msg(LOG_DEBUG, "=== Post-Rotation Sample Queue Clearing ===");
-
-                /* Get queue size before clearing */
-                int queue_size_before = 0;
-                pthread_mutex_lock(&mgr->dht->nodes_for_sample_infohashes->mutex);
-                queue_size_before = mgr->dht->nodes_for_sample_infohashes->size;
-                pthread_mutex_unlock(&mgr->dht->nodes_for_sample_infohashes->mutex);
-
-                log_msg(LOG_DEBUG, "  Clearing sample_infohashes queue: %d nodes", queue_size_before);
-                wbpxre_queue_clear(mgr->dht->nodes_for_sample_infohashes);
-                log_msg(LOG_DEBUG, "  Queue cleared - feeder will repopulate with new keyspace nodes");
-            }
-
-            return 0;
-        }
-    }
-
-    return 0;
-}
-
-/* Timer callback for node ID rotation */
-static void node_rotation_timer_cb(uv_timer_t *handle) {
-    dht_manager_t *mgr = (dht_manager_t *)handle->data;
-    if (!mgr || !mgr->node_rotation_enabled) {
-        return;
-    }
-
-    time_t now = time(NULL);
-
-    switch (mgr->rotation_state) {
-        case ROTATION_STATE_STABLE:
-            /* Check if it's time to start rotation */
-            if (mgr->stats.last_rotation_time == 0) {
-                /* First rotation - initialize timer */
-                mgr->stats.last_rotation_time = now;
-                return;
-            }
-
-            if (now - mgr->stats.last_rotation_time >= mgr->node_rotation_interval_sec) {
-                dht_manager_rotate_node_id_hot(mgr);
-            }
-            break;
-
-        case ROTATION_STATE_ANNOUNCING:
-            /* Advance to transition after configured duration */
-            if (now - mgr->rotation_phase_start >= mgr->rotation_phase_duration_sec) {
-                dht_manager_rotate_node_id_hot(mgr);
-            }
-            break;
-
-        case ROTATION_STATE_TRANSITIONING:
-            /* Complete transition after configured duration */
-            if (now - mgr->rotation_phase_start >= mgr->rotation_phase_duration_sec) {
-                dht_manager_rotate_node_id_hot(mgr);
-            }
-            break;
-    }
-}
-
 /* Peer retry timer callback - periodically checks for retries that are ready */
 static void peer_retry_timer_cb(uv_timer_t *handle) {
     dht_manager_t *mgr = (dht_manager_t *)handle->data;
@@ -1357,16 +1035,12 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                     good, dubious, good + dubious);
 
             /* Print keyspace distribution statistics */
-            uint8_t current_node_id[WBPXRE_NODE_ID_LEN];
-            pthread_rwlock_rdlock(&mgr->dht->node_id_lock);
-            memcpy(current_node_id, mgr->dht->config.node_id, WBPXRE_NODE_ID_LEN);
-            pthread_rwlock_unlock(&mgr->dht->node_id_lock);
-
             int close_nodes = 0, distant_nodes = 0;
             wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(mgr->dht->routing_controller);
-            if (stable_table) {
+            const uint8_t *stable_node_id = triple_routing_get_stable_node_id(mgr->dht->routing_controller);
+            if (stable_table && stable_node_id) {
                 wbpxre_routing_table_get_keyspace_distribution(stable_table,
-                                                                 current_node_id,
+                                                                 stable_node_id,
                                                                  &close_nodes,
                                                                  &distant_nodes);
             }
@@ -1416,47 +1090,6 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
         log_msg(LOG_INFO, "  Infohash queue: size=%zu capacity=%zu full=%s duplicates_filtered=%llu",
                 queue_size, queue_capacity, is_full ? "YES" : "no",
                 (unsigned long long)duplicates_filtered);
-    }
-
-    /* Print node rotation statistics if enabled */
-    if (mgr->node_rotation_enabled) {
-        /* Get routing table node counts */
-        int good = 0, dubious = 0;
-        if (mgr->dht) {
-            wbpxre_dht_nodes(mgr->dht, &good, &dubious);
-        }
-
-        /* Rotation state */
-        const char *state_str =
-            mgr->rotation_state == ROTATION_STATE_STABLE ? "STABLE" :
-            mgr->rotation_state == ROTATION_STATE_ANNOUNCING ? "ANNOUNCING" :
-            "TRANSITIONING";
-
-        log_msg(LOG_INFO, "  Node ID rotation: HOT mode (state: %s)", state_str);
-        log_msg(LOG_INFO, "    Current nodes: %d (no downtime!)", good);
-
-        if (mgr->stats.node_rotations_performed > 0) {
-            log_msg(LOG_INFO, "    Rotations: %llu (preserves routing table)",
-                    (unsigned long long)mgr->stats.node_rotations_performed);
-            log_msg(LOG_INFO, "    Samples: this_period=%llu avg=%llu",
-                    (unsigned long long)mgr->samples_since_rotation,
-                    (unsigned long long)mgr->stats.samples_per_rotation);
-            if (mgr->stats.last_rotation_time > 0) {
-                time_t time_since = now - mgr->stats.last_rotation_time;
-                time_t time_until = mgr->node_rotation_interval_sec - time_since;
-                if (time_until < 0) time_until = 0;
-                log_msg(LOG_INFO, "    Last rotation: %ld seconds ago, next in: %ld seconds",
-                        time_since, time_until);
-            }
-        } else {
-            /* Before first rotation - show countdown */
-            time_t time_until_first = mgr->node_rotation_interval_sec - (now - mgr->stats.start_time);
-            if (time_until_first < 0) time_until_first = 0;
-            log_msg(LOG_INFO, "    ENABLED (interval=%ds) - first rotation in %ld seconds",
-                    mgr->node_rotation_interval_sec, time_until_first);
-            log_msg(LOG_INFO, "    Samples: %llu",
-                    (unsigned long long)mgr->samples_since_rotation);
-        }
     }
 
     /* Print retry statistics */
