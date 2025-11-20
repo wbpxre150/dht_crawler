@@ -1512,7 +1512,7 @@ triple_routing_controller_t* triple_routing_controller_create(
     memset(ctrl->table_node_ids[1], 0, WBPXRE_NODE_ID_LEN);
     memset(ctrl->table_node_ids[2], 0, WBPXRE_NODE_ID_LEN);
 
-    log_msg(LOG_INFO, "Initial node ID generated for table 0");
+    log_msg(LOG_DEBUG, "Initial node ID generated for table 0");
 
     /* Configuration */
     ctrl->rotation_threshold = rotation_threshold;
@@ -1537,9 +1537,9 @@ triple_routing_controller_t* triple_routing_controller_create(
     memset(ctrl->stable_reads, 0, sizeof(ctrl->stable_reads));
     __atomic_store_n(&ctrl->clearing_operations, 0, __ATOMIC_RELAXED);
 
-    log_msg(LOG_INFO, "Triple routing controller initialized: %d tables × %d max nodes, threshold=%u",
+    log_msg(LOG_DEBUG, "Triple routing controller initialized: %d tables × %d max nodes, threshold=%u",
             3, max_nodes_per_table, rotation_threshold);
-    log_msg(LOG_INFO, "Bootstrap in progress: stable table will be available after first rotation");
+    log_msg(LOG_DEBUG, "Bootstrap in progress: stable table will be available after first rotation");
 
     return ctrl;
 }
@@ -1632,7 +1632,7 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
     time_t rotation_start = time(NULL);
     ctrl->rotation_start_time = rotation_start;
 
-    log_msg(LOG_INFO, "=== ROTATION %llu: Table %d reached threshold (%u nodes) ===",
+    log_msg(LOG_DEBUG, "=== ROTATION %llu: Table %d reached threshold (%u nodes) ===",
             (unsigned long long)ctrl->rotation_count, filling_idx, node_count);
 
     /* Record metrics for this rotation */
@@ -1651,14 +1651,14 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         int old_stable_idx = ctrl->stable_idx;
         uint32_t old_stable_nodes = wbpxre_routing_table_count(ctrl->tables[old_stable_idx]);
 
-        log_msg(LOG_INFO, "  Table %d: STABLE → IDLE (%u nodes will be cleared on reuse)",
+        log_msg(LOG_DEBUG, "  Table %d: STABLE → IDLE (%u nodes will be cleared on reuse)",
                 old_stable_idx, old_stable_nodes);
 
         ctrl->states[old_stable_idx] = TABLE_STATE_IDLE;
     }
 
     /* FILLING table → STABLE */
-    log_msg(LOG_INFO, "  Table %d: FILLING → STABLE (%u nodes ready for queries)",
+    log_msg(LOG_DEBUG, "  Table %d: FILLING → STABLE (%u nodes ready for queries)",
             filling_idx, node_count);
 
     ctrl->states[filling_idx] = TABLE_STATE_STABLE;
@@ -1685,14 +1685,14 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
      * This node ID will be used by find_node workers to populate this table */
     wbpxre_random_bytes(ctrl->table_node_ids[next_filling_idx], WBPXRE_NODE_ID_LEN);
 
-    log_msg(LOG_INFO, "  Table %d: New node ID generated", next_filling_idx);
+    log_msg(LOG_DEBUG, "  Table %d: New node ID generated", next_filling_idx);
 
     /* Set next table to FILLING state (it may have stale nodes, but DON'T clear yet!)
      * KEY INSIGHT: A table must sit IDLE for one full rotation before being cleared.
      * This ensures no threads are reading from it when we clear. */
     ctrl->states[next_filling_idx] = TABLE_STATE_FILLING;
 
-    log_msg(LOG_INFO, "  Table %d: FILLING (ready for inserts, may have %u existing nodes)",
+    log_msg(LOG_DEBUG, "  Table %d: FILLING (ready for inserts, may have %u existing nodes)",
             next_filling_idx, wbpxre_routing_table_count(ctrl->tables[next_filling_idx]));
 
     /* Update indices BEFORE releasing lock
@@ -1727,7 +1727,7 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
 
     /* Clear stale table in background if needed */
     if (to_clear_idx >= 0) {
-        log_msg(LOG_INFO, "  Table %d: Background clearing %u stale nodes (has been IDLE)",
+        log_msg(LOG_DEBUG, "  Table %d: Background clearing %u stale nodes (has been IDLE)",
                 to_clear_idx, stale_nodes);
 
         clear_routing_table_internal(ctrl->tables[to_clear_idx]);
@@ -1736,7 +1736,7 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         __atomic_fetch_add(&ctrl->total_nodes_cleared, stale_nodes, __ATOMIC_RELAXED);
         __atomic_fetch_add(&ctrl->clearing_operations, 1, __ATOMIC_RELAXED);
 
-        log_msg(LOG_INFO, "  Table %d: Background clearing complete", to_clear_idx);
+        log_msg(LOG_DEBUG, "  Table %d: Background clearing complete", to_clear_idx);
     }
 
     /* Re-acquire lock for bootstrap check */
@@ -1748,12 +1748,12 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         ctrl->first_rotation_time = ctrl->last_rotation_time;
         uint32_t bootstrap_duration = (uint32_t)difftime(ctrl->first_rotation_time, ctrl->bootstrap_start_time);
 
-        log_msg(LOG_INFO, "╔════════════════════════════════════════════════════════════╗");
-        log_msg(LOG_INFO, "║  DHT BOOTSTRAP COMPLETE!                                   ║");
-        log_msg(LOG_INFO, "║  Duration: %-5u seconds                                    ║", bootstrap_duration);
-        log_msg(LOG_INFO, "║  Stable table available: %-6u nodes                        ║", node_count);
-        log_msg(LOG_INFO, "║  sample_infohashes and DHT queries now operational         ║");
-        log_msg(LOG_INFO, "╚════════════════════════════════════════════════════════════╝");
+        log_msg(LOG_DEBUG, "╔════════════════════════════════════════════════════════════╗");
+        log_msg(LOG_DEBUG, "║  DHT BOOTSTRAP COMPLETE!                                   ║");
+        log_msg(LOG_DEBUG, "║  Duration: %-5u seconds                                    ║", bootstrap_duration);
+        log_msg(LOG_DEBUG, "║  Stable table available: %-6u nodes                        ║", node_count);
+        log_msg(LOG_DEBUG, "║  sample_infohashes and DHT queries now operational         ║");
+        log_msg(LOG_DEBUG, "╚════════════════════════════════════════════════════════════╝");
     }
 
     /* Monitor rotation duration (detect potential issues) */
@@ -1763,7 +1763,7 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
         log_msg(LOG_WARN, "Rotation took %.1f seconds (longer than expected)", rotation_duration_sec);
     }
 
-    log_msg(LOG_INFO, "=== ROTATION COMPLETE: STABLE=table_%d, FILLING=table_%d ===",
+    log_msg(LOG_DEBUG, "=== ROTATION COMPLETE: STABLE=table_%d, FILLING=table_%d ===",
             ctrl->stable_idx, ctrl->filling_idx);
 
     pthread_mutex_unlock(&ctrl->rotation_lock);
@@ -2062,7 +2062,7 @@ void triple_routing_controller_destroy(triple_routing_controller_t *ctrl) {
         return;
     }
 
-    log_msg(LOG_INFO, "Destroying triple routing controller (rotations=%llu, cleared=%llu nodes)",
+    log_msg(LOG_DEBUG, "Destroying triple routing controller (rotations=%llu, cleared=%llu nodes)",
             (unsigned long long)ctrl->rotation_count, (unsigned long long)ctrl->total_nodes_cleared);
 
     /* Free all three tables */

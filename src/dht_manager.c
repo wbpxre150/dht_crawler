@@ -1061,17 +1061,17 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             mgr->stats.dual_routing_nodes_cleared = triple_stats.total_nodes_cleared;
 
             if (!triple_stats.bootstrap_complete) {
-                log_msg(LOG_INFO, "  Triple routing: BOOTSTRAP IN PROGRESS (%.1f%% to first rotation)",
+                log_msg(LOG_DEBUG, "  Triple routing: BOOTSTRAP IN PROGRESS (%.1f%% to first rotation)",
                         triple_stats.fill_progress_pct);
-                log_msg(LOG_INFO, "    Filling table: table_%d (%u / %u nodes)",
+                log_msg(LOG_DEBUG, "    Filling table: table_%d (%u / %u nodes)",
                         triple_stats.filling_idx, triple_stats.filling_table_nodes,
                         triple_stats.rotation_threshold);
             } else {
-                log_msg(LOG_INFO, "  Triple routing: rotations=%llu nodes_cleared=%llu bootstrap_time=%us",
+                log_msg(LOG_DEBUG, "  Triple routing: rotations=%llu nodes_cleared=%llu bootstrap_time=%us",
                         (unsigned long long)triple_stats.total_rotations,
                         (unsigned long long)triple_stats.total_nodes_cleared,
                         triple_stats.bootstrap_duration_sec);
-                log_msg(LOG_INFO, "    Stable table: table_%d (%u nodes) | Filling table: table_%d (%u nodes, %.1f%% full)",
+                log_msg(LOG_DEBUG, "    Stable table: table_%d (%u nodes) | Filling table: table_%d (%u nodes, %.1f%% full)",
                         triple_stats.stable_idx, triple_stats.stable_table_nodes,
                         triple_stats.filling_idx, triple_stats.filling_table_nodes,
                         triple_stats.fill_progress_pct);
