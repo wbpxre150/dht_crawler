@@ -172,8 +172,6 @@ static void *bep51_worker_func(void *arg) {
                     if (tree_infohash_queue_try_push(tree->infohash_queue, response.infohashes[i]) == 0) {
                         if (!first_infohash_found) {
                             first_infohash_found = true;
-                            log_msg(LOG_INFO, "[tree %u] First infohash discovered, starting get_peers phase",
-                                    tree->tree_id);
                             /* Trigger get_peers phase (Stage 4 placeholder) */
                             if (tree->current_phase == TREE_PHASE_BEP51) {
                                 tree->current_phase = TREE_PHASE_GET_PEERS;
