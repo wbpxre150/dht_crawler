@@ -431,10 +431,9 @@ static void *bootstrap_thread_func(void *arg) {
         }
 
         /* Log progress periodically */
-        if (node_count != last_node_count && node_count % 50 == 0) {
+        if (node_count % 50 == 0 && node_count != last_node_count) {
             log_msg(LOG_DEBUG, "[tree %u] Bootstrap progress: %d/%d nodes",
                     tree->tree_id, node_count, tree->routing_threshold);
-            last_node_count = node_count;
         }
 
         /* Detect stalled bootstrap and trigger aggressive mode */
@@ -458,6 +457,19 @@ static void *bootstrap_thread_func(void *arg) {
             }
         } else if (node_count != last_node_count) {
             stall_counter = 0;
+        }
+
+        /* Retransmit bootstrap queries periodically if we have zero nodes */
+        if (node_count == 0 && (loop_iterations % 20) == 0) {  /* Every ~1 second (20 * 50ms) */
+            log_msg(LOG_DEBUG, "[tree %u] No nodes yet, retrying bootstrap nodes (iteration %d)",
+                    tree->tree_id, loop_iterations);
+            for (int i = 0; BOOTSTRAP_NODES[i] != NULL; i++) {
+                struct sockaddr_storage addr;
+                if (resolve_hostname(BOOTSTRAP_NODES[i], BOOTSTRAP_PORT, &addr) == 0) {
+                    tree_send_find_node(tree, sock, tree->node_id, &addr);
+                    queries_sent++;
+                }
+            }
         }
 
         /* PROACTIVE QUERYING: Query random nodes every 10 iterations (regardless of responses) */
@@ -516,6 +528,9 @@ static void *bootstrap_thread_func(void *arg) {
                 queries_sent++;
             }
         }
+
+        /* Update last_node_count at end of iteration for accurate stall detection */
+        last_node_count = node_count;
     }
 
     /* BEP51 phase loop (placeholder - wait until shutdown) */
