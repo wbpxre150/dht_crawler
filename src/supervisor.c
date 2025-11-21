@@ -70,12 +70,14 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
 static thread_tree_t *spawn_tree(supervisor_t *sup) {
     tree_config_t config = {
+        /* Stage 2 settings (Bootstrap) */
+        .num_bootstrap_workers = 10,  /* Default: 10 find_node workers per tree */
+        .bootstrap_timeout_sec = sup->bootstrap_timeout_sec,
+        .routing_threshold = sup->routing_threshold,
+        /* Worker counts */
         .num_bep51_workers = sup->num_bep51_workers,
         .num_get_peers_workers = sup->num_get_peers_workers,
         .num_metadata_workers = sup->num_metadata_workers,
-        /* Stage 2 settings (Bootstrap) */
-        .bootstrap_timeout_sec = sup->bootstrap_timeout_sec,
-        .routing_threshold = sup->routing_threshold,
         /* Stage 5 settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,

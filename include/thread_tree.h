@@ -37,6 +37,7 @@ typedef enum {
 
 /* Configuration for a thread tree */
 typedef struct tree_config {
+    int num_bootstrap_workers;      /* Stage 2: Find_node workers for bootstrap (default: 10) */
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
@@ -109,12 +110,14 @@ typedef struct thread_tree {
 
     /* Thread handles */
     pthread_t bootstrap_thread;
+    pthread_t *bootstrap_workers;   /* Stage 2: Find_node workers for bootstrap */
     pthread_t *bep51_threads;
     pthread_t *get_peers_threads;
     pthread_t *metadata_threads;
     pthread_t rate_monitor_thread;  /* Stage 5: Rate monitor thread */
 
     /* Thread counts */
+    int num_bootstrap_workers;      /* Stage 2: Number of bootstrap find_node workers */
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;

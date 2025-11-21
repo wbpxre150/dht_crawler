@@ -83,6 +83,50 @@ static void tree_start_get_peers_workers(thread_tree_t *tree);
 static void tree_start_metadata_workers(thread_tree_t *tree);
 static void tree_start_rate_monitor(thread_tree_t *tree);
 
+/* Bootstrap find_node worker context */
+typedef struct bootstrap_worker_ctx {
+    thread_tree_t *tree;
+    int worker_id;
+} bootstrap_worker_ctx_t;
+
+/* Bootstrap find_node worker: continuously queries nodes from routing table */
+static void *bootstrap_find_node_worker_func(void *arg) {
+    bootstrap_worker_ctx_t *ctx = (bootstrap_worker_ctx_t *)arg;
+    thread_tree_t *tree = ctx->tree;
+    int worker_id = ctx->worker_id;
+
+    log_msg(LOG_DEBUG, "[tree %u] Bootstrap worker %d started", tree->tree_id, worker_id);
+
+    tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
+    tree_socket_t *sock = (tree_socket_t *)tree->socket;
+
+    while (!atomic_load(&tree->shutdown_requested) && tree->current_phase == TREE_PHASE_BOOTSTRAP) {
+        /* Get random nodes from routing table */
+        tree_node_t nodes[8];
+        int got = tree_routing_get_random_nodes(rt, nodes, 8);
+
+        if (got == 0) {
+            /* No nodes yet, wait a bit */
+            usleep(100000);  /* 100ms */
+            continue;
+        }
+
+        /* Query each node with a random target to explore keyspace */
+        for (int i = 0; i < got; i++) {
+            uint8_t random_target[20];
+            generate_random_target(random_target);
+            tree_send_find_node(tree, sock, random_target, &nodes[i].addr);
+        }
+
+        /* Rate limit: ~10ms per query batch */
+        usleep(10000);
+    }
+
+    free(ctx);
+    log_msg(LOG_DEBUG, "[tree %u] Bootstrap worker %d exiting", tree->tree_id, worker_id);
+    return NULL;
+}
+
 /* BEP51 worker thread function */
 static void *bep51_worker_func(void *arg) {
     bep51_worker_ctx_t *ctx = (bep51_worker_ctx_t *)arg;
@@ -267,8 +311,6 @@ static void *get_peers_worker_func(void *arg) {
                 /* Trigger metadata phase on first peers */
                 if (!first_peers_found) {
                     first_peers_found = true;
-                    log_msg(LOG_INFO, "[tree %u] First peers found (%d peers), starting metadata phase",
-                            tree->tree_id, result.peer_count);
                     if (tree->current_phase == TREE_PHASE_GET_PEERS) {
                         tree->current_phase = TREE_PHASE_METADATA;
                         tree_start_metadata_workers(tree);
@@ -398,6 +440,26 @@ static void *bootstrap_thread_func(void *arg) {
      * keyspace regions that fill only a few buckets. Default k=8, bootstrap k=20 */
     tree_routing_set_bucket_capacity(rt, 20);
     log_msg(LOG_DEBUG, "[tree %u] Bootstrap mode: increased bucket capacity to 20", tree->tree_id);
+
+    /* Start bootstrap find_node worker threads to continuously query routing table */
+    log_msg(LOG_INFO, "[tree %u] Starting %d bootstrap find_node workers",
+            tree->tree_id, tree->num_bootstrap_workers);
+    for (int i = 0; i < tree->num_bootstrap_workers; i++) {
+        bootstrap_worker_ctx_t *ctx = malloc(sizeof(bootstrap_worker_ctx_t));
+        if (!ctx) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to allocate bootstrap worker context", tree->tree_id);
+            continue;
+        }
+        ctx->tree = tree;
+        ctx->worker_id = i;
+
+        int rc = pthread_create(&tree->bootstrap_workers[i], NULL, bootstrap_find_node_worker_func, ctx);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create bootstrap worker %d: %d",
+                    tree->tree_id, i, rc);
+            free(ctx);
+        }
+    }
 
     /* Query bootstrap nodes */
     for (int i = 0; BOOTSTRAP_NODES[i] != NULL && !atomic_load(&tree->shutdown_requested); i++) {
@@ -600,6 +662,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
+    tree->num_bootstrap_workers = config->num_bootstrap_workers > 0 ? config->num_bootstrap_workers : 10;
     tree->num_bep51_workers = config->num_bep51_workers;
     tree->num_get_peers_workers = config->num_get_peers_workers;
     tree->num_metadata_workers = config->num_metadata_workers;
@@ -618,6 +681,15 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->metadata_rate = 0.0;
 
     /* Allocate thread handle arrays */
+    if (tree->num_bootstrap_workers > 0) {
+        tree->bootstrap_workers = calloc(tree->num_bootstrap_workers, sizeof(pthread_t));
+        if (!tree->bootstrap_workers) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to allocate bootstrap workers", tree_id);
+            thread_tree_destroy(tree);
+            return NULL;
+        }
+    }
+
     if (tree->num_bep51_workers > 0) {
         tree->bep51_threads = calloc(tree->num_bep51_workers, sizeof(pthread_t));
         if (!tree->bep51_threads) {
@@ -697,6 +769,16 @@ void thread_tree_destroy(thread_tree_t *tree) {
     /* Join bootstrap thread */
     if (tree->bootstrap_thread) {
         pthread_join(tree->bootstrap_thread, NULL);
+    }
+
+    /* Join bootstrap workers */
+    if (tree->bootstrap_workers) {
+        for (int i = 0; i < tree->num_bootstrap_workers; i++) {
+            if (tree->bootstrap_workers[i]) {
+                pthread_join(tree->bootstrap_workers[i], NULL);
+            }
+        }
+        free(tree->bootstrap_workers);
     }
 
     /* Join BEP51 workers */
