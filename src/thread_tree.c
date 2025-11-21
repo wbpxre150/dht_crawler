@@ -472,11 +472,15 @@ static void *bootstrap_thread_func(void *arg) {
             }
         }
 
-        /* PROACTIVE QUERYING: Query random nodes every 10 iterations (regardless of responses) */
-        /* Use RANDOM targets to explore the entire DHT keyspace, not just our neighborhood */
-        if (loop_iterations % 10 == 0 && node_count > 10) {
-            tree_node_t random_nodes[8];
-            int got = tree_routing_get_random_nodes(rt, random_nodes, 8);
+        /* PROACTIVE QUERYING: Query random nodes every N iterations to explore keyspace */
+        /* During bootstrap, be VERY aggressive to fill empty buckets across entire keyspace */
+        /* Use RANDOM targets to discover nodes in different keyspace regions */
+        int query_frequency = (node_count < tree->routing_threshold) ? 2 : 10;  /* Every 2 iterations during bootstrap */
+        int nodes_to_query = (node_count < tree->routing_threshold) ? 16 : 8;   /* Query more nodes during bootstrap */
+
+        if (loop_iterations % query_frequency == 0 && node_count > 10) {
+            tree_node_t random_nodes[16];
+            int got = tree_routing_get_random_nodes(rt, random_nodes, nodes_to_query);
             for (int i = 0; i < got && queries_sent < 3000; i++) {
                 uint8_t random_target[20];
                 generate_random_target(random_target);
