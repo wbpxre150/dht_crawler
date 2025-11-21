@@ -40,7 +40,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->metadata_workers = 100;
 
     /* Metadata fetcher defaults */
-    config->concurrent_peers_per_torrent = 5;
     config->max_concurrent_connections = 2000;
     config->tcp_connect_timeout_sec = 10;  /* 10s TCP connection timeout */
     config->connection_timeout_sec = 30;  /* 30s idle timeout - resets on activity */
@@ -182,9 +181,7 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->flush_interval = atoi(value);
         }
         /* Metadata fetcher settings */
-        else if (strcmp(key, "concurrent_peers_per_torrent") == 0) {
-            config->concurrent_peers_per_torrent = atoi(value);
-        } else if (strcmp(key, "max_concurrent_connections") == 0) {
+        else if (strcmp(key, "max_concurrent_connections") == 0) {
             config->max_concurrent_connections = atoi(value);
         } else if (strcmp(key, "tcp_connect_timeout_sec") == 0) {
             config->tcp_connect_timeout_sec = atoi(value);

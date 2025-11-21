@@ -1,7 +1,6 @@
 #define _DEFAULT_SOURCE  /* For usleep() */
 #include "metadata_fetcher.h"
 #include "dht_crawler.h"
-#include "dht_manager.h"
 #include "config.h"
 #include "bencode_util.h"
 #include "worker_pool.h"
@@ -21,9 +20,12 @@
 #include <errno.h>
 #include "../lib/bencode-c/bencode.h"
 
-/* Task structure for worker pool */
+/* Task structure for worker pool - self-contained with bundled peers */
 typedef struct {
     uint8_t info_hash[20];
+    struct sockaddr_storage peers[MAX_PEERS_PER_ENTRY];
+    socklen_t peer_lens[MAX_PEERS_PER_ENTRY];
+    int peer_count;
     metadata_fetcher_t *fetcher;
 } fetch_task_t;
 
@@ -46,7 +48,6 @@ static peer_connection_t* create_peer_connection(metadata_fetcher_t *fetcher,
 /* Infohash attempt tracking functions */
 static uint32_t hash_infohash(const uint8_t *info_hash);
 static infohash_attempt_t* lookup_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash);
-static infohash_attempt_t* create_or_get_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash, int peer_count);
 static infohash_attempt_t* create_or_get_attempt_with_peers(metadata_fetcher_t *fetcher, const uint8_t *info_hash,
                                                              struct sockaddr_storage *peers, socklen_t *peer_lens, int peer_count);
 static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt);
@@ -180,8 +181,8 @@ static void on_connection_request(uv_async_t *handle) {
 /* Initialize metadata fetcher */
 int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
                           infohash_queue_t *queue, database_t *database,
-                          peer_store_t *peer_store, crawler_config_t *config) {
-    if (!fetcher || !app_ctx || !queue || !database || !peer_store || !config) {
+                          crawler_config_t *config) {
+    if (!fetcher || !app_ctx || !queue || !database || !config) {
         return -1;
     }
 
@@ -189,16 +190,14 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->app_ctx = app_ctx;
     fetcher->queue = queue;
     fetcher->database = database;
-    fetcher->peer_store = peer_store;
     fetcher->config = config;
-    fetcher->max_concurrent = 5;  /* Kept for backward compatibility */
+    fetcher->max_concurrent = 1;  /* Sequential peer attempts - 1 at a time per infohash */
     fetcher->running = 0;
 
     /* Initialize async callback state flag to prevent event loop starvation */
     fetcher->connection_queue_blocked = 0;
 
     /* Load config values from provided config */
-    fetcher->max_concurrent_per_infohash = config->concurrent_peers_per_torrent;
     fetcher->max_global_connections = config->max_concurrent_connections;
     fetcher->tcp_connect_timeout_ms = config->tcp_connect_timeout_sec * 1000;  /* Convert seconds to ms */
     fetcher->connection_timeout_ms = config->connection_timeout_sec * 1000;  /* Convert seconds to ms */
@@ -262,7 +261,8 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     return 0;
 }
 
-/* Worker function - processes individual fetch tasks (THREAD-SAFE VERSION) */
+/* Worker function - processes individual fetch tasks (THREAD-SAFE VERSION)
+ * NEW ARCHITECTURE: Peers are bundled in the task - no peer_store access needed */
 static void metadata_worker_fn(void *task_data, void *closure) {
     fetch_task_t *task = (fetch_task_t *)task_data;
     metadata_fetcher_t *fetcher = (metadata_fetcher_t *)closure;
@@ -272,35 +272,17 @@ static void metadata_worker_fn(void *task_data, void *closure) {
         return;
     }
 
-    /* NOTE: Bloom filter + database deduplication already happened in dht_manager_query_peers()
-     * before the info_hash entered the get_peers queue. No need to check database again here.
-     * See src/dht_manager.c:979-1003 for the single deduplication point. */
-
-    /* Get peers from peer store (thread-safe) */
-    struct sockaddr_storage peers[MAX_PEERS_PER_REQUEST];
-    socklen_t peer_lens[MAX_PEERS_PER_REQUEST];
-    int peer_count = 0;
-
-    if (peer_store_get_peers(fetcher->peer_store, task->info_hash,
-                            peers, peer_lens, &peer_count, MAX_PEERS_PER_REQUEST) != 0 || peer_count == 0) {
-        /* No peers found - discard immediately (don't retry) */
+    /* Peers are already bundled in the task - no shared state access needed */
+    if (task->peer_count == 0) {
+        /* No peers bundled - should not happen in new architecture */
         uv_mutex_lock(&fetcher->mutex);
         fetcher->no_peers_found++;
         uv_mutex_unlock(&fetcher->mutex);
-
-        /* Create attempt entry with 0 peers to track this as FAILURE_NO_PEERS */
-        infohash_attempt_t *attempt = create_or_get_attempt(fetcher, task->info_hash, 0);
-        if (attempt) {
-            /* Mark as having no peers and handle immediately */
-            handle_infohash_failure(fetcher, attempt);
-            remove_attempt(fetcher, task->info_hash);
-        }
-
         free(task);
         return;
     }
 
-    /* Create connection request */
+    /* Create connection request with embedded peers */
     connection_request_t *req = (connection_request_t *)malloc(sizeof(connection_request_t));
     if (!req) {
         log_msg(LOG_ERROR, "Failed to allocate connection request");
@@ -309,9 +291,9 @@ static void metadata_worker_fn(void *task_data, void *closure) {
     }
 
     memcpy(req->info_hash, task->info_hash, 20);
-    memcpy(req->peers, peers, sizeof(struct sockaddr_storage) * peer_count);
-    memcpy(req->peer_lens, peer_lens, sizeof(socklen_t) * peer_count);
-    req->peer_count = peer_count;
+    memcpy(req->peers, task->peers, sizeof(struct sockaddr_storage) * task->peer_count);
+    memcpy(req->peer_lens, task->peer_lens, sizeof(socklen_t) * task->peer_count);
+    req->peer_count = task->peer_count;
 
     /* Enqueue to connection request queue */
     if (connection_request_queue_push(fetcher->conn_request_queue, req) != 0) {
@@ -336,33 +318,37 @@ static void queue_feeder_thread(void *arg) {
     metadata_fetcher_t *fetcher = (metadata_fetcher_t *)arg;
 
     log_msg(LOG_DEBUG, "Queue feeder thread started");
-    
+
     while (fetcher->running) {
-        uint8_t info_hash[20];
-        
-        /* Try to get an info_hash from queue with timeout */
-        if (infohash_queue_try_pop(fetcher->queue, info_hash, 1000) == 0) {
-            /* Create task for worker pool */
+        infohash_entry_t entry;
+
+        /* Try to get a full entry (with peers) from queue with timeout */
+        if (infohash_queue_try_pop_entry(fetcher->queue, &entry, 1000) == 0) {
+            /* Create task for worker pool with bundled peers */
             fetch_task_t *task = (fetch_task_t *)malloc(sizeof(fetch_task_t));
             if (!task) {
                 log_msg(LOG_ERROR, "Failed to allocate fetch task");
                 continue;
             }
-            
-            memcpy(task->info_hash, info_hash, 20);
+
+            memcpy(task->info_hash, entry.info_hash, 20);
+            memcpy(task->peers, entry.peers, sizeof(struct sockaddr_storage) * entry.peer_count);
+            memcpy(task->peer_lens, entry.peer_lens, sizeof(socklen_t) * entry.peer_count);
+            task->peer_count = entry.peer_count;
             task->fetcher = fetcher;
-            
+
             /* Try to submit to worker pool (non-blocking) */
             if (worker_pool_try_submit(fetcher->worker_pool, task) != 0) {
                 /* Worker pool queue full - put back in infohash queue for later */
-                if (infohash_queue_push(fetcher->queue, info_hash) != 0) {
+                if (infohash_queue_push_with_peers(fetcher->queue, entry.info_hash,
+                                                    entry.peers, entry.peer_lens, entry.peer_count) != 0) {
                     log_msg(LOG_WARN, "Both worker pool and infohash queue full, dropping task");
                 }
                 free(task);
             }
         }
     }
-    
+
     log_msg(LOG_DEBUG, "Queue feeder thread stopped");
 }
 
@@ -411,12 +397,6 @@ void metadata_fetcher_stop(metadata_fetcher_t *fetcher) {
 }
 
 /* Cleanup metadata fetcher */
-/* Set DHT manager reference for peer refresh on retry */
-void metadata_fetcher_set_dht_manager(metadata_fetcher_t *fetcher, struct dht_manager *dht_manager) {
-    if (fetcher) {
-        fetcher->dht_manager = dht_manager;
-    }
-}
 
 /* Set bloom filter for persistence after batch writes */
 void metadata_fetcher_set_bloom_filter(metadata_fetcher_t *fetcher, bloom_filter_t *bloom, const char *bloom_path) {
@@ -650,54 +630,8 @@ static peer_connection_t* create_peer_connection(metadata_fetcher_t *fetcher,
     return peer;
 }
 
-/* Fetch metadata from DHT for a specific info_hash */
-int fetch_metadata_from_dht(metadata_fetcher_t *fetcher, const uint8_t *info_hash) {
-    if (!fetcher || !info_hash || !fetcher->peer_store) {
-        return -1;
-    }
-
-    /* Get peers from peer store */
-    struct sockaddr_storage peers[MAX_PEERS_PER_INFOHASH];
-    socklen_t peer_lens[MAX_PEERS_PER_INFOHASH];
-    int peer_count = 0;
-
-    if (peer_store_get_peers(fetcher->peer_store, info_hash,
-                            peers, peer_lens, &peer_count, MAX_PEERS_PER_INFOHASH) != 0 || peer_count == 0) {
-        /* No peers found */
-        uv_mutex_lock(&fetcher->mutex);
-        fetcher->no_peers_found++;
-        uv_mutex_unlock(&fetcher->mutex);
-
-        return -1;
-    }
-
-    char hex[41];
-    format_infohash_hex(info_hash, hex);
-    log_msg(LOG_DEBUG, "Found %d peers for %s, attempting metadata fetch", peer_count, hex);
-
-    /* Try to connect to multiple peers concurrently (configured value) */
-    int max_concurrent = (peer_count < fetcher->max_concurrent_per_infohash) ? peer_count : fetcher->max_concurrent_per_infohash;
-    int connections_made = 0;
-
-    for (int i = 0; i < peer_count && connections_made < max_concurrent; i++) {
-        /* Create peer connection */
-        peer_connection_t *peer = create_peer_connection(fetcher, info_hash,
-                                                         (struct sockaddr *)&peers[i]);
-        if (peer) {
-            connections_made++;
-        }
-    }
-
-    if (connections_made == 0) {
-        log_msg(LOG_WARN, "Failed to initiate any connections for %s", hex);
-        return -1;
-    }
-
-    /* Connections are now active and will proceed asynchronously
-     * Success/failure will be handled in callbacks
-     * For now, return success to indicate we attempted the fetch */
-    return 0;
-}
+/* NOTE: fetch_metadata_from_dht() removed - no longer used in new architecture.
+ * Peers are bundled with infohash in queue entries, eliminating peer_store. */
 
 /* Send BitTorrent handshake */
 static int send_handshake(peer_connection_t *peer) {
@@ -1431,6 +1365,12 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
 
     int token;
     while ((token = bencode_next(&b)) > 0) {
+        /* Safety check: exit early if connection was closed during parsing
+         * This prevents use-after-free when peer buffers are freed */
+        if (peer->closed) {
+            break;
+        }
+
         /* Note: Removed BENCODE_IS_VALUE checks - they return false when value arrives.
          * Instead, check if b.size > 0 (we're in a dict) and check the key directly. */
         if (token == BENCODE_STRING) {
@@ -1523,6 +1463,18 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
 
     bencode_free(&b);
 
+    /* Handle early exit due to connection closed during parsing */
+    if (peer->closed) {
+        if (name) free(name);
+        if (files) {
+            for (int i = 0; i < num_files; i++) {
+                free(files[i].path);
+            }
+            free(files);
+        }
+        return -1;
+    }
+
     /* Validate required fields */
     if (!name || !pieces_data || piece_length == 0) {
         log_msg(LOG_ERROR, "Missing required fields in info dictionary (name=%s, pieces=%s, piece_length=%ld)",
@@ -1544,15 +1496,9 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
     torrent.name = name;
     torrent.added_timestamp = time(NULL);
 
-    /* Query peer store for total peer count at time of metadata fetch */
-    int peer_count = 0;
-    if (peer->fetcher) {
-        metadata_fetcher_t *fetcher = (metadata_fetcher_t *)peer->fetcher;
-        if (fetcher->peer_store) {
-            peer_count = peer_store_count_peers(fetcher->peer_store, peer->info_hash);
-        }
-    }
-    torrent.total_peers = peer_count;
+    /* Peer count is no longer tracked per-torrent in new architecture
+     * Set to 0 since peer_store is eliminated */
+    torrent.total_peers = 0;
 
     /* Convert temp files to file_info_t and calculate total size */
     file_info_t *file_info = NULL;
@@ -2040,44 +1986,6 @@ static infohash_attempt_t* lookup_attempt(metadata_fetcher_t *fetcher, const uin
     return NULL;
 }
 
-/* Create or get existing attempt entry (thread-safe) */
-static infohash_attempt_t* create_or_get_attempt(metadata_fetcher_t *fetcher, const uint8_t *info_hash, int peer_count) {
-    uv_mutex_lock(&fetcher->attempt_table_mutex);
-
-    /* Check if entry already exists */
-    infohash_attempt_t *attempt = lookup_attempt(fetcher, info_hash);
-    if (attempt) {
-        /* Update peer count if higher */
-        if (peer_count > attempt->peer_count_at_start) {
-            attempt->peer_count_at_start = peer_count;
-        }
-        uv_mutex_unlock(&fetcher->attempt_table_mutex);
-        return attempt;
-    }
-
-    /* Create new entry */
-    attempt = (infohash_attempt_t *)calloc(1, sizeof(infohash_attempt_t));
-    if (!attempt) {
-        uv_mutex_unlock(&fetcher->attempt_table_mutex);
-        return NULL;
-    }
-
-    memcpy(attempt->info_hash, info_hash, 20);
-    attempt->first_attempt_time = time(NULL);
-    attempt->last_attempt_time = time(NULL);
-    attempt->peer_count_at_start = peer_count;
-    attempt->furthest_state = PEER_STATE_CONNECTING;
-    attempt->active_connections = 0;
-
-    /* Insert into hash table */
-    uint32_t bucket = hash_infohash(info_hash);
-    attempt->next = fetcher->attempt_table[bucket];
-    fetcher->attempt_table[bucket] = attempt;
-
-    uv_mutex_unlock(&fetcher->attempt_table_mutex);
-    return attempt;
-}
-
 /* Create or get existing attempt entry with peer queue (thread-safe) */
 static infohash_attempt_t* create_or_get_attempt_with_peers(
     metadata_fetcher_t *fetcher,
@@ -2127,7 +2035,6 @@ static infohash_attempt_t* create_or_get_attempt_with_peers(
     memcpy(attempt->available_peer_lens, peer_lens, sizeof(socklen_t) * peer_count);
     attempt->total_peer_count = peer_count;
     attempt->peers_tried = 0;
-    attempt->max_concurrent_for_this_hash = fetcher->max_concurrent_per_infohash;
     attempt->peer_count_at_start = peer_count;
     attempt->furthest_state = PEER_STATE_CONNECTING;
     attempt->active_connections = 0;
@@ -2141,7 +2048,7 @@ static infohash_attempt_t* create_or_get_attempt_with_peers(
     return attempt;
 }
 
-/* Try to start next peer connection(s) for an infohash - maintains concurrent connections */
+/* Try to start next peer connection for an infohash - sequential, one at a time */
 static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_attempt_t *attempt) {
     if (!fetcher || !attempt) {
         return;
@@ -2149,17 +2056,8 @@ static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_at
 
     uv_mutex_lock(&fetcher->attempt_table_mutex);
 
-    /* Calculate how many more connections we can start */
-    int active = attempt->active_connections;
-    int max_concurrent = attempt->max_concurrent_for_this_hash;
-    int peers_remaining = attempt->total_peer_count - attempt->peers_tried;
-
-    int to_start = max_concurrent - active;
-    if (to_start > peers_remaining) {
-        to_start = peers_remaining;
-    }
-
-    if (to_start <= 0) {
+    /* Sequential: only start if no active connection and peers remaining */
+    if (attempt->active_connections > 0 || attempt->peers_tried >= attempt->total_peer_count) {
         uv_mutex_unlock(&fetcher->attempt_table_mutex);
         return;
     }
@@ -2170,46 +2068,34 @@ static void start_next_peer_connections(metadata_fetcher_t *fetcher, infohash_at
     int global_remaining = fetcher->max_global_connections - current_global;
     uv_mutex_unlock(&fetcher->mutex);
 
-    if (to_start > global_remaining) {
-        to_start = global_remaining;
-    }
-
-    if (to_start <= 0) {
+    if (global_remaining <= 0) {
         uv_mutex_unlock(&fetcher->attempt_table_mutex);
         return;
     }
 
-    /* Collect peers to connect to while holding lock */
-    struct sockaddr_storage peer_addrs[20];  /* Max concurrent per hash is 20 */
-    int peers_to_connect = 0;
-
-    for (int i = 0; i < to_start && attempt->peers_tried < attempt->total_peer_count; i++) {
-        int peer_idx = attempt->peers_tried;
-        peer_addrs[peers_to_connect] = attempt->available_peers[peer_idx];
-        attempt->peers_tried++;
-        peers_to_connect++;
-    }
+    /* Get next peer to try */
+    int peer_idx = attempt->peers_tried;
+    struct sockaddr_storage peer_addr = attempt->available_peers[peer_idx];
+    attempt->peers_tried++;
 
     uint8_t info_hash_copy[20];
     memcpy(info_hash_copy, attempt->info_hash, 20);
 
     uv_mutex_unlock(&fetcher->attempt_table_mutex);
 
-    /* Start connections without holding lock */
-    for (int i = 0; i < peers_to_connect; i++) {
-        peer_connection_t *peer = create_peer_connection(
-            fetcher, info_hash_copy, (struct sockaddr *)&peer_addrs[i]
-        );
+    /* Start single connection without holding lock */
+    peer_connection_t *peer = create_peer_connection(
+        fetcher, info_hash_copy, (struct sockaddr *)&peer_addr
+    );
 
-        if (peer) {
-            uv_mutex_lock(&fetcher->attempt_table_mutex);
-            /* Re-lookup attempt in case it was removed */
-            infohash_attempt_t *current_attempt = lookup_attempt(fetcher, info_hash_copy);
-            if (current_attempt) {
-                current_attempt->active_connections++;
-            }
-            uv_mutex_unlock(&fetcher->attempt_table_mutex);
+    if (peer) {
+        uv_mutex_lock(&fetcher->attempt_table_mutex);
+        /* Re-lookup attempt in case it was removed */
+        infohash_attempt_t *current_attempt = lookup_attempt(fetcher, info_hash_copy);
+        if (current_attempt) {
+            current_attempt->active_connections++;
         }
+        uv_mutex_unlock(&fetcher->attempt_table_mutex);
     }
 }
 

@@ -1528,6 +1528,7 @@ triple_routing_controller_t* triple_routing_controller_create(
 
     /* Synchronization */
     pthread_mutex_init(&ctrl->rotation_lock, NULL);
+    pthread_rwlock_init(&ctrl->index_rwlock, NULL);
     __atomic_store_n(&ctrl->rotation_in_progress, ROTATION_PROGRESS_IDLE, __ATOMIC_RELAXED);
     ctrl->rotation_start_time = 0;
 
@@ -1583,8 +1584,11 @@ int triple_routing_insert_node(
         return -1;
     }
 
-    /* Get filling table index (fast read, no lock) */
+    /* Get filling table index with read lock to ensure consistency during rotation */
+    pthread_rwlock_rdlock(&ctrl->index_rwlock);
     int filling_idx = ctrl->filling_idx;
+    pthread_rwlock_unlock(&ctrl->index_rwlock);
+
     wbpxre_routing_table_t *filling_table = ctrl->tables[filling_idx];
 
     /* Insert into filling table (table has own lock) */
@@ -1718,10 +1722,13 @@ static void triple_routing_try_rotate(triple_routing_controller_t *ctrl) {
     log_msg(LOG_DEBUG, "  Table %d: FILLING (ready for inserts, may have %u existing nodes)",
             next_filling_idx, wbpxre_routing_table_count(ctrl->tables[next_filling_idx]));
 
-    /* Update indices BEFORE releasing lock
-     * This ensures insert threads immediately start writing to the correct table. */
+    /* Update indices with write lock to prevent readers from seeing inconsistent state
+     * This blocks ALL index readers (get_stable_table, insert_node) during the brief update */
+    pthread_rwlock_wrlock(&ctrl->index_rwlock);
     ctrl->filling_idx = next_filling_idx;
     ctrl->stable_idx = new_stable_idx;
+    pthread_rwlock_unlock(&ctrl->index_rwlock);
+
     ctrl->rotation_count++;
     ctrl->last_rotation_time = time(NULL);
 
@@ -1831,8 +1838,11 @@ wbpxre_routing_table_t* triple_routing_get_stable_table(
         return NULL;  /* No stable table yet, still bootstrapping */
     }
 
-    /* Get stable table index (volatile read, no lock needed) */
+    /* Read stable_idx with read lock to ensure consistency during rotation */
+    pthread_rwlock_rdlock(&ctrl->index_rwlock);
     int stable_idx = ctrl->stable_idx;
+    pthread_rwlock_unlock(&ctrl->index_rwlock);
+
     if (stable_idx < 0 || stable_idx >= 3) {
         return NULL;  /* Should never happen after bootstrap */
     }
@@ -1862,8 +1872,11 @@ wbpxre_routing_table_t* triple_routing_get_filling_table(
         return NULL;
     }
 
-    /* Get filling table index (volatile read) */
+    /* Get filling table index with read lock */
+    pthread_rwlock_rdlock(&ctrl->index_rwlock);
     int filling_idx = ctrl->filling_idx;
+    pthread_rwlock_unlock(&ctrl->index_rwlock);
+
     if (filling_idx < 0 || filling_idx >= 3) {
         return NULL;  /* Invalid state */
     }
@@ -2050,15 +2063,21 @@ const uint8_t* triple_routing_get_stable_node_id(
     if (!__atomic_load_n(&ctrl->bootstrap_complete, __ATOMIC_ACQUIRE)) {
         /* Bootstrap not complete yet - fall back to filling table's node ID
          * This allows early queries during bootstrap phase */
+        pthread_rwlock_rdlock(&ctrl->index_rwlock);
         int filling_idx = ctrl->filling_idx;
+        pthread_rwlock_unlock(&ctrl->index_rwlock);
+
         if (filling_idx < 0 || filling_idx >= 3) {
             return NULL;
         }
         return ctrl->table_node_ids[filling_idx];
     }
 
-    /* Get stable table index (volatile read, no lock needed after bootstrap) */
+    /* Get stable table index with read lock */
+    pthread_rwlock_rdlock(&ctrl->index_rwlock);
     int stable_idx = ctrl->stable_idx;
+    pthread_rwlock_unlock(&ctrl->index_rwlock);
+
     if (stable_idx < 0 || stable_idx >= 3) {
         return NULL;  /* Should never happen after bootstrap */
     }
@@ -2082,8 +2101,11 @@ const uint8_t* triple_routing_get_filling_node_id(
         return NULL;
     }
 
-    /* Get filling table index (volatile read) */
+    /* Get filling table index with read lock */
+    pthread_rwlock_rdlock(&ctrl->index_rwlock);
     int filling_idx = ctrl->filling_idx;
+    pthread_rwlock_unlock(&ctrl->index_rwlock);
+
     if (filling_idx < 0 || filling_idx >= 3) {
         return NULL;  /* Invalid state */
     }
@@ -2112,5 +2134,6 @@ void triple_routing_controller_destroy(triple_routing_controller_t *ctrl) {
     }
 
     pthread_mutex_destroy(&ctrl->rotation_lock);
+    pthread_rwlock_destroy(&ctrl->index_rwlock);
     free(ctrl);
 }

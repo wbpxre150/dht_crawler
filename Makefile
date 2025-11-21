@@ -99,7 +99,11 @@ asan: CFLAGS += -g -fsanitize=address -fsanitize=undefined -fno-omit-frame-point
 asan: LDFLAGS += -fsanitize=address -fsanitize=undefined
 asan: clean all
 
+tsan: CFLAGS += -g -fsanitize=thread -fno-omit-frame-pointer
+tsan: LDFLAGS += -fsanitize=thread
+tsan: clean all
+
 valgrind: debug
 	valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
 
-.PHONY: run debug asan valgrind
+.PHONY: run debug asan tsan valgrind

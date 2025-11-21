@@ -5,7 +5,6 @@
 #include "config.h"
 #include "database.h"
 #include "infohash_queue.h"
-#include "peer_store.h"
 #include "connection_request_queue.h"
 #include <uv.h>
 
@@ -114,7 +113,6 @@ typedef struct infohash_attempt {
     socklen_t *available_peer_lens;
     int total_peer_count;
     int peers_tried;
-    int max_concurrent_for_this_hash;  /* How many concurrent connections allowed */
 
     int total_connections_tried;
     int connections_failed;
@@ -139,13 +137,13 @@ typedef enum {
 /* Forward declaration - avoid including dht_manager.h to prevent circular dependencies */
 struct dht_manager;
 
-/* Metadata fetcher manager */
+/* Metadata fetcher manager
+ * NEW ARCHITECTURE: Workers receive self-contained entries with peers bundled in.
+ * No peer_store or attempt_table needed - eliminates shared state and deadlocks. */
 typedef struct {
     app_context_t *app_ctx;
     infohash_queue_t *queue;
     database_t *database;
-    peer_store_t *peer_store;  /* Peer store for fetching peer addresses */
-    struct dht_manager *dht_manager; /* DHT manager for re-querying peers on retry */
 
     /* Worker pool for concurrent fetching */
     struct worker_pool *worker_pool;
@@ -154,7 +152,6 @@ typedef struct {
     uv_mutex_t mutex;
 
     /* Configuration */
-    int max_concurrent_per_infohash;  /* Max connections per infohash (default: 5) */
     int max_global_connections;       /* Max global connections (default: 2000) */
     int tcp_connect_timeout_ms;       /* TCP connection timeout (default: 10000ms) */
     int connection_timeout_ms;        /* Idle timeout in milliseconds - resets on activity */
@@ -183,7 +180,7 @@ typedef struct {
 
     /* Statistics - detailed failure tracking */
     uint64_t total_attempts;          /* Worker tasks processed */
-    uint64_t no_peers_found;          /* Info_hashes with no peers in store */
+    uint64_t no_peers_found;          /* Info_hashes with no peers bundled */
     uint64_t connection_initiated;     /* TCP connections attempted */
     uint64_t connection_failed;        /* TCP connections that failed */
     uint64_t connection_timeout;       /* Connections that timed out */
@@ -231,17 +228,15 @@ typedef struct {
 /* Function declarations */
 int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
                           infohash_queue_t *queue, database_t *database,
-                          peer_store_t *peer_store, crawler_config_t *config);
+                          crawler_config_t *config);
 int metadata_fetcher_start(metadata_fetcher_t *fetcher);
 void metadata_fetcher_stop(metadata_fetcher_t *fetcher);
 void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher);
-void metadata_fetcher_set_dht_manager(metadata_fetcher_t *fetcher, struct dht_manager *dht_manager);
 void metadata_fetcher_set_bloom_filter(metadata_fetcher_t *fetcher, bloom_filter_t *bloom, const char *bloom_path);
 void metadata_fetcher_get_stats(metadata_fetcher_t *fetcher, metadata_fetcher_stats_t *stats);
 
 /* Internal functions */
 void metadata_worker_thread(void *arg);
-int fetch_metadata_from_dht(metadata_fetcher_t *fetcher, const uint8_t *info_hash);
 void free_metadata_result(metadata_result_t *result);
 
 #endif /* METADATA_FETCHER_H */

@@ -3,7 +3,6 @@
 #include "dht_crawler.h"
 #include "config.h"
 #include "infohash_queue.h"
-#include "peer_store.h"
 #include "metadata_fetcher.h"
 #include "worker_pool.h"
 #include "wbpxre_dht.h"
@@ -70,23 +69,25 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
         return;
     }
 
-    /* SAFETY: If peer_store is NULL or shutdown, skip all operations
-     * This prevents DHT worker threads from blocking on peer_store mutex during shutdown */
-    if (!mgr->peer_store || mgr->peer_store->shutdown) {
+    /* SAFETY: If manager is shutting down, skip all operations */
+    if (!mgr->infohash_queue) {
         return;
     }
 
     switch (event) {
         case WBPXRE_EVENT_VALUES: {
-            /* Peers found for an info_hash via get_peers query */
-            if (info_hash && data && data_len >= sizeof(wbpxre_peer_t) && mgr->peer_store) {
-                /* FIXED: data is wbpxre_peer_t array, not raw bytes */
+            /* Peers found for an info_hash via get_peers query
+             * NEW ARCHITECTURE: Bundle peers with infohash at queue time to eliminate peer_store */
+            if (info_hash && data && data_len >= sizeof(wbpxre_peer_t)) {
                 const wbpxre_peer_t *peer_array = (const wbpxre_peer_t *)data;
                 int num_peers = data_len / sizeof(wbpxre_peer_t);
-                int peers_added = 0;
-                int valid_peers = 0;  /* NEW: Count valid peers */
 
-                for (int i = 0; i < num_peers; i++) {
+                /* Collect valid peers into local arrays */
+                struct sockaddr_storage valid_peers[MAX_PEERS_PER_ENTRY];
+                socklen_t valid_peer_lens[MAX_PEERS_PER_ENTRY];
+                int valid_peer_count = 0;
+
+                for (int i = 0; i < num_peers && valid_peer_count < MAX_PEERS_PER_ENTRY; i++) {
                     const wbpxre_peer_t *peer = &peer_array[i];
 
                     /* Validate peer address */
@@ -98,83 +99,45 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                         (ip_addr & 0xFFFF0000) == 0xC0A80000 ||   /* 192.168.x.x */
                         (ip_addr & 0xFFF00000) == 0xAC100000 ||   /* 172.16-31.x.x */
                         (ip_addr & 0xFF000000) == 0x7F000000) {   /* 127.x.x.x */
-                        mgr->stats.peers_invalid_ip++;
                         continue;
                     }
 
                     /* Skip invalid ports */
                     if (peer->port == 0) {
-                        mgr->stats.peers_invalid_port++;
                         continue;
                     }
 
-                    valid_peers++;  /* NEW: Count valid peer */
+                    /* Store valid peer */
+                    memset(&valid_peers[valid_peer_count], 0, sizeof(struct sockaddr_storage));
+                    memcpy(&valid_peers[valid_peer_count], &peer->addr, sizeof(peer->addr));
+                    valid_peer_lens[valid_peer_count] = sizeof(peer->addr);
+                    valid_peer_count++;
+                }
 
-                    /* Add valid peer to peer_store */
-                    if (peer_store_add_peer(mgr->peer_store, info_hash,
-                                          (struct sockaddr *)&peer->addr,
-                                          sizeof(peer->addr)) == 0) {
-                        peers_added++;
-                        mgr->stats.total_peers_discovered++;
+                /* Update any pending refresh query */
+                if (mgr->refresh_query_store && valid_peer_count > 0) {
+                    refresh_query_add_peers(mgr->refresh_query_store, info_hash, valid_peer_count);
+                }
+
+                /* Push to queue with peers if we have >= 10 valid peers
+                 * This is the new self-contained work unit model */
+                if (valid_peer_count >= 10 && mgr->infohash_queue) {
+                    infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
+                    if (!infohash_queue_is_full(queue)) {
+                        infohash_queue_push_with_peers(queue, info_hash,
+                                                       valid_peers, valid_peer_lens, valid_peer_count);
+                    } else {
+                        char hex[41];
+                        format_infohash(info_hash, hex, sizeof(hex));
+                        log_msg(LOG_WARN, "Infohash queue is full, dropping %s", hex);
                     }
-                }
 
-                /* NEW: Update any pending refresh query */
-                if (mgr->refresh_query_store && valid_peers > 0) {
-                    refresh_query_add_peers(mgr->refresh_query_store, info_hash, valid_peers);
-                }
-
-                /* Track filtered peers */
-                mgr->stats.peers_filtered = mgr->stats.peers_invalid_ip + mgr->stats.peers_invalid_port;
-
-                if (peers_added > 0) {
-                    mgr->stats.get_peers_responses++;
-                    mgr->stats.info_hashes_with_peers++;
-
-                    /* Hybrid approach: Allow immediate queue entry if we have enough peers
-                     * This fixes queue starvation while maintaining the 10-peer quality threshold */
-
-                    /* Get current total peer count from peer_store */
-                    int total_peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
-
-                    /* Check if in retry tracking */
-                    bool in_retry = false;
+                    /* Mark as complete in retry system if applicable */
                     if (mgr->peer_retry_tracker) {
-                        peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
-                        in_retry = (entry != NULL);
-                    }
-
-                    /* Decision logic (FIXED):
-                     * - If we have >= 10 peers: proceed to metadata fetcher immediately
-                     * - If we have < 10 peers: WAIT for retry system to collect more peers via SEARCH_DONE
-                     *
-                     * This fixes the bug where info_hashes were queued with only 1 peer, causing
-                     * low metadata fetch success rates (4% instead of expected 25-40%).
-                     */
-                    bool should_queue = false;
-
-                    if (total_peer_count >= 10) {
-                        /* Threshold met - proceed immediately */
-                        should_queue = true;
-
-                        /* If in retry system, mark as complete since we have enough peers */
-                        if (in_retry && mgr->peer_retry_tracker) {
-                            peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, total_peer_count);
-                        }
-                    }
-                    /* else: < 10 peers - let SEARCH_DONE event trigger retry system to collect more */
-
-                    if (should_queue && mgr->infohash_queue) {
-                        infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
-                        if (!infohash_queue_is_full(queue)) {
-                            infohash_queue_push(queue, info_hash);
-                        } else {
-                            char hex[41];
-                            format_infohash(info_hash, hex, sizeof(hex));
-                            log_msg(LOG_WARN, "Infohash queue is full, dropping %s", hex);
-                        }
+                        peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, valid_peer_count);
                     }
                 }
+                /* else: < 10 peers - let SEARCH_DONE event trigger retry system */
             }
             break;
         }
@@ -189,80 +152,30 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
                 refresh_query_complete(mgr->refresh_query_store, info_hash);
             }
 
-            /* Check if we should retry for more peers */
-            if (info_hash && mgr->peer_store && mgr->peer_retry_tracker) {
-                int peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
-
-                /* Clear query_in_progress flag first - the query is done regardless of whether we retry */
+            /* Check if we should retry for more peers
+             * NOTE: With the new architecture, SEARCH_DONE doesn't push to queue directly.
+             * Peers are bundled during VALUES events. SEARCH_DONE only manages retry tracking. */
+            if (info_hash && mgr->peer_retry_tracker) {
                 peer_retry_entry_t *entry = peer_retry_entry_find(mgr->peer_retry_tracker, info_hash);
                 if (entry) {
                     pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
                     entry->query_in_progress = 0;
-                    entry->peer_count = peer_count;
                     pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
-                }
 
-                /* Check if retry is needed */
-                if (peer_retry_should_retry(mgr->peer_retry_tracker, info_hash, peer_count)) {
-                    /* Schedule retry after delay */
-                    if (entry) {
+                    /* Check if retry is needed (no peers bundled yet means we had < 10) */
+                    if (peer_retry_should_retry(mgr->peer_retry_tracker, info_hash, 0)) {
                         pthread_mutex_lock(&mgr->peer_retry_tracker->mutex);
                         entry->attempts_made++;
                         entry->last_attempt_time = time(NULL);
                         mgr->peer_retry_tracker->retries_triggered++;
-                        pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
-
-                        mgr->stats.peer_retries_triggered++;
-
                         /* Schedule retry by setting target_retry_time */
-                        time_t target_time = time(NULL) + (mgr->peer_retry_tracker->retry_delay_ms / 1000);
-                        entry->target_retry_time = target_time;
-                    }
-                } else {
-                    /* No retry needed - add to queue for metadata fetching */
-                    if (peer_count > 0 && mgr->infohash_queue) {
-                        /* FIXED: Push to queue immediately after retry completion
-                         * This ensures infohashes with peers reach the metadata fetcher */
-                        infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
-                        if (!infohash_queue_is_full(queue)) {
-                            infohash_queue_push(queue, info_hash);
-                        } else {
-                            char hex[41];
-                            format_infohash(info_hash, hex, sizeof(hex));
-                            log_msg(LOG_WARN, "Infohash queue is full after retry completion, dropping %s", hex);
-                        }
-                    } else if (peer_count == 0) {
-                        mgr->stats.info_hashes_no_peers++;
-                    }
-
-                    /* Mark as complete and remove from tracker */
-                    peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, peer_count);
-                }
-
-                if (mgr->active_peer_queries > 0) {
-                    mgr->active_peer_queries--;
-                }
-            }
-            /* Fallback for when retry tracker is disabled */
-            else if (info_hash && mgr->peer_store) {
-                int peer_count = peer_store_count_peers(mgr->peer_store, info_hash);
-
-                if (peer_count > 0 && mgr->infohash_queue) {
-                    /* Push to queue for metadata fetching */
-                    infohash_queue_t *queue = (infohash_queue_t *)mgr->infohash_queue;
-                    if (!infohash_queue_is_full(queue)) {
-                        infohash_queue_push(queue, info_hash);
+                        entry->target_retry_time = time(NULL) + (mgr->peer_retry_tracker->retry_delay_ms / 1000);
+                        pthread_mutex_unlock(&mgr->peer_retry_tracker->mutex);
                     } else {
-                        char hex[41];
-                        format_infohash(info_hash, hex, sizeof(hex));
-                        log_msg(LOG_WARN, "Infohash queue is full, dropping %s", hex);
+                        /* No more retries - remove from tracker (infohash was either
+                         * already queued via VALUES with enough peers, or we give up) */
+                        peer_retry_mark_complete(mgr->peer_retry_tracker, info_hash, 0);
                     }
-                } else if (peer_count == 0) {
-                    mgr->stats.info_hashes_no_peers++;
-                }
-
-                if (mgr->active_peer_queries > 0) {
-                    mgr->active_peer_queries--;
                 }
             }
             break;
@@ -272,13 +185,10 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
             if (data && data_len > 0 && data_len % 20 == 0) {
                 int num_samples = data_len / 20;
                 const uint8_t *samples = (const uint8_t *)data;
-                mgr->stats.bep51_responses_received++;
-                mgr->stats.bep51_samples_received += num_samples;
 
                 /* Trigger peer queries for all samples */
                 for (int i = 0; i < num_samples; i++) {
                     const uint8_t *hash = samples + (i * 20);
-                    mgr->stats.infohashes_discovered++;
 
                     /* Create retry tracker entry if enabled */
                     if (mgr->peer_retry_tracker) {
@@ -294,9 +204,6 @@ void wbpxre_callback_wrapper(void *closure, wbpxre_event_t event,
 
         case WBPXRE_EVENT_NODE_DISCOVERED: {
             /* New node discovered */
-            if (data && data_len >= 26) {
-                mgr->stats.nodes_from_queries++;
-            }
             break;
         }
 
@@ -365,20 +272,6 @@ static void stats_timer_cb(uv_timer_t *handle) {
         }
     }
 
-    /* Peer store cleanup (every 300 seconds / 5 minutes) */
-    static int cleanup_counter = 0;
-    cleanup_counter++;  /* Timer fires every 1 second */
-
-    if (cleanup_counter >= 300) {  /* Every 5 minutes */
-        if (mgr->peer_store) {
-            log_msg(LOG_DEBUG, "Running periodic peer store cleanup");
-            int expired = peer_store_cleanup_expired(mgr->peer_store);
-            if (expired > 0) {
-                log_msg(LOG_DEBUG, "Peer store cleanup: %d expired peers removed", expired);
-            }
-        }
-        cleanup_counter = 0;
-    }
 
     /* Peer retry tracker cleanup (configurable interval) */
     static int peer_retry_cleanup_counter = 0;
@@ -523,18 +416,11 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     mgr->config.peer_discovery_enabled = 1;
     mgr->config.max_concurrent_peer_queries = 50;
     mgr->config.peer_query_timeout_sec = 30;
-    mgr->active_peer_queries = 0;
 
     /* Node discovery configuration */
     mgr->config.node_discovery_enabled = 1;
 
-    /* Initialize peer store */
-    mgr->peer_store = peer_store_init(1000, 500, 3600);
-    if (!mgr->peer_store) {
-        log_msg(LOG_ERROR, "Failed to create peer store");
-        return -1;
-    }
-    log_msg(LOG_DEBUG, "Peer store created at address: %p", (void*)mgr->peer_store);
+    /* NOTE: peer_store removed - peers are now bundled with infohash at queue time */
 
     /* Build wbpxre-dht configuration */
     wbpxre_config_t dht_config = {0};
@@ -577,7 +463,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
     mgr->dht = wbpxre_dht_init(&dht_config);
     if (!mgr->dht) {
         log_msg(LOG_ERROR, "Failed to initialize wbpxre-dht");
-        peer_store_cleanup(mgr->peer_store);
         return -1;
     }
     log_msg(LOG_DEBUG, "Initialized wbpxre-dht:");
@@ -596,7 +481,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         log_msg(LOG_ERROR, "Failed to start wbpxre-dht");
         wbpxre_dht_cleanup(mgr->dht);
         mgr->dht = NULL;
-        peer_store_cleanup(mgr->peer_store);
         return -1;
     }
     log_msg(LOG_DEBUG, "Started wbpxre-dht worker threads");
@@ -608,7 +492,6 @@ int dht_manager_init(dht_manager_t *mgr, app_context_t *app_ctx, void *infohash_
         wbpxre_dht_stop(mgr->dht);
         wbpxre_dht_cleanup(mgr->dht);
         mgr->dht = NULL;
-        peer_store_cleanup(mgr->peer_store);
         return -1;
     }
     mgr->bootstrap_reseed_timer.data = mgr;
@@ -767,22 +650,10 @@ void dht_manager_stop(dht_manager_t *mgr) {
     uv_timer_stop(&mgr->dual_routing_timer);
     log_msg(LOG_DEBUG, "Dual routing timer stopped");
 
-    /* Step 1: Set peer_store shutdown flag FIRST
-     * This causes DHT callbacks to exit early (see wbpxre_callback_wrapper)
-     * preventing them from blocking on peer_store mutex */
-    if (mgr->peer_store) {
-        peer_store_shutdown(mgr->peer_store);
-    }
-
-    /* Step 2: Stop wbpxre-dht (joins all worker threads)
-     * Worker threads should exit quickly since callbacks skip when shutdown=true */
+    /* Stop wbpxre-dht (joins all worker threads) */
     if (mgr->dht) {
         wbpxre_dht_stop(mgr->dht);
     }
-
-    /* Step 3: Do NOT cleanup peer_store here - wait until dht_manager_cleanup
-     * after metadata_fetcher_stop has joined all threads */
-    log_msg(LOG_DEBUG, "DHT manager stopped (peer_store will be cleaned up later)");
 
     log_msg(LOG_DEBUG, "DHT manager stopped");
 }
@@ -864,13 +735,7 @@ void dht_manager_cleanup(dht_manager_t *mgr) {
         mgr->dht = NULL;
     }
 
-    /* peer_store cleanup moved here from dht_manager_stop()
-     * Safe now because metadata_fetcher_stop() has already been called */
-    if (mgr->peer_store) {
-        log_msg(LOG_DEBUG, "Cleaning up peer_store...");
-        peer_store_cleanup(mgr->peer_store);
-        mgr->peer_store = NULL;
-    }
+    /* NOTE: peer_store removed from architecture */
 
     /* Cleanup refresh query store */
     if (mgr->refresh_query_store) {
@@ -944,16 +809,10 @@ int dht_manager_query_peers(dht_manager_t *mgr, const uint8_t *info_hash, bool p
      * Priority queries (e.g., from /refresh API) skip to front of queue */
     int rc = wbpxre_dht_query_peers(mgr->dht, info_hash, priority);
 
-    if (rc == 0) {
-        /* Track the request */
-        mgr->stats.get_peers_queries_sent++;
-        mgr->active_peer_queries++;
-
-        if (priority) {
-            char hex[41];
-            format_infohash(info_hash, hex, sizeof(hex));
-            log_msg(LOG_DEBUG, "Priority get_peers query for hash %s", hex);
-        }
+    if (rc == 0 && priority) {
+        char hex[41];
+        format_infohash(info_hash, hex, sizeof(hex));
+        log_msg(LOG_DEBUG, "Priority get_peers query for hash %s", hex);
     }
 
     return rc;
@@ -1050,11 +909,6 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                     (unsigned long long)wbpxre_stats.bep51_queries_sent,
                     (unsigned long long)wbpxre_stats.bep51_responses_received,
                     (unsigned long long)wbpxre_stats.bep51_samples_received);
-            log_msg(LOG_INFO, "  Peers: discovered=%llu filtered=%llu (invalid_ip=%llu invalid_port=%llu)",
-                    (unsigned long long)mgr->stats.total_peers_discovered,
-                    (unsigned long long)mgr->stats.peers_filtered,
-                    (unsigned long long)mgr->stats.peers_invalid_ip,
-                    (unsigned long long)mgr->stats.peers_invalid_port);
 
             /* Get current routing table stats from wbpxre-dht */
             int good = 0, dubious = 0;
@@ -1165,9 +1019,8 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                 (unsigned long long)fetcher->metadata_rejected,
                 (unsigned long long)fetcher->hash_mismatch);
 
-        log_msg(LOG_INFO, "    Active: connections=%d max_per_infohash=%d max_global=%d",
+        log_msg(LOG_INFO, "    Active: connections=%d max_global=%d",
                 fetcher->active_count,
-                fetcher->max_concurrent_per_infohash,
                 fetcher->max_global_connections);
 
         /* Print worker pool statistics */

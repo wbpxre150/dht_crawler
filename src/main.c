@@ -228,20 +228,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Initialize metadata fetcher with peer store from DHT manager */
+    /* Initialize metadata fetcher */
     log_msg(LOG_DEBUG, "Initializing metadata fetcher...");
-    log_msg(LOG_DEBUG, "g_dht_mgr.peer_store address: %p", (void*)g_dht_mgr.peer_store);
-    peer_store_t *peer_store = g_dht_mgr.peer_store;
-    if (!peer_store) {
-        log_msg(LOG_ERROR, "DHT manager has no peer store");
-        dht_manager_cleanup(&g_dht_mgr);
-        database_cleanup(&g_database);
-        bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
-        return 1;
-    }
 
-    rc = metadata_fetcher_init(&g_fetcher, &g_app_ctx, &g_queue, &g_database, peer_store, &config);
+    rc = metadata_fetcher_init(&g_fetcher, &g_app_ctx, &g_queue, &g_database, &config);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize metadata fetcher: %d", rc);
         dht_manager_cleanup(&g_dht_mgr);
@@ -253,9 +243,6 @@ int main(int argc, char *argv[]) {
 
     /* Set metadata fetcher reference in DHT manager for statistics */
     dht_manager_set_metadata_fetcher(&g_dht_mgr, &g_fetcher);
-
-    /* Set DHT manager reference in metadata fetcher for peer refresh on retry */
-    metadata_fetcher_set_dht_manager(&g_fetcher, (struct dht_manager *)&g_dht_mgr);
 
     /* Connect bloom filter to batch writer for persistence after each batch write
      * This ensures bloom filter on disk stays synchronized with database */

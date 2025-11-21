@@ -32,7 +32,6 @@ typedef struct {
     int metadata_workers;
 
     /* Metadata fetcher settings */
-    int concurrent_peers_per_torrent;
     int max_concurrent_connections;
     int tcp_connect_timeout_sec;        /* TCP connection establishment timeout */
     int connection_timeout_sec;         /* Idle timeout - resets on activity */

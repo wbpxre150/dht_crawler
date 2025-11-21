@@ -2,11 +2,11 @@
 #define DHT_MANAGER_H
 
 #include "dht_crawler.h"
-#include "peer_store.h"
 #include "discovered_nodes.h"
 #include "wbpxre_dht.h"
 #include "refresh_query.h"
 #include "peer_retry_tracker.h"
+#include "infohash_queue.h"
 #include <uv.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -14,41 +14,9 @@
 
 /* DHT statistics */
 typedef struct {
-    uint64_t packets_received;
-    uint64_t packets_sent;
-    uint64_t packets_dropped;
-    uint64_t queries_received;
-    uint64_t responses_received;
-    uint64_t errors_received;
-    uint64_t announce_peer_received;
-    uint64_t get_peers_received;
-    uint64_t find_node_received;
-    uint64_t ping_received;
-    uint64_t infohashes_discovered;
-    uint64_t active_searches;
-    uint64_t bucket_refreshes_sent;   /* Bucket refresh searches */
-    uint64_t neighbourhood_searches_sent; /* Neighbourhood maintenance searches */
-    uint64_t wandering_searches_sent; /* Random keyspace exploration searches */
-    uint64_t stale_nodes_pinged;      /* Stale node verification pings */
-    uint64_t responses_sent;          /* Responses to queries (good citizenship) */
-    /* BEP 51 statistics */
-    uint64_t bep51_queries_sent;      /* BEP 51 sample_infohashes queries sent */
-    uint64_t bep51_responses_received; /* BEP 51 responses received */
-    uint64_t bep51_samples_received;  /* Total sample hashes received from BEP 51 */
-    /* Peer discovery statistics */
-    uint64_t get_peers_queries_sent;  /* Active get_peers queries sent */
-    uint64_t get_peers_responses;     /* get_peers responses received */
-    uint64_t total_peers_discovered;  /* Total peers found via get_peers */
-    uint64_t info_hashes_with_peers;  /* Info hashes that found at least one peer */
-    uint64_t info_hashes_no_peers;    /* Info hashes with no peers found */
-    /* Peer validation statistics */
-    uint64_t peers_invalid_ip;        /* Peers with invalid/private IPs */
-    uint64_t peers_invalid_port;      /* Peers with port 0 */
-    uint64_t peers_filtered;          /* Total peers filtered out */
     time_t start_time;
     time_t last_routing_table_log;    /* Last time we logged routing table stats */
-    /* Node discovery statistics */
-    uint64_t nodes_from_queries;      /* Nodes discovered from outgoing queries */
+    /* Node discovery statistics (main thread only) */
     uint64_t nodes_from_incoming;     /* Nodes discovered from incoming requests */
     uint64_t nodes_from_bootstrap;    /* Nodes discovered from bootstrap */
     uint64_t nodes_deduped;           /* Duplicate nodes filtered */
@@ -56,9 +24,7 @@ typedef struct {
     uint64_t find_node_success;       /* find_node successful responses */
     uint64_t find_node_timeout;       /* find_node query timeouts */
     uint64_t nodes_in_jech_table;     /* Current nodes in jech/dht table */
-    /* Peer retry statistics */
-    uint64_t peer_retries_triggered;     /* Number of retry attempts triggered */
-    /* Dual routing table statistics */
+    /* Dual routing table statistics (timer callback only) */
     uint64_t dual_routing_rotations;     /* Total dual routing table rotations */
     uint64_t dual_routing_nodes_cleared; /* Total nodes cleared during rotations */
     /* Queue clearing statistics (for rotation synchronization) */
@@ -104,9 +70,6 @@ typedef struct {
     unsigned char bep51_target[20];   /* Current target ID for sample_infohashes */
     time_t last_target_rotation;      /* Last time we rotated the target */
     time_t last_bep51_query;          /* Last time we sent BEP 51 queries */
-    /* Peer discovery state */
-    peer_store_t *peer_store;         /* Storage for discovered peers */
-    int active_peer_queries;          /* Current number of active get_peers queries */
     /* Node discovery state */
     discovered_nodes_queue_t discovered_nodes; /* Queue for discovered nodes */
     void *find_node_worker_pool;      /* Worker pool for find_node queries */

@@ -297,6 +297,7 @@ typedef struct {
 
     /* Synchronization */
     pthread_mutex_t rotation_lock;  /* Protects state transitions */
+    pthread_rwlock_t index_rwlock;  /* Protects stable_idx/filling_idx reads/writes during rotation */
     int rotation_in_progress;       /* Guard flag: ROTATION_PROGRESS_IDLE=0, ROTATION_PROGRESS_IN_PROGRESS=1 (accessed atomically) */
     time_t rotation_start_time;     /* When current rotation started (for monitoring) */
 

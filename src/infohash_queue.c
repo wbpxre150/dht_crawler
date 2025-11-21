@@ -61,15 +61,11 @@ void infohash_queue_set_database(infohash_queue_t *queue, struct database *db) {
     queue->db = db;
 }
 
-/* Push an info hash to the queue (blocks if full) */
+/* Push an info hash to the queue (blocks if full) - backward compatibility */
 int infohash_queue_push(infohash_queue_t *queue, const uint8_t *info_hash) {
     if (!queue || !info_hash) {
         return -1;
     }
-
-    /* No deduplication here - it happens upstream in dht_manager_query_peers()
-     * before info_hashes enter the get_peers queue. This function now only
-     * handles queue operations. */
 
     uv_mutex_lock(&queue->mutex);
 
@@ -81,14 +77,10 @@ int infohash_queue_push(infohash_queue_t *queue, const uint8_t *info_hash) {
     /* Add to tail */
     memcpy(queue->entries[queue->tail].info_hash, info_hash, SHA1_DIGEST_LENGTH);
     queue->entries[queue->tail].timestamp = time(NULL);
+    queue->entries[queue->tail].peer_count = 0;  /* No peers in legacy mode */
 
     queue->tail = (queue->tail + 1) % queue->capacity;
     queue->count++;
-
-    /* NOTE: Bloom filter is NOT checked here - deduplication happens upstream
-     * in dht_manager_query_peers() before info_hashes enter the get_peers queue.
-     * Bloom filter is updated only after successful database write in
-     * database_insert_batch() to prevent data loss from failed metadata fetches. */
 
     /* Signal that queue is not empty */
     uv_cond_signal(&queue->cond_not_empty);
@@ -97,7 +89,49 @@ int infohash_queue_push(infohash_queue_t *queue, const uint8_t *info_hash) {
     return 0;
 }
 
-/* Pop an info hash from the queue (blocks if empty) */
+/* Push an info hash with peers to the queue (blocks if full) */
+int infohash_queue_push_with_peers(infohash_queue_t *queue, const uint8_t *info_hash,
+                                    struct sockaddr_storage *peers, socklen_t *peer_lens, int peer_count) {
+    if (!queue || !info_hash) {
+        return -1;
+    }
+
+    uv_mutex_lock(&queue->mutex);
+
+    /* Wait if queue is full */
+    while (queue->count >= queue->capacity) {
+        uv_cond_wait(&queue->cond_not_full, &queue->mutex);
+    }
+
+    /* Add to tail */
+    infohash_entry_t *entry = &queue->entries[queue->tail];
+    memcpy(entry->info_hash, info_hash, SHA1_DIGEST_LENGTH);
+    entry->timestamp = time(NULL);
+
+    /* Copy peers (limit to MAX_PEERS_PER_ENTRY) */
+    int copy_count = peer_count;
+    if (copy_count > MAX_PEERS_PER_ENTRY) {
+        copy_count = MAX_PEERS_PER_ENTRY;
+    }
+    if (peers && peer_lens && copy_count > 0) {
+        memcpy(entry->peers, peers, sizeof(struct sockaddr_storage) * copy_count);
+        memcpy(entry->peer_lens, peer_lens, sizeof(socklen_t) * copy_count);
+        entry->peer_count = copy_count;
+    } else {
+        entry->peer_count = 0;
+    }
+
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->count++;
+
+    /* Signal that queue is not empty */
+    uv_cond_signal(&queue->cond_not_empty);
+    uv_mutex_unlock(&queue->mutex);
+
+    return 0;
+}
+
+/* Pop an info hash from the queue (blocks if empty) - backward compatibility */
 int infohash_queue_pop(infohash_queue_t *queue, uint8_t *info_hash) {
     if (!queue || !info_hash) {
         return -1;
@@ -123,7 +157,33 @@ int infohash_queue_pop(infohash_queue_t *queue, uint8_t *info_hash) {
     return 0;
 }
 
-/* Try to pop with timeout */
+/* Pop a full entry from the queue (blocks if empty) */
+int infohash_queue_pop_entry(infohash_queue_t *queue, infohash_entry_t *entry) {
+    if (!queue || !entry) {
+        return -1;
+    }
+
+    uv_mutex_lock(&queue->mutex);
+
+    /* Wait if queue is empty */
+    while (queue->count == 0) {
+        uv_cond_wait(&queue->cond_not_empty, &queue->mutex);
+    }
+
+    /* Copy full entry from head */
+    memcpy(entry, &queue->entries[queue->head], sizeof(infohash_entry_t));
+
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+
+    /* Signal that queue is not full */
+    uv_cond_signal(&queue->cond_not_full);
+    uv_mutex_unlock(&queue->mutex);
+
+    return 0;
+}
+
+/* Try to pop with timeout - backward compatibility */
 int infohash_queue_try_pop(infohash_queue_t *queue, uint8_t *info_hash, int timeout_ms) {
     if (!queue || !info_hash) {
         return -1;
@@ -133,29 +193,67 @@ int infohash_queue_try_pop(infohash_queue_t *queue, uint8_t *info_hash, int time
 
     if (queue->count == 0) {
         uv_mutex_unlock(&queue->mutex);
-        
+
         if (timeout_ms == 0) {
             return -1;
         }
 
-        /* Sleep for the timeout period, then retry once
-         * This prevents busy-looping when queue is empty */
+        /* Sleep for the timeout period, then retry once */
         struct timespec ts;
         ts.tv_sec = timeout_ms / 1000;
         ts.tv_nsec = (timeout_ms % 1000) * 1000000;
         nanosleep(&ts, NULL);
-        
-        /* Try one more time after timeout */
+
         uv_mutex_lock(&queue->mutex);
         if (queue->count == 0) {
             uv_mutex_unlock(&queue->mutex);
             return -1;
         }
-        /* Fall through to pop if queue now has items */
     }
 
     /* Remove from head */
     memcpy(info_hash, queue->entries[queue->head].info_hash, SHA1_DIGEST_LENGTH);
+
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+
+    /* Signal that queue is not full */
+    uv_cond_signal(&queue->cond_not_full);
+    uv_mutex_unlock(&queue->mutex);
+
+    return 0;
+}
+
+/* Try to pop full entry with timeout */
+int infohash_queue_try_pop_entry(infohash_queue_t *queue, infohash_entry_t *entry, int timeout_ms) {
+    if (!queue || !entry) {
+        return -1;
+    }
+
+    uv_mutex_lock(&queue->mutex);
+
+    if (queue->count == 0) {
+        uv_mutex_unlock(&queue->mutex);
+
+        if (timeout_ms == 0) {
+            return -1;
+        }
+
+        /* Sleep for the timeout period, then retry once */
+        struct timespec ts;
+        ts.tv_sec = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+        nanosleep(&ts, NULL);
+
+        uv_mutex_lock(&queue->mutex);
+        if (queue->count == 0) {
+            uv_mutex_unlock(&queue->mutex);
+            return -1;
+        }
+    }
+
+    /* Copy full entry from head */
+    memcpy(entry, &queue->entries[queue->head], sizeof(infohash_entry_t));
 
     queue->head = (queue->head + 1) % queue->capacity;
     queue->count--;
