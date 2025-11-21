@@ -859,8 +859,8 @@ static void dual_routing_timer_cb(uv_timer_t *handle) {
     static uint64_t last_rotation_count = 0;
 
     /* Get current rotation count */
-    triple_routing_stats_t stats;
-    triple_routing_get_stats(mgr->dht->routing_controller, &stats);
+    tribuf_stats_t stats;
+    tribuf_get_stats(mgr->dht->routing_controller, &stats);
 
     /* Check if rotation occurred */
     if (stats.total_rotations > last_rotation_count) {
@@ -920,11 +920,11 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
 
             /* Print keyspace distribution statistics */
             int close_nodes = 0, distant_nodes = 0;
-            wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(mgr->dht->routing_controller);
-            const uint8_t *stable_node_id = triple_routing_get_stable_node_id(mgr->dht->routing_controller);
-            if (stable_table && stable_node_id) {
-                wbpxre_routing_table_get_keyspace_distribution(stable_table,
-                                                                 stable_node_id,
+            wbpxre_routing_table_t *readable_table = tribuf_get_readable_table(mgr->dht->routing_controller);
+            const uint8_t *readable_node_id = tribuf_get_readable_node_id(mgr->dht->routing_controller);
+            if (readable_table && readable_node_id) {
+                wbpxre_routing_table_get_keyspace_distribution(readable_table,
+                                                                 readable_node_id,
                                                                  &close_nodes,
                                                                  &distant_nodes);
             }
@@ -936,29 +936,27 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                         distant_nodes, (distant_nodes * 100.0) / total_nodes);
             }
 
-            /* Get and print triple routing table statistics */
-            triple_routing_stats_t triple_stats;
-            triple_routing_get_stats(mgr->dht->routing_controller, &triple_stats);
+            /* Get and print tribuf statistics */
+            tribuf_stats_t tribuf_stats;
+            tribuf_get_stats(mgr->dht->routing_controller, &tribuf_stats);
 
             /* Update mgr stats for HTTP API */
-            mgr->stats.dual_routing_rotations = triple_stats.total_rotations;
-            mgr->stats.dual_routing_nodes_cleared = triple_stats.total_nodes_cleared;
+            mgr->stats.dual_routing_rotations = tribuf_stats.total_rotations;
+            mgr->stats.dual_routing_nodes_cleared = tribuf_stats.total_nodes_cleared;
 
-            if (!triple_stats.bootstrap_complete) {
-                log_msg(LOG_DEBUG, "  Triple routing: BOOTSTRAP IN PROGRESS (%.1f%% to first rotation)",
-                        triple_stats.fill_progress_pct);
-                log_msg(LOG_DEBUG, "    Filling table: table_%d (%u / %u nodes)",
-                        triple_stats.filling_idx, triple_stats.filling_table_nodes,
-                        triple_stats.rotation_threshold);
+            if (!tribuf_stats.bootstrap_complete) {
+                log_msg(LOG_DEBUG, "  Tribuf: BOOTSTRAP IN PROGRESS");
+                log_msg(LOG_DEBUG, "    Filling table: table_%d (%u nodes)",
+                        tribuf_stats.filling_idx, tribuf_stats.filling_table_nodes);
             } else {
-                log_msg(LOG_DEBUG, "  Triple routing: rotations=%llu nodes_cleared=%llu bootstrap_time=%us",
-                        (unsigned long long)triple_stats.total_rotations,
-                        (unsigned long long)triple_stats.total_nodes_cleared,
-                        triple_stats.bootstrap_duration_sec);
-                log_msg(LOG_DEBUG, "    Stable table: table_%d (%u nodes) | Filling table: table_%d (%u nodes, %.1f%% full)",
-                        triple_stats.stable_idx, triple_stats.stable_table_nodes,
-                        triple_stats.filling_idx, triple_stats.filling_table_nodes,
-                        triple_stats.fill_progress_pct);
+                log_msg(LOG_DEBUG, "  Tribuf: rotations=%llu clears=%llu nodes_cleared=%llu bootstrap_time=%us",
+                        (unsigned long long)tribuf_stats.total_rotations,
+                        (unsigned long long)tribuf_stats.total_clears,
+                        (unsigned long long)tribuf_stats.total_nodes_cleared,
+                        tribuf_stats.bootstrap_duration_sec);
+                log_msg(LOG_DEBUG, "    FULL tables: %u | Filling table: table_%d (%u nodes)",
+                        tribuf_stats.total_full_tables,
+                        tribuf_stats.filling_idx, tribuf_stats.filling_table_nodes);
             }
         }
     }

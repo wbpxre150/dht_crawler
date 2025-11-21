@@ -459,7 +459,7 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
         memcpy(&addr, rp->ai_addr, sizeof(addr));
 
         /* Get FILLING table's node ID for bootstrap queries */
-        const uint8_t *filling_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        const uint8_t *filling_node_id = tribuf_get_filling_node_id(dht->routing_controller);
         if (!filling_node_id) {
             continue;  /* No valid node ID yet, try next address */
         }
@@ -477,7 +477,7 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
             node.discovered_at = time(NULL);
             node.last_responded_at = time(NULL);
 
-            triple_routing_insert_node(dht->routing_controller, &node);
+            tribuf_insert(dht->routing_controller, &node);
 
             /* Follow up with find_node to discover more nodes
              * Use filling table's node ID as the target (self-lookup) */
@@ -489,7 +489,7 @@ int wbpxre_dht_bootstrap(wbpxre_dht_t *dht, const char *hostname, uint16_t port)
                 for (int i = 0; i < found_count; i++) {
                     /* Make a copy to avoid use-after-free if insert holds reference */
                     wbpxre_routing_node_t node_copy = found_nodes[i];
-                    triple_routing_insert_node(dht->routing_controller, &node_copy);
+                    tribuf_insert(dht->routing_controller, &node_copy);
                 }
                 if (found_count > 0) {
                     fprintf(stderr, "Bootstrap: Discovered %d nodes from %s:%d\n",
@@ -531,26 +531,17 @@ wbpxre_dht_t *wbpxre_dht_init(const wbpxre_config_t *config) {
         return NULL;
     }
 
-    /* Initialize triple routing controller */
-    uint32_t rotation_threshold = config->triple_routing_threshold > 0 ?
+    /* Initialize tribuf controller
+     * max_nodes_per_table determines when table rotates to FULL state */
+    int max_nodes_per_table = config->triple_routing_threshold > 0 ?
         config->triple_routing_threshold : 1500;
 
-    int rotation_time_sec = config->triple_routing_rotation_time > 0 ?
-        config->triple_routing_rotation_time : 60;
-
-    /* Set max_nodes_per_table to threshold (table rotates when it hits threshold)
-     * No need for excess capacity since we rotate at threshold */
-    int max_nodes_per_table = rotation_threshold;
-
-    dht->routing_controller = triple_routing_controller_create(max_nodes_per_table, rotation_threshold, rotation_time_sec);
+    dht->routing_controller = tribuf_create(max_nodes_per_table);
     if (!dht->routing_controller) {
         close(dht->udp_socket);
         free(dht);
         return NULL;
     }
-
-    /* Set DHT context for queue clearing during rotation */
-    triple_routing_set_dht_context(dht->routing_controller, dht);
 
     /* Initialize mutexes and locks */
     pthread_mutex_init(&dht->pending_queries_mutex, NULL);
@@ -624,7 +615,7 @@ static void *find_node_worker_func(void *arg) {
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
         /* Get FILLING table's node ID (this is the node ID used to discover nodes) */
-        const uint8_t *filling_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        const uint8_t *filling_node_id = tribuf_get_filling_node_id(dht->routing_controller);
         if (!filling_node_id) {
             free(node);
             continue;  /* No valid node ID yet */
@@ -638,13 +629,13 @@ static void *find_node_worker_func(void *arg) {
 
         if (rc == 0) {
             /* Success -> update lastRespondedAt */
-            triple_routing_update_node_responded(dht->routing_controller,node->id);
+            tribuf_update_node_responded(dht->routing_controller,node->id);
 
             /* Insert discovered nodes into routing table and discovered_nodes queue */
             for (int i = 0; i < found_count; i++) {
                 /* Insert into routing table */
                 wbpxre_routing_node_t node_copy = found_nodes[i];
-                triple_routing_insert_node(dht->routing_controller, &node_copy);
+                tribuf_insert(dht->routing_controller, &node_copy);
 
                 /* Try to push to discovered_nodes queue (non-blocking) */
                 wbpxre_routing_node_t *discovered_copy = malloc(sizeof(wbpxre_routing_node_t));
@@ -696,14 +687,14 @@ static void *sample_infohashes_worker_func(void *arg) {
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
         /* Get STABLE table's node ID (this is the node ID used to query nodes from stable table) */
-        const uint8_t *stable_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+        const uint8_t *stable_node_id = tribuf_get_readable_node_id(dht->routing_controller);
         if (!stable_node_id) {
             free(node);
             continue;  /* Bootstrap not complete */
         }
 
         /* Track query attempt BEFORE sending (so failed nodes have queries_sent > 0) */
-        triple_routing_update_node_queried(dht->routing_controller, node->id);
+        tribuf_update_node_queried(dht->routing_controller, node->id);
 
         /* Send sample_infohashes query */
         uint8_t *hashes = NULL;
@@ -719,8 +710,8 @@ static void *sample_infohashes_worker_func(void *arg) {
 
         if (rc == 0) {
             /* Success -> update node metadata */
-            triple_routing_update_node_responded(dht->routing_controller,node->id);
-            triple_routing_update_sample_response(dht->routing_controller, node->id,
+            tribuf_update_node_responded(dht->routing_controller,node->id);
+            tribuf_update_sample_response(dht->routing_controller, node->id,
                                                         hash_count, total_num, interval);
 
             /* Update stats */
@@ -761,7 +752,7 @@ static void *get_peers_worker_func(void *arg) {
 
         /* Get K=8 closest nodes from routing table */
         wbpxre_routing_node_t *nodes[8];
-        wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+        wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
 
         /* Skip if bootstrap not complete yet */
         if (!stable_table) {
@@ -772,7 +763,7 @@ static void *get_peers_worker_func(void *arg) {
         int node_count = wbpxre_routing_table_get_closest(stable_table, work->info_hash, nodes, 8);
 
         /* Get STABLE table's node ID (for get_peers queries) */
-        const uint8_t *stable_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+        const uint8_t *stable_node_id = tribuf_get_readable_node_id(dht->routing_controller);
         if (!stable_node_id) {
             /* Free nodes */
             for (int i = 0; i < node_count; i++) {
@@ -813,7 +804,7 @@ static void *get_peers_worker_func(void *arg) {
 
                 if (rc == 0) {
                     /* Success -> update node as responsive */
-                    triple_routing_update_node_responded(dht->routing_controller,nodes[i]->id);
+                    tribuf_update_node_responded(dht->routing_controller,nodes[i]->id);
 
                     /* Update stats */
                     pthread_mutex_lock(&dht->stats_mutex);
@@ -828,7 +819,7 @@ static void *get_peers_worker_func(void *arg) {
 
                     /* Add returned nodes to routing table */
                     for (int j = 0; j < returned_node_count; j++) {
-                        triple_routing_insert_node(dht->routing_controller, &returned_nodes[j]);
+                        tribuf_insert(dht->routing_controller, &returned_nodes[j]);
                     }
 
                     /* Free the arrays (not individual elements, they're stack-allocated structs in the array) */
@@ -905,7 +896,7 @@ static void *discovered_nodes_dispatcher_func(void *arg) {
 
         /* Only dispatch to sample_infohashes queue if bootstrap is complete
          * This prevents BEP 51 queries during bootstrap phase */
-        wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+        wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
         if (stable_table && wbpxre_queue_try_push(dht->nodes_for_sample_infohashes, node)) {
             continue;
         }
@@ -931,11 +922,11 @@ static void *sample_infohashes_feeder_func(void *arg) {
 
     while (dht->running) {
         /* Get current node ID for keyspace-aware filtering (use STABLE table's node ID) */
-        const uint8_t *current_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+        const uint8_t *current_node_id = tribuf_get_readable_node_id(dht->routing_controller);
 
         /* BEP 51 queries should ONLY run when STABLE table exists (bootstrap complete)
          * Do NOT fall back to FILLING table - wait for first rotation to complete */
-        wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+        wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
 
         if (!stable_table) {
             /* Bootstrap not complete - wait for first rotation */
@@ -1004,7 +995,7 @@ static void *find_node_feeder_func(void *arg) {
 
     while (dht->running) {
         /* Check if bootstrap is complete */
-        bool in_bootstrap = !triple_routing_is_bootstrapped(dht->routing_controller);
+        bool in_bootstrap = !tribuf_is_bootstrapped(dht->routing_controller);
 
         /* Get current target */
         pthread_mutex_lock(&dht->sought_node_id_mutex);
@@ -1013,12 +1004,12 @@ static void *find_node_feeder_func(void *arg) {
         pthread_mutex_unlock(&dht->sought_node_id_mutex);
 
         /* Select table to read based on bootstrap status */
-        wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+        wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
         wbpxre_routing_table_t *table_to_read = stable_table;
 
         /* Bootstrap mode: fall back to FILLING table if STABLE doesn't exist */
         if (!table_to_read) {
-            table_to_read = triple_routing_get_filling_table(dht->routing_controller);
+            table_to_read = tribuf_get_filling_table(dht->routing_controller);
         }
 
         /* Still no table available - very early in initialization */
@@ -1038,7 +1029,7 @@ static void *find_node_feeder_func(void *arg) {
             /* Query ALL available nodes (not just closest 10)
              * During bootstrap, we want to discover as many nodes as possible
              * Use sample_candidates to get broad coverage across the keyspace */
-            const uint8_t *current_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+            const uint8_t *current_node_id = tribuf_get_filling_node_id(dht->routing_controller);
             if (!current_node_id) {
                 usleep(100000);  /* Sleep 100ms and retry */
                 continue;
@@ -1241,7 +1232,7 @@ void wbpxre_dht_cleanup(wbpxre_dht_t *dht) {
 
     /* NOW destroy routing controller (after pending queries are freed) */
     if (dht->routing_controller) {
-        triple_routing_controller_destroy(dht->routing_controller);
+        tribuf_destroy(dht->routing_controller);
     }
 
     /* Destroy queues */
@@ -1272,7 +1263,7 @@ int wbpxre_dht_insert_node(wbpxre_dht_t *dht, const uint8_t *node_id,
     node.discovered_at = time(NULL);
     node.last_responded_at = time(NULL);
 
-    return triple_routing_insert_node(dht->routing_controller, &node);
+    return tribuf_insert(dht->routing_controller, &node);
 }
 
 int wbpxre_dht_query_peers(wbpxre_dht_t *dht, const uint8_t *info_hash, bool priority) {
@@ -1326,12 +1317,12 @@ int wbpxre_dht_nodes(wbpxre_dht_t *dht, int *good_return, int *dubious_return) {
     if (!dht || !dht->routing_controller) return -1;
 
     /* Try stable table first (after bootstrap) */
-    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
 
     /* Fallback to filling table during bootstrap
      * This ensures accurate node counts before first rotation completes */
     if (!stable_table) {
-        wbpxre_routing_table_t *filling_table = triple_routing_get_filling_table(dht->routing_controller);
+        wbpxre_routing_table_t *filling_table = tribuf_get_filling_table(dht->routing_controller);
         int total = filling_table ? filling_table->node_count : 0;
 
         if (good_return) *good_return = total;
@@ -1401,7 +1392,7 @@ int wbpxre_dht_test_socket(wbpxre_dht_t *dht) {
     wbpxre_random_bytes(msg.transaction_id, WBPXRE_TRANSACTION_ID_LEN);
 
     /* Use filling table's node ID for test socket */
-    const uint8_t *filling_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+    const uint8_t *filling_node_id = tribuf_get_filling_node_id(dht->routing_controller);
     if (!filling_node_id) {
         fprintf(stderr, "ERROR: No node ID available for test socket\n");
         return -1;

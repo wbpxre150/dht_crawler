@@ -791,10 +791,10 @@ static int encode_compact_nodes(wbpxre_routing_table_t *table, const uint8_t *ta
 void wbpxre_handle_ping(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                         const struct sockaddr_in *from) {
     /* Use stable table's node ID for responses */
-    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    const uint8_t *local_node_id = tribuf_get_readable_node_id(dht->routing_controller);
     if (!local_node_id) {
         /* Bootstrap not complete - use filling table's node ID as fallback */
-        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        local_node_id = tribuf_get_filling_node_id(dht->routing_controller);
     }
     if (!local_node_id) {
         return;  /* No valid node ID yet */
@@ -809,14 +809,14 @@ void wbpxre_handle_find_node(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                               const struct sockaddr_in *from) {
     /* Get closest nodes to target */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
     int nodes_len = stable_table ? encode_compact_nodes(stable_table, query->target,
                                          compact_nodes, sizeof(compact_nodes), 8) : 0;
 
     /* Use stable table's node ID for responses */
-    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    const uint8_t *local_node_id = tribuf_get_readable_node_id(dht->routing_controller);
     if (!local_node_id) {
-        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        local_node_id = tribuf_get_filling_node_id(dht->routing_controller);
     }
     if (!local_node_id) {
         return;  /* No valid node ID yet */
@@ -832,14 +832,14 @@ void wbpxre_handle_get_peers(wbpxre_dht_t *dht, const wbpxre_message_t *query,
                               const struct sockaddr_in *from) {
     /* In crawler mode, we don't store peers - just return nodes */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
     int nodes_len = stable_table ? encode_compact_nodes(stable_table, query->info_hash,
                                          compact_nodes, sizeof(compact_nodes), 8) : 0;
 
     /* Use stable table's node ID for responses */
-    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    const uint8_t *local_node_id = tribuf_get_readable_node_id(dht->routing_controller);
     if (!local_node_id) {
-        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        local_node_id = tribuf_get_filling_node_id(dht->routing_controller);
     }
     if (!local_node_id) {
         return;  /* No valid node ID yet */
@@ -860,9 +860,9 @@ void wbpxre_handle_announce_peer(wbpxre_dht_t *dht, const wbpxre_message_t *quer
     }
 
     /* Use stable table's node ID for responses */
-    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    const uint8_t *local_node_id = tribuf_get_readable_node_id(dht->routing_controller);
     if (!local_node_id) {
-        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        local_node_id = tribuf_get_filling_node_id(dht->routing_controller);
     }
     if (!local_node_id) {
         return;  /* No valid node ID yet */
@@ -891,9 +891,9 @@ void wbpxre_handle_incoming_query(wbpxre_dht_t *dht, wbpxre_message_t *query,
     /* Since decoder doesn't extract method yet, respond generically */
 
     /* Use stable table's node ID for responses */
-    const uint8_t *local_node_id = triple_routing_get_stable_node_id(dht->routing_controller);
+    const uint8_t *local_node_id = tribuf_get_readable_node_id(dht->routing_controller);
     if (!local_node_id) {
-        local_node_id = triple_routing_get_filling_node_id(dht->routing_controller);
+        local_node_id = tribuf_get_filling_node_id(dht->routing_controller);
     }
     if (!local_node_id) {
         return;  /* No valid node ID yet */
@@ -901,7 +901,7 @@ void wbpxre_handle_incoming_query(wbpxre_dht_t *dht, wbpxre_message_t *query,
 
     /* Always send a valid response to keep us in routing tables */
     uint8_t compact_nodes[8 * WBPXRE_COMPACT_NODE_INFO_LEN];
-    wbpxre_routing_table_t *stable_table = triple_routing_get_stable_table(dht->routing_controller);
+    wbpxre_routing_table_t *stable_table = tribuf_get_readable_table(dht->routing_controller);
     int nodes_len = stable_table ? encode_compact_nodes(stable_table, local_node_id,
                                          compact_nodes, sizeof(compact_nodes), 8) : 0;
 

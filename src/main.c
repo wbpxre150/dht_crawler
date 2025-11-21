@@ -8,18 +8,24 @@
 #include "porn_filter.h"
 #include "torrent_search.h"
 #include "config.h"
+#include "supervisor.h"
+#include "batch_writer.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
 
 /* Global application context */
 static app_context_t g_app_ctx;
-static dht_manager_t g_dht_mgr;  /* Single DHT instance */
+static dht_manager_t g_dht_mgr;  /* Single DHT instance (old architecture) */
 static database_t g_database;
 static infohash_queue_t g_queue;
 static metadata_fetcher_t g_fetcher;
 static http_api_t g_http_api;
 static bloom_filter_t *g_bloom = NULL;
+
+/* Stage 6: Thread tree architecture globals */
+static supervisor_t *g_supervisor = NULL;
+static batch_writer_t *g_batch_writer = NULL;  /* Shared batch writer for thread trees */
 
 /* Signal handler for graceful shutdown */
 static void signal_handler(int signum) {
@@ -40,7 +46,8 @@ void log_msg(log_level_t level, const char *format, ...) {
 
     const char *level_str[] = {"DEBUG", "INFO", "WARN", "ERROR"};
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    struct tm tm_info_buf;
+    struct tm *tm_info = localtime_r(&now, &tm_info_buf);  /* Thread-safe version */
     char time_buf[64];
 
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
@@ -206,8 +213,151 @@ int main(int argc, char *argv[]) {
      * This prevents data loss from failed metadata fetches by allowing retries. */
     if (g_bloom) {
         database_set_bloom(&g_database, g_bloom);
+    }
 
-        /* Connect bloom filter and database to queue for read-only duplicate checking */
+    /*******************************************************************
+     * Stage 6: Branch based on architecture selection
+     *******************************************************************/
+    if (config.use_thread_trees) {
+        /*******************************************************************
+         * NEW ARCHITECTURE: Thread Tree Supervisor
+         *******************************************************************/
+        log_msg(LOG_INFO, "=== Starting Thread Tree Architecture ===");
+
+        /* Create shared batch writer for all trees */
+        g_batch_writer = batch_writer_init(&g_database, config.batch_size,
+                                            config.flush_interval, g_app_ctx.loop);
+        if (!g_batch_writer) {
+            log_msg(LOG_ERROR, "Failed to create batch writer");
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
+        /* Connect bloom filter to batch writer */
+        if (g_bloom && config.bloom_persist) {
+            batch_writer_set_bloom(g_batch_writer, g_bloom, config.bloom_path);
+        }
+
+        /* Create supervisor config */
+        supervisor_config_t sup_config = {
+            .max_trees = config.num_trees,
+            .min_metadata_rate = config.min_metadata_rate,
+            .batch_writer = g_batch_writer,
+            .bloom_filter = g_bloom,
+            .num_bep51_workers = config.tree_bep51_workers,
+            .num_get_peers_workers = config.tree_get_peers_workers,
+            .num_metadata_workers = config.tree_metadata_workers,
+            /* Stage 2 settings (Bootstrap) */
+            .bootstrap_timeout_sec = config.tree_bootstrap_timeout_sec,
+            .routing_threshold = config.tree_routing_threshold,
+            /* Stage 5 settings */
+            .rate_check_interval_sec = config.tree_rate_check_interval_sec,
+            .rate_grace_period_sec = config.tree_rate_grace_period_sec,
+            .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms
+        };
+
+        g_supervisor = supervisor_create(&sup_config);
+        if (!g_supervisor) {
+            log_msg(LOG_ERROR, "Failed to create supervisor");
+            batch_writer_cleanup(g_batch_writer);
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
+        /* Start supervisor (spawns all trees) */
+        supervisor_start(g_supervisor);
+
+        /* Initialize HTTP API (minimal - no DHT manager in thread tree mode) */
+        log_msg(LOG_DEBUG, "Initializing HTTP API for thread tree mode...");
+        rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, NULL,
+                           g_batch_writer, NULL, HTTP_API_PORT);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "Failed to initialize HTTP API: %d", rc);
+            supervisor_stop(g_supervisor);
+            supervisor_destroy(g_supervisor);
+            batch_writer_cleanup(g_batch_writer);
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
+        /* Set supervisor reference for stats */
+        http_api_set_supervisor(&g_http_api, g_supervisor);
+
+        /* Start HTTP API */
+        log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
+        rc = http_api_start(&g_http_api);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "Failed to start HTTP API: %d", rc);
+            supervisor_stop(g_supervisor);
+            supervisor_destroy(g_supervisor);
+            http_api_cleanup(&g_http_api);
+            batch_writer_cleanup(g_batch_writer);
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
+        log_msg(LOG_INFO, "DHT crawler (thread tree mode) is running.");
+        log_msg(LOG_INFO, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
+                config.num_trees, config.tree_bep51_workers,
+                config.tree_get_peers_workers, config.tree_metadata_workers);
+        log_msg(LOG_DEBUG, "HTTP API available at http://localhost:%d/", HTTP_API_PORT);
+        log_msg(LOG_DEBUG, "Press Ctrl+C to stop.");
+
+        /* Wait for shutdown signal (blocking) */
+        while (g_app_ctx.running) {
+            sleep(1);
+        }
+
+        /* Graceful shutdown sequence for thread tree mode */
+        log_msg(LOG_DEBUG, "=== Beginning thread tree shutdown sequence ===");
+
+        log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
+        http_api_stop(&g_http_api);
+
+        log_msg(LOG_DEBUG, "Step 2: Stopping supervisor (stops all trees)...");
+        supervisor_stop(g_supervisor);
+
+        log_msg(LOG_DEBUG, "Step 3: Flushing batch writer...");
+        batch_writer_flush(g_batch_writer);
+
+        log_msg(LOG_DEBUG, "=== Thread tree shutdown complete, beginning cleanup ===");
+
+        /* Save bloom filter */
+        if (g_bloom && config.bloom_persist) {
+            log_msg(LOG_DEBUG, "Saving bloom filter to %s...", config.bloom_path);
+            if (bloom_filter_save(g_bloom, config.bloom_path) == 0) {
+                log_msg(LOG_DEBUG, "Bloom filter saved successfully");
+            } else {
+                log_msg(LOG_WARN, "Failed to save bloom filter");
+            }
+        }
+
+        /* Cleanup */
+        http_api_cleanup(&g_http_api);
+        supervisor_destroy(g_supervisor);
+        batch_writer_cleanup(g_batch_writer);
+        database_cleanup(&g_database);
+        torrent_search_cleanup();
+        porn_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        cleanup_app_context(&g_app_ctx);
+
+        log_msg(LOG_DEBUG, "DHT Crawler (thread tree mode) stopped.");
+        return 0;
+    }
+
+    /*******************************************************************
+     * OLD ARCHITECTURE: Single DHT instance with metadata fetcher
+     * (Kept for backward compatibility - set use_thread_trees=0)
+     *******************************************************************/
+    log_msg(LOG_INFO, "=== Starting Old Architecture (use_thread_trees=0) ===");
+
+    /* Connect bloom filter and database to queue for read-only duplicate checking */
+    if (g_bloom) {
         infohash_queue_set_bloom(&g_queue, g_bloom);
         infohash_queue_set_database(&g_queue, (struct database *)&g_database);
         log_msg(LOG_DEBUG, "Bloom filter duplicate detection enabled");

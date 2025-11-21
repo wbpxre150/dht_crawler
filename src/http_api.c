@@ -6,6 +6,8 @@
 #include "metadata_fetcher.h"
 #include "porn_filter.h"
 #include "torrent_search.h"
+#include "supervisor.h"
+#include "thread_tree.h"
 #include <civetweb.h>
 #include <cJSON.h>
 #include <string.h>
@@ -46,7 +48,8 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
                   dht_manager_t *dht_manager, batch_writer_t *batch_writer,
                   metadata_fetcher_t *metadata_fetcher, int port) {
-    if (!api || !app_ctx || !database || !dht_manager) {
+    /* dht_manager can be NULL in thread tree mode */
+    if (!api || !app_ctx || !database) {
         return -1;
     }
 
@@ -121,6 +124,13 @@ void http_api_cleanup(http_api_t *api) {
     }
 
     log_msg(LOG_DEBUG, "HTTP API cleaned up");
+}
+
+/* Stage 6: Set supervisor for thread tree mode */
+void http_api_set_supervisor(http_api_t *api, struct supervisor *supervisor) {
+    if (api) {
+        api->supervisor = supervisor;
+    }
 }
 
 /* Root handler - Google-like search interface */
@@ -432,6 +442,41 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(porn_filter, "filter_rate_percent", filter_rate);
 
         cJSON_AddItemToObject(root, "porn_filter", porn_filter);
+    }
+
+    /* Stage 6: Add supervisor/thread tree statistics */
+    if (api->supervisor) {
+        int active_trees = 0;
+        uint64_t total_metadata = 0;
+        supervisor_stats(api->supervisor, &active_trees, &total_metadata);
+
+        cJSON *supervisor_json = cJSON_CreateObject();
+        cJSON_AddNumberToObject(supervisor_json, "active_trees", active_trees);
+        cJSON_AddNumberToObject(supervisor_json, "max_trees", api->supervisor->max_trees);
+        cJSON_AddNumberToObject(supervisor_json, "total_trees_spawned", (double)api->supervisor->next_tree_id - 1);
+        cJSON_AddItemToObject(root, "supervisor", supervisor_json);
+
+        /* Add per-tree stats */
+        cJSON *trees_array = cJSON_CreateArray();
+        pthread_mutex_lock(&api->supervisor->trees_lock);
+        for (int i = 0; i < api->supervisor->max_trees; i++) {
+            thread_tree_t *tree = api->supervisor->trees[i];
+            if (tree) {
+                cJSON *tree_json = cJSON_CreateObject();
+                cJSON_AddNumberToObject(tree_json, "tree_id", tree->tree_id);
+                cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(tree->current_phase));
+                cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
+                cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
+                cJSON_AddItemToArray(trees_array, tree_json);
+            }
+        }
+        pthread_mutex_unlock(&api->supervisor->trees_lock);
+        cJSON_AddItemToObject(root, "trees", trees_array);
+
+        /* Add aggregate stats */
+        cJSON *aggregate = cJSON_CreateObject();
+        cJSON_AddNumberToObject(aggregate, "total_metadata_fetched", (double)total_metadata);
+        cJSON_AddItemToObject(root, "aggregate", aggregate);
     }
 
     char *json = cJSON_Print(root);

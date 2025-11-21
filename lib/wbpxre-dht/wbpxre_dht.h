@@ -220,24 +220,25 @@ typedef struct {
 } dual_routing_controller_t;
 
 /* ============================================================================
- * Triple Routing Table System
+ * Triple-Buffer Routing Table System
+ *
+ * Simple, correct 3-table rotation with exclusive mutex during clear:
+ * - FILLING table: writers insert here (protected by filling_mutex)
+ * - FULL tables: readers read from here (immutable until cleared)
+ * - EMPTY tables: waiting to become FILLING
+ *
+ * When all 3 tables are full, the oldest FULL table is cleared while
+ * holding global_mutex, which blocks ALL readers and writers.
  * ============================================================================ */
 
-/* Table states for triple routing */
+/* Table states for triple-buffer */
 typedef enum {
-    TABLE_STATE_IDLE,      /* Empty, not in use (can be selected for filling) */
-    TABLE_STATE_FILLING,   /* Receiving inserts from find_node workers */
-    TABLE_STATE_STABLE,    /* Full, being read by sample/DHT workers */
-    TABLE_STATE_CLEARING   /* Being cleared before transitioning to FILLING */
-} triple_table_state_t;
+    TRIBUF_STATE_EMPTY,    /* Cleared, ready to become FILLING */
+    TRIBUF_STATE_FILLING,  /* Currently receiving inserts */
+    TRIBUF_STATE_FULL      /* Filled, available for reading (immutable) */
+} tribuf_state_t;
 
-/* Rotation progress state (atomic guard to prevent concurrent rotations) */
-typedef enum {
-    ROTATION_PROGRESS_IDLE = 0,        /* No rotation in progress */
-    ROTATION_PROGRESS_IN_PROGRESS = 1  /* Rotation currently happening */
-} rotation_progress_state_t;
-
-/* Statistics for triple routing */
+/* Statistics for triple-buffer */
 typedef struct {
     /* Bootstrap status */
     bool bootstrap_complete;
@@ -245,71 +246,54 @@ typedef struct {
 
     /* Rotation stats */
     uint64_t total_rotations;
-    int stable_idx;           /* -1 if bootstrap incomplete */
+    uint64_t total_clears;
     int filling_idx;
-    uint32_t rotation_threshold;
 
     /* Table metrics */
-    uint32_t stable_table_nodes;
     uint32_t filling_table_nodes;
-    double fill_progress_pct;
+    uint32_t total_full_tables;
 
     /* Detailed metrics */
     uint64_t total_nodes_cleared;
-    uint64_t clearing_operations;
     time_t last_rotation_time;
-    uint32_t nodes_at_rotation[3];
-    double rotation_duration_ms[3];
-    uint64_t stable_reads[3];
+    time_t last_clear_time;
 
     /* Per-table state */
-    triple_table_state_t table_states[3];
+    tribuf_state_t table_states[3];
     uint32_t table_node_counts[3];
-} triple_routing_stats_t;
+} tribuf_stats_t;
 
-/* Triple routing table controller */
+/* Triple-buffer routing controller */
 typedef struct {
     /* The three routing tables */
     wbpxre_routing_table_t *tables[3];
+    tribuf_state_t states[3];
 
-    /* State of each table */
-    triple_table_state_t states[3];
-
-    /* Current table indices */
-    int stable_idx;   /* Index of current STABLE table (-1 if none) */
-    int filling_idx;  /* Index of current FILLING table */
-
-    /* Rotation configuration */
-    uint32_t rotation_threshold;  /* Node count to trigger rotation */
-    int max_nodes_per_table;      /* Capacity per table */
-    int rotation_time_sec;        /* Minimum time between rotations (seconds) */
-
-    /* Bootstrap tracking */
-    int bootstrap_complete;           /* 1 after first rotation, 0 otherwise (accessed atomically) */
-    time_t bootstrap_start_time;      /* When bootstrap started */
-    time_t first_rotation_time;       /* When first rotation completed */
-
-    /* Per-table node IDs (one for each routing table) */
+    /* Per-table node IDs (generated when table becomes FILLING) */
     uint8_t table_node_ids[3][WBPXRE_NODE_ID_LEN];
 
-    /* DHT context for queue clearing during rotation */
-    void *dht_context;  /* wbpxre_dht_t* (void* to avoid circular dependency) */
+    /* Index tracking */
+    int filling_idx;           /* Which table is FILLING */
+    int clear_order[3];        /* Order in which FULL tables should be cleared (circular) */
+    int clear_order_head;      /* Index into clear_order for next table to clear */
 
-    /* Synchronization */
-    pthread_mutex_t rotation_lock;  /* Protects state transitions */
-    pthread_rwlock_t index_rwlock;  /* Protects stable_idx/filling_idx reads/writes during rotation */
-    int rotation_in_progress;       /* Guard flag: ROTATION_PROGRESS_IDLE=0, ROTATION_PROGRESS_IN_PROGRESS=1 (accessed atomically) */
-    time_t rotation_start_time;     /* When current rotation started (for monitoring) */
+    /* Configuration */
+    int max_nodes_per_table;   /* Capacity per table */
+
+    /* SYNCHRONIZATION - Simple and correct */
+    pthread_mutex_t global_mutex;    /* Held during clear OR any access - blocks EVERYTHING */
+
+    /* Bootstrap tracking */
+    bool bootstrap_complete;         /* true after first table fills */
+    time_t bootstrap_start_time;
 
     /* Statistics */
-    uint64_t rotation_count;          /* Total rotations performed */
-    unsigned long long total_nodes_cleared;     /* Total nodes freed (accessed atomically for background clearing) */
-    time_t last_rotation_time;        /* Timestamp of last rotation */
-    uint32_t nodes_at_rotation[3];    /* Node count at each rotation */
-    double rotation_duration_ms[3];   /* Fill time for each table */
-    uint64_t stable_reads[3];         /* Reads from each table while STABLE */
-    unsigned long long clearing_operations;     /* Total clear operations (accessed atomically for background clearing) */
-} triple_routing_controller_t;
+    uint64_t rotation_count;         /* Times a table went FILLING -> FULL */
+    uint64_t clear_count;            /* Times we had to clear a FULL table */
+    uint64_t total_nodes_cleared;
+    time_t last_rotation_time;
+    time_t last_clear_time;
+} tribuf_controller_t;
 
 /* Peer info */
 typedef struct {
@@ -439,8 +423,8 @@ typedef struct {
     int udp_socket;
     struct sockaddr_in bind_addr;
 
-    /* Triple routing table controller (replaces dual routing) */
-    triple_routing_controller_t *routing_controller;
+    /* Triple-buffer routing controller */
+    tribuf_controller_t *routing_controller;
 
     /* Pending queries */
     wbpxre_pending_query_t *pending_queries[256];
@@ -758,83 +742,57 @@ void dual_routing_get_stats(dual_routing_controller_t *controller,
 int dual_routing_get_total_nodes(dual_routing_controller_t *controller);
 
 /* ============================================================================
- * Triple Routing Controller Functions (implemented in wbpxre_routing.c)
+ * Triple-Buffer Controller Functions (implemented in wbpxre_routing.c)
  * ============================================================================ */
 
-/* Create triple routing controller */
-triple_routing_controller_t *triple_routing_controller_create(
-    int max_nodes_per_table,
-    uint32_t rotation_threshold,
-    int rotation_time_sec
-);
+/* Create triple-buffer controller */
+tribuf_controller_t *tribuf_create(int max_nodes_per_table);
 
-/* Destroy triple routing controller */
-void triple_routing_controller_destroy(triple_routing_controller_t *ctrl);
+/* Destroy triple-buffer controller */
+void tribuf_destroy(tribuf_controller_t *ctrl);
 
-/* Insert node into filling table (called by find_node workers) */
-int triple_routing_insert_node(
-    triple_routing_controller_t *ctrl,
-    const wbpxre_routing_node_t *node
-);
+/* Insert node into filling table (called by find_node workers)
+ * Thread-safe: acquires global_mutex, may trigger rotation/clear
+ * Returns 0 on success, -1 on error */
+int tribuf_insert(tribuf_controller_t *ctrl, const wbpxre_routing_node_t *node);
 
-/* Get stable table for reading (called by sample/DHT workers)
- * Returns NULL if bootstrap incomplete */
-wbpxre_routing_table_t *triple_routing_get_stable_table(
-    triple_routing_controller_t *ctrl
-);
+/* Get a FULL table for reading (called by sample/DHT workers)
+ * Thread-safe: acquires global_mutex briefly
+ * Returns NULL if no FULL table available (bootstrap incomplete) */
+wbpxre_routing_table_t *tribuf_get_readable_table(tribuf_controller_t *ctrl);
 
-/* Get filling table for reading (bootstrap fallback)
+/* Get the FILLING table for reading (bootstrap fallback)
+ * Thread-safe: acquires global_mutex briefly
  * Returns NULL if controller is invalid */
-wbpxre_routing_table_t *triple_routing_get_filling_table(
-    triple_routing_controller_t *ctrl
-);
+wbpxre_routing_table_t *tribuf_get_filling_table(tribuf_controller_t *ctrl);
 
-/* Check if bootstrap is complete */
-bool triple_routing_is_bootstrapped(triple_routing_controller_t *ctrl);
+/* Check if bootstrap is complete (at least one FULL table exists) */
+bool tribuf_is_bootstrapped(tribuf_controller_t *ctrl);
 
-/* Update node metadata - responded to query */
-int triple_routing_update_node_responded(
-    triple_routing_controller_t *ctrl,
-    const uint8_t *node_id
-);
+/* Get node ID for a readable (FULL) table
+ * Returns NULL if bootstrap incomplete */
+const uint8_t *tribuf_get_readable_node_id(tribuf_controller_t *ctrl);
 
-/* Update node metadata - we sent query */
-int triple_routing_update_node_queried(
-    triple_routing_controller_t *ctrl,
-    const uint8_t *node_id
-);
+/* Get node ID for filling table (used by find_node workers) */
+const uint8_t *tribuf_get_filling_node_id(tribuf_controller_t *ctrl);
 
-/* Update sample_infohashes response metadata */
-int triple_routing_update_sample_response(
-    triple_routing_controller_t *ctrl,
+/* Update node metadata in FULL tables - responded to query */
+void tribuf_update_node_responded(tribuf_controller_t *ctrl, const uint8_t *node_id);
+
+/* Update node metadata in FULL tables - we sent query */
+void tribuf_update_node_queried(tribuf_controller_t *ctrl, const uint8_t *node_id);
+
+/* Update sample_infohashes response metadata in FULL tables */
+void tribuf_update_sample_response(
+    tribuf_controller_t *ctrl,
     const uint8_t *node_id,
-    uint32_t sampled_num,
-    uint64_t total_num,
-    time_t next_sample_time
+    int discovered_num,
+    int total_num,
+    int interval
 );
 
 /* Get statistics */
-void triple_routing_get_stats(
-    triple_routing_controller_t *ctrl,
-    triple_routing_stats_t *stats
-);
-
-/* Get node ID for stable table (used by sample/get_peers workers)
- * Returns NULL if bootstrap incomplete */
-const uint8_t* triple_routing_get_stable_node_id(
-    triple_routing_controller_t *ctrl
-);
-
-/* Get node ID for filling table (used by find_node workers) */
-const uint8_t* triple_routing_get_filling_node_id(
-    triple_routing_controller_t *ctrl
-);
-
-/* Set DHT context for queue clearing during rotation */
-void triple_routing_set_dht_context(
-    triple_routing_controller_t *ctrl,
-    void *dht_context
-);
+void tribuf_get_stats(tribuf_controller_t *ctrl, tribuf_stats_t *stats);
 
 /* ============================================================================
  * Worker Queue Functions (implemented in wbpxre_worker.c)

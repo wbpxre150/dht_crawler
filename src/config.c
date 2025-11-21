@@ -79,6 +79,33 @@ void config_init_defaults(crawler_config_t *config) {
     config->porn_filter_keyword_threshold = 8;      /* Min weight for keyword match */
     config->porn_filter_regex_threshold = 9;        /* Min weight for regex match */
     config->porn_filter_heuristic_threshold = 5;    /* Min score for heuristic match */
+
+    /* Thread tree defaults (Stage 1) */
+    config->num_trees = 4;                          /* 4 concurrent thread trees */
+    config->min_metadata_rate = 0.5;                /* Min 0.5 metadata/sec before restart */
+
+    /* Thread tree Stage 2 defaults */
+    config->tree_bootstrap_timeout_sec = 30;        /* 30 second bootstrap timeout */
+    config->tree_routing_threshold = 200;           /* 200 nodes before BEP51 phase (lowered from 500) */
+
+    /* Thread tree Stage 3 defaults (BEP51) */
+    config->tree_bep51_workers = 10;                /* 10 BEP51 workers per tree */
+    config->tree_infohash_queue_capacity = 5000;    /* 5000 infohash queue capacity */
+    config->tree_bep51_query_interval_ms = 10;      /* 10ms between BEP51 queries */
+
+    /* Thread tree Stage 4 defaults (get_peers) */
+    config->tree_get_peers_workers = 500;           /* 500 get_peers workers per tree */
+    config->tree_peers_queue_capacity = 2000;       /* 2000 peers queue capacity */
+    config->tree_get_peers_timeout_ms = 3000;       /* 3 second get_peers timeout */
+
+    /* Thread tree Stage 5 defaults (metadata) */
+    config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
+    config->tree_rate_check_interval_sec = 10;      /* 10 second rate check interval */
+    config->tree_rate_grace_period_sec = 30;        /* 30 second grace period */
+    config->tree_tcp_connect_timeout_ms = 5000;     /* 5 second TCP connect timeout */
+
+    /* Thread tree mode toggle - disabled by default for safety */
+    config->use_thread_trees = 0;                   /* 0=old architecture */
 }
 
 /* Load config from INI-style file */
@@ -254,6 +281,66 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->porn_filter_heuristic_threshold = atoi(value);
             if (config->porn_filter_heuristic_threshold < 0) config->porn_filter_heuristic_threshold = 0;
             if (config->porn_filter_heuristic_threshold > 20) config->porn_filter_heuristic_threshold = 20;
+        }
+        /* Thread tree settings (Stage 1) */
+        else if (strcmp(key, "num_trees") == 0) {
+            config->num_trees = atoi(value);
+            if (config->num_trees < 1) config->num_trees = 1;
+            if (config->num_trees > 64) config->num_trees = 64;
+        } else if (strcmp(key, "min_metadata_rate") == 0) {
+            config->min_metadata_rate = atof(value);
+            if (config->min_metadata_rate < 0.0) config->min_metadata_rate = 0.0;
+        }
+        /* Thread tree Stage 2 settings */
+        else if (strcmp(key, "tree_bootstrap_timeout_sec") == 0) {
+            config->tree_bootstrap_timeout_sec = atoi(value);
+            if (config->tree_bootstrap_timeout_sec < 5) config->tree_bootstrap_timeout_sec = 5;
+        } else if (strcmp(key, "tree_routing_threshold") == 0) {
+            config->tree_routing_threshold = atoi(value);
+            if (config->tree_routing_threshold < 10) config->tree_routing_threshold = 10;
+        }
+        /* Thread tree Stage 3 settings (BEP51) */
+        else if (strcmp(key, "tree_bep51_workers") == 0) {
+            config->tree_bep51_workers = atoi(value);
+            if (config->tree_bep51_workers < 1) config->tree_bep51_workers = 1;
+            if (config->tree_bep51_workers > 100) config->tree_bep51_workers = 100;
+        } else if (strcmp(key, "tree_infohash_queue_capacity") == 0) {
+            config->tree_infohash_queue_capacity = atoi(value);
+            if (config->tree_infohash_queue_capacity < 100) config->tree_infohash_queue_capacity = 100;
+        } else if (strcmp(key, "tree_bep51_query_interval_ms") == 0) {
+            config->tree_bep51_query_interval_ms = atoi(value);
+            if (config->tree_bep51_query_interval_ms < 0) config->tree_bep51_query_interval_ms = 0;
+        }
+        /* Thread tree Stage 4 settings (get_peers) */
+        else if (strcmp(key, "tree_get_peers_workers") == 0) {
+            config->tree_get_peers_workers = atoi(value);
+            if (config->tree_get_peers_workers < 1) config->tree_get_peers_workers = 1;
+            if (config->tree_get_peers_workers > 1000) config->tree_get_peers_workers = 1000;
+        } else if (strcmp(key, "tree_peers_queue_capacity") == 0) {
+            config->tree_peers_queue_capacity = atoi(value);
+            if (config->tree_peers_queue_capacity < 100) config->tree_peers_queue_capacity = 100;
+        } else if (strcmp(key, "tree_get_peers_timeout_ms") == 0) {
+            config->tree_get_peers_timeout_ms = atoi(value);
+            if (config->tree_get_peers_timeout_ms < 100) config->tree_get_peers_timeout_ms = 100;
+        }
+        /* Thread tree Stage 5 settings (metadata) */
+        else if (strcmp(key, "tree_metadata_workers") == 0) {
+            config->tree_metadata_workers = atoi(value);
+            if (config->tree_metadata_workers < 1) config->tree_metadata_workers = 1;
+            if (config->tree_metadata_workers > 50) config->tree_metadata_workers = 50;
+        } else if (strcmp(key, "tree_rate_check_interval_sec") == 0) {
+            config->tree_rate_check_interval_sec = atoi(value);
+            if (config->tree_rate_check_interval_sec < 5) config->tree_rate_check_interval_sec = 5;
+        } else if (strcmp(key, "tree_rate_grace_period_sec") == 0) {
+            config->tree_rate_grace_period_sec = atoi(value);
+            if (config->tree_rate_grace_period_sec < 10) config->tree_rate_grace_period_sec = 10;
+        } else if (strcmp(key, "tree_tcp_connect_timeout_ms") == 0) {
+            config->tree_tcp_connect_timeout_ms = atoi(value);
+            if (config->tree_tcp_connect_timeout_ms < 1000) config->tree_tcp_connect_timeout_ms = 1000;
+        }
+        /* Thread tree mode toggle */
+        else if (strcmp(key, "use_thread_trees") == 0) {
+            config->use_thread_trees = atoi(value);
         }
     }
 

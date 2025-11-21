@@ -71,6 +71,33 @@ typedef struct {
     int porn_filter_keyword_threshold;   /* Min weight for keyword match (1-10, default: 8) */
     int porn_filter_regex_threshold;     /* Min weight for regex match (1-10, default: 9) */
     int porn_filter_heuristic_threshold; /* Min score for heuristic match (0-20, default: 5) */
+
+    /* Thread tree settings (Stage 1) */
+    int num_trees;                       /* Number of concurrent thread trees (default: 4) */
+    double min_metadata_rate;            /* Minimum metadata/sec before tree restart (default: 0.5) */
+
+    /* Thread tree Stage 2 settings */
+    int tree_bootstrap_timeout_sec;      /* Bootstrap phase timeout (default: 30) */
+    int tree_routing_threshold;          /* Nodes required before BEP51 phase (default: 200) */
+
+    /* Thread tree Stage 3 settings (BEP51) */
+    int tree_bep51_workers;              /* BEP51 workers per tree (default: 10) */
+    int tree_infohash_queue_capacity;    /* Infohash queue size per tree (default: 5000) */
+    int tree_bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 10) */
+
+    /* Thread tree Stage 4 settings (get_peers) */
+    int tree_get_peers_workers;          /* get_peers workers per tree (default: 500) */
+    int tree_peers_queue_capacity;       /* Peers queue size per tree (default: 2000) */
+    int tree_get_peers_timeout_ms;       /* get_peers response timeout (default: 3000) */
+
+    /* Thread tree Stage 5 settings (metadata) */
+    int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
+    int tree_rate_check_interval_sec;    /* Rate check interval (default: 10) */
+    int tree_rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
+    int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+
+    /* Thread tree mode toggle */
+    int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
 } crawler_config_t;
 
 /* Initialize config with default values */
