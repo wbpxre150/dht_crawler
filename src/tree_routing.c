@@ -302,3 +302,15 @@ int tree_routing_get_count(tree_routing_table_t *rt) {
     pthread_mutex_unlock(&rt->lock);
     return count;
 }
+
+void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity) {
+    if (!rt || capacity <= 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&rt->lock);
+    for (int i = 0; i < 160; i++) {
+        rt->buckets[i].max_nodes = capacity;
+    }
+    pthread_mutex_unlock(&rt->lock);
+}

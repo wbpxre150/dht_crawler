@@ -96,4 +96,11 @@ void tree_routing_mark_failed(tree_routing_table_t *rt, const uint8_t *node_id);
  */
 int tree_routing_get_count(tree_routing_table_t *rt);
 
+/**
+ * Set bucket capacity (for bootstrap mode)
+ * @param rt Routing table
+ * @param capacity New max_nodes per bucket (default 8, bootstrap 20)
+ */
+void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity);
+
 #endif /* TREE_ROUTING_H */

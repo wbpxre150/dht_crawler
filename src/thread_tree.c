@@ -393,6 +393,12 @@ static void *bootstrap_thread_func(void *arg) {
         goto shutdown;
     }
 
+    /* Increase bucket capacity during bootstrap to allow more nodes per bucket
+     * This helps overcome the issue where bootstrap discovers nodes in similar
+     * keyspace regions that fill only a few buckets. Default k=8, bootstrap k=20 */
+    tree_routing_set_bucket_capacity(rt, 20);
+    log_msg(LOG_DEBUG, "[tree %u] Bootstrap mode: increased bucket capacity to 20", tree->tree_id);
+
     /* Query bootstrap nodes */
     for (int i = 0; BOOTSTRAP_NODES[i] != NULL && !atomic_load(&tree->shutdown_requested); i++) {
         struct sockaddr_storage addr;
@@ -426,6 +432,9 @@ static void *bootstrap_thread_func(void *arg) {
         if (node_count >= tree->routing_threshold) {
             log_msg(LOG_INFO, "[tree %u] Reached routing threshold (%d nodes)",
                     tree->tree_id, node_count);
+            /* Reset bucket capacity to normal k=8 */
+            tree_routing_set_bucket_capacity(rt, 8);
+            log_msg(LOG_DEBUG, "[tree %u] Bootstrap complete: reset bucket capacity to 8", tree->tree_id);
             tree_start_bep51_phase(tree);
             break;
         }
