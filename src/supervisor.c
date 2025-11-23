@@ -370,9 +370,20 @@ static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec
             for (int i = 0; i < count; i++) {
                 struct sockaddr_storage addr;
                 memset(&addr, 0, sizeof(addr));
-                /* Cast to sockaddr_in* to preserve sin_family at correct offset */
                 struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
-                memcpy(sin, &nodes[i]->addr.addr, sizeof(struct sockaddr_in));
+
+                /* Convert wbpxre_node_addr_t (ip string + port) to sockaddr_in */
+                sin->sin_family = AF_INET;
+                sin->sin_port = htons(nodes[i]->addr.port);
+
+                /* Convert IP string to binary format */
+                if (inet_pton(AF_INET, nodes[i]->addr.ip, &sin->sin_addr) != 1) {
+                    /* Invalid IP address, skip this node */
+                    log_msg(LOG_DEBUG, "[global_bootstrap] Skipping node with invalid IP: %s",
+                            nodes[i]->addr.ip);
+                    free(nodes[i]);
+                    continue;
+                }
 
                 int rc = shared_node_pool_add_node(sup->shared_node_pool,
                                                    nodes[i]->id,
@@ -462,11 +473,23 @@ void supervisor_stop(supervisor_t *sup) {
     /* Stop monitor thread */
     log_msg(LOG_DEBUG, "[supervisor] Stopping monitor thread...");
     sup->monitor_running = 0;
+
+    /* Wait for monitor thread with timeout detection */
     if (sup->monitor_thread) {
+        time_t start = time(NULL);
         pthread_join(sup->monitor_thread, NULL);
         sup->monitor_thread = 0;
+        time_t elapsed = time(NULL) - start;
+
+        if (elapsed > 2) {
+            log_msg(LOG_WARN, "[supervisor] Monitor thread took %ld seconds to exit", elapsed);
+        }
     }
     log_msg(LOG_DEBUG, "[supervisor] Monitor thread stopped");
+
+    /* Sleep briefly to ensure monitor thread has fully released all locks
+     * This prevents race where monitor thread is still holding trees_lock */
+    usleep(50000);  /* 50ms grace period */
 
     /* Request shutdown on all trees */
     log_msg(LOG_DEBUG, "[supervisor] Requesting shutdown on all trees...");
@@ -481,16 +504,34 @@ void supervisor_stop(supervisor_t *sup) {
 
     /* Wait for all trees to finish and destroy them */
     pthread_mutex_lock(&sup->trees_lock);
+    thread_tree_t *trees_to_destroy[sup->max_trees];
+    int num_trees = 0;
+
+    /* Collect trees to destroy (under lock) */
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
-            log_msg(LOG_DEBUG, "[supervisor] Destroying tree %u...", sup->trees[i]->tree_id);
-            thread_tree_destroy(sup->trees[i]);
+            trees_to_destroy[num_trees++] = sup->trees[i];
             sup->trees[i] = NULL;
-            log_msg(LOG_DEBUG, "[supervisor] Tree destroyed");
         }
     }
     sup->active_trees = 0;
     pthread_mutex_unlock(&sup->trees_lock);
+
+    /* Destroy trees WITHOUT holding lock (pthread_join can block) */
+    for (int i = 0; i < num_trees; i++) {
+        log_msg(LOG_DEBUG, "[supervisor] Destroying tree %u...", trees_to_destroy[i]->tree_id);
+
+        /* Track time to detect hanging threads */
+        time_t start = time(NULL);
+        thread_tree_destroy(trees_to_destroy[i]);
+        time_t elapsed = time(NULL) - start;
+
+        if (elapsed > 2) {
+            log_msg(LOG_WARN, "[supervisor] Tree %u took %ld seconds to destroy (possible hang)",
+                    trees_to_destroy[i]->tree_id, elapsed);
+        }
+        log_msg(LOG_DEBUG, "[supervisor] Tree destroyed");
+    }
 
     log_msg(LOG_INFO, "[supervisor] Stopped");
 }

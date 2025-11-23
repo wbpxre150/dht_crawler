@@ -9,6 +9,11 @@
 #include "supervisor.h"
 #include "thread_tree.h"
 #include <civetweb.h>
+
+/* Forward declarations for tree queue functions to avoid type conflicts */
+int tree_routing_get_count(void *rt);
+int tree_infohash_queue_count(void *q);
+int tree_peers_queue_count(void *q);
 #include <cJSON.h>
 #include <string.h>
 #include <stdlib.h>
@@ -467,6 +472,36 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(tree->current_phase));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
+
+                /* Add queue sizes for monitoring and tuning */
+                cJSON *queues = cJSON_CreateObject();
+
+                /* Routing table node count */
+                int node_count = 0;
+                if (tree->routing_table) {
+                    node_count = tree_routing_get_count(tree->routing_table);
+                }
+                cJSON_AddNumberToObject(queues, "routing_table_nodes", node_count);
+
+                /* Sample infohash queue (before get_peers) */
+                int infohash_queue_size = 0;
+                int infohash_queue_capacity = tree->infohash_queue_capacity;
+                if (tree->infohash_queue) {
+                    infohash_queue_size = tree_infohash_queue_count(tree->infohash_queue);
+                }
+                cJSON_AddNumberToObject(queues, "infohash_queue_size", infohash_queue_size);
+                cJSON_AddNumberToObject(queues, "infohash_queue_capacity", infohash_queue_capacity);
+
+                /* Peers queue (for metadata fetchers) */
+                int peers_queue_size = 0;
+                int peers_queue_capacity = tree->peers_queue_capacity;
+                if (tree->peers_queue) {
+                    peers_queue_size = tree_peers_queue_count(tree->peers_queue);
+                }
+                cJSON_AddNumberToObject(queues, "peers_queue_size", peers_queue_size);
+                cJSON_AddNumberToObject(queues, "peers_queue_capacity", peers_queue_capacity);
+
+                cJSON_AddItemToObject(tree_json, "queues", queues);
                 cJSON_AddItemToArray(trees_array, tree_json);
             }
         }

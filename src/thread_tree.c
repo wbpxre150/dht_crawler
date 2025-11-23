@@ -17,6 +17,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 /* Generate random node ID for DHT identity */
 static void generate_random_node_id(uint8_t *node_id) {
@@ -82,9 +83,9 @@ static void *bep51_worker_func(void *arg) {
         generate_random_target(target);
         tree_send_sample_infohashes(tree, sock, target, &node.addr);
 
-        /* 3. Wait for response with timeout */
+        /* 3. Wait for response with timeout (100ms for faster shutdown response) */
         struct sockaddr_storage from;
-        int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 500);
+        int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 100);
 
         if (recv_len > 0) {
             /* 4. Parse response, extract infohashes */
@@ -199,9 +200,9 @@ static void *get_peers_worker_func(void *arg) {
             for (int i = 0; i < n && result.peer_count < MAX_PEERS_PER_ENTRY; i++) {
                 tree_send_get_peers(tree, sock, infohash, &closest[i].addr);
 
-                /* Wait for response with timeout */
+                /* Wait for response with timeout (100ms for faster shutdown response) */
                 struct sockaddr_storage from;
-                int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 500);
+                int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 100);
 
                 if (recv_len > 0) {
                     tree_get_peers_response_t response;
@@ -413,8 +414,10 @@ shutdown:
     log_msg(LOG_INFO, "[tree %u] Bootstrap thread exiting (final: %d nodes)",
             tree->tree_id, tree->routing_table ? tree_routing_get_count(tree->routing_table) : 0);
 
-    /* Notify supervisor of shutdown completion */
-    if (tree->on_shutdown) {
+    /* Notify supervisor of shutdown completion
+     * ONLY if we're NOT in global shutdown (avoid deadlock on trees_lock)
+     * During shutdown, supervisor already knows it's destroying the tree */
+    if (tree->on_shutdown && tree->current_phase != TREE_PHASE_SHUTTING_DOWN) {
         tree->on_shutdown(tree);
     }
 
@@ -622,6 +625,20 @@ void thread_tree_destroy(thread_tree_t *tree) {
         pthread_join(tree->rate_monitor_thread, NULL);
     }
     log_msg(LOG_DEBUG, "[tree %u] Rate monitor thread joined", tree->tree_id);
+
+    /* Close socket BEFORE cleanup to unblock any pending recv() calls
+     * This is critical - workers may be blocked in poll() */
+    log_msg(LOG_DEBUG, "[tree %u] Closing socket to unblock workers...", tree->tree_id);
+    if (tree->socket) {
+        /* Close the file descriptor but don't free the structure yet */
+        tree_socket_t *sock = (tree_socket_t *)tree->socket;
+        if (sock->fd >= 0) {
+            shutdown(sock->fd, SHUT_RDWR);  /* Unblock pending recv/send */
+            close(sock->fd);
+            sock->fd = -1;
+        }
+    }
+    log_msg(LOG_DEBUG, "[tree %u] Socket closed", tree->tree_id);
 
     /* Stage 2: Cleanup private data structures */
     if (tree->routing_table) {
