@@ -815,7 +815,10 @@ void *tree_rate_monitor_func(void *arg) {
     time_t last_time = time(NULL);
 
     while (!atomic_load(&tree->shutdown_requested)) {
-        sleep(check_interval);
+        /* Sleep in small chunks to be responsive to shutdown */
+        for (int i = 0; i < check_interval && !atomic_load(&tree->shutdown_requested); i++) {
+            sleep(1);
+        }
 
         if (atomic_load(&tree->shutdown_requested)) break;
 
@@ -838,8 +841,10 @@ void *tree_rate_monitor_func(void *arg) {
             log_msg(LOG_WARN, "[tree %u] Metadata rate %.2f/s below threshold %.2f/s, entering grace period",
                     tree->tree_id, rate, min_rate);
 
-            /* Grace period */
-            sleep(grace_period);
+            /* Grace period - sleep in small chunks to be responsive to shutdown */
+            for (int i = 0; i < grace_period && !atomic_load(&tree->shutdown_requested); i++) {
+                sleep(1);
+            }
 
             if (atomic_load(&tree->shutdown_requested)) break;
 

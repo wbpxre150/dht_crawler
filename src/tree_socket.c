@@ -87,6 +87,14 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
     } else if (dest->ss_family == AF_INET6) {
         addrlen = sizeof(struct sockaddr_in6);
     } else {
+        log_msg(LOG_DEBUG, "[tree_socket] Unknown address family: %d", dest->ss_family);
+        pthread_mutex_unlock(&sock->send_lock);
+        return -1;
+    }
+
+    /* IPv4 socket can't send to IPv6 addresses */
+    if (dest->ss_family == AF_INET6) {
+        log_msg(LOG_DEBUG, "[tree_socket] Cannot send IPv6 through IPv4 socket");
         pthread_mutex_unlock(&sock->send_lock);
         return -1;
     }

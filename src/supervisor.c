@@ -138,13 +138,16 @@ void supervisor_stop(supervisor_t *sup) {
     log_msg(LOG_INFO, "[supervisor] Stopping");
 
     /* Stop monitor thread */
+    log_msg(LOG_DEBUG, "[supervisor] Stopping monitor thread...");
     sup->monitor_running = 0;
     if (sup->monitor_thread) {
         pthread_join(sup->monitor_thread, NULL);
         sup->monitor_thread = 0;
     }
+    log_msg(LOG_DEBUG, "[supervisor] Monitor thread stopped");
 
     /* Request shutdown on all trees */
+    log_msg(LOG_DEBUG, "[supervisor] Requesting shutdown on all trees...");
     pthread_mutex_lock(&sup->trees_lock);
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
@@ -152,13 +155,16 @@ void supervisor_stop(supervisor_t *sup) {
         }
     }
     pthread_mutex_unlock(&sup->trees_lock);
+    log_msg(LOG_DEBUG, "[supervisor] Shutdown requested on all trees");
 
     /* Wait for all trees to finish and destroy them */
     pthread_mutex_lock(&sup->trees_lock);
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
+            log_msg(LOG_DEBUG, "[supervisor] Destroying tree %u...", sup->trees[i]->tree_id);
             thread_tree_destroy(sup->trees[i]);
             sup->trees[i] = NULL;
+            log_msg(LOG_DEBUG, "[supervisor] Tree destroyed");
         }
     }
     sup->active_trees = 0;
@@ -228,9 +234,11 @@ static void *monitor_thread_func(void *arg) {
     log_msg(LOG_INFO, "[supervisor] Monitor thread started");
 
     while (sup->monitor_running) {
-        /* Sleep for 10 seconds between checks */
-        struct timespec ts = {10, 0};
-        nanosleep(&ts, NULL);
+        /* Sleep in small chunks (1 second) to be responsive to shutdown */
+        for (int i = 0; i < 10 && sup->monitor_running; i++) {
+            struct timespec ts = {1, 0};
+            nanosleep(&ts, NULL);
+        }
 
         if (!sup->monitor_running) {
             break;

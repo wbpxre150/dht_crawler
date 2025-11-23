@@ -505,24 +505,15 @@ static void *bootstrap_thread_func(void *arg) {
                     tree->tree_id, node_count, tree->routing_threshold);
         }
 
-        /* Detect stalled bootstrap and trigger aggressive mode */
+        /* Detect stalled bootstrap - aggressive mode disabled per user request */
+        /* Just let stall_counter track stalls without triggering aggressive queries */
         if (node_count == last_node_count && node_count < tree->routing_threshold && node_count > 0) {
             stall_counter++;
-            if (stall_counter >= 10) {
-                /* Stalled for 10+ iterations, trigger aggressive queries */
-                log_msg(LOG_DEBUG, "[tree %u] Bootstrap stalled at %d nodes, entering aggressive mode",
-                        tree->tree_id, node_count);
-
-                /* Query ALL available nodes with RANDOM targets for keyspace exploration */
-                tree_node_t all_nodes[256];
-                int got = tree_routing_get_random_nodes(rt, all_nodes, 256);
-                for (int i = 0; i < got && queries_sent < 3000; i++) {
-                    uint8_t random_target[20];
-                    generate_random_target(random_target);
-                    tree_send_find_node(tree, sock, random_target, &all_nodes[i].addr);
-                    queries_sent++;
-                }
-                stall_counter = 0;
+            /* Aggressive mode disabled - let normal bootstrap queries handle it */
+            if (stall_counter >= 10 && (stall_counter % 50) == 0) {
+                /* Log stall status periodically, but don't flood the network */
+                log_msg(LOG_DEBUG, "[tree %u] Bootstrap progress slow at %d nodes (stalled %d iterations)",
+                        tree->tree_id, node_count, stall_counter);
             }
         } else if (node_count != last_node_count) {
             stall_counter = 0;
@@ -765,11 +756,14 @@ void thread_tree_destroy(thread_tree_t *tree) {
     thread_tree_request_shutdown(tree);
 
     /* Join bootstrap thread */
+    log_msg(LOG_DEBUG, "[tree %u] Joining bootstrap thread...", tree->tree_id);
     if (tree->bootstrap_thread) {
         pthread_join(tree->bootstrap_thread, NULL);
     }
+    log_msg(LOG_DEBUG, "[tree %u] Bootstrap thread joined", tree->tree_id);
 
     /* Join bootstrap workers */
+    log_msg(LOG_DEBUG, "[tree %u] Joining %d bootstrap workers...", tree->tree_id, tree->num_bootstrap_workers);
     if (tree->bootstrap_workers) {
         for (int i = 0; i < tree->num_bootstrap_workers; i++) {
             if (tree->bootstrap_workers[i]) {
@@ -778,8 +772,10 @@ void thread_tree_destroy(thread_tree_t *tree) {
         }
         free(tree->bootstrap_workers);
     }
+    log_msg(LOG_DEBUG, "[tree %u] Bootstrap workers joined", tree->tree_id);
 
     /* Join BEP51 workers */
+    log_msg(LOG_DEBUG, "[tree %u] Joining %d BEP51 workers...", tree->tree_id, tree->num_bep51_workers);
     if (tree->bep51_threads) {
         for (int i = 0; i < tree->num_bep51_workers; i++) {
             if (tree->bep51_threads[i]) {
@@ -788,8 +784,10 @@ void thread_tree_destroy(thread_tree_t *tree) {
         }
         free(tree->bep51_threads);
     }
+    log_msg(LOG_DEBUG, "[tree %u] BEP51 workers joined", tree->tree_id);
 
     /* Join get_peers workers */
+    log_msg(LOG_DEBUG, "[tree %u] Joining %d get_peers workers...", tree->tree_id, tree->num_get_peers_workers);
     if (tree->get_peers_threads) {
         for (int i = 0; i < tree->num_get_peers_workers; i++) {
             if (tree->get_peers_threads[i]) {
@@ -798,8 +796,10 @@ void thread_tree_destroy(thread_tree_t *tree) {
         }
         free(tree->get_peers_threads);
     }
+    log_msg(LOG_DEBUG, "[tree %u] get_peers workers joined", tree->tree_id);
 
     /* Join metadata workers */
+    log_msg(LOG_DEBUG, "[tree %u] Joining %d metadata workers...", tree->tree_id, tree->num_metadata_workers);
     if (tree->metadata_threads) {
         for (int i = 0; i < tree->num_metadata_workers; i++) {
             if (tree->metadata_threads[i]) {
@@ -808,11 +808,14 @@ void thread_tree_destroy(thread_tree_t *tree) {
         }
         free(tree->metadata_threads);
     }
+    log_msg(LOG_DEBUG, "[tree %u] Metadata workers joined", tree->tree_id);
 
     /* Stage 5: Join rate monitor thread */
+    log_msg(LOG_DEBUG, "[tree %u] Joining rate monitor thread...", tree->tree_id);
     if (tree->rate_monitor_thread) {
         pthread_join(tree->rate_monitor_thread, NULL);
     }
+    log_msg(LOG_DEBUG, "[tree %u] Rate monitor thread joined", tree->tree_id);
 
     /* Stage 2: Cleanup private data structures */
     if (tree->routing_table) {
