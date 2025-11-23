@@ -112,7 +112,16 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
 
     if (sent < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            log_msg(LOG_DEBUG, "[tree_socket] sendto failed: %s", strerror(errno));
+            /* Log detailed info about the failed address */
+            char ip_str[INET6_ADDRSTRLEN];
+            uint16_t port = 0;
+            if (dest->ss_family == AF_INET) {
+                const struct sockaddr_in *sin = (const struct sockaddr_in *)dest;
+                inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+                port = ntohs(sin->sin_port);
+            }
+            log_msg(LOG_DEBUG, "[tree_socket] sendto failed: %s (dest=%s:%u, family=%d, addrlen=%d)",
+                    strerror(errno), ip_str, port, dest->ss_family, addrlen);
         }
         return -1;
     }

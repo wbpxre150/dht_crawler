@@ -165,6 +165,14 @@ int tree_parse_compact_nodes(const uint8_t *compact, size_t compact_len,
         memcpy(&addr->sin_port, compact + pos, 2);  /* Already in network order */
         pos += 2;
 
+        /* Validate address: skip invalid IPs (0.0.0.0, 255.255.255.255) and port 0 */
+        uint32_t ip = ntohl(addr->sin_addr.s_addr);
+        uint16_t port = ntohs(addr->sin_port);
+        if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
+            /* Invalid address, skip this node */
+            continue;
+        }
+
         node_count++;
     }
 
@@ -407,6 +415,14 @@ int tree_parse_compact_peers(const uint8_t *compact, size_t compact_len,
         pos += 4;
         memcpy(&addr->sin_port, compact + pos, 2);  /* Already in network order */
         pos += 2;
+
+        /* Validate address: skip invalid IPs (0.0.0.0, 255.255.255.255) and port 0 */
+        uint32_t ip = ntohl(addr->sin_addr.s_addr);
+        uint16_t port = ntohs(addr->sin_port);
+        if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
+            /* Invalid address, skip this peer */
+            continue;
+        }
 
         peer_count++;
     }
