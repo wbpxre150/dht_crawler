@@ -1035,10 +1035,11 @@ static void *find_node_feeder_func(void *arg) {
                 continue;
             }
 
-            /* Get ALL available nodes for aggressive bootstrap querying */
-            wbpxre_routing_node_t *candidates[200];
+            /* Get ALL available nodes for aggressive bootstrap querying
+             * Increased from 200 to 500 for faster discovery */
+            wbpxre_routing_node_t *candidates[500];
             int count = wbpxre_routing_table_get_sample_candidates(table_to_read, current_node_id,
-                                                                     candidates, 200);
+                                                                     candidates, 500);
 
             /* Feed all candidates to worker queue */
             int fed = 0, dropped = 0;
@@ -1058,15 +1059,17 @@ static void *find_node_feeder_func(void *arg) {
                 }
             }
 
-            /* Log bootstrap progress every 2 cycles */
+            /* Log bootstrap progress every 5 cycles (reduced logging frequency) */
             static int bootstrap_log_counter = 0;
-            if (++bootstrap_log_counter >= 2) {
+            if (++bootstrap_log_counter >= 5) {
                 fprintf(stderr, "INFO: Bootstrap progress: %d nodes in FILLING table, fed=%d/dropped=%d\n",
                        table_to_read->node_count, fed, dropped);
                 bootstrap_log_counter = 0;
             }
 
-            usleep(500000);  /* Sleep 500ms between cycles */
+            /* Reduced sleep from 500ms to 100ms for faster bootstrap
+             * This allows workers to be fed continuously with new nodes */
+            usleep(100000);  /* Sleep 100ms between cycles */
 
         /* STEADY STATE: Conservative querying for normal operation */
         } else {

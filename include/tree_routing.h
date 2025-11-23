@@ -10,8 +10,11 @@
 /**
  * Private routing table for thread trees
  *
- * Unlike wbpxre_routing (which uses RCU for concurrent access),
- * this is simpler - private to one tree, uses simple mutex locking.
+ * Design: Single routing table per thread tree with read-write mutex locking.
+ * - Each thread tree has its own isolated routing table
+ * - Read operations use read locks (allow concurrent readers)
+ * - Write operations use write locks (exclusive access)
+ * - No RCU, no triple buffering - simple and reliable
  */
 
 /* Node in the routing table */
@@ -35,7 +38,7 @@ typedef struct tree_routing_table {
     uint8_t our_node_id[20];
     tree_bucket_t buckets[160];  /* 160-bit address space */
     int total_nodes;
-    pthread_mutex_t lock;  /* Simple mutex - no RCU needed (private) */
+    pthread_rwlock_t rwlock;  /* Read-write lock: concurrent reads, exclusive writes */
 } tree_routing_table_t;
 
 /**

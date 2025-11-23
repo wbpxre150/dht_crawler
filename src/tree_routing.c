@@ -51,7 +51,7 @@ tree_routing_table_t *tree_routing_create(const uint8_t *our_node_id) {
     }
 
     memcpy(rt->our_node_id, our_node_id, 20);
-    pthread_mutex_init(&rt->lock, NULL);
+    pthread_rwlock_init(&rt->rwlock, NULL);
 
     /* Initialize all buckets */
     for (int i = 0; i < 160; i++) {
@@ -69,7 +69,7 @@ void tree_routing_destroy(tree_routing_table_t *rt) {
         return;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_wrlock(&rt->rwlock);
 
     /* Free all nodes in all buckets */
     for (int i = 0; i < 160; i++) {
@@ -81,8 +81,8 @@ void tree_routing_destroy(tree_routing_table_t *rt) {
         }
     }
 
-    pthread_mutex_unlock(&rt->lock);
-    pthread_mutex_destroy(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
+    pthread_rwlock_destroy(&rt->rwlock);
     free(rt);
 }
 
@@ -97,7 +97,7 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
         return 0;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_wrlock(&rt->rwlock);
 
     int bucket_idx = get_bucket_index(rt->our_node_id, node_id);
     tree_bucket_t *bucket = &rt->buckets[bucket_idx];
@@ -110,7 +110,7 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
             memcpy(&existing->addr, addr, sizeof(struct sockaddr_storage));
             existing->last_seen = time(NULL);
             existing->fail_count = 0;
-            pthread_mutex_unlock(&rt->lock);
+            pthread_rwlock_unlock(&rt->rwlock);
             return 0;
         }
         existing = existing->next;
@@ -135,7 +135,7 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
 
         /* If still full, don't add */
         if (bucket->count >= bucket->max_nodes) {
-            pthread_mutex_unlock(&rt->lock);
+            pthread_rwlock_unlock(&rt->rwlock);
             return 0;  /* Not an error, just bucket full */
         }
     }
@@ -143,7 +143,7 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
     /* Add new node */
     tree_node_t *new_node = calloc(1, sizeof(tree_node_t));
     if (!new_node) {
-        pthread_mutex_unlock(&rt->lock);
+        pthread_rwlock_unlock(&rt->rwlock);
         return -1;
     }
 
@@ -156,7 +156,7 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
     bucket->count++;
     rt->total_nodes++;
 
-    pthread_mutex_unlock(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
     return 0;
 }
 
@@ -166,7 +166,7 @@ int tree_routing_get_closest(tree_routing_table_t *rt, const uint8_t *target,
         return 0;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_rdlock(&rt->rwlock);
 
     /* Collect all nodes with their distances */
     typedef struct {
@@ -176,7 +176,7 @@ int tree_routing_get_closest(tree_routing_table_t *rt, const uint8_t *target,
 
     node_with_dist_t *candidates = malloc(rt->total_nodes * sizeof(node_with_dist_t));
     if (!candidates) {
-        pthread_mutex_unlock(&rt->lock);
+        pthread_rwlock_unlock(&rt->rwlock);
         return 0;
     }
 
@@ -210,7 +210,7 @@ int tree_routing_get_closest(tree_routing_table_t *rt, const uint8_t *target,
     }
 
     free(candidates);
-    pthread_mutex_unlock(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
     return result_count;
 }
 
@@ -220,17 +220,17 @@ int tree_routing_get_random_nodes(tree_routing_table_t *rt,
         return 0;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_rdlock(&rt->rwlock);
 
     if (rt->total_nodes == 0) {
-        pthread_mutex_unlock(&rt->lock);
+        pthread_rwlock_unlock(&rt->rwlock);
         return 0;
     }
 
     /* Collect all nodes into array */
     tree_node_t *all_nodes = malloc(rt->total_nodes * sizeof(tree_node_t));
     if (!all_nodes) {
-        pthread_mutex_unlock(&rt->lock);
+        pthread_rwlock_unlock(&rt->rwlock);
         return 0;
     }
 
@@ -256,7 +256,7 @@ int tree_routing_get_random_nodes(tree_routing_table_t *rt,
     }
 
     free(all_nodes);
-    pthread_mutex_unlock(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
     return result_count;
 }
 
@@ -265,7 +265,7 @@ void tree_routing_mark_failed(tree_routing_table_t *rt, const uint8_t *node_id) 
         return;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_wrlock(&rt->rwlock);
 
     int bucket_idx = get_bucket_index(rt->our_node_id, node_id);
     tree_bucket_t *bucket = &rt->buckets[bucket_idx];
@@ -282,14 +282,14 @@ void tree_routing_mark_failed(tree_routing_table_t *rt, const uint8_t *node_id) 
                 bucket->count--;
                 rt->total_nodes--;
             }
-            pthread_mutex_unlock(&rt->lock);
+            pthread_rwlock_unlock(&rt->rwlock);
             return;
         }
         prev = &curr->next;
         curr = curr->next;
     }
 
-    pthread_mutex_unlock(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
 }
 
 int tree_routing_get_count(tree_routing_table_t *rt) {
@@ -297,9 +297,9 @@ int tree_routing_get_count(tree_routing_table_t *rt) {
         return 0;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_rdlock(&rt->rwlock);
     int count = rt->total_nodes;
-    pthread_mutex_unlock(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
     return count;
 }
 
@@ -308,9 +308,9 @@ void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity) {
         return;
     }
 
-    pthread_mutex_lock(&rt->lock);
+    pthread_rwlock_wrlock(&rt->rwlock);
     for (int i = 0; i < 160; i++) {
         rt->buckets[i].max_nodes = capacity;
     }
-    pthread_mutex_unlock(&rt->lock);
+    pthread_rwlock_unlock(&rt->rwlock);
 }

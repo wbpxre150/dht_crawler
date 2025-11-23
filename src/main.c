@@ -245,12 +245,15 @@ int main(int argc, char *argv[]) {
             .min_metadata_rate = config.min_metadata_rate,
             .batch_writer = g_batch_writer,
             .bloom_filter = g_bloom,
+            .num_find_node_workers = config.tree_find_node_workers,
             .num_bep51_workers = config.tree_bep51_workers,
             .num_get_peers_workers = config.tree_get_peers_workers,
             .num_metadata_workers = config.tree_metadata_workers,
-            /* Stage 2 settings (Bootstrap) */
-            .bootstrap_timeout_sec = config.tree_bootstrap_timeout_sec,
-            .routing_threshold = config.tree_routing_threshold,
+            /* Stage 2 settings (Global Bootstrap - NEW) */
+            .global_bootstrap_target = config.global_bootstrap_target,
+            .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
+            .global_bootstrap_workers = config.global_bootstrap_workers,
+            .per_tree_sample_size = config.per_tree_sample_size,
             /* Stage 5 settings */
             .rate_check_interval_sec = config.tree_rate_check_interval_sec,
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,

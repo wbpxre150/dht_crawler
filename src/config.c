@@ -84,9 +84,14 @@ void config_init_defaults(crawler_config_t *config) {
     config->num_trees = 4;                          /* 4 concurrent thread trees */
     config->min_metadata_rate = 0.5;                /* Min 0.5 metadata/sec before restart */
 
-    /* Thread tree Stage 2 defaults */
-    config->tree_bootstrap_timeout_sec = 30;        /* 30 second bootstrap timeout */
-    config->tree_routing_threshold = 200;           /* 200 nodes before BEP51 phase (lowered from 500) */
+    /* Thread tree Stage 2 defaults (Global Bootstrap - NEW) */
+    config->global_bootstrap_target = 5000;         /* Target 5000 nodes in shared pool */
+    config->global_bootstrap_timeout_sec = 60;      /* 60 second global bootstrap timeout */
+    config->global_bootstrap_workers = 50;          /* 50 worker threads for bootstrap */
+    config->per_tree_sample_size = 1000;            /* Each tree samples 1000 nodes */
+
+    /* Thread tree Stage 2 defaults (find_node/bootstrap) */
+    config->tree_find_node_workers = 10;            /* 10 find_node workers per tree */
 
     /* Thread tree Stage 3 defaults (BEP51) */
     config->tree_bep51_workers = 10;                /* 10 BEP51 workers per tree */
@@ -291,13 +296,29 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->min_metadata_rate = atof(value);
             if (config->min_metadata_rate < 0.0) config->min_metadata_rate = 0.0;
         }
-        /* Thread tree Stage 2 settings */
-        else if (strcmp(key, "tree_bootstrap_timeout_sec") == 0) {
-            config->tree_bootstrap_timeout_sec = atoi(value);
-            if (config->tree_bootstrap_timeout_sec < 5) config->tree_bootstrap_timeout_sec = 5;
-        } else if (strcmp(key, "tree_routing_threshold") == 0) {
-            config->tree_routing_threshold = atoi(value);
-            if (config->tree_routing_threshold < 10) config->tree_routing_threshold = 10;
+        /* Thread tree Stage 2 settings (Global Bootstrap - NEW) */
+        else if (strcmp(key, "global_bootstrap_target") == 0) {
+            config->global_bootstrap_target = atoi(value);
+            if (config->global_bootstrap_target < 1000) config->global_bootstrap_target = 1000;
+            if (config->global_bootstrap_target > 50000) config->global_bootstrap_target = 50000;
+        } else if (strcmp(key, "global_bootstrap_timeout_sec") == 0) {
+            config->global_bootstrap_timeout_sec = atoi(value);
+            if (config->global_bootstrap_timeout_sec < 10) config->global_bootstrap_timeout_sec = 10;
+            if (config->global_bootstrap_timeout_sec > 600) config->global_bootstrap_timeout_sec = 600;
+        } else if (strcmp(key, "global_bootstrap_workers") == 0) {
+            config->global_bootstrap_workers = atoi(value);
+            if (config->global_bootstrap_workers < 1) config->global_bootstrap_workers = 1;
+            if (config->global_bootstrap_workers > 200) config->global_bootstrap_workers = 200;
+        } else if (strcmp(key, "per_tree_sample_size") == 0) {
+            config->per_tree_sample_size = atoi(value);
+            if (config->per_tree_sample_size < 100) config->per_tree_sample_size = 100;
+            if (config->per_tree_sample_size > 10000) config->per_tree_sample_size = 10000;
+        }
+        /* Thread tree Stage 2 settings (find_node/bootstrap) */
+        else if (strcmp(key, "tree_find_node_workers") == 0) {
+            config->tree_find_node_workers = atoi(value);
+            if (config->tree_find_node_workers < 1) config->tree_find_node_workers = 1;
+            if (config->tree_find_node_workers > 100) config->tree_find_node_workers = 100;
         }
         /* Thread tree Stage 3 settings (BEP51) */
         else if (strcmp(key, "tree_bep51_workers") == 0) {

@@ -8,6 +8,8 @@
 #include "tree_peers_queue.h"
 #include "tree_metadata.h"
 #include "bloom_filter.h"
+#include "shared_node_pool.h"
+#include "supervisor.h"
 #include "dht_crawler.h"
 #include <stdlib.h>
 #include <string.h>
@@ -15,15 +17,6 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-
-/* Bootstrap nodes */
-static const char *BOOTSTRAP_NODES[] = {
-    "router.bittorrent.com",
-    "dht.transmissionbt.com",
-    "router.utorrent.com",
-    NULL
-};
-static const int BOOTSTRAP_PORT = 6881;
 
 /* Generate random node ID for DHT identity */
 static void generate_random_node_id(uint8_t *node_id) {
@@ -45,26 +38,6 @@ const char *thread_tree_phase_name(tree_phase_t phase) {
     }
 }
 
-/* Resolve hostname to sockaddr_storage */
-static int resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    int ret = getaddrinfo(hostname, port_str, &hints, &res);
-    if (ret != 0) {
-        return -1;
-    }
-
-    memcpy(addr, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-    return 0;
-}
-
 /* BEP51 worker context */
 typedef struct bep51_worker_ctx {
     thread_tree_t *tree;
@@ -82,50 +55,6 @@ static void generate_random_target(uint8_t *target) {
 static void tree_start_get_peers_workers(thread_tree_t *tree);
 static void tree_start_metadata_workers(thread_tree_t *tree);
 static void tree_start_rate_monitor(thread_tree_t *tree);
-
-/* Bootstrap find_node worker context */
-typedef struct bootstrap_worker_ctx {
-    thread_tree_t *tree;
-    int worker_id;
-} bootstrap_worker_ctx_t;
-
-/* Bootstrap find_node worker: continuously queries nodes from routing table */
-static void *bootstrap_find_node_worker_func(void *arg) {
-    bootstrap_worker_ctx_t *ctx = (bootstrap_worker_ctx_t *)arg;
-    thread_tree_t *tree = ctx->tree;
-    int worker_id = ctx->worker_id;
-
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap worker %d started", tree->tree_id, worker_id);
-
-    tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
-    tree_socket_t *sock = (tree_socket_t *)tree->socket;
-
-    while (!atomic_load(&tree->shutdown_requested) && tree->current_phase == TREE_PHASE_BOOTSTRAP) {
-        /* Get random nodes from routing table */
-        tree_node_t nodes[8];
-        int got = tree_routing_get_random_nodes(rt, nodes, 8);
-
-        if (got == 0) {
-            /* No nodes yet, wait a bit */
-            usleep(100000);  /* 100ms */
-            continue;
-        }
-
-        /* Query each node with a random target to explore keyspace */
-        for (int i = 0; i < got; i++) {
-            uint8_t random_target[20];
-            generate_random_target(random_target);
-            tree_send_find_node(tree, sock, random_target, &nodes[i].addr);
-        }
-
-        /* Rate limit: ~10ms per query batch */
-        usleep(10000);
-    }
-
-    free(ctx);
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap worker %d exiting", tree->tree_id, worker_id);
-    return NULL;
-}
 
 /* BEP51 worker thread function */
 static void *bep51_worker_func(void *arg) {
@@ -419,187 +348,64 @@ static void tree_start_bep51_phase(thread_tree_t *tree) {
     tree_start_bep51_workers(tree);
 }
 
-/* Bootstrap thread function */
+/* Bootstrap thread function - NEW SIMPLIFIED VERSION using shared node pool */
 static void *bootstrap_thread_func(void *arg) {
     thread_tree_t *tree = (thread_tree_t *)arg;
 
-    log_msg(LOG_INFO, "[tree %u] Bootstrap thread started", tree->tree_id);
+    log_msg(LOG_INFO, "[tree %u] Bootstrap thread started (using shared node pool)", tree->tree_id);
 
     tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
-    tree_socket_t *sock = (tree_socket_t *)tree->socket;
 
-    if (!rt || !sock) {
-        log_msg(LOG_ERROR, "[tree %u] Missing routing table or socket", tree->tree_id);
+    if (!rt) {
+        log_msg(LOG_ERROR, "[tree %u] Missing routing table", tree->tree_id);
         goto shutdown;
     }
 
-    /* Increase bucket capacity during bootstrap to allow more nodes per bucket
-     * This helps overcome the issue where bootstrap discovers nodes in similar
-     * keyspace regions that fill only a few buckets. Default k=8, bootstrap k=20 */
-    tree_routing_set_bucket_capacity(rt, 20);
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap mode: increased bucket capacity to 20", tree->tree_id);
-
-    /* Start bootstrap find_node worker threads to continuously query routing table */
-    log_msg(LOG_INFO, "[tree %u] Starting %d bootstrap find_node workers",
-            tree->tree_id, tree->num_bootstrap_workers);
-    for (int i = 0; i < tree->num_bootstrap_workers; i++) {
-        bootstrap_worker_ctx_t *ctx = malloc(sizeof(bootstrap_worker_ctx_t));
-        if (!ctx) {
-            log_msg(LOG_ERROR, "[tree %u] Failed to allocate bootstrap worker context", tree->tree_id);
-            continue;
-        }
-        ctx->tree = tree;
-        ctx->worker_id = i;
-
-        int rc = pthread_create(&tree->bootstrap_workers[i], NULL, bootstrap_find_node_worker_func, ctx);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "[tree %u] Failed to create bootstrap worker %d: %d",
-                    tree->tree_id, i, rc);
-            free(ctx);
-        }
+    /* Check if supervisor and shared_node_pool are available */
+    if (!tree->supervisor || !tree->supervisor->shared_node_pool) {
+        log_msg(LOG_ERROR, "[tree %u] No shared node pool available, cannot bootstrap", tree->tree_id);
+        goto shutdown;
     }
 
-    /* Query bootstrap nodes */
-    for (int i = 0; BOOTSTRAP_NODES[i] != NULL && !atomic_load(&tree->shutdown_requested); i++) {
-        struct sockaddr_storage addr;
-        if (resolve_hostname(BOOTSTRAP_NODES[i], BOOTSTRAP_PORT, &addr) == 0) {
-            log_msg(LOG_DEBUG, "[tree %u] Sending find_node to %s",
-                    tree->tree_id, BOOTSTRAP_NODES[i]);
-            tree_send_find_node(tree, sock, tree->node_id, &addr);
-        }
+    shared_node_pool_t *pool = tree->supervisor->shared_node_pool;
+    int sample_size = tree->supervisor->per_tree_sample_size;
+
+    /* Sample random nodes from the shared pool */
+    tree_node_t *sampled_nodes = malloc(sample_size * sizeof(tree_node_t));
+    if (!sampled_nodes) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to allocate memory for sampled nodes", tree->tree_id);
+        goto shutdown;
     }
 
-    /* Bootstrap loop: query and process responses */
-    time_t start_time = time(NULL);
-    uint8_t recv_buf[2048];
-    int queries_sent = 0;
-    int last_node_count = 0;
-    int stall_counter = 0;       /* Stall detection counter (tree-local, not static) */
-    int loop_iterations = 0;     /* Track loop iterations for proactive queries */
+    int got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
+    if (got < 100) {
+        log_msg(LOG_ERROR, "[tree %u] Insufficient nodes in shared pool: got %d, need at least 100",
+                tree->tree_id, got);
+        free(sampled_nodes);
+        goto shutdown;
+    }
 
+    log_msg(LOG_INFO, "[tree %u] Sampled %d nodes from shared pool", tree->tree_id, got);
+
+    /* Add sampled nodes to routing table */
+    for (int i = 0; i < got; i++) {
+        tree_routing_add_node(rt, sampled_nodes[i].node_id, &sampled_nodes[i].addr);
+    }
+
+    free(sampled_nodes);
+
+    int final_count = tree_routing_get_count(rt);
+    log_msg(LOG_INFO, "[tree %u] Bootstrap complete: %d nodes in routing table",
+            tree->tree_id, final_count);
+
+    /* Transition to BEP51 phase to discover infohashes */
+    log_msg(LOG_INFO, "[tree %u] Transitioning to BEP51 phase (sample_infohashes)", tree->tree_id);
+    tree->current_phase = TREE_PHASE_BEP51;
+    tree_start_bep51_workers(tree);
+
+    /* Wait for shutdown */
     while (!atomic_load(&tree->shutdown_requested)) {
-        loop_iterations++;
-        /* Check timeout */
-        time_t elapsed = time(NULL) - start_time;
-        if (elapsed > tree->bootstrap_timeout_sec && tree_routing_get_count(rt) < 10) {
-            log_msg(LOG_WARN, "[tree %u] Bootstrap timeout with only %d nodes",
-                    tree->tree_id, tree_routing_get_count(rt));
-            /* Continue anyway, maybe we'll get more nodes */
-        }
-
-        /* Check if we've reached the threshold */
-        int node_count = tree_routing_get_count(rt);
-        if (node_count >= tree->routing_threshold) {
-            log_msg(LOG_INFO, "[tree %u] Reached routing threshold (%d nodes)",
-                    tree->tree_id, node_count);
-            /* Reset bucket capacity to normal k=8 */
-            tree_routing_set_bucket_capacity(rt, 8);
-            log_msg(LOG_DEBUG, "[tree %u] Bootstrap complete: reset bucket capacity to 8", tree->tree_id);
-            tree_start_bep51_phase(tree);
-            break;
-        }
-
-        /* Log progress periodically */
-        if (node_count % 50 == 0 && node_count != last_node_count) {
-            log_msg(LOG_DEBUG, "[tree %u] Bootstrap progress: %d/%d nodes",
-                    tree->tree_id, node_count, tree->routing_threshold);
-        }
-
-        /* Detect stalled bootstrap - aggressive mode disabled per user request */
-        /* Just let stall_counter track stalls without triggering aggressive queries */
-        if (node_count == last_node_count && node_count < tree->routing_threshold && node_count > 0) {
-            stall_counter++;
-            /* Aggressive mode disabled - let normal bootstrap queries handle it */
-            if (stall_counter >= 10 && (stall_counter % 50) == 0) {
-                /* Log stall status periodically, but don't flood the network */
-                log_msg(LOG_DEBUG, "[tree %u] Bootstrap progress slow at %d nodes (stalled %d iterations)",
-                        tree->tree_id, node_count, stall_counter);
-            }
-        } else if (node_count != last_node_count) {
-            stall_counter = 0;
-        }
-
-        /* Retransmit bootstrap queries periodically if we have zero nodes */
-        if (node_count == 0 && (loop_iterations % 20) == 0) {  /* Every ~1 second (20 * 50ms) */
-            log_msg(LOG_DEBUG, "[tree %u] No nodes yet, retrying bootstrap nodes (iteration %d)",
-                    tree->tree_id, loop_iterations);
-            for (int i = 0; BOOTSTRAP_NODES[i] != NULL; i++) {
-                struct sockaddr_storage addr;
-                if (resolve_hostname(BOOTSTRAP_NODES[i], BOOTSTRAP_PORT, &addr) == 0) {
-                    tree_send_find_node(tree, sock, tree->node_id, &addr);
-                    queries_sent++;
-                }
-            }
-        }
-
-        /* PROACTIVE QUERYING: Query random nodes every N iterations to explore keyspace */
-        /* During bootstrap, be VERY aggressive to fill empty buckets across entire keyspace */
-        /* Use RANDOM targets to discover nodes in different keyspace regions */
-        int query_frequency = (node_count < tree->routing_threshold) ? 2 : 10;  /* Every 2 iterations during bootstrap */
-        int nodes_to_query = (node_count < tree->routing_threshold) ? 16 : 8;   /* Query more nodes during bootstrap */
-
-        if (loop_iterations % query_frequency == 0 && node_count > 10) {
-            tree_node_t random_nodes[16];
-            int got = tree_routing_get_random_nodes(rt, random_nodes, nodes_to_query);
-            for (int i = 0; i < got && queries_sent < 3000; i++) {
-                uint8_t random_target[20];
-                generate_random_target(random_target);
-                tree_send_find_node(tree, sock, random_target, &random_nodes[i].addr);
-                queries_sent++;
-            }
-        }
-
-        /* Receive and process responses (reduced timeout from 100ms to 50ms for faster iterations) */
-        struct sockaddr_storage from;
-        int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 50);
-
-        if (recv_len > 0) {
-            tree_find_node_response_t response;
-            memset(&response, 0, sizeof(response));
-
-            tree_response_type_t resp_type = tree_handle_response(
-                tree, recv_buf, recv_len, &from, &response);
-
-            if (resp_type == TREE_RESP_FIND_NODE && response.node_count > 0) {
-                /* Add discovered nodes to routing table */
-                for (int i = 0; i < response.node_count; i++) {
-                    tree_routing_add_node(rt, response.nodes[i], &response.addrs[i]);
-                }
-
-                /* Query some of the new nodes for more nodes (increased from 3 to 8) */
-                /* Use random targets to explore different parts of the keyspace */
-                int to_query = (response.node_count < 8) ? response.node_count : 8;
-                for (int i = 0; i < to_query && queries_sent < 2000; i++) {
-                    uint8_t random_target[20];
-                    generate_random_target(random_target);
-                    tree_send_find_node(tree, sock, random_target, &response.addrs[i]);
-                    queries_sent++;
-                }
-            }
-        }
-
-        /* Response-based random node queries: more aggressive after initial bootstrap */
-        /* After 50 nodes, query every 3rd response. Before 50, query every 5th to avoid overwhelming network */
-        /* Use random targets for keyspace exploration */
-        int query_interval = (node_count >= 50) ? 3 : 5;
-        if (queries_sent % query_interval == 0 && node_count > 0) {
-            tree_node_t random_nodes[8];
-            int got = tree_routing_get_random_nodes(rt, random_nodes, 8);
-            for (int i = 0; i < got && queries_sent < 3000; i++) {
-                uint8_t random_target[20];
-                generate_random_target(random_target);
-                tree_send_find_node(tree, sock, random_target, &random_nodes[i].addr);
-                queries_sent++;
-            }
-        }
-
-        /* Update last_node_count at end of iteration for accurate stall detection */
-        last_node_count = node_count;
-    }
-
-    /* BEP51 phase loop (placeholder - wait until shutdown) */
-    while (!atomic_load(&tree->shutdown_requested) && tree->current_phase == TREE_PHASE_BEP51) {
-        struct timespec ts = {0, 100000000};  /* 100ms */
+        struct timespec ts = {1, 0};  /* 1 second */
         nanosleep(&ts, NULL);
     }
 

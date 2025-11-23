@@ -81,7 +81,7 @@ typedef struct thread_tree {
     void *socket;                  /* Private UDP socket (tree_socket_t*) */
 
     /* Shared resources (from supervisor) */
-    struct bloom_filter *shared_bloom;  /* Stage 3: Shared bloom filter (RCU read) */
+    struct bloom_filter *shared_bloom;  /* Stage 3: Shared bloom filter (thread-safe) */
 
     /* Stage 2 config */
     int bootstrap_timeout_sec;
@@ -130,6 +130,7 @@ typedef struct thread_tree {
     /* Supervisor callback */
     void (*on_shutdown)(struct thread_tree *tree);
     void *supervisor_ctx;
+    struct supervisor *supervisor;  /* NEW: Backlink to supervisor for accessing shared_node_pool */
 } thread_tree_t;
 
 /**

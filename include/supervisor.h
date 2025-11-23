@@ -8,6 +8,7 @@
 /* Forward declarations */
 struct batch_writer;
 struct bloom_filter;
+struct shared_node_pool;
 
 /**
  * Supervisor: Manages multiple thread trees for DHT crawling
@@ -25,13 +26,16 @@ typedef struct supervisor_config {
     double min_metadata_rate;       /* Minimum metadata/sec before tree restart */
 
     /* Worker counts per tree */
+    int num_find_node_workers;
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
 
-    /* Stage 2 settings (Bootstrap) */
-    int bootstrap_timeout_sec;      /* Bootstrap phase timeout (default: 30) */
-    int routing_threshold;          /* Nodes required before BEP51 phase (default: 500) */
+    /* Stage 2 settings (Global Bootstrap - NEW) */
+    int global_bootstrap_target;         /* Target nodes for shared pool (default: 5000) */
+    int global_bootstrap_timeout_sec;    /* Global bootstrap timeout (default: 60) */
+    int global_bootstrap_workers;        /* Bootstrap worker threads (default: 50) */
+    int per_tree_sample_size;            /* Nodes each tree samples from pool (default: 1000) */
 
     /* Stage 5 settings */
     int rate_check_interval_sec;    /* Rate check interval (default: 10) */
@@ -53,16 +57,20 @@ typedef struct supervisor {
     /* Shared resources (only these are shared between trees) */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
+    struct shared_node_pool *shared_node_pool;  /* NEW: Shared bootstrap node pool */
 
     /* Configuration */
     double min_metadata_rate;
+    int num_find_node_workers;
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
 
-    /* Stage 2 settings (Bootstrap) */
-    int bootstrap_timeout_sec;
-    int routing_threshold;
+    /* Stage 2 settings (Global Bootstrap - NEW) */
+    int global_bootstrap_target;
+    int global_bootstrap_timeout_sec;
+    int global_bootstrap_workers;
+    int per_tree_sample_size;
 
     /* Stage 5 settings */
     int rate_check_interval_sec;

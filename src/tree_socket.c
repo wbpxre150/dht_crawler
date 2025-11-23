@@ -81,6 +81,13 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
 
     pthread_mutex_lock(&sock->send_lock);
 
+    /* Validate address family is initialized */
+    if (dest->ss_family == 0) {
+        log_msg(LOG_ERROR, "[tree_socket] Address family not initialized (ss_family=0) - this is a bug!");
+        pthread_mutex_unlock(&sock->send_lock);
+        return -1;
+    }
+
     socklen_t addrlen;
     if (dest->ss_family == AF_INET) {
         addrlen = sizeof(struct sockaddr_in);
