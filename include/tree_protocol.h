@@ -75,11 +75,14 @@ int tree_send_ping(struct thread_tree *tree, void *sock,
  * Build and send a find_node message
  * @param tree Thread tree context
  * @param sock Socket to send on
+ * @param tid Transaction ID bytes
+ * @param tid_len Length of transaction ID
  * @param target 20-byte target node ID to find
  * @param dest Destination address
  * @return 0 on success, -1 on error
  */
 int tree_send_find_node(struct thread_tree *tree, void *sock,
+                        const uint8_t *tid, int tid_len,
                         const uint8_t *target,
                         const struct sockaddr_storage *dest);
 
@@ -115,11 +118,14 @@ int tree_parse_compact_nodes(const uint8_t *compact, size_t compact_len,
  * Build and send a sample_infohashes message (BEP51)
  * @param tree Thread tree context
  * @param sock Socket to send on
+ * @param tid Transaction ID bytes
+ * @param tid_len Length of transaction ID
  * @param target 20-byte target to sample around
  * @param dest Destination address
  * @return 0 on success, -1 on error
  */
 int tree_send_sample_infohashes(struct thread_tree *tree, void *sock,
+                                 const uint8_t *tid, int tid_len,
                                  const uint8_t *target,
                                  const struct sockaddr_storage *dest);
 
@@ -141,11 +147,14 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
  * Build and send a get_peers message (Stage 4)
  * @param tree Thread tree context
  * @param sock Socket to send on
+ * @param tid Transaction ID bytes
+ * @param tid_len Length of transaction ID
  * @param infohash 20-byte infohash to query
  * @param dest Destination address
  * @return 0 on success, -1 on error
  */
 int tree_send_get_peers(struct thread_tree *tree, void *sock,
+                        const uint8_t *tid, int tid_len,
                         const uint8_t *infohash,
                         const struct sockaddr_storage *dest);
 
@@ -174,5 +183,16 @@ int tree_handle_get_peers_response(struct thread_tree *tree,
 int tree_parse_compact_peers(const uint8_t *compact, size_t compact_len,
                               struct sockaddr_storage *out_addrs,
                               int max_peers);
+
+/**
+ * Extract transaction ID from a DHT response
+ * @param data Raw response data
+ * @param len Length of response data
+ * @param out_tid Output buffer for TID (at least 4 bytes)
+ * @param out_tid_len Pointer to store TID length
+ * @return 0 on success, -1 on error
+ */
+int tree_protocol_extract_tid(const uint8_t *data, size_t len,
+                               uint8_t *out_tid, int *out_tid_len);
 
 #endif /* TREE_PROTOCOL_H */

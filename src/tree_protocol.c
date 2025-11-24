@@ -120,14 +120,12 @@ int tree_send_ping(struct thread_tree *tree, void *sock,
 }
 
 int tree_send_find_node(struct thread_tree *tree, void *sock,
+                        const uint8_t *tid, int tid_len,
                         const uint8_t *target,
                         const struct sockaddr_storage *dest) {
-    if (!tree || !sock || !target || !dest) {
+    if (!tree || !sock || !tid || tid_len <= 0 || !target || !dest) {
         return -1;
     }
-
-    uint8_t tid[4];
-    int tid_len = tree_protocol_gen_tid(tid);
 
     uint8_t buf[256];
     int len = build_find_node_query(buf, sizeof(buf), tid, tid_len,
@@ -314,14 +312,12 @@ static int build_sample_infohashes_query(uint8_t *buf, size_t buflen,
 }
 
 int tree_send_sample_infohashes(struct thread_tree *tree, void *sock,
+                                 const uint8_t *tid, int tid_len,
                                  const uint8_t *target,
                                  const struct sockaddr_storage *dest) {
-    if (!tree || !sock || !target || !dest) {
+    if (!tree || !sock || !tid || tid_len <= 0 || !target || !dest) {
         return -1;
     }
-
-    uint8_t tid[4];
-    int tid_len = tree_protocol_gen_tid(tid);
 
     uint8_t buf[256];
     int len = build_sample_infohashes_query(buf, sizeof(buf), tid, tid_len,
@@ -377,14 +373,12 @@ static int build_get_peers_query(uint8_t *buf, size_t buflen,
 }
 
 int tree_send_get_peers(struct thread_tree *tree, void *sock,
+                        const uint8_t *tid, int tid_len,
                         const uint8_t *infohash,
                         const struct sockaddr_storage *dest) {
-    if (!tree || !sock || !infohash || !dest) {
+    if (!tree || !sock || !tid || tid_len <= 0 || !infohash || !dest) {
         return -1;
     }
-
-    uint8_t tid[4];
-    int tid_len = tree_protocol_gen_tid(tid);
 
     uint8_t buf[256];
     int len = build_get_peers_query(buf, sizeof(buf), tid, tid_len,
@@ -643,4 +637,108 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
     }
 
     return 0;
+}
+
+int tree_protocol_extract_tid(const uint8_t *data, size_t len,
+                               uint8_t *out_tid, int *out_tid_len) {
+    if (!data || len == 0 || !out_tid || !out_tid_len) {
+        return -1;
+    }
+
+    *out_tid_len = 0;
+
+    /* Parse bencode to extract transaction ID ("t" key) */
+    struct bencode bc;
+    bencode_init(&bc, data, len);
+
+    int type = bencode_next(&bc);
+    if (type != BENCODE_DICT_BEGIN) {
+        /* DEBUG: Not a dict */
+        log_msg(LOG_DEBUG, "[tree_protocol] TID extract failed: not a bencode dict (type=%d, first_byte=0x%02x)",
+                type, len > 0 ? data[0] : 0);
+        bencode_free(&bc);
+        return -1;
+    }
+
+    /* DEBUG: Log all keys we see in the dict */
+    static int debug_count = 0;
+    debug_count++;
+    bool log_this = (debug_count <= 20);  /* Log first 20 failures */
+
+    if (log_this) {
+        log_msg(LOG_DEBUG, "[tree_protocol] Parsing bencode dict (len=%zu), scanning for 't' key...", len);
+    }
+
+    /* Helper function to skip over a bencode value */
+    auto void skip_bencode_value(int value_type) {
+        if (value_type == BENCODE_DICT_BEGIN) {
+            /* Skip entire dictionary */
+            int depth = 1;
+            while (depth > 0 && (type = bencode_next(&bc)) > 0) {
+                if (type == BENCODE_DICT_BEGIN || type == BENCODE_LIST_BEGIN) {
+                    depth++;
+                } else if (type == BENCODE_DICT_END || type == BENCODE_LIST_END) {
+                    depth--;
+                }
+            }
+        } else if (value_type == BENCODE_LIST_BEGIN) {
+            /* Skip entire list */
+            int depth = 1;
+            while (depth > 0 && (type = bencode_next(&bc)) > 0) {
+                if (type == BENCODE_DICT_BEGIN || type == BENCODE_LIST_BEGIN) {
+                    depth++;
+                } else if (type == BENCODE_DICT_END || type == BENCODE_LIST_END) {
+                    depth--;
+                }
+            }
+        }
+        /* For STRING and INTEGER, they're already consumed by bencode_next() */
+    }
+
+    /* Scan for "t" key at TOP LEVEL only */
+    int keys_seen = 0;
+    while ((type = bencode_next(&bc)) != BENCODE_DICT_END && type > 0) {
+        if (type == BENCODE_STRING) {
+            const char *key = bc.tok;
+            size_t keylen = bc.toklen;
+
+            type = bencode_next(&bc);
+            if (type < 0) break;
+
+            /* DEBUG: Log keys we find */
+            if (log_this && keys_seen < 10) {
+                char key_str[32] = {0};
+                size_t copy_len = keylen < 31 ? keylen : 31;
+                memcpy(key_str, key, copy_len);
+                log_msg(LOG_DEBUG, "[tree_protocol]   Found key: '%s' (len=%zu, value_type=%d)",
+                        key_str, keylen, type);
+            }
+            keys_seen++;
+
+            if (keylen == 1 && key[0] == 't' && type == BENCODE_STRING) {
+                /* Found transaction ID */
+                int tid_len = (int)bc.toklen;
+                if (tid_len > 4) {
+                    tid_len = 4;  /* Limit to 4 bytes */
+                }
+                memcpy(out_tid, bc.tok, tid_len);
+                *out_tid_len = tid_len;
+                if (log_this) {
+                    log_msg(LOG_DEBUG, "[tree_protocol] Found 't' key! tid_len=%d", tid_len);
+                }
+                bencode_free(&bc);
+                return 0;
+            } else {
+                /* Not the 't' key - skip over the value if it's a dict/list */
+                skip_bencode_value(type);
+            }
+        }
+    }
+
+    if (log_this) {
+        log_msg(LOG_DEBUG, "[tree_protocol] TID not found after scanning %d keys", keys_seen);
+    }
+
+    bencode_free(&bc);
+    return -1;  /* TID not found */
 }

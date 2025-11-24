@@ -12,6 +12,7 @@ struct bloom_filter;
 struct thread_tree;  /* Forward declare for callback typedef */
 struct tree_infohash_queue;
 struct tree_peers_queue;
+struct tree_dispatcher;
 
 /**
  * Thread Tree: Isolated DHT crawler unit with private state
@@ -38,6 +39,7 @@ typedef enum {
 /* Configuration for a thread tree */
 typedef struct tree_config {
     int num_bootstrap_workers;      /* Stage 2: Find_node workers for bootstrap (default: 10) */
+    int num_find_node_workers;      /* Continuous find_node workers (default: 30) */
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
@@ -79,6 +81,7 @@ typedef struct thread_tree {
     struct tree_infohash_queue *infohash_queue;  /* Stage 3: Private infohash queue */
     void *peers_queue;             /* Private peers queue */
     void *socket;                  /* Private UDP socket (tree_socket_t*) */
+    struct tree_dispatcher *dispatcher;  /* UDP response dispatcher */
 
     /* Shared resources (from supervisor) */
     struct bloom_filter *shared_bloom;  /* Stage 3: Shared bloom filter (thread-safe) */
@@ -111,6 +114,7 @@ typedef struct thread_tree {
     /* Thread handles */
     pthread_t bootstrap_thread;
     pthread_t *bootstrap_workers;   /* Stage 2: Find_node workers for bootstrap */
+    pthread_t *find_node_workers;   /* Continuous find_node workers */
     pthread_t *bep51_threads;
     pthread_t *get_peers_threads;
     pthread_t *metadata_threads;
@@ -118,6 +122,7 @@ typedef struct thread_tree {
 
     /* Thread counts */
     int num_bootstrap_workers;      /* Stage 2: Number of bootstrap find_node workers */
+    int num_find_node_workers;      /* Continuous find_node workers */
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;

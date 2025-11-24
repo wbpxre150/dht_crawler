@@ -96,6 +96,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup) {
     tree_config_t config = {
         /* Stage 2 settings (Bootstrap) - using configurable find_node workers */
         .num_bootstrap_workers = sup->num_find_node_workers,
+        .num_find_node_workers = sup->num_find_node_workers,  /* Continuous find_node workers */
         .bootstrap_timeout_sec = 0,  /* No longer used */
         .routing_threshold = 0,      /* No longer used */
         /* Worker counts */

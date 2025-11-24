@@ -7,6 +7,8 @@
 #include "tree_infohash_queue.h"
 #include "tree_peers_queue.h"
 #include "tree_metadata.h"
+#include "tree_dispatcher.h"
+#include "tree_response_queue.h"
 #include "bloom_filter.h"
 #include "shared_node_pool.h"
 #include "supervisor.h"
@@ -43,6 +45,7 @@ const char *thread_tree_phase_name(tree_phase_t phase) {
 typedef struct bep51_worker_ctx {
     thread_tree_t *tree;
     int worker_id;
+    tree_response_queue_t *response_queue;  /* Per-worker response queue */
 } bep51_worker_ctx_t;
 
 /* Generate random 20-byte target for BEP51 queries */
@@ -53,45 +56,270 @@ static void generate_random_target(uint8_t *target) {
 }
 
 /* Forward declarations */
+static void tree_start_find_node_workers(thread_tree_t *tree);
 static void tree_start_get_peers_workers(thread_tree_t *tree);
 static void tree_start_metadata_workers(thread_tree_t *tree);
 static void tree_start_rate_monitor(thread_tree_t *tree);
 
-/* BEP51 worker thread function */
+/* find_node worker context */
+typedef struct find_node_worker_ctx {
+    thread_tree_t *tree;
+    int worker_id;
+    tree_response_queue_t *response_queue;  /* Per-worker response queue */
+} find_node_worker_ctx_t;
+
+/* find_node worker thread function - NEW DISPATCHER PATTERN */
+static void *find_node_worker_func(void *arg) {
+    find_node_worker_ctx_t *ctx = (find_node_worker_ctx_t *)arg;
+    thread_tree_t *tree = ctx->tree;
+    int worker_id = ctx->worker_id;
+    tree_response_queue_t *my_queue = ctx->response_queue;
+
+    log_msg(LOG_INFO, "[tree %u] ===== find_node worker %d STARTED =====", tree->tree_id, worker_id);
+
+    tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
+    tree_socket_t *sock = (tree_socket_t *)tree->socket;
+    tree_dispatcher_t *dispatcher = tree->dispatcher;
+    static int query_count = 0;
+
+    /* DEBUG: Log socket info */
+    int sock_fd = sock ? sock->fd : -1;
+    int sock_port = tree_socket_get_port(sock);
+    log_msg(LOG_INFO, "[tree %u] find_node worker %d: socket_fd=%d, port=%d",
+            tree->tree_id, worker_id, sock_fd, sock_port);
+
+    unsigned long queries_sent = 0;
+    unsigned long responses_received = 0;
+    unsigned long timeouts = 0;
+
+    while (!atomic_load(&tree->shutdown_requested)) {
+        /* 1. Get random nodes from routing table */
+        tree_node_t nodes[3];
+        int n = tree_routing_get_random_nodes(rt, nodes, 3);
+
+        if (n < 1) {
+            /* DEBUG: Log when we have no nodes */
+            if (queries_sent == 0) {
+                log_msg(LOG_WARN, "[tree %u] find_node worker %d: NO NODES in routing table (count=%d)",
+                        tree->tree_id, worker_id, tree_routing_get_count(rt));
+            }
+            usleep(100000);  /* 100ms backoff if no nodes */
+            continue;
+        }
+
+        /* 2. Query each node with find_node */
+        for (int i = 0; i < n && !atomic_load(&tree->shutdown_requested); i++) {
+            /* Generate random target for broad keyspace coverage */
+            uint8_t target[20];
+            generate_random_target(target);
+
+            /* Generate TID and register with dispatcher */
+            uint8_t tid[4];
+            int tid_len = tree_protocol_gen_tid(tid);
+            tree_dispatcher_register_tid(dispatcher, tid, tid_len, my_queue);
+
+            /* DEBUG: Log node we're querying */
+            char node_ip[INET6_ADDRSTRLEN] = {0};
+            uint16_t node_port = 0;
+            if (nodes[i].addr.ss_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)&nodes[i].addr;
+                inet_ntop(AF_INET, &sin->sin_addr, node_ip, sizeof(node_ip));
+                node_port = ntohs(sin->sin_port);
+            }
+
+            /* Send find_node query with our TID */
+            int send_result = tree_send_find_node(tree, sock, tid, tid_len, target, &nodes[i].addr);
+            queries_sent++;
+
+            /* DEBUG: Log every send */
+            if (queries_sent <= 10 || queries_sent % 100 == 0) {
+                log_msg(LOG_INFO, "[tree %u] find_node worker %d: SENT query #%lu (TID=%02x%02x%02x) to %s:%u (result=%d)",
+                        tree->tree_id, worker_id, queries_sent, tid[0], tid[1], tid[2],
+                        node_ip, node_port, send_result);
+            }
+
+            /* 3. Wait for response on personal queue (500ms timeout) */
+            tree_response_t response_pkt;
+            int rc = tree_response_queue_pop(my_queue, &response_pkt, 500);
+
+            /* Unregister TID immediately after receiving response (or timeout) */
+            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+
+            if (rc == 0) {
+                responses_received++;
+                /* DEBUG: Log response receipt */
+                if (responses_received <= 10 || responses_received % 100 == 0) {
+                    log_msg(LOG_INFO, "[tree %u] find_node worker %d: RECEIVED response #%lu (TID=%02x%02x%02x)",
+                            tree->tree_id, worker_id, responses_received, tid[0], tid[1], tid[2]);
+                }
+            } else {
+                timeouts++;
+                /* DEBUG: Log timeout */
+                if (timeouts <= 10 || timeouts % 100 == 0) {
+                    log_msg(LOG_DEBUG, "[tree %u] find_node worker %d: TIMEOUT #%lu (TID=%02x%02x%02x)",
+                            tree->tree_id, worker_id, timeouts, tid[0], tid[1], tid[2]);
+                }
+            }
+
+            if (rc == 0) {
+                /* 4. Parse response and insert discovered nodes */
+                tree_find_node_response_t response;
+                if (tree_handle_response(tree, response_pkt.data, response_pkt.len,
+                                        &response_pkt.from, &response) == TREE_RESP_FIND_NODE) {
+                    /* Add all discovered nodes to routing table */
+                    for (int j = 0; j < response.node_count; j++) {
+                        tree_routing_add_node(rt, response.nodes[j], &response.addrs[j]);
+                    }
+
+                    /* Log discovery occasionally (every 100 queries) with routing table stats */
+                    if (++query_count % 100 == 0) {
+                        int rt_count = tree_routing_get_count(rt);
+                        log_msg(LOG_DEBUG, "[tree %u] find_node worker %d: discovered %d nodes (total: %d, target: ~1500)",
+                                tree->tree_id, worker_id, response.node_count, rt_count);
+                    }
+                }
+            }
+
+            /* Rate limit: 100ms between queries = ~10 queries/sec per worker
+             * Phase 4: Increased from 20ms to reduce CPU load
+             * 3 workers * 10 queries/sec = 30 queries/sec per tree (sufficient) */
+            usleep(100000);
+        }
+    }
+
+    free(ctx);
+    log_msg(LOG_DEBUG, "[tree %u] find_node worker %d exiting", tree->tree_id, worker_id);
+    return NULL;
+}
+
+/* Start find_node workers */
+static void tree_start_find_node_workers(thread_tree_t *tree) {
+    if (tree->num_find_node_workers <= 0) {
+        log_msg(LOG_INFO, "[tree %u] find_node workers disabled (count=0)", tree->tree_id);
+        return;
+    }
+
+    log_msg(LOG_INFO, "[tree %u] Starting %d find_node workers", tree->tree_id, tree->num_find_node_workers);
+
+    for (int i = 0; i < tree->num_find_node_workers; i++) {
+        find_node_worker_ctx_t *ctx = malloc(sizeof(find_node_worker_ctx_t));
+        if (!ctx) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to allocate find_node worker context", tree->tree_id);
+            continue;
+        }
+        ctx->tree = tree;
+        ctx->worker_id = i;
+
+        /* Create per-worker response queue (capacity 10 = buffer up to 10 responses) */
+        ctx->response_queue = tree_response_queue_create(10);
+        if (!ctx->response_queue) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create find_node worker %d response queue", tree->tree_id, i);
+            free(ctx);
+            continue;
+        }
+
+        int rc = pthread_create(&tree->find_node_workers[i], NULL, find_node_worker_func, ctx);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create find_node worker %d: %d", tree->tree_id, i, rc);
+            tree_response_queue_destroy(ctx->response_queue);
+            free(ctx);
+        }
+    }
+}
+
+/* BEP51 worker thread function - NEW DISPATCHER PATTERN */
 static void *bep51_worker_func(void *arg) {
     bep51_worker_ctx_t *ctx = (bep51_worker_ctx_t *)arg;
     thread_tree_t *tree = ctx->tree;
     int worker_id = ctx->worker_id;
+    tree_response_queue_t *my_queue = ctx->response_queue;
 
-    log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d started", tree->tree_id, worker_id);
+    log_msg(LOG_INFO, "[tree %u] ===== BEP51 worker %d STARTED =====", tree->tree_id, worker_id);
 
     tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
     tree_socket_t *sock = (tree_socket_t *)tree->socket;
-    uint8_t recv_buf[2048];
+    tree_dispatcher_t *dispatcher = tree->dispatcher;
     bool first_infohash_found = false;
+
+    /* DEBUG: Log socket info */
+    int sock_fd = sock ? sock->fd : -1;
+    int sock_port = tree_socket_get_port(sock);
+    log_msg(LOG_INFO, "[tree %u] BEP51 worker %d: socket_fd=%d, port=%d",
+            tree->tree_id, worker_id, sock_fd, sock_port);
+
+    unsigned long queries_sent = 0;
+    unsigned long responses_received = 0;
+    unsigned long timeouts = 0;
 
     while (!atomic_load(&tree->shutdown_requested)) {
         /* 1. Get random node from routing table */
         tree_node_t node;
         if (tree_routing_get_random_nodes(rt, &node, 1) < 1) {
+            /* DEBUG: Log when we have no nodes */
+            if (queries_sent == 0) {
+                log_msg(LOG_WARN, "[tree %u] BEP51 worker %d: NO NODES in routing table (count=%d)",
+                        tree->tree_id, worker_id, tree_routing_get_count(rt));
+            }
             usleep(100000);  /* 100ms backoff if no nodes */
             continue;
         }
 
-        /* 2. Send sample_infohashes to node */
+        /* 2. Generate TID and register with dispatcher BEFORE sending */
+        uint8_t tid[4];
+        int tid_len = tree_protocol_gen_tid(tid);
+        tree_dispatcher_register_tid(dispatcher, tid, tid_len, my_queue);
+
+        /* DEBUG: Log node we're querying */
+        char node_ip[INET6_ADDRSTRLEN] = {0};
+        uint16_t node_port = 0;
+        if (node.addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&node.addr;
+            inet_ntop(AF_INET, &sin->sin_addr, node_ip, sizeof(node_ip));
+            node_port = ntohs(sin->sin_port);
+        }
+
+        /* 3. Send sample_infohashes to node with our TID */
         uint8_t target[20];
         generate_random_target(target);
-        tree_send_sample_infohashes(tree, sock, target, &node.addr);
+        int send_result = tree_send_sample_infohashes(tree, sock, tid, tid_len, target, &node.addr);
+        queries_sent++;
 
-        /* 3. Wait for response with timeout (100ms for faster shutdown response) */
-        struct sockaddr_storage from;
-        int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 100);
+        /* DEBUG: Log every send */
+        if (queries_sent <= 10 || queries_sent % 100 == 0) {
+            log_msg(LOG_INFO, "[tree %u] BEP51 worker %d: SENT query #%lu (TID=%02x%02x%02x) to %s:%u (result=%d)",
+                    tree->tree_id, worker_id, queries_sent, tid[0], tid[1], tid[2],
+                    node_ip, node_port, send_result);
+        }
 
-        if (recv_len > 0) {
-            /* 4. Parse response, extract infohashes */
+        /* 4. Wait for response on personal queue (1000ms timeout) */
+        tree_response_t response_pkt;
+        int rc = tree_response_queue_pop(my_queue, &response_pkt, 1000);
+
+        /* Unregister TID immediately after receiving response (or timeout) */
+        tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+
+        if (rc == 0) {
+            responses_received++;
+            /* DEBUG: Log response receipt */
+            if (responses_received <= 10 || responses_received % 100 == 0) {
+                log_msg(LOG_INFO, "[tree %u] BEP51 worker %d: RECEIVED response #%lu (TID=%02x%02x%02x)",
+                        tree->tree_id, worker_id, responses_received, tid[0], tid[1], tid[2]);
+            }
+        } else {
+            timeouts++;
+            /* DEBUG: Log timeout */
+            if (timeouts <= 10 || timeouts % 100 == 0) {
+                log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: TIMEOUT #%lu (TID=%02x%02x%02x)",
+                        tree->tree_id, worker_id, timeouts, tid[0], tid[1], tid[2]);
+            }
+        }
+
+        if (rc == 0) {
+            /* 5. Parse response, extract infohashes */
             tree_sample_response_t response;
-            if (tree_handle_sample_infohashes_response(tree, recv_buf, recv_len, &from, &response) == 0) {
-                /* 5. Push infohashes to queue (with bloom check) */
+            if (tree_handle_sample_infohashes_response(tree, response_pkt.data, response_pkt.len,
+                                                       &response_pkt.from, &response) == 0) {
+                /* 6. Push infohashes to queue (with bloom check) */
                 for (int i = 0; i < response.infohash_count; i++) {
                     /* Check bloom filter (shared, thread-safe) */
                     if (tree->shared_bloom && bloom_filter_check(tree->shared_bloom, response.infohashes[i])) {
@@ -102,7 +330,7 @@ static void *bep51_worker_func(void *arg) {
                     if (tree_infohash_queue_try_push(tree->infohash_queue, response.infohashes[i]) == 0) {
                         if (!first_infohash_found) {
                             first_infohash_found = true;
-                            /* Trigger get_peers phase (Stage 4 placeholder) */
+                            /* Trigger get_peers phase (Stage 4) */
                             if (tree->current_phase == TREE_PHASE_BEP51) {
                                 tree->current_phase = TREE_PHASE_GET_PEERS;
                                 tree_start_get_peers_workers(tree);
@@ -111,12 +339,13 @@ static void *bep51_worker_func(void *arg) {
                     }
                 }
 
-                /* 6. Update routing table with new nodes from response */
+                /* 7. Update routing table with new nodes from response */
                 for (int i = 0; i < response.node_count; i++) {
                     tree_routing_add_node(rt, response.nodes[i], &response.addrs[i]);
                 }
             }
         }
+        /* If timeout (rc != 0), just continue to next query */
 
         /* Rate limit */
         if (tree->bep51_query_interval_ms > 0) {
@@ -140,9 +369,18 @@ static void tree_start_bep51_workers(thread_tree_t *tree) {
         ctx->tree = tree;
         ctx->worker_id = i;
 
+        /* Create per-worker response queue (capacity 10 = buffer up to 10 responses) */
+        ctx->response_queue = tree_response_queue_create(10);
+        if (!ctx->response_queue) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create BEP51 worker %d response queue", tree->tree_id, i);
+            free(ctx);
+            continue;
+        }
+
         int rc = pthread_create(&tree->bep51_threads[i], NULL, bep51_worker_func, ctx);
         if (rc != 0) {
             log_msg(LOG_ERROR, "[tree %u] Failed to create BEP51 worker %d: %d", tree->tree_id, i, rc);
+            tree_response_queue_destroy(ctx->response_queue);
             free(ctx);
         }
     }
@@ -152,6 +390,7 @@ static void tree_start_bep51_workers(thread_tree_t *tree) {
 typedef struct get_peers_worker_ctx {
     thread_tree_t *tree;
     int worker_id;
+    tree_response_queue_t *response_queue;  /* Per-worker response queue */
 } get_peers_worker_ctx_t;
 
 /* Get_peers worker thread function (Stage 4) */
@@ -198,7 +437,10 @@ static void *get_peers_worker_func(void *arg) {
 
             /* Query each node */
             for (int i = 0; i < n && result.peer_count < MAX_PEERS_PER_ENTRY; i++) {
-                tree_send_get_peers(tree, sock, infohash, &closest[i].addr);
+                /* Generate TID for this query */
+                uint8_t tid[4];
+                int tid_len = tree_protocol_gen_tid(tid);
+                tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
 
                 /* Wait for response with timeout (100ms for faster shutdown response) */
                 struct sockaddr_storage from;
@@ -399,6 +641,9 @@ static void *bootstrap_thread_func(void *arg) {
     log_msg(LOG_INFO, "[tree %u] Bootstrap complete: %d nodes in routing table",
             tree->tree_id, final_count);
 
+    /* Start find_node workers to continuously discover new nodes */
+    tree_start_find_node_workers(tree);
+
     /* Transition to BEP51 phase to discover infohashes */
     log_msg(LOG_INFO, "[tree %u] Transitioning to BEP51 phase (sample_infohashes)", tree->tree_id);
     tree->current_phase = TREE_PHASE_BEP51;
@@ -461,6 +706,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Initialize thread counts from config */
     tree->num_bootstrap_workers = config->num_bootstrap_workers > 0 ? config->num_bootstrap_workers : 10;
+    tree->num_find_node_workers = config->num_find_node_workers > 0 ? config->num_find_node_workers : 30;
     tree->num_bep51_workers = config->num_bep51_workers;
     tree->num_get_peers_workers = config->num_get_peers_workers;
     tree->num_metadata_workers = config->num_metadata_workers;
@@ -483,6 +729,15 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
         tree->bootstrap_workers = calloc(tree->num_bootstrap_workers, sizeof(pthread_t));
         if (!tree->bootstrap_workers) {
             log_msg(LOG_ERROR, "[tree %u] Failed to allocate bootstrap workers", tree_id);
+            thread_tree_destroy(tree);
+            return NULL;
+        }
+    }
+
+    if (tree->num_find_node_workers > 0) {
+        tree->find_node_workers = calloc(tree->num_find_node_workers, sizeof(pthread_t));
+        if (!tree->find_node_workers) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to allocate find_node workers", tree_id);
             thread_tree_destroy(tree);
             return NULL;
         }
@@ -547,6 +802,14 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
         return NULL;
     }
 
+    /* Create UDP response dispatcher */
+    tree->dispatcher = tree_dispatcher_create(tree, (tree_socket_t *)tree->socket);
+    if (!tree->dispatcher) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to create dispatcher", tree_id);
+        thread_tree_destroy(tree);
+        return NULL;
+    }
+
     int port = tree_socket_get_port(tree->socket);
     log_msg(LOG_INFO, "[tree %u] Created with node_id %02x%02x%02x%02x... on port %d",
             tree_id, tree->node_id[0], tree->node_id[1], tree->node_id[2], tree->node_id[3], port);
@@ -582,6 +845,18 @@ void thread_tree_destroy(thread_tree_t *tree) {
         free(tree->bootstrap_workers);
     }
     log_msg(LOG_DEBUG, "[tree %u] Bootstrap workers joined", tree->tree_id);
+
+    /* Join find_node workers */
+    log_msg(LOG_DEBUG, "[tree %u] Joining %d find_node workers...", tree->tree_id, tree->num_find_node_workers);
+    if (tree->find_node_workers) {
+        for (int i = 0; i < tree->num_find_node_workers; i++) {
+            if (tree->find_node_workers[i]) {
+                pthread_join(tree->find_node_workers[i], NULL);
+            }
+        }
+        free(tree->find_node_workers);
+    }
+    log_msg(LOG_DEBUG, "[tree %u] find_node workers joined", tree->tree_id);
 
     /* Join BEP51 workers */
     log_msg(LOG_DEBUG, "[tree %u] Joining %d BEP51 workers...", tree->tree_id, tree->num_bep51_workers);
@@ -658,6 +933,11 @@ void thread_tree_destroy(thread_tree_t *tree) {
         tree_peers_queue_destroy(tree->peers_queue);
     }
 
+    /* Cleanup dispatcher */
+    if (tree->dispatcher) {
+        tree_dispatcher_destroy(tree->dispatcher);
+    }
+
     log_msg(LOG_INFO, "[tree %u] Destroyed (metadata_count=%lu)",
             tree->tree_id, (unsigned long)atomic_load(&tree->metadata_count));
 
@@ -671,6 +951,12 @@ void thread_tree_start(thread_tree_t *tree) {
 
     log_msg(LOG_INFO, "[tree %u] Starting (phase: %s)",
             tree->tree_id, thread_tree_phase_name(tree->current_phase));
+
+    /* Start UDP response dispatcher FIRST before any workers send queries */
+    if (tree_dispatcher_start(tree->dispatcher) != 0) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to start dispatcher", tree->tree_id);
+        return;
+    }
 
     /* Spawn bootstrap thread */
     int rc = pthread_create(&tree->bootstrap_thread, NULL, bootstrap_thread_func, tree);

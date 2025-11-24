@@ -3,8 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define K_BUCKET_SIZE 8
+#define K_BUCKET_SIZE 50  /* Increased to 50 to allow ~1500 nodes (50 * ~30 active buckets) */
 #define MAX_FAIL_COUNT 3
+#define MIN_NODE_AGE_FOR_EVICTION 5  /* Don't evict nodes younger than 5 seconds */
 
 /* Calculate XOR distance between two node IDs */
 static void xor_distance(const uint8_t *id1, const uint8_t *id2, uint8_t *out) {
@@ -118,13 +119,16 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
 
     /* Check if bucket is full */
     if (bucket->count >= bucket->max_nodes) {
-        /* Try to evict a failed node */
+        /* Strategy 1: Try to evict a failed node first */
         tree_node_t **prev = &bucket->nodes;
         tree_node_t *curr = bucket->nodes;
+        tree_node_t *evicted = NULL;
+
         while (curr) {
             if (curr->fail_count >= MAX_FAIL_COUNT) {
                 *prev = curr->next;
-                free(curr);
+                evicted = curr;
+                free(evicted);
                 bucket->count--;
                 rt->total_nodes--;
                 break;
@@ -133,10 +137,67 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
             curr = curr->next;
         }
 
-        /* If still full, don't add */
+        /* Strategy 2: If no failed nodes, evict least-recently-seen (LRU) node */
         if (bucket->count >= bucket->max_nodes) {
-            pthread_rwlock_unlock(&rt->rwlock);
-            return 0;  /* Not an error, just bucket full */
+            tree_node_t **lru_prev = NULL;
+            tree_node_t **prev_ptr = &bucket->nodes;
+            tree_node_t *node = bucket->nodes;
+            tree_node_t *lru_node = NULL;
+            time_t oldest_time = 0;
+            time_t now = time(NULL);
+
+            /* Find LRU node that's old enough to evict (> MIN_NODE_AGE_FOR_EVICTION)
+             * Optimization: Early exit after checking first 10 nodes if we found an evictable one
+             * This reduces O(n) search cost when buckets are full */
+            int nodes_checked = 0;
+            int max_nodes_to_check = 10;  /* Don't search entire list if we found a candidate */
+
+            while (node) {
+                time_t node_age = now - node->last_seen;
+                if (node_age >= MIN_NODE_AGE_FOR_EVICTION) {
+                    if (lru_node == NULL || node->last_seen < oldest_time) {
+                        oldest_time = node->last_seen;
+                        lru_node = node;
+                        lru_prev = prev_ptr;
+                    }
+                    /* Early exit: If we found an evictable node after checking first few nodes */
+                    if (++nodes_checked >= max_nodes_to_check && lru_node != NULL) {
+                        break;
+                    }
+                }
+                prev_ptr = &node->next;
+                node = node->next;
+            }
+
+            /* If no evictable node found (all nodes too fresh), don't add new node */
+            if (lru_node == NULL) {
+                static int thrash_warning_count = 0;
+                if (++thrash_warning_count % 10000 == 0) {
+                    log_msg(LOG_WARN, "Routing table: bucket %d full, all nodes too fresh to evict (warning #%d)",
+                            bucket_idx, thrash_warning_count);
+                }
+                pthread_rwlock_unlock(&rt->rwlock);
+                return 0;  /* Not an error, just can't add right now */
+            }
+
+            /* Evict LRU node */
+            if (lru_prev) {
+                *lru_prev = lru_node->next;
+            } else {
+                bucket->nodes = lru_node->next;
+            }
+
+            /* Log LRU eviction periodically (every 1000 evictions) */
+            static int lru_eviction_count = 0;
+            if (++lru_eviction_count % 1000 == 0) {
+                time_t age = now - oldest_time;
+                log_msg(LOG_DEBUG, "Routing table: LRU eviction #%d, bucket %d full, evicted node age %ld sec",
+                        lru_eviction_count, bucket_idx, (long)age);
+            }
+
+            free(lru_node);
+            bucket->count--;
+            rt->total_nodes--;
         }
     }
 
