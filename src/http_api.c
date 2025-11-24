@@ -472,6 +472,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(tree->current_phase));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
+                cJSON_AddBoolToObject(tree_json, "find_node_paused", atomic_load(&tree->find_node_paused));
 
                 /* Add queue sizes for monitoring and tuning */
                 cJSON *queues = cJSON_CreateObject();
@@ -500,6 +501,10 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 }
                 cJSON_AddNumberToObject(queues, "peers_queue_size", peers_queue_size);
                 cJSON_AddNumberToObject(queues, "peers_queue_capacity", peers_queue_capacity);
+
+                /* Throttling thresholds */
+                cJSON_AddNumberToObject(queues, "pause_threshold", tree->infohash_pause_threshold);
+                cJSON_AddNumberToObject(queues, "resume_threshold", tree->infohash_resume_threshold);
 
                 cJSON_AddItemToObject(tree_json, "queues", queues);
                 cJSON_AddItemToArray(trees_array, tree_json);

@@ -73,10 +73,16 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
     sup->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 3000;
 
+    /* Find_node throttling settings */
+    sup->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
+    sup->infohash_resume_threshold = config->infohash_resume_threshold > 0 ? config->infohash_resume_threshold : 1000;
+
     /* Stage 5 settings */
     sup->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 10;
     sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
+    sup->min_lifetime_minutes = config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10;
+    sup->require_empty_queue = config->require_empty_queue;
 
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
@@ -117,11 +123,16 @@ static thread_tree_t *spawn_tree(supervisor_t *sup) {
         /* Stage 4 settings */
         .peers_queue_capacity = sup->peers_queue_capacity,
         .get_peers_timeout_ms = sup->get_peers_timeout_ms,
+        /* Find_node throttling settings */
+        .infohash_pause_threshold = sup->infohash_pause_threshold,
+        .infohash_resume_threshold = sup->infohash_resume_threshold,
         /* Stage 5 settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,
         .rate_grace_period_sec = sup->rate_grace_period_sec,
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
+        .min_lifetime_minutes = sup->min_lifetime_minutes,
+        .require_empty_queue = sup->require_empty_queue,
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,

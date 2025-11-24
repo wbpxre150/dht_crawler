@@ -95,11 +95,17 @@ typedef struct {
     int tree_peers_queue_capacity;       /* Peers queue size per tree (default: 2000) */
     int tree_get_peers_timeout_ms;       /* get_peers response timeout (default: 3000) */
 
+    /* Find_node throttling settings */
+    int tree_infohash_pause_threshold;   /* Queue size to pause find_node workers (default: 2000) */
+    int tree_infohash_resume_threshold;  /* Queue size to resume find_node workers (default: 1000) */
+
     /* Thread tree Stage 5 settings (metadata) */
     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
     int tree_rate_check_interval_sec;    /* Rate check interval (default: 10) */
     int tree_rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int tree_min_lifetime_minutes;       /* Minimum lifetime before rate checks apply (default: 10) */
+    int tree_require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
     /* Thread tree mode toggle */
     int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */

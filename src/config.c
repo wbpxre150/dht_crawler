@@ -103,11 +103,17 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_peers_queue_capacity = 2000;       /* 2000 peers queue capacity */
     config->tree_get_peers_timeout_ms = 3000;       /* 3 second get_peers timeout */
 
+    /* Find_node throttling defaults */
+    config->tree_infohash_pause_threshold = 2000;   /* Pause find_node at 2000 infohashes */
+    config->tree_infohash_resume_threshold = 1000;  /* Resume find_node at 1000 infohashes */
+
     /* Thread tree Stage 5 defaults (metadata) */
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
     config->tree_rate_check_interval_sec = 10;      /* 10 second rate check interval */
     config->tree_rate_grace_period_sec = 30;        /* 30 second grace period */
     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
+    config->tree_min_lifetime_minutes = 10;         /* 10 minute minimum lifetime */
+    config->tree_require_empty_queue = 1;           /* Require empty queue for shutdown */
 
     /* Thread tree mode toggle - disabled by default for safety */
     config->use_thread_trees = 0;                   /* 0=old architecture */
@@ -344,6 +350,14 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->tree_get_peers_timeout_ms = atoi(value);
             if (config->tree_get_peers_timeout_ms < 100) config->tree_get_peers_timeout_ms = 100;
         }
+        /* Find_node throttling settings */
+        else if (strcmp(key, "tree_infohash_pause_threshold") == 0) {
+            config->tree_infohash_pause_threshold = atoi(value);
+            if (config->tree_infohash_pause_threshold < 100) config->tree_infohash_pause_threshold = 100;
+        } else if (strcmp(key, "tree_infohash_resume_threshold") == 0) {
+            config->tree_infohash_resume_threshold = atoi(value);
+            if (config->tree_infohash_resume_threshold < 100) config->tree_infohash_resume_threshold = 100;
+        }
         /* Thread tree Stage 5 settings (metadata) */
         else if (strcmp(key, "tree_metadata_workers") == 0) {
             config->tree_metadata_workers = atoi(value);
@@ -357,6 +371,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "tree_tcp_connect_timeout_ms") == 0) {
             config->tree_tcp_connect_timeout_ms = atoi(value);
             if (config->tree_tcp_connect_timeout_ms < 1000) config->tree_tcp_connect_timeout_ms = 1000;
+        } else if (strcmp(key, "tree_min_lifetime_minutes") == 0) {
+            config->tree_min_lifetime_minutes = atoi(value);
+            if (config->tree_min_lifetime_minutes < 0) config->tree_min_lifetime_minutes = 0;
+        } else if (strcmp(key, "tree_require_empty_queue") == 0) {
+            config->tree_require_empty_queue = atoi(value);
         }
         /* Thread tree mode toggle */
         else if (strcmp(key, "use_thread_trees") == 0) {

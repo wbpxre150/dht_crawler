@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <time.h>
 
 /* Forward declarations */
 struct batch_writer;
@@ -56,11 +57,17 @@ typedef struct tree_config {
     int peers_queue_capacity;       /* Peers queue size (default: 2000) */
     int get_peers_timeout_ms;       /* Get_peers response timeout (default: 3000) */
 
+    /* Find_node throttling settings */
+    int infohash_pause_threshold;   /* Queue size to pause find_node (default: 2000) */
+    int infohash_resume_threshold;  /* Queue size to resume find_node (default: 1000) */
+
     /* Stage 5: Metadata fetcher settings */
     double min_metadata_rate;       /* Minimum metadata/sec before shutdown (default: 0.5) */
     int rate_check_interval_sec;    /* Rate check interval (default: 10) */
     int rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int min_lifetime_minutes;       /* Minimum lifetime before rate checks apply (default: 10) */
+    int require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
     /* Shared resources from supervisor */
     struct batch_writer *batch_writer;
@@ -103,6 +110,8 @@ typedef struct thread_tree {
     int rate_check_interval_sec;
     int rate_grace_period_sec;
     int tcp_connect_timeout_ms;
+    int min_lifetime_sec;           /* Minimum lifetime before rate checks apply */
+    bool require_empty_queue;       /* Only shutdown if queue is empty */
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;
@@ -110,6 +119,13 @@ typedef struct thread_tree {
     /* Phase management */
     tree_phase_t current_phase;
     atomic_bool shutdown_requested;
+
+    /* Find_node throttling state */
+    atomic_bool find_node_paused;           /* Signal to pause find_node workers */
+    pthread_mutex_t throttle_lock;          /* Protects throttle state changes */
+    pthread_cond_t throttle_resume;         /* Condition variable for resuming workers */
+    int infohash_pause_threshold;           /* Queue size to pause (default: 2000) */
+    int infohash_resume_threshold;          /* Queue size to resume (default: 1000) */
 
     /* Thread handles */
     pthread_t bootstrap_thread;
@@ -119,6 +135,7 @@ typedef struct thread_tree {
     pthread_t *get_peers_threads;
     pthread_t *metadata_threads;
     pthread_t rate_monitor_thread;  /* Stage 5: Rate monitor thread */
+    pthread_t throttle_monitor_thread;  /* Monitors queue size for throttling */
 
     /* Thread counts */
     int num_bootstrap_workers;      /* Stage 2: Number of bootstrap find_node workers */
@@ -131,6 +148,9 @@ typedef struct thread_tree {
     atomic_uint_fast64_t metadata_count;
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
+
+    /* Lifecycle tracking */
+    time_t creation_time;           /* When tree was created */
 
     /* Supervisor callback */
     void (*on_shutdown)(struct thread_tree *tree);

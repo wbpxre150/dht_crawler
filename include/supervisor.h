@@ -45,10 +45,16 @@ typedef struct supervisor_config {
     int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
     int get_peers_timeout_ms;       /* get_peers timeout (default: 3000) */
 
+    /* Find_node throttling settings */
+    int infohash_pause_threshold;   /* Queue size to pause find_node (default: 2000) */
+    int infohash_resume_threshold;  /* Queue size to resume find_node (default: 1000) */
+
     /* Stage 5 settings */
     int rate_check_interval_sec;    /* Rate check interval (default: 10) */
     int rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int min_lifetime_minutes;       /* Minimum lifetime before rate checks (default: 10) */
+    int require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
     /* Shared resources */
     struct batch_writer *batch_writer;
@@ -88,10 +94,16 @@ typedef struct supervisor {
     int peers_queue_capacity;
     int get_peers_timeout_ms;
 
+    /* Find_node throttling settings */
+    int infohash_pause_threshold;
+    int infohash_resume_threshold;
+
     /* Stage 5 settings */
     int rate_check_interval_sec;
     int rate_grace_period_sec;
     int tcp_connect_timeout_ms;
+    int min_lifetime_minutes;
+    int require_empty_queue;
 
     /* Tree ID counter */
     uint32_t next_tree_id;

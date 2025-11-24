@@ -260,10 +260,15 @@ int main(int argc, char *argv[]) {
             /* Stage 4 settings (get_peers) */
             .peers_queue_capacity = config.tree_peers_queue_capacity,
             .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,
+            /* Find_node throttling settings */
+            .infohash_pause_threshold = config.tree_infohash_pause_threshold,
+            .infohash_resume_threshold = config.tree_infohash_resume_threshold,
             /* Stage 5 settings */
             .rate_check_interval_sec = config.tree_rate_check_interval_sec,
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,
-            .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms
+            .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
+            .min_lifetime_minutes = config.tree_min_lifetime_minutes,
+            .require_empty_queue = config.tree_require_empty_queue
         };
 
         g_supervisor = supervisor_create(&sup_config);

@@ -93,6 +93,65 @@ static void *find_node_worker_func(void *arg) {
     unsigned long timeouts = 0;
 
     while (!atomic_load(&tree->shutdown_requested)) {
+        /* 0. Check if we should pause (infohash queue is full enough) */
+        if (atomic_load(&tree->find_node_paused)) {
+            log_msg(LOG_DEBUG, "[tree %u] find_node worker %d PAUSED (queue >= %d)",
+                    tree->tree_id, worker_id, tree->infohash_pause_threshold);
+
+            /* Wait on condition variable until resumed */
+            pthread_mutex_lock(&tree->throttle_lock);
+            while (atomic_load(&tree->find_node_paused) &&
+                   !atomic_load(&tree->shutdown_requested)) {
+                pthread_cond_wait(&tree->throttle_resume, &tree->throttle_lock);
+            }
+            pthread_mutex_unlock(&tree->throttle_lock);
+
+            log_msg(LOG_DEBUG, "[tree %u] find_node worker %d RESUMED (queue < %d)",
+                    tree->tree_id, worker_id, tree->infohash_resume_threshold);
+
+            if (atomic_load(&tree->shutdown_requested)) break;
+        }
+
+        /* 1. Check routing table size and throttle aggressively when full */
+        int current_nodes = tree_routing_get_count(rt);
+        int target_nodes = 1500;  /* Target from triple_routing_threshold config */
+
+        if (current_nodes >= target_nodes) {
+            /* Routing table is full (>= 1500 nodes) - aggressive throttle */
+            /* Sleep 10 seconds, then do minimal maintenance (1 query) */
+            usleep(10000000);  /* 10 seconds */
+
+            /* After sleep, do just 1 maintenance query then go back to sleep */
+            tree_node_t nodes[1];
+            int n = tree_routing_get_random_nodes(rt, nodes, 1);
+            if (n < 1) {
+                continue;  /* No nodes, try again after next sleep */
+            }
+
+            /* Single maintenance query */
+            uint8_t target[20];
+            generate_random_target(target);
+            uint8_t tid[4];
+            int tid_len = tree_protocol_gen_tid(tid);
+            tree_dispatcher_register_tid(dispatcher, tid, tid_len, my_queue);
+            tree_send_find_node(tree, sock, tid, tid_len, target, &nodes[0].addr);
+            queries_sent++;
+
+            tree_response_t response_pkt;
+            tree_response_queue_pop(my_queue, &response_pkt, 500);
+            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+
+            continue;  /* Go back to sleep check */
+
+        } else if (current_nodes >= (int)(target_nodes * 0.9)) {
+            /* 90-100% full (1350-1500 nodes) - heavy throttle */
+            usleep(2000000);  /* 2 seconds between query batches */
+        } else if (current_nodes >= (int)(target_nodes * 0.7)) {
+            /* 70-90% full (1050-1350 nodes) - moderate throttle */
+            usleep(500000);  /* 500ms between query batches */
+        }
+        /* else: < 70% full (< 1050 nodes) - aggressive discovery mode, no throttle */
+
         /* 1. Get random nodes from routing table */
         tree_node_t nodes[3];
         int n = tree_routing_get_random_nodes(rt, nodes, 3);
@@ -180,16 +239,93 @@ static void *find_node_worker_func(void *arg) {
                 }
             }
 
-            /* Rate limit: 100ms between queries = ~10 queries/sec per worker
-             * Phase 4: Increased from 20ms to reduce CPU load
-             * 3 workers * 10 queries/sec = 30 queries/sec per tree (sufficient) */
-            usleep(100000);
+            /* No rate limit here - throttling is adaptive at top of loop based on routing table size
+             * < 70% full (< 1050 nodes): no delay - aggressive discovery
+             * 70-90% full: 500ms delay between batches
+             * 90-100% full: 2s delay between batches
+             * >= 100% full: 10s delay, single maintenance query */
         }
     }
 
     free(ctx);
     log_msg(LOG_DEBUG, "[tree %u] find_node worker %d exiting", tree->tree_id, worker_id);
     return NULL;
+}
+
+/* Throttle monitor context */
+typedef struct throttle_monitor_ctx {
+    thread_tree_t *tree;
+} throttle_monitor_ctx_t;
+
+/* Throttle monitor thread - checks infohash queue size and pauses/resumes find_node workers */
+static void *throttle_monitor_func(void *arg) {
+    throttle_monitor_ctx_t *ctx = (throttle_monitor_ctx_t *)arg;
+    thread_tree_t *tree = ctx->tree;
+
+    log_msg(LOG_DEBUG, "[tree %u] Throttle monitor started", tree->tree_id);
+
+    bool currently_paused = false;
+
+    while (!atomic_load(&tree->shutdown_requested)) {
+        /* Check infohash queue size */
+        int queue_size = tree_infohash_queue_count(tree->infohash_queue);
+
+        if (!currently_paused && queue_size >= tree->infohash_pause_threshold) {
+            /* Pause find_node workers */
+            log_msg(LOG_INFO, "[tree %u] PAUSING find_node workers (queue=%d >= %d)",
+                    tree->tree_id, queue_size, tree->infohash_pause_threshold);
+
+            pthread_mutex_lock(&tree->throttle_lock);
+            atomic_store(&tree->find_node_paused, true);
+            pthread_mutex_unlock(&tree->throttle_lock);
+
+            currently_paused = true;
+
+        } else if (currently_paused && queue_size < tree->infohash_resume_threshold) {
+            /* Resume find_node workers */
+            log_msg(LOG_INFO, "[tree %u] RESUMING find_node workers (queue=%d < %d)",
+                    tree->tree_id, queue_size, tree->infohash_resume_threshold);
+
+            pthread_mutex_lock(&tree->throttle_lock);
+            atomic_store(&tree->find_node_paused, false);
+            pthread_cond_broadcast(&tree->throttle_resume);  /* Wake all workers */
+            pthread_mutex_unlock(&tree->throttle_lock);
+
+            currently_paused = false;
+        }
+
+        /* Check every 2 seconds (responsive but not too aggressive) */
+        usleep(2000000);
+    }
+
+    /* On shutdown, resume all workers so they can exit cleanly */
+    if (currently_paused) {
+        pthread_mutex_lock(&tree->throttle_lock);
+        atomic_store(&tree->find_node_paused, false);
+        pthread_cond_broadcast(&tree->throttle_resume);
+        pthread_mutex_unlock(&tree->throttle_lock);
+    }
+
+    free(ctx);
+    log_msg(LOG_DEBUG, "[tree %u] Throttle monitor exiting", tree->tree_id);
+    return NULL;
+}
+
+/* Start throttle monitor */
+static void tree_start_throttle_monitor(thread_tree_t *tree) {
+    log_msg(LOG_DEBUG, "[tree %u] Starting throttle monitor", tree->tree_id);
+
+    throttle_monitor_ctx_t *ctx = malloc(sizeof(throttle_monitor_ctx_t));
+    if (!ctx) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to allocate throttle monitor context", tree->tree_id);
+        return;
+    }
+    ctx->tree = tree;
+
+    if (pthread_create(&tree->throttle_monitor_thread, NULL, throttle_monitor_func, ctx) != 0) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to create throttle monitor thread", tree->tree_id);
+        free(ctx);
+    }
 }
 
 /* Start find_node workers */
@@ -561,6 +697,8 @@ static void tree_start_rate_monitor(thread_tree_t *tree) {
     ctx->min_metadata_rate = tree->min_metadata_rate;
     ctx->check_interval_sec = tree->rate_check_interval_sec;
     ctx->grace_period_sec = tree->rate_grace_period_sec;
+    ctx->min_lifetime_sec = tree->min_lifetime_sec;
+    ctx->require_empty_queue = tree->require_empty_queue;
 
     int rc = pthread_create(&tree->rate_monitor_thread, NULL, tree_rate_monitor_func, ctx);
     if (rc != 0) {
@@ -644,6 +782,9 @@ static void *bootstrap_thread_func(void *arg) {
     /* Start find_node workers to continuously discover new nodes */
     tree_start_find_node_workers(tree);
 
+    /* Start throttle monitor to control find_node worker pausing */
+    tree_start_throttle_monitor(tree);
+
     /* Transition to BEP51 phase to discover infohashes */
     log_msg(LOG_DEBUG, "[tree %u] Transitioning to BEP51 phase (sample_infohashes)", tree->tree_id);
     tree->current_phase = TREE_PHASE_BEP51;
@@ -702,6 +843,8 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 10;
     tree->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
+    tree->min_lifetime_sec = (config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10) * 60;
+    tree->require_empty_queue = config->require_empty_queue;
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
@@ -719,10 +862,20 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->current_phase = TREE_PHASE_BOOTSTRAP;
     atomic_store(&tree->shutdown_requested, false);
 
+    /* Initialize find_node throttling */
+    atomic_store(&tree->find_node_paused, false);
+    pthread_mutex_init(&tree->throttle_lock, NULL);
+    pthread_cond_init(&tree->throttle_resume, NULL);
+    tree->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
+    tree->infohash_resume_threshold = config->infohash_resume_threshold > 0 ? config->infohash_resume_threshold : 1000;
+
     /* Initialize statistics */
     atomic_store(&tree->metadata_count, 0);
     atomic_store(&tree->last_metadata_time, 0);
     tree->metadata_rate = 0.0;
+
+    /* Initialize lifecycle tracking */
+    tree->creation_time = time(NULL);
 
     /* Allocate thread handle arrays */
     if (tree->num_bootstrap_workers > 0) {
@@ -901,6 +1054,13 @@ void thread_tree_destroy(thread_tree_t *tree) {
     }
     log_msg(LOG_DEBUG, "[tree %u] Rate monitor thread joined", tree->tree_id);
 
+    /* Join throttle monitor thread */
+    log_msg(LOG_DEBUG, "[tree %u] Joining throttle monitor thread...", tree->tree_id);
+    if (tree->throttle_monitor_thread) {
+        pthread_join(tree->throttle_monitor_thread, NULL);
+    }
+    log_msg(LOG_DEBUG, "[tree %u] Throttle monitor thread joined", tree->tree_id);
+
     /* Close socket BEFORE cleanup to unblock any pending recv() calls
      * This is critical - workers may be blocked in poll() */
     log_msg(LOG_DEBUG, "[tree %u] Closing socket to unblock workers...", tree->tree_id);
@@ -937,6 +1097,10 @@ void thread_tree_destroy(thread_tree_t *tree) {
     if (tree->dispatcher) {
         tree_dispatcher_destroy(tree->dispatcher);
     }
+
+    /* Cleanup throttling synchronization primitives */
+    pthread_mutex_destroy(&tree->throttle_lock);
+    pthread_cond_destroy(&tree->throttle_resume);
 
     log_msg(LOG_DEBUG, "[tree %u] Destroyed (metadata_count=%lu)",
             tree->tree_id, (unsigned long)atomic_load(&tree->metadata_count));

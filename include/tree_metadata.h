@@ -83,6 +83,8 @@ typedef struct rate_monitor_ctx {
     double min_metadata_rate;
     int check_interval_sec;
     int grace_period_sec;
+    int min_lifetime_sec;           /* Minimum lifetime before rate checks apply */
+    bool require_empty_queue;       /* Only shutdown if queue is empty */
 } rate_monitor_ctx_t;
 
 /**
