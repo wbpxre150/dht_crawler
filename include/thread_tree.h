@@ -120,8 +120,8 @@ typedef struct thread_tree {
     tree_phase_t current_phase;
     atomic_bool shutdown_requested;
 
-    /* Find_node throttling state */
-    atomic_bool find_node_paused;           /* Signal to pause find_node workers */
+    /* Discovery throttling state (find_node + BEP51) */
+    atomic_bool discovery_paused;           /* Signal to pause discovery workers (find_node + BEP51) */
     pthread_mutex_t throttle_lock;          /* Protects throttle state changes */
     pthread_cond_t throttle_resume;         /* Condition variable for resuming workers */
     int infohash_pause_threshold;           /* Queue size to pause (default: 2000) */

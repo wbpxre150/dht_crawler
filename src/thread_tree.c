@@ -94,13 +94,13 @@ static void *find_node_worker_func(void *arg) {
 
     while (!atomic_load(&tree->shutdown_requested)) {
         /* 0. Check if we should pause (infohash queue is full enough) */
-        if (atomic_load(&tree->find_node_paused)) {
+        if (atomic_load(&tree->discovery_paused)) {
             log_msg(LOG_DEBUG, "[tree %u] find_node worker %d PAUSED (queue >= %d)",
                     tree->tree_id, worker_id, tree->infohash_pause_threshold);
 
             /* Wait on condition variable until resumed */
             pthread_mutex_lock(&tree->throttle_lock);
-            while (atomic_load(&tree->find_node_paused) &&
+            while (atomic_load(&tree->discovery_paused) &&
                    !atomic_load(&tree->shutdown_requested)) {
                 pthread_cond_wait(&tree->throttle_resume, &tree->throttle_lock);
             }
@@ -257,7 +257,7 @@ typedef struct throttle_monitor_ctx {
     thread_tree_t *tree;
 } throttle_monitor_ctx_t;
 
-/* Throttle monitor thread - checks infohash queue size and pauses/resumes find_node workers */
+/* Throttle monitor thread - checks infohash queue size and pauses/resumes discovery workers (find_node + BEP51) */
 static void *throttle_monitor_func(void *arg) {
     throttle_monitor_ctx_t *ctx = (throttle_monitor_ctx_t *)arg;
     thread_tree_t *tree = ctx->tree;
@@ -271,23 +271,23 @@ static void *throttle_monitor_func(void *arg) {
         int queue_size = tree_infohash_queue_count(tree->infohash_queue);
 
         if (!currently_paused && queue_size >= tree->infohash_pause_threshold) {
-            /* Pause find_node workers */
-            log_msg(LOG_INFO, "[tree %u] PAUSING find_node workers (queue=%d >= %d)",
+            /* Pause discovery workers (find_node + BEP51) */
+            log_msg(LOG_INFO, "[tree %u] PAUSING discovery workers (find_node + BEP51) (queue=%d >= %d)",
                     tree->tree_id, queue_size, tree->infohash_pause_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
-            atomic_store(&tree->find_node_paused, true);
+            atomic_store(&tree->discovery_paused, true);
             pthread_mutex_unlock(&tree->throttle_lock);
 
             currently_paused = true;
 
         } else if (currently_paused && queue_size < tree->infohash_resume_threshold) {
-            /* Resume find_node workers */
-            log_msg(LOG_INFO, "[tree %u] RESUMING find_node workers (queue=%d < %d)",
+            /* Resume discovery workers (find_node + BEP51) */
+            log_msg(LOG_INFO, "[tree %u] RESUMING discovery workers (find_node + BEP51) (queue=%d < %d)",
                     tree->tree_id, queue_size, tree->infohash_resume_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
-            atomic_store(&tree->find_node_paused, false);
+            atomic_store(&tree->discovery_paused, false);
             pthread_cond_broadcast(&tree->throttle_resume);  /* Wake all workers */
             pthread_mutex_unlock(&tree->throttle_lock);
 
@@ -301,7 +301,7 @@ static void *throttle_monitor_func(void *arg) {
     /* On shutdown, resume all workers so they can exit cleanly */
     if (currently_paused) {
         pthread_mutex_lock(&tree->throttle_lock);
-        atomic_store(&tree->find_node_paused, false);
+        atomic_store(&tree->discovery_paused, false);
         pthread_cond_broadcast(&tree->throttle_resume);
         pthread_mutex_unlock(&tree->throttle_lock);
     }
@@ -388,6 +388,25 @@ static void *bep51_worker_func(void *arg) {
     unsigned long timeouts = 0;
 
     while (!atomic_load(&tree->shutdown_requested)) {
+        /* 0. Check if we should pause (infohash queue is full enough) */
+        if (atomic_load(&tree->discovery_paused)) {
+            log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d PAUSED (queue >= %d)",
+                    tree->tree_id, worker_id, tree->infohash_pause_threshold);
+
+            /* Wait on condition variable until resumed */
+            pthread_mutex_lock(&tree->throttle_lock);
+            while (atomic_load(&tree->discovery_paused) &&
+                   !atomic_load(&tree->shutdown_requested)) {
+                pthread_cond_wait(&tree->throttle_resume, &tree->throttle_lock);
+            }
+            pthread_mutex_unlock(&tree->throttle_lock);
+
+            log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d RESUMED (queue < %d)",
+                    tree->tree_id, worker_id, tree->infohash_resume_threshold);
+
+            if (atomic_load(&tree->shutdown_requested)) break;
+        }
+
         /* 1. Get random node from routing table */
         tree_node_t node;
         if (tree_routing_get_random_nodes(rt, &node, 1) < 1) {
@@ -862,8 +881,8 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->current_phase = TREE_PHASE_BOOTSTRAP;
     atomic_store(&tree->shutdown_requested, false);
 
-    /* Initialize find_node throttling */
-    atomic_store(&tree->find_node_paused, false);
+    /* Initialize discovery throttling (find_node + BEP51) */
+    atomic_store(&tree->discovery_paused, false);
     pthread_mutex_init(&tree->throttle_lock, NULL);
     pthread_cond_init(&tree->throttle_resume, NULL);
     tree->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
