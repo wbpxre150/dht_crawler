@@ -37,6 +37,14 @@ typedef struct supervisor_config {
     int global_bootstrap_workers;        /* Bootstrap worker threads (default: 50) */
     int per_tree_sample_size;            /* Nodes each tree samples from pool (default: 1000) */
 
+    /* Stage 3 settings (BEP51) */
+    int infohash_queue_capacity;    /* Infohash queue capacity per tree (default: 5000) */
+    int bep51_query_interval_ms;    /* BEP51 query interval (default: 10) */
+
+    /* Stage 4 settings (get_peers) */
+    int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
+    int get_peers_timeout_ms;       /* get_peers timeout (default: 3000) */
+
     /* Stage 5 settings */
     int rate_check_interval_sec;    /* Rate check interval (default: 10) */
     int rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
@@ -71,6 +79,14 @@ typedef struct supervisor {
     int global_bootstrap_timeout_sec;
     int global_bootstrap_workers;
     int per_tree_sample_size;
+
+    /* Stage 3 settings (BEP51) */
+    int infohash_queue_capacity;
+    int bep51_query_interval_ms;
+
+    /* Stage 4 settings (get_peers) */
+    int peers_queue_capacity;
+    int get_peers_timeout_ms;
 
     /* Stage 5 settings */
     int rate_check_interval_sec;

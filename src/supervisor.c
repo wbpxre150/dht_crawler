@@ -65,6 +65,14 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->global_bootstrap_workers = config->global_bootstrap_workers > 0 ? config->global_bootstrap_workers : 50;
     sup->per_tree_sample_size = config->per_tree_sample_size > 0 ? config->per_tree_sample_size : 1000;
 
+    /* Stage 3 settings (BEP51) */
+    sup->infohash_queue_capacity = config->infohash_queue_capacity > 0 ? config->infohash_queue_capacity : 5000;
+    sup->bep51_query_interval_ms = config->bep51_query_interval_ms >= 0 ? config->bep51_query_interval_ms : 10;
+
+    /* Stage 4 settings (get_peers) */
+    sup->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
+    sup->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 3000;
+
     /* Stage 5 settings */
     sup->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 10;
     sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
@@ -103,6 +111,12 @@ static thread_tree_t *spawn_tree(supervisor_t *sup) {
         .num_bep51_workers = sup->num_bep51_workers,
         .num_get_peers_workers = sup->num_get_peers_workers,
         .num_metadata_workers = sup->num_metadata_workers,
+        /* Stage 3 settings */
+        .infohash_queue_capacity = sup->infohash_queue_capacity,
+        .bep51_query_interval_ms = sup->bep51_query_interval_ms,
+        /* Stage 4 settings */
+        .peers_queue_capacity = sup->peers_queue_capacity,
+        .get_peers_timeout_ms = sup->get_peers_timeout_ms,
         /* Stage 5 settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,

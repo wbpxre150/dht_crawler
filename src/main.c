@@ -254,6 +254,12 @@ int main(int argc, char *argv[]) {
             .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
             .global_bootstrap_workers = config.global_bootstrap_workers,
             .per_tree_sample_size = config.per_tree_sample_size,
+            /* Stage 3 settings (BEP51) */
+            .infohash_queue_capacity = config.tree_infohash_queue_capacity,
+            .bep51_query_interval_ms = config.tree_bep51_query_interval_ms,
+            /* Stage 4 settings (get_peers) */
+            .peers_queue_capacity = config.tree_peers_queue_capacity,
+            .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,
             /* Stage 5 settings */
             .rate_check_interval_sec = config.tree_rate_check_interval_sec,
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,
