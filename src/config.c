@@ -107,7 +107,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
     config->tree_rate_check_interval_sec = 10;      /* 10 second rate check interval */
     config->tree_rate_grace_period_sec = 30;        /* 30 second grace period */
-    config->tree_tcp_connect_timeout_ms = 5000;     /* 5 second TCP connect timeout */
+    config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
 
     /* Thread tree mode toggle - disabled by default for safety */
     config->use_thread_trees = 0;                   /* 0=old architecture */
@@ -348,7 +348,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         else if (strcmp(key, "tree_metadata_workers") == 0) {
             config->tree_metadata_workers = atoi(value);
             if (config->tree_metadata_workers < 1) config->tree_metadata_workers = 1;
-            if (config->tree_metadata_workers > 50) config->tree_metadata_workers = 50;
         } else if (strcmp(key, "tree_rate_check_interval_sec") == 0) {
             config->tree_rate_check_interval_sec = atoi(value);
             if (config->tree_rate_check_interval_sec < 5) config->tree_rate_check_interval_sec = 5;
