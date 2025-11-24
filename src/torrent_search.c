@@ -185,7 +185,7 @@ static int load_strip_keywords(const char *file_path) {
     }
 
     fclose(fp);
-    log_msg(LOG_INFO, "Loaded %d strip keywords from %s", loaded, file_path);
+    log_msg(LOG_DEBUG, "Loaded %d strip keywords from %s", loaded, file_path);
     return 0;
 }
 
@@ -406,7 +406,7 @@ int torrent_search_init(const char *keyword_file_path) {
     }
 
     search_state.initialized = 1;
-    log_msg(LOG_INFO, "Torrent search module initialized");
+    log_msg(LOG_DEBUG, "Torrent search module initialized");
     return 0;
 }
 
@@ -429,7 +429,7 @@ void torrent_search_cleanup(void) {
     }
 
     search_state.initialized = 0;
-    log_msg(LOG_INFO, "Torrent search module cleaned up");
+    log_msg(LOG_DEBUG, "Torrent search module cleaned up");
 }
 
 /**

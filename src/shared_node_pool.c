@@ -34,7 +34,7 @@ shared_node_pool_t *shared_node_pool_create(size_t capacity) {
         return NULL;
     }
 
-    log_msg(LOG_INFO, "Created shared node pool with capacity %zu", capacity);
+    log_msg(LOG_DEBUG, "Created shared node pool with capacity %zu", capacity);
     return pool;
 }
 
@@ -162,7 +162,7 @@ void shared_node_pool_destroy(shared_node_pool_t *pool) {
     size_t final_count = pool->count;
     pthread_mutex_unlock(&pool->lock);
 
-    log_msg(LOG_INFO, "Destroying shared node pool (final count: %zu)", final_count);
+    log_msg(LOG_DEBUG, "Destroying shared node pool (final count: %zu)", final_count);
 
     pthread_mutex_destroy(&pool->lock);
     free(pool->nodes);

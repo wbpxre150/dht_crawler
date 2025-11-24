@@ -788,7 +788,7 @@ void *tree_metadata_worker_func(void *arg) {
             /* Convert to database format and submit */
             /* Note: In a real implementation, we'd need access to the shared batch_writer
              * through tree->supervisor_ctx or similar. For now, just log success. */
-            log_msg(LOG_INFO, "[tree %u] Fetched metadata: %s (%lld bytes, %d files)",
+            log_msg(LOG_DEBUG, "[tree %u] Fetched metadata: %s (%lld bytes, %d files)",
                     tree->tree_id, metadata->name,
                     (long long)metadata->total_size, metadata->file_count);
 
@@ -853,12 +853,12 @@ void *tree_rate_monitor_func(void *arg) {
             double rate2 = (count2 - count) / (double)grace_period;
 
             if (rate2 < min_rate) {
-                log_msg(LOG_INFO, "[tree %u] Metadata rate %.2f/s still below threshold, requesting shutdown",
+                log_msg(LOG_DEBUG, "[tree %u] Metadata rate %.2f/s still below threshold, requesting shutdown",
                         tree->tree_id, rate2);
                 thread_tree_request_shutdown(tree);
                 break;
             } else {
-                log_msg(LOG_INFO, "[tree %u] Metadata rate recovered to %.2f/s",
+                log_msg(LOG_DEBUG, "[tree %u] Metadata rate recovered to %.2f/s",
                         tree->tree_id, rate2);
             }
         }

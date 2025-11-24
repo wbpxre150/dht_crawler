@@ -202,7 +202,7 @@ static int load_keywords(const char *file_path) {
     }
 
     fclose(fp);
-    log_msg(LOG_INFO, "Loaded %d keywords from %s", loaded, file_path);
+    log_msg(LOG_DEBUG, "Loaded %d keywords from %s", loaded, file_path);
     return 0;
 }
 
@@ -295,7 +295,7 @@ static int init_regex_patterns(void) {
         }
     }
 
-    log_msg(LOG_INFO, "Compiled %d/%zu regex patterns", compiled_count, filter_state.num_regex);
+    log_msg(LOG_DEBUG, "Compiled %d/%zu regex patterns", compiled_count, filter_state.num_regex);
     return 0;
 }
 
@@ -511,7 +511,7 @@ int porn_filter_init(const char *keyword_file_path) {
     }
 
     filter_state.initialized = 1;
-    log_msg(LOG_INFO, "Porn filter initialized successfully");
+    log_msg(LOG_DEBUG, "Porn filter initialized successfully");
     return 0;
 }
 
@@ -531,7 +531,7 @@ void porn_filter_cleanup(void) {
     cleanup_regex_patterns();
 
     filter_state.initialized = 0;
-    log_msg(LOG_INFO, "Porn filter cleaned up");
+    log_msg(LOG_DEBUG, "Porn filter cleaned up");
 }
 
 int porn_filter_check(const torrent_metadata_t *metadata) {
@@ -636,6 +636,6 @@ void porn_filter_set_thresholds(int keyword_threshold, int regex_threshold, int 
     filter_state.regex_threshold = regex_threshold;
     filter_state.heuristic_threshold = heuristic_threshold;
 
-    log_msg(LOG_INFO, "Porn filter thresholds updated: keyword=%d, regex=%d, heuristic=%d",
+    log_msg(LOG_DEBUG, "Porn filter thresholds updated: keyword=%d, regex=%d, heuristic=%d",
             keyword_threshold, regex_threshold, heuristic_threshold);
 }

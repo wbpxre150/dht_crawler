@@ -171,7 +171,7 @@ int main(int argc, char *argv[]) {
             porn_filter_set_thresholds(config.porn_filter_keyword_threshold,
                                       config.porn_filter_regex_threshold,
                                       config.porn_filter_heuristic_threshold);
-            log_msg(LOG_INFO, "Porn filter enabled (thresholds: keyword=%d, regex=%d, heuristic=%d)",
+            log_msg(LOG_DEBUG, "Porn filter enabled (thresholds: keyword=%d, regex=%d, heuristic=%d)",
                     config.porn_filter_keyword_threshold,
                     config.porn_filter_regex_threshold,
                     config.porn_filter_heuristic_threshold);
@@ -222,7 +222,7 @@ int main(int argc, char *argv[]) {
         /*******************************************************************
          * NEW ARCHITECTURE: Thread Tree Supervisor
          *******************************************************************/
-        log_msg(LOG_INFO, "=== Starting Thread Tree Architecture ===");
+        log_msg(LOG_DEBUG, "=== Starting Thread Tree Architecture ===");
 
         /* Create shared batch writer for all trees */
         g_batch_writer = batch_writer_init(&g_database, config.batch_size,
@@ -303,8 +303,8 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        log_msg(LOG_INFO, "DHT crawler (thread tree mode) is running.");
-        log_msg(LOG_INFO, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
+        log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
+        log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
                 config.num_trees, config.tree_bep51_workers,
                 config.tree_get_peers_workers, config.tree_metadata_workers);
         log_msg(LOG_DEBUG, "HTTP API available at http://localhost:%d/", HTTP_API_PORT);
@@ -357,7 +357,7 @@ int main(int argc, char *argv[]) {
      * OLD ARCHITECTURE: Single DHT instance with metadata fetcher
      * (Kept for backward compatibility - set use_thread_trees=0)
      *******************************************************************/
-    log_msg(LOG_INFO, "=== Starting Old Architecture (use_thread_trees=0) ===");
+    log_msg(LOG_DEBUG, "=== Starting Old Architecture (use_thread_trees=0) ===");
 
     /* Connect bloom filter and database to queue for read-only duplicate checking */
     if (g_bloom) {

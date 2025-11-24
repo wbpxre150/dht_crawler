@@ -892,20 +892,20 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
     time_t now = time(NULL);
     time_t uptime = now - mgr->stats.start_time;
 
-    log_msg(LOG_INFO, "=== DHT Statistics (uptime: %ld seconds) ===", uptime);
+    log_msg(LOG_DEBUG, "=== DHT Statistics (uptime: %ld seconds) ===", uptime);
 
     /* Get statistics from wbpxre-dht */
     if (mgr->dht) {
         wbpxre_stats_t wbpxre_stats;
         if (wbpxre_dht_get_stats(mgr->dht, &wbpxre_stats) == 0) {
-            log_msg(LOG_INFO, "  Packets: sent=%llu received=%llu",
+            log_msg(LOG_DEBUG, "  Packets: sent=%llu received=%llu",
                     (unsigned long long)wbpxre_stats.packets_sent,
                     (unsigned long long)wbpxre_stats.packets_received);
-            log_msg(LOG_INFO, "  Queries: sent=%llu",
+            log_msg(LOG_DEBUG, "  Queries: sent=%llu",
                     (unsigned long long)wbpxre_stats.queries_sent);
-            log_msg(LOG_INFO, "  Info hashes: discovered=%llu",
+            log_msg(LOG_DEBUG, "  Info hashes: discovered=%llu",
                     (unsigned long long)wbpxre_stats.infohashes_discovered);
-            log_msg(LOG_INFO, "  BEP 51: queries=%llu responses=%llu samples=%llu",
+            log_msg(LOG_DEBUG, "  BEP 51: queries=%llu responses=%llu samples=%llu",
                     (unsigned long long)wbpxre_stats.bep51_queries_sent,
                     (unsigned long long)wbpxre_stats.bep51_responses_received,
                     (unsigned long long)wbpxre_stats.bep51_samples_received);
@@ -913,9 +913,9 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
             /* Get current routing table stats from wbpxre-dht */
             int good = 0, dubious = 0;
             wbpxre_dht_nodes(mgr->dht, &good, &dubious);
-            log_msg(LOG_INFO, "  Routing table: nodes=%d",
+            log_msg(LOG_DEBUG, "  Routing table: nodes=%d",
                     good + dubious);
-            log_msg(LOG_INFO, "  wbpxre-dht: good=%d dubious=%d total=%d",
+            log_msg(LOG_DEBUG, "  wbpxre-dht: good=%d dubious=%d total=%d",
                     good, dubious, good + dubious);
 
             /* Print keyspace distribution statistics */
@@ -931,7 +931,7 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
 
             int total_nodes = close_nodes + distant_nodes;
             if (total_nodes > 0) {
-                log_msg(LOG_INFO, "  Keyspace distribution: close=%d (%.1f%%) distant=%d (%.1f%%)",
+                log_msg(LOG_DEBUG, "  Keyspace distribution: close=%d (%.1f%%) distant=%d (%.1f%%)",
                         close_nodes, (close_nodes * 100.0) / total_nodes,
                         distant_nodes, (distant_nodes * 100.0) / total_nodes);
             }
@@ -969,7 +969,7 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
         int is_full = infohash_queue_is_full(queue);
         uint64_t duplicates_filtered = infohash_queue_get_duplicates(queue);
 
-        log_msg(LOG_INFO, "  Infohash queue: size=%zu capacity=%zu full=%s duplicates_filtered=%llu",
+        log_msg(LOG_DEBUG, "  Infohash queue: size=%zu capacity=%zu full=%s duplicates_filtered=%llu",
                 queue_size, queue_capacity, is_full ? "YES" : "no",
                 (unsigned long long)duplicates_filtered);
     }
@@ -980,7 +980,7 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
 
         /* Print rotation synchronization statistics */
         if (mgr->stats.total_rotation_clears > 0) {
-            log_msg(LOG_INFO, "    Rotation clears: total=%llu entries_cleared=%llu",
+            log_msg(LOG_DEBUG, "    Rotation clears: total=%llu entries_cleared=%llu",
                     (unsigned long long)mgr->stats.total_rotation_clears,
                     (unsigned long long)mgr->stats.peer_retry_entries_cleared);
         }
@@ -998,18 +998,18 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                                 fetcher->metadata_rejected +
                                 fetcher->hash_mismatch;
 
-        log_msg(LOG_INFO, "  Metadata: fetched=%llu failed=%llu (success_rate=%.1f%%)",
+        log_msg(LOG_DEBUG, "  Metadata: fetched=%llu failed=%llu (success_rate=%.1f%%)",
                 (unsigned long long)fetcher->total_fetched,
                 (unsigned long long)total_failed,
                 fetcher->total_attempts > 0 ?
                     (100.0 * fetcher->total_fetched / fetcher->total_attempts) : 0.0);
 
-        log_msg(LOG_INFO, "    Attempts: total=%llu no_peers=%llu connections=%llu",
+        log_msg(LOG_DEBUG, "    Attempts: total=%llu no_peers=%llu connections=%llu",
                 (unsigned long long)fetcher->total_attempts,
                 (unsigned long long)fetcher->no_peers_found,
                 (unsigned long long)fetcher->connection_initiated);
 
-        log_msg(LOG_INFO, "    Failures: conn_failed=%llu timeout=%llu handshake=%llu no_support=%llu rejected=%llu hash_mismatch=%llu",
+        log_msg(LOG_DEBUG, "    Failures: conn_failed=%llu timeout=%llu handshake=%llu no_support=%llu rejected=%llu hash_mismatch=%llu",
                 (unsigned long long)fetcher->connection_failed,
                 (unsigned long long)fetcher->connection_timeout,
                 (unsigned long long)fetcher->handshake_failed,
@@ -1017,7 +1017,7 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                 (unsigned long long)fetcher->metadata_rejected,
                 (unsigned long long)fetcher->hash_mismatch);
 
-        log_msg(LOG_INFO, "    Active: connections=%d max_global=%d",
+        log_msg(LOG_DEBUG, "    Active: connections=%d max_global=%d",
                 fetcher->active_count,
                 fetcher->max_global_connections);
 
@@ -1029,7 +1029,7 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
                             &active_workers, &idle_workers);
             double utilization = fetcher->num_workers > 0 ?
                 (100.0 * active_workers / fetcher->num_workers) : 0.0;
-            log_msg(LOG_INFO, "    Worker pool: active=%zu idle=%zu queue=%zu utilization=%.1f%% tasks_processed=%llu",
+            log_msg(LOG_DEBUG, "    Worker pool: active=%zu idle=%zu queue=%zu utilization=%.1f%% tasks_processed=%llu",
                     active_workers, idle_workers, queue_size, utilization,
                     (unsigned long long)tasks_processed);
         }
@@ -1038,7 +1038,7 @@ void dht_manager_print_stats(dht_manager_t *mgr) {
         if (fetcher->conn_request_queue) {
             size_t conn_queue_size = connection_request_queue_size(fetcher->conn_request_queue);
             double conn_queue_utilization = (100.0 * conn_queue_size / 4000.0);
-            log_msg(LOG_INFO, "    Connection request queue: size=%zu capacity=4000 utilization=%.1f%%",
+            log_msg(LOG_DEBUG, "    Connection request queue: size=%zu capacity=4000 utilization=%.1f%%",
                     conn_queue_size, conn_queue_utilization);
         }
     }

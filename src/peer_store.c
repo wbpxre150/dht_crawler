@@ -386,16 +386,16 @@ void peer_store_print_stats(peer_store_t *store) {
     pthread_mutex_t *mutex = (pthread_mutex_t*)store->mutex;
     pthread_mutex_lock(mutex);
 
-    log_msg(LOG_INFO, "Peer Store Stats:");
-    log_msg(LOG_INFO, "  Total hashes: %zu (max: %zu)",
+    log_msg(LOG_DEBUG, "Peer Store Stats:");
+    log_msg(LOG_DEBUG, "  Total hashes: %zu (max: %zu)",
             store->total_hashes, store->max_hashes);
-    log_msg(LOG_INFO, "  Total peers: %zu (avg: %.1f per hash)",
+    log_msg(LOG_DEBUG, "  Total peers: %zu (avg: %.1f per hash)",
             store->total_peers,
             store->total_hashes > 0 ? (double)store->total_peers / store->total_hashes : 0.0);
-    log_msg(LOG_INFO, "  Peers added: %lu", store->peers_added);
-    log_msg(LOG_INFO, "  Peers expired: %lu", store->peers_expired);
-    log_msg(LOG_INFO, "  Hashes evicted: %lu", store->hashes_evicted);
-    log_msg(LOG_INFO, "  Lookups: %lu success, %lu miss (%.1f%% hit rate)",
+    log_msg(LOG_DEBUG, "  Peers added: %lu", store->peers_added);
+    log_msg(LOG_DEBUG, "  Peers expired: %lu", store->peers_expired);
+    log_msg(LOG_DEBUG, "  Hashes evicted: %lu", store->hashes_evicted);
+    log_msg(LOG_DEBUG, "  Lookups: %lu success, %lu miss (%.1f%% hit rate)",
             store->lookups_success, store->lookups_miss,
             (store->lookups_success + store->lookups_miss) > 0 ?
             100.0 * store->lookups_success / (store->lookups_success + store->lookups_miss) : 0.0);

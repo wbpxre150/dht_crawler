@@ -86,7 +86,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
-    log_msg(LOG_INFO, "[supervisor] Created with max_trees=%d, min_rate=%.2f, bootstrap_target=%d",
+    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, min_rate=%.2f, bootstrap_target=%d",
             sup->max_trees, sup->min_metadata_rate, sup->global_bootstrap_target);
 
     return sup;
@@ -224,7 +224,7 @@ static void *global_bootstrap_worker_func(void *arg) {
  * @return 0 on success (reached target or timeout), -1 on error
  */
 static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec, int num_workers) {
-    log_msg(LOG_INFO, "[global_bootstrap] Starting (target: %d nodes, timeout: %ds, workers: %d)",
+    log_msg(LOG_DEBUG, "[global_bootstrap] Starting (target: %d nodes, timeout: %ds, workers: %d)",
             target_nodes, timeout_sec, num_workers);
 
     time_t start_time = time(NULL);
@@ -305,7 +305,7 @@ static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec
     /* Let worker threads discover nodes in parallel
      * The find_node_feeder and find_node_worker threads will automatically
      * query nodes from the routing table and discover new nodes */
-    log_msg(LOG_INFO, "[global_bootstrap] Worker threads discovering nodes in parallel (workers: %d)",
+    log_msg(LOG_DEBUG, "[global_bootstrap] Worker threads discovering nodes in parallel (workers: %d)",
             config.find_node_workers);
 
     int last_logged_count = 0;
@@ -328,14 +328,14 @@ static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec
 
         /* Log progress every 10 polls (2 seconds) */
         if (poll_count % 10 == 0 && good_nodes != last_logged_count) {
-            log_msg(LOG_INFO, "[global_bootstrap] Progress: %d nodes discovered (%.1f sec elapsed)",
+            log_msg(LOG_DEBUG, "[global_bootstrap] Progress: %d nodes discovered (%.1f sec elapsed)",
                     good_nodes, (double)elapsed);
             last_logged_count = good_nodes;
         }
 
         /* Check if we have enough nodes */
         if (good_nodes >= target_nodes) {
-            log_msg(LOG_INFO, "[global_bootstrap] Reached target: %d nodes in %ld seconds",
+            log_msg(LOG_DEBUG, "[global_bootstrap] Reached target: %d nodes in %ld seconds",
                     good_nodes, elapsed);
             break;
         }
@@ -346,7 +346,7 @@ static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec
     }
 
     /* Extract nodes from wbpxre routing table and add to shared pool */
-    log_msg(LOG_INFO, "[global_bootstrap] Extracting nodes from routing table to shared pool");
+    log_msg(LOG_DEBUG, "[global_bootstrap] Extracting nodes from routing table to shared pool");
 
     tribuf_controller_t *ctrl = bootstrap_dht->routing_controller;
     wbpxre_routing_table_t *table = tribuf_get_readable_table(ctrl);
@@ -402,7 +402,7 @@ static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec
     size_t final_count = shared_node_pool_get_count(sup->shared_node_pool);
     time_t elapsed = time(NULL) - start_time;
 
-    log_msg(LOG_INFO, "[global_bootstrap] Complete: added %d nodes to shared pool (%zu total) in %ld seconds",
+    log_msg(LOG_DEBUG, "[global_bootstrap] Complete: added %d nodes to shared pool (%zu total) in %ld seconds",
             nodes_added, final_count, elapsed);
 
     /* Stop and cleanup */
@@ -417,7 +417,7 @@ void supervisor_start(supervisor_t *sup) {
         return;
     }
 
-    log_msg(LOG_INFO, "[supervisor] Starting with %d trees", sup->max_trees);
+    log_msg(LOG_DEBUG, "[supervisor] Starting with %d trees", sup->max_trees);
 
     /* Create shared node pool for global bootstrap */
     sup->shared_node_pool = shared_node_pool_create(sup->global_bootstrap_target);
@@ -427,7 +427,7 @@ void supervisor_start(supervisor_t *sup) {
     }
 
     /* Perform global bootstrap ONCE before spawning trees */
-    log_msg(LOG_INFO, "[supervisor] Starting global bootstrap (target: %d nodes, timeout: %ds, workers: %d)",
+    log_msg(LOG_DEBUG, "[supervisor] Starting global bootstrap (target: %d nodes, timeout: %ds, workers: %d)",
             sup->global_bootstrap_target, sup->global_bootstrap_timeout_sec, sup->global_bootstrap_workers);
 
     int rc = global_bootstrap(sup, sup->global_bootstrap_target,
@@ -439,7 +439,7 @@ void supervisor_start(supervisor_t *sup) {
     }
 
     size_t nodes_collected = shared_node_pool_get_count(sup->shared_node_pool);
-    log_msg(LOG_INFO, "[supervisor] Global bootstrap finished: %zu nodes available", nodes_collected);
+    log_msg(LOG_DEBUG, "[supervisor] Global bootstrap finished: %zu nodes available", nodes_collected);
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -461,7 +461,7 @@ void supervisor_start(supervisor_t *sup) {
         sup->monitor_running = 0;
     }
 
-    log_msg(LOG_INFO, "[supervisor] Started %d trees", sup->active_trees);
+    log_msg(LOG_DEBUG, "[supervisor] Started %d trees", sup->active_trees);
 }
 
 void supervisor_stop(supervisor_t *sup) {
@@ -469,7 +469,7 @@ void supervisor_stop(supervisor_t *sup) {
         return;
     }
 
-    log_msg(LOG_INFO, "[supervisor] Stopping");
+    log_msg(LOG_DEBUG, "[supervisor] Stopping");
 
     /* Stop monitor thread */
     log_msg(LOG_DEBUG, "[supervisor] Stopping monitor thread...");
@@ -534,7 +534,7 @@ void supervisor_stop(supervisor_t *sup) {
         log_msg(LOG_DEBUG, "[supervisor] Tree destroyed");
     }
 
-    log_msg(LOG_INFO, "[supervisor] Stopped");
+    log_msg(LOG_DEBUG, "[supervisor] Stopped");
 }
 
 void supervisor_destroy(supervisor_t *sup) {
@@ -555,7 +555,7 @@ void supervisor_destroy(supervisor_t *sup) {
     free(sup->trees);
     free(sup);
 
-    log_msg(LOG_INFO, "[supervisor] Destroyed");
+    log_msg(LOG_DEBUG, "[supervisor] Destroyed");
 }
 
 void supervisor_on_tree_shutdown(thread_tree_t *tree) {
@@ -565,7 +565,7 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree) {
 
     supervisor_t *sup = (supervisor_t *)tree->supervisor_ctx;
 
-    log_msg(LOG_INFO, "[supervisor] Tree %u signaled shutdown", tree->tree_id);
+    log_msg(LOG_DEBUG, "[supervisor] Tree %u signaled shutdown", tree->tree_id);
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -586,7 +586,7 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree) {
 
         /* Spawn replacement if monitor is still running */
         if (sup->monitor_running) {
-            log_msg(LOG_INFO, "[supervisor] Spawning replacement tree for slot %d", slot);
+            log_msg(LOG_DEBUG, "[supervisor] Spawning replacement tree for slot %d", slot);
             sup->trees[slot] = spawn_tree(sup);
             if (sup->trees[slot]) {
                 thread_tree_start(sup->trees[slot]);
@@ -601,7 +601,7 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree) {
 static void *monitor_thread_func(void *arg) {
     supervisor_t *sup = (supervisor_t *)arg;
 
-    log_msg(LOG_INFO, "[supervisor] Monitor thread started");
+    log_msg(LOG_DEBUG, "[supervisor] Monitor thread started");
 
     while (sup->monitor_running) {
         /* Sleep in small chunks (1 second) to be responsive to shutdown */
@@ -635,7 +635,7 @@ static void *monitor_thread_func(void *arg) {
         pthread_mutex_unlock(&sup->trees_lock);
     }
 
-    log_msg(LOG_INFO, "[supervisor] Monitor thread exiting");
+    log_msg(LOG_DEBUG, "[supervisor] Monitor thread exiting");
     return NULL;
 }
 

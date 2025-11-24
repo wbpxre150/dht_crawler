@@ -456,41 +456,41 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
     uv_mutex_destroy(&fetcher->mutex);
 
     /* Print detailed statistics breakdown */
-    log_msg(LOG_INFO, "=== Metadata Fetcher Statistics ===");
-    log_msg(LOG_INFO, "  Total attempts: %llu", (unsigned long long)fetcher->total_attempts);
-    log_msg(LOG_INFO, "  No peers found: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "=== Metadata Fetcher Statistics ===");
+    log_msg(LOG_DEBUG, "  Total attempts: %llu", (unsigned long long)fetcher->total_attempts);
+    log_msg(LOG_DEBUG, "  No peers found: %llu (%.1f%%)",
             (unsigned long long)fetcher->no_peers_found,
             fetcher->total_attempts > 0 ? (fetcher->no_peers_found * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  Connections initiated: %llu (avg %.1f per attempt)",
+    log_msg(LOG_DEBUG, "  Connections initiated: %llu (avg %.1f per attempt)",
             (unsigned long long)fetcher->connection_initiated,
             fetcher->total_attempts > 0 ? ((double)fetcher->connection_initiated / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  Connection failures: %llu (%.1f per attempt, %.1f%% of connections)",
+    log_msg(LOG_DEBUG, "  Connection failures: %llu (%.1f per attempt, %.1f%% of connections)",
             (unsigned long long)fetcher->connection_failed,
             fetcher->total_attempts > 0 ? ((double)fetcher->connection_failed / fetcher->total_attempts) : 0.0,
             fetcher->connection_initiated > 0 ? (100.0 * fetcher->connection_failed / fetcher->connection_initiated) : 0.0);
-    log_msg(LOG_INFO, "  Connection timeouts: %llu (%.1f per attempt, %.1f%% of connections)",
+    log_msg(LOG_DEBUG, "  Connection timeouts: %llu (%.1f per attempt, %.1f%% of connections)",
             (unsigned long long)fetcher->connection_timeout,
             fetcher->total_attempts > 0 ? ((double)fetcher->connection_timeout / fetcher->total_attempts) : 0.0,
             fetcher->connection_initiated > 0 ? (100.0 * fetcher->connection_timeout / fetcher->connection_initiated) : 0.0);
-    log_msg(LOG_INFO, "  Handshake failures: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  Handshake failures: %llu (%.1f%%)",
             (unsigned long long)fetcher->handshake_failed,
             fetcher->total_attempts > 0 ? (fetcher->handshake_failed * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  No metadata support: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  No metadata support: %llu (%.1f%%)",
             (unsigned long long)fetcher->no_metadata_support,
             fetcher->total_attempts > 0 ? (fetcher->no_metadata_support * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  Metadata rejected: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  Metadata rejected: %llu (%.1f%%)",
             (unsigned long long)fetcher->metadata_rejected,
             fetcher->total_attempts > 0 ? (fetcher->metadata_rejected * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  Hash mismatches: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  Hash mismatches: %llu (%.1f%%)",
             (unsigned long long)fetcher->hash_mismatch,
             fetcher->total_attempts > 0 ? (fetcher->hash_mismatch * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  Successfully fetched: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  Successfully fetched: %llu (%.1f%%)",
             (unsigned long long)fetcher->total_fetched,
             fetcher->total_attempts > 0 ? (fetcher->total_fetched * 100.0 / fetcher->total_attempts) : 0.0);
-    log_msg(LOG_INFO, "  Filtered by porn filter: %llu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  Filtered by porn filter: %llu (%.1f%%)",
             (unsigned long long)fetcher->filtered_count,
             fetcher->total_fetched > 0 ? (fetcher->filtered_count * 100.0 / fetcher->total_fetched) : 0.0);
-    log_msg(LOG_INFO, "===================================");
+    log_msg(LOG_DEBUG, "===================================");
 }
 
 /* Get thread-safe snapshot of metadata fetcher statistics */

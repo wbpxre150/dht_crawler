@@ -355,41 +355,41 @@ void peer_retry_print_stats(peer_retry_tracker_t *tracker) {
                                 tracker->success_third_try +
                                 tracker->failed_all_attempts;
 
-    log_msg(LOG_INFO, "  Peer Retry Statistics:");
-    log_msg(LOG_INFO, "    Active entries: %zu / %zu (%.1f%%)",
+    log_msg(LOG_DEBUG, "  Peer Retry Statistics:");
+    log_msg(LOG_DEBUG, "    Active entries: %zu / %zu (%.1f%%)",
             tracker->current_count, tracker->max_entries,
             (100.0 * tracker->current_count) / tracker->max_entries);
-    log_msg(LOG_INFO, "    Retries triggered: %llu", (unsigned long long)tracker->retries_triggered);
-    log_msg(LOG_INFO, "    Evicted for space: %llu", (unsigned long long)tracker->evicted_for_space);
+    log_msg(LOG_DEBUG, "    Retries triggered: %llu", (unsigned long long)tracker->retries_triggered);
+    log_msg(LOG_DEBUG, "    Evicted for space: %llu", (unsigned long long)tracker->evicted_for_space);
 
     if (total_completed > 0) {
-        log_msg(LOG_INFO, "    Success on 1st try: %llu (%.1f%%)",
+        log_msg(LOG_DEBUG, "    Success on 1st try: %llu (%.1f%%)",
                 (unsigned long long)tracker->success_first_try,
                 (100.0 * tracker->success_first_try) / total_completed);
-        log_msg(LOG_INFO, "    Success on 2nd try: %llu (%.1f%%)",
+        log_msg(LOG_DEBUG, "    Success on 2nd try: %llu (%.1f%%)",
                 (unsigned long long)tracker->success_second_try,
                 (100.0 * tracker->success_second_try) / total_completed);
-        log_msg(LOG_INFO, "    Success on 3rd+ try: %llu (%.1f%%)",
+        log_msg(LOG_DEBUG, "    Success on 3rd+ try: %llu (%.1f%%)",
                 (unsigned long long)tracker->success_third_try,
                 (100.0 * tracker->success_third_try) / total_completed);
-        log_msg(LOG_INFO, "    Failed all attempts: %llu (%.1f%%)",
+        log_msg(LOG_DEBUG, "    Failed all attempts: %llu (%.1f%%)",
                 (unsigned long long)tracker->failed_all_attempts,
                 (100.0 * tracker->failed_all_attempts) / total_completed);
 
         /* Calculate retry efficiency */
         uint64_t retry_successes = tracker->success_second_try + tracker->success_third_try;
         if (tracker->retries_triggered > 0) {
-            log_msg(LOG_INFO, "    Retry efficiency: %.1f%% (successes after retry / total retries)",
+            log_msg(LOG_DEBUG, "    Retry efficiency: %.1f%% (successes after retry / total retries)",
                     (100.0 * retry_successes) / tracker->retries_triggered);
         }
     }
 
     if (tracker->skipped_queue_full > 0) {
-        log_msg(LOG_INFO, "    Skipped (queue full): %llu",
+        log_msg(LOG_DEBUG, "    Skipped (queue full): %llu",
                 (unsigned long long)tracker->skipped_queue_full);
     }
 
-    log_msg(LOG_INFO, "    Config: max_attempts=%d min_peers=%d delay=%dms max_entries=%zu",
+    log_msg(LOG_DEBUG, "    Config: max_attempts=%d min_peers=%d delay=%dms max_entries=%zu",
             tracker->max_attempts, tracker->min_peer_threshold, tracker->retry_delay_ms,
             tracker->max_entries);
 

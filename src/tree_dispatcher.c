@@ -35,7 +35,7 @@ static void *dispatcher_thread_func(void *arg) {
     int sock_port = tree_socket_get_port(sock);
     uint32_t tree_id = dispatcher->tree ? dispatcher->tree->tree_id : 0;
 
-    log_msg(LOG_INFO, "[tree %u] ===== DISPATCHER THREAD STARTED ===== (socket_fd=%d, port=%d)",
+    log_msg(LOG_DEBUG, "[tree %u] ===== DISPATCHER THREAD STARTED ===== (socket_fd=%d, port=%d)",
             tree_id, sock_fd, sock_port);
 
     time_t last_cleanup = time(NULL);
@@ -81,7 +81,7 @@ static void *dispatcher_thread_func(void *arg) {
                 unsigned long dropped = atomic_load(&dispatcher->dropped_responses);
                 unsigned long queue_full = atomic_load(&dispatcher->queue_full_drops);
 
-                log_msg(LOG_INFO, "[tree %u] DISPATCHER STATS: loops=%lu, timeouts=%lu, packets=%lu, routed=%lu, dropped=%lu, queue_full=%lu",
+                log_msg(LOG_DEBUG, "[tree %u] DISPATCHER STATS: loops=%lu, timeouts=%lu, packets=%lu, routed=%lu, dropped=%lu, queue_full=%lu",
                         tree_id, loop_count, timeout_count, total, routed, dropped, queue_full);
                 last_stats = now;
             }
@@ -236,7 +236,7 @@ int tree_dispatcher_start(tree_dispatcher_t *dispatcher) {
         return -1;
     }
 
-    log_msg(LOG_INFO, "[tree %u] Dispatcher thread started",
+    log_msg(LOG_DEBUG, "[tree %u] Dispatcher thread started",
             dispatcher->tree ? dispatcher->tree->tree_id : 0);
 
     return 0;

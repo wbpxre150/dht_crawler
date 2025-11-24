@@ -23,7 +23,7 @@ tree_socket_t *tree_socket_create(int port) {
         return NULL;
     }
 
-    log_msg(LOG_INFO, "[tree_socket] Created socket with fd=%d", sock->fd);
+    log_msg(LOG_DEBUG, "[tree_socket] Created socket with fd=%d", sock->fd);
 
     /* Set non-blocking */
     int flags = fcntl(sock->fd, F_GETFL, 0);
@@ -59,7 +59,7 @@ tree_socket_t *tree_socket_create(int port) {
     pthread_mutex_init(&sock->send_lock, NULL);
 
     int bound_port = tree_socket_get_port(sock);
-    log_msg(LOG_INFO, "[tree_socket] ===== SOCKET CREATED: fd=%d, port=%d =====", sock->fd, bound_port);
+    log_msg(LOG_DEBUG, "[tree_socket] ===== SOCKET CREATED: fd=%d, port=%d =====", sock->fd, bound_port);
 
     return sock;
 }
@@ -216,7 +216,7 @@ int tree_socket_recv(tree_socket_t *sock, void *buf, size_t buflen,
     }
 
     if (recv_success_count <= 10 || recv_success_count % 100 == 0) {
-        log_msg(LOG_INFO, "[tree_socket] recvfrom SUCCESS #%lu: fd=%d, received=%zd bytes from %s:%u",
+        log_msg(LOG_DEBUG, "[tree_socket] recvfrom SUCCESS #%lu: fd=%d, received=%zd bytes from %s:%u",
                 recv_success_count, sock->fd, received, from_ip, from_port);
     }
 

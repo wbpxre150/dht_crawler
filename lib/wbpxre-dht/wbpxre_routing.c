@@ -1528,7 +1528,7 @@ tribuf_controller_t *tribuf_create(int max_nodes_per_table) {
     ctrl->last_rotation_time = 0;
     ctrl->last_clear_time = 0;
 
-    log_msg(LOG_INFO, "Tribuf controller created: 3 tables × %d max nodes", max_nodes_per_table);
+    log_msg(LOG_DEBUG, "Tribuf controller created: 3 tables × %d max nodes", max_nodes_per_table);
 
     return ctrl;
 }
@@ -1536,7 +1536,7 @@ tribuf_controller_t *tribuf_create(int max_nodes_per_table) {
 void tribuf_destroy(tribuf_controller_t *ctrl) {
     if (!ctrl) return;
 
-    log_msg(LOG_INFO, "Destroying tribuf controller (rotations=%llu, clears=%llu, cleared=%llu nodes)",
+    log_msg(LOG_DEBUG, "Destroying tribuf controller (rotations=%llu, clears=%llu, cleared=%llu nodes)",
             (unsigned long long)ctrl->rotation_count,
             (unsigned long long)ctrl->clear_count,
             (unsigned long long)ctrl->total_nodes_cleared);
@@ -1607,14 +1607,14 @@ int tribuf_insert(tribuf_controller_t *ctrl, const wbpxre_routing_node_t *node) 
         ctrl->rotation_count++;
         ctrl->last_rotation_time = time(NULL);
 
-        log_msg(LOG_INFO, "TRIBUF: Table %d FILLING→FULL (%u nodes), rotation #%llu",
+        log_msg(LOG_DEBUG, "TRIBUF: Table %d FILLING→FULL (%u nodes), rotation #%llu",
                 old_filling, node_count, (unsigned long long)ctrl->rotation_count);
 
         /* Mark bootstrap complete after first table fills */
         if (!ctrl->bootstrap_complete) {
             ctrl->bootstrap_complete = true;
             uint32_t duration = (uint32_t)difftime(time(NULL), ctrl->bootstrap_start_time);
-            log_msg(LOG_INFO, "TRIBUF: Bootstrap complete in %u seconds", duration);
+            log_msg(LOG_DEBUG, "TRIBUF: Bootstrap complete in %u seconds", duration);
         }
 
         /* Find next table to fill */
@@ -1632,7 +1632,7 @@ int tribuf_insert(tribuf_controller_t *ctrl, const wbpxre_routing_node_t *node) 
             }
 
             uint32_t cleared_nodes = wbpxre_routing_table_count(ctrl->tables[to_clear]);
-            log_msg(LOG_INFO, "TRIBUF: === CLEARING table %d (%u nodes) - ALL THREADS BLOCKED ===",
+            log_msg(LOG_DEBUG, "TRIBUF: === CLEARING table %d (%u nodes) - ALL THREADS BLOCKED ===",
                     to_clear, cleared_nodes);
 
             /* CLEAR the table - this is what we're blocking for */
@@ -1646,7 +1646,7 @@ int tribuf_insert(tribuf_controller_t *ctrl, const wbpxre_routing_node_t *node) 
             /* Advance clear order head */
             ctrl->clear_order_head = (ctrl->clear_order_head + 1) % 3;
 
-            log_msg(LOG_INFO, "TRIBUF: === Table %d cleared, UNBLOCKING ===", to_clear);
+            log_msg(LOG_DEBUG, "TRIBUF: === Table %d cleared, UNBLOCKING ===", to_clear);
 
             next_filling = to_clear;
         }
@@ -1658,7 +1658,7 @@ int tribuf_insert(tribuf_controller_t *ctrl, const wbpxre_routing_node_t *node) 
         /* Generate new node ID for this table */
         wbpxre_random_bytes(ctrl->table_node_ids[next_filling], WBPXRE_NODE_ID_LEN);
 
-        log_msg(LOG_INFO, "TRIBUF: Table %d now FILLING (new node ID generated)", next_filling);
+        log_msg(LOG_DEBUG, "TRIBUF: Table %d now FILLING (new node ID generated)", next_filling);
     }
 
     pthread_mutex_unlock(&ctrl->global_mutex);
