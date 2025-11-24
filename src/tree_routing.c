@@ -3,9 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define K_BUCKET_SIZE 50  /* Increased to 50 to allow ~1500 nodes (50 * ~30 active buckets) */
+#define K_BUCKET_SIZE 100  /* Increased to 100 to allow ~3000 nodes (100 * ~30 active buckets) */
 #define MAX_FAIL_COUNT 3
-#define MIN_NODE_AGE_FOR_EVICTION 5  /* Don't evict nodes younger than 5 seconds */
+#define MIN_NODE_AGE_FOR_EVICTION 60  /* Don't evict nodes younger than 60 seconds */
 
 /* Calculate XOR distance between two node IDs */
 static void xor_distance(const uint8_t *id1, const uint8_t *id2, uint8_t *out) {
