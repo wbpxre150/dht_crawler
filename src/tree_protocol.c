@@ -639,6 +639,33 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
     return 0;
 }
 
+/* Helper function to skip over a bencode value */
+static void skip_bencode_value(struct bencode *bc, int value_type) {
+    int type;
+    if (value_type == BENCODE_DICT_BEGIN) {
+        /* Skip entire dictionary */
+        int depth = 1;
+        while (depth > 0 && (type = bencode_next(bc)) > 0) {
+            if (type == BENCODE_DICT_BEGIN || type == BENCODE_LIST_BEGIN) {
+                depth++;
+            } else if (type == BENCODE_DICT_END || type == BENCODE_LIST_END) {
+                depth--;
+            }
+        }
+    } else if (value_type == BENCODE_LIST_BEGIN) {
+        /* Skip entire list */
+        int depth = 1;
+        while (depth > 0 && (type = bencode_next(bc)) > 0) {
+            if (type == BENCODE_DICT_BEGIN || type == BENCODE_LIST_BEGIN) {
+                depth++;
+            } else if (type == BENCODE_DICT_END || type == BENCODE_LIST_END) {
+                depth--;
+            }
+        }
+    }
+    /* For STRING and INTEGER, they're already consumed by bencode_next() */
+}
+
 int tree_protocol_extract_tid(const uint8_t *data, size_t len,
                                uint8_t *out_tid, int *out_tid_len) {
     if (!data || len == 0 || !out_tid || !out_tid_len) {
@@ -667,32 +694,6 @@ int tree_protocol_extract_tid(const uint8_t *data, size_t len,
 
     if (log_this) {
         log_msg(LOG_DEBUG, "[tree_protocol] Parsing bencode dict (len=%zu), scanning for 't' key...", len);
-    }
-
-    /* Helper function to skip over a bencode value */
-    auto void skip_bencode_value(int value_type) {
-        if (value_type == BENCODE_DICT_BEGIN) {
-            /* Skip entire dictionary */
-            int depth = 1;
-            while (depth > 0 && (type = bencode_next(&bc)) > 0) {
-                if (type == BENCODE_DICT_BEGIN || type == BENCODE_LIST_BEGIN) {
-                    depth++;
-                } else if (type == BENCODE_DICT_END || type == BENCODE_LIST_END) {
-                    depth--;
-                }
-            }
-        } else if (value_type == BENCODE_LIST_BEGIN) {
-            /* Skip entire list */
-            int depth = 1;
-            while (depth > 0 && (type = bencode_next(&bc)) > 0) {
-                if (type == BENCODE_DICT_BEGIN || type == BENCODE_LIST_BEGIN) {
-                    depth++;
-                } else if (type == BENCODE_DICT_END || type == BENCODE_LIST_END) {
-                    depth--;
-                }
-            }
-        }
-        /* For STRING and INTEGER, they're already consumed by bencode_next() */
     }
 
     /* Scan for "t" key at TOP LEVEL only */
@@ -730,7 +731,7 @@ int tree_protocol_extract_tid(const uint8_t *data, size_t len,
                 return 0;
             } else {
                 /* Not the 't' key - skip over the value if it's a dict/list */
-                skip_bencode_value(type);
+                skip_bencode_value(&bc, type);
             }
         }
     }
