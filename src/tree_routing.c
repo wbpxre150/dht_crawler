@@ -280,46 +280,70 @@ int tree_routing_get_closest(tree_routing_table_t *rt, const uint8_t *target,
 
     pthread_rwlock_rdlock(&rt->rwlock);
 
-    /* Collect all nodes with their distances */
+    /* K-smallest heap selection - O(N*log(K)) time, O(K) space
+     * Maintain a sorted array of the K closest nodes seen so far.
+     * This avoids allocating space for ALL nodes! */
+
     typedef struct {
         tree_node_t node;
         uint8_t distance[20];
     } node_with_dist_t;
 
-    node_with_dist_t *candidates = malloc(rt->total_nodes * sizeof(node_with_dist_t));
-    if (!candidates) {
-        pthread_rwlock_unlock(&rt->rwlock);
-        return 0;
-    }
+    /* Stack-allocate small fixed buffer for K closest nodes (typically K=8) */
+    node_with_dist_t closest[count];
+    int num_closest = 0;
 
-    /* Use flat index for fast iteration (single-pass instead of nested loops) */
-    int num_candidates = 0;
     tree_node_t *node, *tmp;
     HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
-        memcpy(&candidates[num_candidates].node, node, sizeof(tree_node_t));
-        candidates[num_candidates].node.next = NULL;  /* Don't copy linked list pointer */
-        xor_distance(target, node->node_id, candidates[num_candidates].distance);
-        num_candidates++;
-    }
+        uint8_t dist[20];
+        xor_distance(target, node->node_id, dist);
 
-    /* Simple insertion sort by distance (good enough for small K) */
-    for (int i = 1; i < num_candidates; i++) {
-        node_with_dist_t temp = candidates[i];
-        int j = i - 1;
-        while (j >= 0 && memcmp(candidates[j].distance, temp.distance, 20) > 0) {
-            candidates[j + 1] = candidates[j];
-            j--;
+        if (num_closest < count) {
+            /* Fill initial array */
+            memcpy(&closest[num_closest].node, node, sizeof(tree_node_t));
+            closest[num_closest].node.next = NULL;
+            memcpy(closest[num_closest].distance, dist, 20);
+            num_closest++;
+
+            /* If filled, sort once */
+            if (num_closest == count) {
+                /* Insertion sort on initial fill */
+                for (int i = 1; i < num_closest; i++) {
+                    node_with_dist_t temp = closest[i];
+                    int j = i - 1;
+                    while (j >= 0 && memcmp(closest[j].distance, temp.distance, 20) > 0) {
+                        closest[j + 1] = closest[j];
+                        j--;
+                    }
+                    closest[j + 1] = temp;
+                }
+            }
+        } else {
+            /* Check if this node is closer than furthest in our K-set */
+            if (memcmp(dist, closest[count - 1].distance, 20) < 0) {
+                /* Replace furthest, then insertion sort to maintain order */
+                memcpy(&closest[count - 1].node, node, sizeof(tree_node_t));
+                closest[count - 1].node.next = NULL;
+                memcpy(closest[count - 1].distance, dist, 20);
+
+                /* Bubble down the replaced element */
+                int j = count - 2;
+                while (j >= 0 && memcmp(closest[j].distance, closest[j + 1].distance, 20) > 0) {
+                    node_with_dist_t temp = closest[j];
+                    closest[j] = closest[j + 1];
+                    closest[j + 1] = temp;
+                    j--;
+                }
+            }
         }
-        candidates[j + 1] = temp;
     }
 
-    /* Copy closest nodes to output */
-    int result_count = (num_candidates < count) ? num_candidates : count;
+    /* Copy results to output */
+    int result_count = num_closest;
     for (int i = 0; i < result_count; i++) {
-        memcpy(&out[i], &candidates[i].node, sizeof(tree_node_t));
+        memcpy(&out[i], &closest[i].node, sizeof(tree_node_t));
     }
 
-    free(candidates);
     pthread_rwlock_unlock(&rt->rwlock);
     return result_count;
 }
@@ -337,32 +361,31 @@ int tree_routing_get_random_nodes(tree_routing_table_t *rt,
         return 0;
     }
 
-    /* Collect all nodes into array using flat index (fast single-pass iteration) */
-    tree_node_t *all_nodes = malloc(rt->total_nodes * sizeof(tree_node_t));
-    if (!all_nodes) {
-        pthread_rwlock_unlock(&rt->rwlock);
-        return 0;
-    }
+    /* Reservoir sampling algorithm - O(N) time, O(K) space
+     * Instead of copying ALL nodes and shuffling, we iterate once and randomly select K nodes.
+     * This avoids malloc of entire table! Much faster for large tables with small K. */
 
-    int idx = 0;
+    int result_count = (rt->total_nodes < count) ? rt->total_nodes : count;
+    int nodes_seen = 0;
+
     tree_node_t *node, *tmp;
     HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
-        memcpy(&all_nodes[idx], node, sizeof(tree_node_t));
-        all_nodes[idx].next = NULL;
-        idx++;
+        nodes_seen++;
+
+        if (nodes_seen <= result_count) {
+            /* Fill reservoir: copy first K nodes */
+            memcpy(&out[nodes_seen - 1], node, sizeof(tree_node_t));
+            out[nodes_seen - 1].next = NULL;
+        } else {
+            /* Randomly replace elements with decreasing probability */
+            int j = rand() % nodes_seen;
+            if (j < result_count) {
+                memcpy(&out[j], node, sizeof(tree_node_t));
+                out[j].next = NULL;
+            }
+        }
     }
 
-    /* Fisher-Yates shuffle and take first 'count' */
-    int result_count = (rt->total_nodes < count) ? rt->total_nodes : count;
-    for (int i = 0; i < result_count; i++) {
-        int j = i + (rand() % (idx - i));
-        tree_node_t temp = all_nodes[i];
-        all_nodes[i] = all_nodes[j];
-        all_nodes[j] = temp;
-        memcpy(&out[i], &all_nodes[i], sizeof(tree_node_t));
-    }
-
-    free(all_nodes);
     pthread_rwlock_unlock(&rt->rwlock);
     return result_count;
 }
