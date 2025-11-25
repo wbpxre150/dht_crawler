@@ -62,6 +62,7 @@ tree_routing_table_t *tree_routing_create(const uint8_t *our_node_id) {
     }
 
     rt->total_nodes = 0;
+    rt->node_hash = NULL;  /* Initialize uthash */
     return rt;
 }
 
@@ -71,6 +72,13 @@ void tree_routing_destroy(tree_routing_table_t *rt) {
     }
 
     pthread_rwlock_wrlock(&rt->rwlock);
+
+    /* Free hash map entries first */
+    tree_node_hash_entry_t *hash_entry, *tmp;
+    HASH_ITER(hh, rt->node_hash, hash_entry, tmp) {
+        HASH_DEL(rt->node_hash, hash_entry);
+        free(hash_entry);
+    }
 
     /* Free all nodes in all buckets */
     for (int i = 0; i < 160; i++) {
@@ -103,18 +111,18 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
     int bucket_idx = get_bucket_index(rt->our_node_id, node_id);
     tree_bucket_t *bucket = &rt->buckets[bucket_idx];
 
-    /* Check if node already exists */
-    tree_node_t *existing = bucket->nodes;
-    while (existing) {
-        if (memcmp(existing->node_id, node_id, 20) == 0) {
-            /* Update existing node */
-            memcpy(&existing->addr, addr, sizeof(struct sockaddr_storage));
-            existing->last_seen = time(NULL);
-            existing->fail_count = 0;
-            pthread_rwlock_unlock(&rt->rwlock);
-            return 0;
-        }
-        existing = existing->next;
+    /* Check if node already exists using hash map (O(1) instead of O(n)) */
+    tree_node_hash_entry_t *hash_entry = NULL;
+    HASH_FIND(hh, rt->node_hash, node_id, 20, hash_entry);
+
+    if (hash_entry) {
+        /* Update existing node */
+        tree_node_t *existing = hash_entry->node_ptr;
+        memcpy(&existing->addr, addr, sizeof(struct sockaddr_storage));
+        existing->last_seen = time(NULL);
+        existing->fail_count = 0;
+        pthread_rwlock_unlock(&rt->rwlock);
+        return 0;
     }
 
     /* Check if bucket is full */
@@ -128,6 +136,15 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
             if (curr->fail_count >= MAX_FAIL_COUNT) {
                 *prev = curr->next;
                 evicted = curr;
+
+                /* Remove from hash map */
+                tree_node_hash_entry_t *evict_hash_entry = NULL;
+                HASH_FIND(hh, rt->node_hash, evicted->node_id, 20, evict_hash_entry);
+                if (evict_hash_entry) {
+                    HASH_DEL(rt->node_hash, evict_hash_entry);
+                    free(evict_hash_entry);
+                }
+
                 free(evicted);
                 bucket->count--;
                 rt->total_nodes--;
@@ -195,6 +212,14 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
                         lru_eviction_count, bucket_idx, (long)age);
             }
 
+            /* Remove from hash map */
+            tree_node_hash_entry_t *lru_hash_entry = NULL;
+            HASH_FIND(hh, rt->node_hash, lru_node->node_id, 20, lru_hash_entry);
+            if (lru_hash_entry) {
+                HASH_DEL(rt->node_hash, lru_hash_entry);
+                free(lru_hash_entry);
+            }
+
             free(lru_node);
             bucket->count--;
             rt->total_nodes--;
@@ -216,6 +241,14 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
     bucket->nodes = new_node;
     bucket->count++;
     rt->total_nodes++;
+
+    /* Add to hash map for O(1) future lookups */
+    tree_node_hash_entry_t *new_hash_entry = malloc(sizeof(tree_node_hash_entry_t));
+    if (new_hash_entry) {
+        memcpy(new_hash_entry->node_id, node_id, 20);
+        new_hash_entry->node_ptr = new_node;
+        HASH_ADD(hh, rt->node_hash, node_id, 20, new_hash_entry);
+    }
 
     pthread_rwlock_unlock(&rt->rwlock);
     return 0;
@@ -331,23 +364,37 @@ void tree_routing_mark_failed(tree_routing_table_t *rt, const uint8_t *node_id) 
     int bucket_idx = get_bucket_index(rt->our_node_id, node_id);
     tree_bucket_t *bucket = &rt->buckets[bucket_idx];
 
-    tree_node_t **prev = &bucket->nodes;
-    tree_node_t *curr = bucket->nodes;
-    while (curr) {
-        if (memcmp(curr->node_id, node_id, 20) == 0) {
-            curr->fail_count++;
-            if (curr->fail_count >= MAX_FAIL_COUNT) {
-                /* Evict node */
+    /* O(1) hash lookup instead of O(n) linked list search */
+    tree_node_hash_entry_t *hash_entry = NULL;
+    HASH_FIND(hh, rt->node_hash, node_id, 20, hash_entry);
+
+    if (!hash_entry) {
+        pthread_rwlock_unlock(&rt->rwlock);
+        return;  /* Node not found */
+    }
+
+    tree_node_t *node = hash_entry->node_ptr;
+    node->fail_count++;
+
+    if (node->fail_count >= MAX_FAIL_COUNT) {
+        /* Evict node from bucket linked list */
+        tree_node_t **prev = &bucket->nodes;
+        tree_node_t *curr = bucket->nodes;
+        while (curr) {
+            if (curr == node) {
                 *prev = curr->next;
-                free(curr);
-                bucket->count--;
-                rt->total_nodes--;
+                break;
             }
-            pthread_rwlock_unlock(&rt->rwlock);
-            return;
+            prev = &curr->next;
+            curr = curr->next;
         }
-        prev = &curr->next;
-        curr = curr->next;
+
+        /* Remove from hash map */
+        HASH_DEL(rt->node_hash, hash_entry);
+        free(hash_entry);
+        free(node);
+        bucket->count--;
+        rt->total_nodes--;
     }
 
     pthread_rwlock_unlock(&rt->rwlock);

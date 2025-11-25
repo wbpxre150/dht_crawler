@@ -6,6 +6,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "../lib/uthash/src/uthash.h"
 
 /**
  * Private routing table for thread trees
@@ -33,12 +34,22 @@ typedef struct tree_bucket {
     int max_nodes;  /* k = 8 typically */
 } tree_bucket_t;
 
+/* Hash map entry: node_id → pointer to tree_node_t in bucket */
+typedef struct tree_node_hash_entry {
+    uint8_t node_id[20];        /* Key (20 bytes) */
+    tree_node_t *node_ptr;      /* Value: pointer to node in bucket linked list */
+    UT_hash_handle hh;          /* uthash handle */
+} tree_node_hash_entry_t;
+
 /* Complete routing table */
 typedef struct tree_routing_table {
     uint8_t our_node_id[20];
     tree_bucket_t buckets[160];  /* 160-bit address space */
     int total_nodes;
     pthread_rwlock_t rwlock;  /* Read-write lock: concurrent reads, exclusive writes */
+
+    /* Hash map for O(1) lookups */
+    tree_node_hash_entry_t *node_hash;  /* node_id → tree_node_t* */
 } tree_routing_table_t;
 
 /**
