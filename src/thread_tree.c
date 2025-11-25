@@ -548,19 +548,24 @@ typedef struct get_peers_worker_ctx {
     tree_response_queue_t *response_queue;  /* Per-worker response queue */
 } get_peers_worker_ctx_t;
 
-/* Get_peers worker thread function (Stage 4) */
+/* Get_peers worker thread function (Stage 4) - NEW DISPATCHER PATTERN */
 static void *get_peers_worker_func(void *arg) {
     get_peers_worker_ctx_t *ctx = (get_peers_worker_ctx_t *)arg;
     thread_tree_t *tree = ctx->tree;
     int worker_id = ctx->worker_id;
+    tree_response_queue_t *my_queue = ctx->response_queue;
 
     log_msg(LOG_DEBUG, "[tree %u] get_peers worker %d started", tree->tree_id, worker_id);
 
     tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
     tree_socket_t *sock = (tree_socket_t *)tree->socket;
     tree_peers_queue_t *peers_queue = (tree_peers_queue_t *)tree->peers_queue;
-    uint8_t recv_buf[2048];
+    tree_dispatcher_t *dispatcher = tree->dispatcher;
     bool first_peers_found = false;
+
+    unsigned long queries_sent = 0;
+    unsigned long responses_received = 0;
+    unsigned long timeouts = 0;
 
     while (!atomic_load(&tree->shutdown_requested)) {
         /* 1. Pop infohash from queue (with timeout) */
@@ -595,15 +600,28 @@ static void *get_peers_worker_func(void *arg) {
                 /* Generate TID for this query */
                 uint8_t tid[4];
                 int tid_len = tree_protocol_gen_tid(tid);
+
+                /* Register TID with dispatcher BEFORE sending */
+                tree_dispatcher_register_tid(dispatcher, tid, tid_len, my_queue);
+
+                /* Send get_peers query */
                 tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
+                queries_sent++;
 
-                /* Wait for response with timeout (100ms for faster shutdown response) */
-                struct sockaddr_storage from;
-                int recv_len = tree_socket_recv(sock, recv_buf, sizeof(recv_buf), &from, 100);
+                /* Wait for response on personal queue (500ms timeout, increased from 100ms) */
+                tree_response_t response_pkt;
+                int pop_result = tree_response_queue_pop(my_queue, &response_pkt, 500);
 
-                if (recv_len > 0) {
+                /* Unregister TID immediately after receiving (or timeout) */
+                tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+
+                if (pop_result == 0) {
+                    /* Got a response! */
+                    responses_received++;
+
                     tree_get_peers_response_t response;
-                    if (tree_handle_get_peers_response(tree, recv_buf, recv_len, &from, &response) == 0) {
+                    if (tree_handle_get_peers_response(tree, response_pkt.data, response_pkt.len,
+                                                       &response_pkt.from, &response) == 0) {
                         /* Collect peers */
                         for (int p = 0; p < response.peer_count && result.peer_count < MAX_PEERS_PER_ENTRY; p++) {
                             memcpy(&result.peers[result.peer_count], &response.peers[p],
@@ -617,6 +635,9 @@ static void *get_peers_worker_func(void *arg) {
                             /* Could track these for next iteration, but keeping it simple */
                         }
                     }
+                } else {
+                    /* Timeout or error */
+                    timeouts++;
                 }
             }
 
@@ -645,27 +666,43 @@ static void *get_peers_worker_func(void *arg) {
         }
     }
 
+    /* Log worker statistics on exit */
+    log_msg(LOG_INFO, "[tree %u] get_peers worker %d exiting: queries=%lu, responses=%lu, timeouts=%lu (%.1f%% success)",
+            tree->tree_id, worker_id, queries_sent, responses_received, timeouts,
+            queries_sent > 0 ? (100.0 * responses_received / queries_sent) : 0.0);
+
     free(ctx);
-    log_msg(LOG_DEBUG, "[tree %u] get_peers worker %d exiting", tree->tree_id, worker_id);
     return NULL;
 }
 
-/* Start get_peers workers (Stage 4) */
+/* Start get_peers workers (Stage 4) - NEW DISPATCHER PATTERN */
 static void tree_start_get_peers_workers(thread_tree_t *tree) {
-    log_msg(LOG_DEBUG, "[tree %u] Starting %d get_peers workers", tree->tree_id, tree->num_get_peers_workers);
+    log_msg(LOG_DEBUG, "[tree %u] Starting %d get_peers workers with dispatcher pattern",
+            tree->tree_id, tree->num_get_peers_workers);
 
     for (int i = 0; i < tree->num_get_peers_workers; i++) {
+        /* Create per-worker response queue (capacity 10 for buffering burst responses) */
+        tree_response_queue_t *response_queue = tree_response_queue_create(10);
+        if (!response_queue) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create response queue for get_peers worker %d",
+                    tree->tree_id, i);
+            continue;
+        }
+
         get_peers_worker_ctx_t *ctx = malloc(sizeof(get_peers_worker_ctx_t));
         if (!ctx) {
             log_msg(LOG_ERROR, "[tree %u] Failed to allocate get_peers worker context", tree->tree_id);
+            tree_response_queue_destroy(response_queue);
             continue;
         }
         ctx->tree = tree;
         ctx->worker_id = i;
+        ctx->response_queue = response_queue;
 
         int rc = pthread_create(&tree->get_peers_threads[i], NULL, get_peers_worker_func, ctx);
         if (rc != 0) {
             log_msg(LOG_ERROR, "[tree %u] Failed to create get_peers worker %d: %d", tree->tree_id, i, rc);
+            tree_response_queue_destroy(response_queue);
             free(ctx);
         }
     }

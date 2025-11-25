@@ -28,13 +28,16 @@ struct thread_tree;
 /* Maximum TID size (4 bytes for 32-bit counter) */
 #define MAX_TID_SIZE 4
 
-/* TID registration entry */
+/* Include uthash for TID hash table */
+#include "../lib/uthash/src/uthash.h"
+
+/* TID registration entry - uses uthash for O(1) lookups */
 typedef struct tid_registration {
     uint8_t tid[MAX_TID_SIZE];
     int tid_len;
     tree_response_queue_t *response_queue;
     time_t registered_at;
-    struct tid_registration *next;  /* For hash table chaining */
+    UT_hash_handle hh;  /* uthash handle (replaces manual 'next' pointer) */
 } tid_registration_t;
 
 /* Dispatcher structure */
@@ -42,9 +45,8 @@ typedef struct tree_dispatcher {
     struct thread_tree *tree;
     tree_socket_t *socket;
 
-    /* TID → response queue mapping (simple hash table) */
-    tid_registration_t **tid_map;
-    int tid_map_capacity;
+    /* TID → response queue mapping (uthash table) */
+    tid_registration_t *tid_map_head;  /* uthash head pointer */
     pthread_rwlock_t tid_map_lock;
 
     /* Dispatcher thread */

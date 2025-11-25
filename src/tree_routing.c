@@ -62,7 +62,8 @@ tree_routing_table_t *tree_routing_create(const uint8_t *our_node_id) {
     }
 
     rt->total_nodes = 0;
-    rt->node_hash = NULL;  /* Initialize uthash */
+    rt->node_hash = NULL;  /* Initialize uthash for lookups */
+    rt->flat_index_head = NULL;  /* Initialize uthash for iteration */
     return rt;
 }
 
@@ -73,20 +74,28 @@ void tree_routing_destroy(tree_routing_table_t *rt) {
 
     pthread_rwlock_wrlock(&rt->rwlock);
 
-    /* Free hash map entries first */
-    tree_node_hash_entry_t *hash_entry, *tmp;
-    HASH_ITER(hh, rt->node_hash, hash_entry, tmp) {
+    /* Free hash map entries first (lookup index) */
+    tree_node_hash_entry_t *hash_entry, *tmp_hash;
+    HASH_ITER(hh, rt->node_hash, hash_entry, tmp_hash) {
         HASH_DEL(rt->node_hash, hash_entry);
         free(hash_entry);
     }
 
-    /* Free all nodes in all buckets */
+    /* Note: flat_index_head points to same nodes as buckets, so don't free twice.
+     * Just clear the flat index structure (uthash handles) */
+    tree_node_t *node, *tmp_node;
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp_node) {
+        HASH_DELETE(hh_flat, rt->flat_index_head, node);
+        /* Don't free(node) here - we'll free from buckets below */
+    }
+
+    /* Free all nodes in all buckets (actual memory deallocation) */
     for (int i = 0; i < 160; i++) {
-        tree_node_t *node = rt->buckets[i].nodes;
-        while (node) {
-            tree_node_t *next = node->next;
-            free(node);
-            node = next;
+        tree_node_t *bucket_node = rt->buckets[i].nodes;
+        while (bucket_node) {
+            tree_node_t *next = bucket_node->next;
+            free(bucket_node);
+            bucket_node = next;
         }
     }
 
@@ -144,6 +153,9 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
                     HASH_DEL(rt->node_hash, evict_hash_entry);
                     free(evict_hash_entry);
                 }
+
+                /* Remove from flat index */
+                HASH_DELETE(hh_flat, rt->flat_index_head, evicted);
 
                 free(evicted);
                 bucket->count--;
@@ -220,6 +232,9 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
                 free(lru_hash_entry);
             }
 
+            /* Remove from flat index */
+            HASH_DELETE(hh_flat, rt->flat_index_head, lru_node);
+
             free(lru_node);
             bucket->count--;
             rt->total_nodes--;
@@ -250,6 +265,9 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
         HASH_ADD(hh, rt->node_hash, node_id, 20, new_hash_entry);
     }
 
+    /* Add to flat index for fast iteration (using separate hash handle) */
+    HASH_ADD_KEYPTR(hh_flat, rt->flat_index_head, new_node->node_id, 20, new_node);
+
     pthread_rwlock_unlock(&rt->rwlock);
     return 0;
 }
@@ -274,16 +292,14 @@ int tree_routing_get_closest(tree_routing_table_t *rt, const uint8_t *target,
         return 0;
     }
 
+    /* Use flat index for fast iteration (single-pass instead of nested loops) */
     int num_candidates = 0;
-    for (int i = 0; i < 160; i++) {
-        tree_node_t *node = rt->buckets[i].nodes;
-        while (node) {
-            memcpy(&candidates[num_candidates].node, node, sizeof(tree_node_t));
-            candidates[num_candidates].node.next = NULL;  /* Don't copy linked list pointer */
-            xor_distance(target, node->node_id, candidates[num_candidates].distance);
-            num_candidates++;
-            node = node->next;
-        }
+    tree_node_t *node, *tmp;
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
+        memcpy(&candidates[num_candidates].node, node, sizeof(tree_node_t));
+        candidates[num_candidates].node.next = NULL;  /* Don't copy linked list pointer */
+        xor_distance(target, node->node_id, candidates[num_candidates].distance);
+        num_candidates++;
     }
 
     /* Simple insertion sort by distance (good enough for small K) */
@@ -321,7 +337,7 @@ int tree_routing_get_random_nodes(tree_routing_table_t *rt,
         return 0;
     }
 
-    /* Collect all nodes into array */
+    /* Collect all nodes into array using flat index (fast single-pass iteration) */
     tree_node_t *all_nodes = malloc(rt->total_nodes * sizeof(tree_node_t));
     if (!all_nodes) {
         pthread_rwlock_unlock(&rt->rwlock);
@@ -329,14 +345,11 @@ int tree_routing_get_random_nodes(tree_routing_table_t *rt,
     }
 
     int idx = 0;
-    for (int i = 0; i < 160; i++) {
-        tree_node_t *node = rt->buckets[i].nodes;
-        while (node) {
-            memcpy(&all_nodes[idx], node, sizeof(tree_node_t));
-            all_nodes[idx].next = NULL;
-            idx++;
-            node = node->next;
-        }
+    tree_node_t *node, *tmp;
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
+        memcpy(&all_nodes[idx], node, sizeof(tree_node_t));
+        all_nodes[idx].next = NULL;
+        idx++;
     }
 
     /* Fisher-Yates shuffle and take first 'count' */
@@ -392,6 +405,10 @@ void tree_routing_mark_failed(tree_routing_table_t *rt, const uint8_t *node_id) 
         /* Remove from hash map */
         HASH_DEL(rt->node_hash, hash_entry);
         free(hash_entry);
+
+        /* Remove from flat index */
+        HASH_DELETE(hh_flat, rt->flat_index_head, node);
+
         free(node);
         bucket->count--;
         rt->total_nodes--;

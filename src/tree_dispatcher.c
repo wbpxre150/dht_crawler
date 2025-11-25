@@ -11,18 +11,8 @@
 #include <errno.h>
 #include <arpa/inet.h>
 
-/* Hash function for TID (simple sum mod capacity) */
-static int tid_hash(const uint8_t *tid, int tid_len, int capacity) {
-    if (!tid || tid_len <= 0 || capacity <= 0) {
-        return 0;
-    }
-
-    int hash = 0;
-    for (int i = 0; i < tid_len; i++) {
-        hash += tid[i];
-    }
-    return hash % capacity;
-}
+/* TID comparison helper for uthash
+ * NOTE: uthash requires exact key length match, so we use variable-length keys */
 
 /* Dispatcher thread function */
 static void *dispatcher_thread_func(void *arg) {
@@ -119,27 +109,24 @@ static void *dispatcher_thread_func(void *arg) {
         log_msg(LOG_DEBUG, "[tree %u] Dispatcher: Extracted TID (len=%d): %02x %02x %02x",
                 tree_id, tid_len, tid[0], tid[1], tid[2]);
 
-        /* Find response queue for this TID */
+        /* Find response queue for this TID using uthash O(1) lookup */
         pthread_rwlock_rdlock(&dispatcher->tid_map_lock);
 
-        int hash_idx = tid_hash(tid, tid_len, dispatcher->tid_map_capacity);
-        tid_registration_t *reg = dispatcher->tid_map[hash_idx];
-
+        tid_registration_t *reg = NULL;
         tree_response_queue_t *target_queue = NULL;
-        while (reg) {
-            if (reg->tid_len == tid_len && memcmp(reg->tid, tid, tid_len) == 0) {
-                target_queue = reg->response_queue;
-                break;
-            }
-            reg = reg->next;
+
+        /* uthash lookup with variable-length key */
+        HASH_FIND(hh, dispatcher->tid_map_head, tid, tid_len, reg);
+        if (reg) {
+            target_queue = reg->response_queue;
         }
 
         pthread_rwlock_unlock(&dispatcher->tid_map_lock);
 
         if (!target_queue) {
             /* No registered worker for this TID - might be response to old query */
-            log_msg(LOG_DEBUG, "[tree %u] Dispatcher: No registered worker for TID %02x%02x%02x (hash=%d)",
-                    tree_id, tid[0], tid[1], tid[2], hash_idx);
+            log_msg(LOG_DEBUG, "[tree %u] Dispatcher: No registered worker for TID %02x%02x%02x",
+                    tree_id, tid[0], tid[1], tid[2]);
             atomic_fetch_add(&dispatcher->dropped_responses, 1);
             continue;
         }
@@ -194,18 +181,11 @@ tree_dispatcher_t *tree_dispatcher_create(struct thread_tree *tree, tree_socket_
     dispatcher->tree = tree;
     dispatcher->socket = socket;
 
-    /* Initialize TID map (simple hash table with chaining) */
-    dispatcher->tid_map_capacity = 1024;  /* Support up to ~1000 concurrent queries */
-    dispatcher->tid_map = calloc(dispatcher->tid_map_capacity, sizeof(tid_registration_t *));
-    if (!dispatcher->tid_map) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to allocate TID map", tree->tree_id);
-        free(dispatcher);
-        return NULL;
-    }
+    /* Initialize TID map (uthash - starts empty) */
+    dispatcher->tid_map_head = NULL;  /* uthash: NULL = empty hash table */
 
     if (pthread_rwlock_init(&dispatcher->tid_map_lock, NULL) != 0) {
         log_msg(LOG_ERROR, "[tree %u] Failed to init TID map lock", tree->tree_id);
-        free(dispatcher->tid_map);
         free(dispatcher);
         return NULL;
     }
@@ -265,22 +245,18 @@ void tree_dispatcher_destroy(tree_dispatcher_t *dispatcher) {
 
     tree_dispatcher_stop(dispatcher);
 
-    /* Free all TID registrations */
+    /* Free all TID registrations using uthash iteration */
     pthread_rwlock_wrlock(&dispatcher->tid_map_lock);
 
-    for (int i = 0; i < dispatcher->tid_map_capacity; i++) {
-        tid_registration_t *reg = dispatcher->tid_map[i];
-        while (reg) {
-            tid_registration_t *next = reg->next;
-            free(reg);
-            reg = next;
-        }
+    tid_registration_t *reg, *tmp;
+    HASH_ITER(hh, dispatcher->tid_map_head, reg, tmp) {
+        HASH_DEL(dispatcher->tid_map_head, reg);
+        free(reg);
     }
 
     pthread_rwlock_unlock(&dispatcher->tid_map_lock);
     pthread_rwlock_destroy(&dispatcher->tid_map_lock);
 
-    free(dispatcher->tid_map);
     free(dispatcher);
 
     log_msg(LOG_DEBUG, "[dispatcher] Destroyed");
@@ -293,8 +269,26 @@ int tree_dispatcher_register_tid(tree_dispatcher_t *dispatcher,
         return -1;
     }
 
+    pthread_rwlock_wrlock(&dispatcher->tid_map_lock);
+
+    /* Check for duplicate TID using uthash O(1) lookup */
+    tid_registration_t *existing = NULL;
+    HASH_FIND(hh, dispatcher->tid_map_head, tid, tid_len, existing);
+
+    if (existing) {
+        /* TID already registered - this is a bug, but update it anyway */
+        log_msg(LOG_WARN, "[tree %u] TID already registered, updating",
+                dispatcher->tree ? dispatcher->tree->tree_id : 0);
+        existing->response_queue = response_queue;
+        existing->registered_at = time(NULL);
+        pthread_rwlock_unlock(&dispatcher->tid_map_lock);
+        return 0;
+    }
+
+    /* Create new registration */
     tid_registration_t *reg = malloc(sizeof(tid_registration_t));
     if (!reg) {
+        pthread_rwlock_unlock(&dispatcher->tid_map_lock);
         return -1;
     }
 
@@ -302,31 +296,9 @@ int tree_dispatcher_register_tid(tree_dispatcher_t *dispatcher,
     reg->tid_len = tid_len;
     reg->response_queue = response_queue;
     reg->registered_at = time(NULL);
-    reg->next = NULL;
 
-    pthread_rwlock_wrlock(&dispatcher->tid_map_lock);
-
-    int hash_idx = tid_hash(tid, tid_len, dispatcher->tid_map_capacity);
-
-    /* Check for duplicate TID (should be rare with good TID generation) */
-    tid_registration_t *existing = dispatcher->tid_map[hash_idx];
-    while (existing) {
-        if (existing->tid_len == tid_len && memcmp(existing->tid, tid, tid_len) == 0) {
-            /* TID already registered - this is a bug, but update it anyway */
-            log_msg(LOG_WARN, "[tree %u] TID already registered, updating",
-                    dispatcher->tree ? dispatcher->tree->tree_id : 0);
-            existing->response_queue = response_queue;
-            existing->registered_at = time(NULL);
-            pthread_rwlock_unlock(&dispatcher->tid_map_lock);
-            free(reg);
-            return 0;
-        }
-        existing = existing->next;
-    }
-
-    /* Insert at head of chain */
-    reg->next = dispatcher->tid_map[hash_idx];
-    dispatcher->tid_map[hash_idx] = reg;
+    /* Add to uthash table (variable-length key) */
+    HASH_ADD_KEYPTR(hh, dispatcher->tid_map_head, reg->tid, reg->tid_len, reg);
 
     pthread_rwlock_unlock(&dispatcher->tid_map_lock);
 
@@ -341,20 +313,13 @@ void tree_dispatcher_unregister_tid(tree_dispatcher_t *dispatcher,
 
     pthread_rwlock_wrlock(&dispatcher->tid_map_lock);
 
-    int hash_idx = tid_hash(tid, tid_len, dispatcher->tid_map_capacity);
+    /* Find and delete registration using uthash O(1) operations */
+    tid_registration_t *reg = NULL;
+    HASH_FIND(hh, dispatcher->tid_map_head, tid, tid_len, reg);
 
-    tid_registration_t **prev = &dispatcher->tid_map[hash_idx];
-    tid_registration_t *curr = dispatcher->tid_map[hash_idx];
-
-    while (curr) {
-        if (curr->tid_len == tid_len && memcmp(curr->tid, tid, tid_len) == 0) {
-            *prev = curr->next;
-            free(curr);
-            pthread_rwlock_unlock(&dispatcher->tid_map_lock);
-            return;
-        }
-        prev = &curr->next;
-        curr = curr->next;
+    if (reg) {
+        HASH_DEL(dispatcher->tid_map_head, reg);
+        free(reg);
     }
 
     pthread_rwlock_unlock(&dispatcher->tid_map_lock);
@@ -370,20 +335,13 @@ int tree_dispatcher_cleanup_stale_tids(tree_dispatcher_t *dispatcher, int timeou
 
     pthread_rwlock_wrlock(&dispatcher->tid_map_lock);
 
-    for (int i = 0; i < dispatcher->tid_map_capacity; i++) {
-        tid_registration_t **prev = &dispatcher->tid_map[i];
-        tid_registration_t *curr = dispatcher->tid_map[i];
-
-        while (curr) {
-            if ((now - curr->registered_at) > timeout_sec) {
-                *prev = curr->next;
-                free(curr);
-                curr = *prev;
-                removed++;
-            } else {
-                prev = &curr->next;
-                curr = curr->next;
-            }
+    /* Iterate all registrations using uthash and remove stale ones */
+    tid_registration_t *reg, *tmp;
+    HASH_ITER(hh, dispatcher->tid_map_head, reg, tmp) {
+        if ((now - reg->registered_at) > timeout_sec) {
+            HASH_DEL(dispatcher->tid_map_head, reg);
+            free(reg);
+            removed++;
         }
     }
 

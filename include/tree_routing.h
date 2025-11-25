@@ -25,6 +25,7 @@ typedef struct tree_node {
     time_t last_seen;
     int fail_count;
     struct tree_node *next;  /* For bucket linked list */
+    UT_hash_handle hh_flat;  /* uthash handle for flat index (fast iteration) */
 } tree_node_t;
 
 /* Bucket in the routing table (k-bucket) */
@@ -49,7 +50,10 @@ typedef struct tree_routing_table {
     pthread_rwlock_t rwlock;  /* Read-write lock: concurrent reads, exclusive writes */
 
     /* Hash map for O(1) lookups */
-    tree_node_hash_entry_t *node_hash;  /* node_id → tree_node_t* */
+    tree_node_hash_entry_t *node_hash;  /* node_id → tree_node_t* (for updates/lookups) */
+
+    /* Flat index for fast iteration (avoids bucket traversal) */
+    tree_node_t *flat_index_head;  /* node_id → tree_node_t* (for iteration) */
 } tree_routing_table_t;
 
 /**
