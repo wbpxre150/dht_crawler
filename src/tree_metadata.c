@@ -736,6 +736,86 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     return result;
 }
 
+/**
+ * Convert tree metadata format to database format
+ * @param tree_meta Tree metadata structure (will NOT be freed)
+ * @param db_meta Output database metadata structure (caller must free)
+ * @return 0 on success, -1 on error
+ */
+static int tree_metadata_to_database_format(
+    const tree_torrent_metadata_t *tree_meta,
+    torrent_metadata_t *db_meta
+) {
+    if (!tree_meta || !db_meta) {
+        return -1;
+    }
+
+    memset(db_meta, 0, sizeof(torrent_metadata_t));
+
+    /* Copy infohash */
+    memcpy(db_meta->info_hash, tree_meta->infohash, 20);
+
+    /* Copy name (strdup for ownership) */
+    db_meta->name = strdup(tree_meta->name);
+    if (!db_meta->name) {
+        return -1;
+    }
+
+    /* Copy size and metadata */
+    db_meta->size_bytes = tree_meta->total_size;
+    db_meta->total_peers = 0;  /* Not tracked in tree architecture */
+    db_meta->added_timestamp = time(NULL);
+
+    /* Convert file arrays to file_info_t array */
+    db_meta->num_files = tree_meta->file_count;
+    if (tree_meta->file_count > 0) {
+        db_meta->files = malloc(tree_meta->file_count * sizeof(file_info_t));
+        if (!db_meta->files) {
+            free(db_meta->name);
+            return -1;
+        }
+
+        for (int i = 0; i < tree_meta->file_count; i++) {
+            db_meta->files[i].path = strdup(tree_meta->files[i]);
+            if (!db_meta->files[i].path) {
+                /* Cleanup on failure */
+                for (int j = 0; j < i; j++) {
+                    free(db_meta->files[j].path);
+                }
+                free(db_meta->files);
+                free(db_meta->name);
+                return -1;
+            }
+            db_meta->files[i].size_bytes = tree_meta->file_sizes[i];
+            db_meta->files[i].file_index = i;
+        }
+    } else {
+        db_meta->files = NULL;
+    }
+
+    return 0;
+}
+
+/**
+ * Free database format metadata (after batch_writer_add copies it)
+ */
+static void free_database_metadata(torrent_metadata_t *db_meta) {
+    if (!db_meta) return;
+
+    if (db_meta->name) {
+        free(db_meta->name);
+    }
+
+    if (db_meta->files) {
+        for (int i = 0; i < db_meta->num_files; i++) {
+            if (db_meta->files[i].path) {
+                free(db_meta->files[i].path);
+            }
+        }
+        free(db_meta->files);
+    }
+}
+
 /* Free metadata */
 void tree_free_metadata(tree_torrent_metadata_t *meta) {
     if (!meta) return;
@@ -786,13 +866,38 @@ void *tree_metadata_worker_func(void *arg) {
             atomic_fetch_add(&tree->metadata_count, 1);
             atomic_store(&tree->last_metadata_time, time(NULL));
 
-            /* Convert to database format and submit */
-            /* Note: In a real implementation, we'd need access to the shared batch_writer
-             * through tree->supervisor_ctx or similar. For now, just log success. */
             log_msg(LOG_DEBUG, "[tree %u] Fetched metadata: %s (%lld bytes, %d files)",
                     tree->tree_id, metadata->name,
                     (long long)metadata->total_size, metadata->file_count);
 
+            /* Convert to database format */
+            torrent_metadata_t db_meta;
+            int rc = tree_metadata_to_database_format(metadata, &db_meta);
+
+            if (rc == 0 && tree->shared_batch_writer) {
+                /* Add to batch writer (batch_writer makes deep copy) */
+                rc = batch_writer_add(tree->shared_batch_writer, &db_meta);
+                if (rc != 0) {
+                    char hex[41];
+                    for (int i = 0; i < 20; i++) {
+                        snprintf(hex + i * 2, 3, "%02x", metadata->infohash[i]);
+                    }
+                    log_msg(LOG_ERROR, "[tree %u] Failed to add torrent %s to batch writer",
+                            tree->tree_id, hex);
+                }
+
+                /* Free our temporary conversion (batch_writer has its own copy) */
+                free_database_metadata(&db_meta);
+            } else {
+                log_msg(LOG_ERROR, "[tree %u] Failed to convert metadata or batch_writer unavailable",
+                        tree->tree_id);
+                if (rc == 0) {
+                    /* Conversion succeeded but batch_writer missing - clean up */
+                    free_database_metadata(&db_meta);
+                }
+            }
+
+            /* Free original tree metadata */
             tree_free_metadata(metadata);
         }
     }
