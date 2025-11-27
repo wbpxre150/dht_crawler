@@ -126,6 +126,16 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Keyspace partitioning - enabled by default */
     config->use_keyspace_partitioning = 1;          /* 1=enabled (evenly distributed node IDs) */
+
+    /* Refresh thread defaults (for /refresh HTTP endpoint) */
+    config->refresh_bootstrap_sample_size = 1000;   /* Sample 1000 nodes from shared pool */
+    config->refresh_routing_table_target = 500;     /* Target 500 nodes in routing table */
+    config->refresh_ping_workers = 1;               /* 1 ping worker */
+    config->refresh_find_node_workers = 1;          /* 1 find_node worker */
+    config->refresh_get_peers_workers = 1;          /* 1 get_peers worker */
+    config->refresh_request_queue_capacity = 100;   /* 100 request queue capacity */
+    config->refresh_get_peers_timeout_ms = 500;     /* 500ms get_peers timeout */
+    config->refresh_max_iterations = 3;             /* 3 iterations max */
 }
 
 /* Load config from INI-style file */
@@ -405,6 +415,38 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Keyspace partitioning toggle */
         else if (strcmp(key, "use_keyspace_partitioning") == 0) {
             config->use_keyspace_partitioning = atoi(value);
+        }
+        /* Refresh thread settings */
+        else if (strcmp(key, "refresh_bootstrap_sample_size") == 0) {
+            config->refresh_bootstrap_sample_size = atoi(value);
+            if (config->refresh_bootstrap_sample_size < 100) config->refresh_bootstrap_sample_size = 100;
+            if (config->refresh_bootstrap_sample_size > 10000) config->refresh_bootstrap_sample_size = 10000;
+        } else if (strcmp(key, "refresh_routing_table_target") == 0) {
+            config->refresh_routing_table_target = atoi(value);
+            if (config->refresh_routing_table_target < 50) config->refresh_routing_table_target = 50;
+            if (config->refresh_routing_table_target > 2000) config->refresh_routing_table_target = 2000;
+        } else if (strcmp(key, "refresh_ping_workers") == 0) {
+            config->refresh_ping_workers = atoi(value);
+            if (config->refresh_ping_workers < 0) config->refresh_ping_workers = 0;
+            if (config->refresh_ping_workers > 10) config->refresh_ping_workers = 10;
+        } else if (strcmp(key, "refresh_find_node_workers") == 0) {
+            config->refresh_find_node_workers = atoi(value);
+            if (config->refresh_find_node_workers < 1) config->refresh_find_node_workers = 1;
+            if (config->refresh_find_node_workers > 10) config->refresh_find_node_workers = 10;
+        } else if (strcmp(key, "refresh_get_peers_workers") == 0) {
+            config->refresh_get_peers_workers = atoi(value);
+            if (config->refresh_get_peers_workers < 1) config->refresh_get_peers_workers = 1;
+            if (config->refresh_get_peers_workers > 10) config->refresh_get_peers_workers = 10;
+        } else if (strcmp(key, "refresh_request_queue_capacity") == 0) {
+            config->refresh_request_queue_capacity = atoi(value);
+            if (config->refresh_request_queue_capacity < 10) config->refresh_request_queue_capacity = 10;
+        } else if (strcmp(key, "refresh_get_peers_timeout_ms") == 0) {
+            config->refresh_get_peers_timeout_ms = atoi(value);
+            if (config->refresh_get_peers_timeout_ms < 100) config->refresh_get_peers_timeout_ms = 100;
+        } else if (strcmp(key, "refresh_max_iterations") == 0) {
+            config->refresh_max_iterations = atoi(value);
+            if (config->refresh_max_iterations < 1) config->refresh_max_iterations = 1;
+            if (config->refresh_max_iterations > 10) config->refresh_max_iterations = 10;
         }
     }
 

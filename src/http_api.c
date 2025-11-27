@@ -2,6 +2,7 @@
 #include "dht_crawler.h"
 #include "dht_manager.h"
 #include "refresh_query.h"
+#include "refresh_thread.h"
 #include "batch_writer.h"
 #include "metadata_fetcher.h"
 #include "porn_filter.h"
@@ -27,6 +28,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
+static void format_hex(const uint8_t *data, size_t len, char *out);
 
 /* Helper: Format info_hash as hex */
 static void format_hex(const uint8_t *data, size_t len, char *out) {
@@ -135,6 +137,12 @@ void http_api_cleanup(http_api_t *api) {
 void http_api_set_supervisor(http_api_t *api, struct supervisor *supervisor) {
     if (api) {
         api->supervisor = supervisor;
+    }
+}
+
+void http_api_set_refresh_thread(http_api_t *api, struct refresh_thread *refresh_thread) {
+    if (api) {
+        api->refresh_thread = refresh_thread;
     }
 }
 
@@ -547,7 +555,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     return 200;
 }
 
-/* Refresh handler - Query DHT network for live peer count */
 static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
 
@@ -600,7 +607,20 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         return 404;
     }
 
-    /* Check DHT manager availability */
+    /* Check refresh thread availability */
+    if (!api->refresh_thread) {
+        const char *error = "{\"error\":\"Refresh thread not available\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 503 Service Unavailable\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 503;
+    }
+
+    /* Check refresh query store availability (from dht_manager) */
     if (!api->dht_manager || !api->dht_manager->refresh_query_store) {
         const char *error = "{\"error\":\"DHT query system not available\"}";
         mg_printf(conn,
@@ -627,48 +647,51 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         return 500;
     }
 
-    /* Trigger DHT get_peers query with PRIORITY (skip to front of queue) */
-    int rc = dht_manager_query_peers(api->dht_manager, info_hash, true);
+    /* Submit to refresh thread */
+    int rc = refresh_thread_submit_request(api->refresh_thread, info_hash);
     if (rc != 0) {
-        log_msg(LOG_WARN, "Failed to trigger priority DHT query for refresh");
+        log_msg(LOG_WARN, "Failed to submit refresh request, queue may be full");
+        refresh_query_complete(api->dht_manager->refresh_query_store, info_hash);
+        refresh_query_unref(query);
+        const char *error = "{\"error\":\"Refresh queue full, try again later\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 503 Service Unavailable\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 503;
     }
 
-    /* Wait for DHT responses (blocks for up to 8 seconds)
-     * timed_out is returned safely via output parameter to avoid use-after-free */
+    /* Wait for results (8 seconds, matching old behavior) */
     int timed_out = 0;
     int peer_count = refresh_query_wait(query, 8, &timed_out);
     int retry_attempted = 0;
 
-    /* Retry logic: If zero peers found, try one more time immediately */
-    if (peer_count == 0) {
+    /* Retry logic: If zero peers found, try one more time */
+    if (peer_count == 0 && !timed_out) {
         log_msg(LOG_DEBUG, "First query returned 0 peers for %s, retrying...", hash_buf);
 
-        /* Remove old query from store by pointer (critical for thread safety) */
-        refresh_query_remove_ptr(api->dht_manager->refresh_query_store, query);
+        /* Submit retry */
+        rc = refresh_thread_submit_request(api->refresh_thread, info_hash);
+        if (rc == 0) {
+            peer_count = refresh_query_wait(query, 8, &timed_out);
+            retry_attempted = 1;
 
-        /* Create new query for retry */
-        query = refresh_query_create(api->dht_manager->refresh_query_store, info_hash);
-        if (query) {
-            /* Trigger second priority query */
-            rc = dht_manager_query_peers(api->dht_manager, info_hash, true);
-            if (rc == 0) {
-                /* Wait for retry results (up to 8 seconds) */
-                peer_count = refresh_query_wait(query, 8, &timed_out);
-                retry_attempted = 1;
-
-                if (peer_count > 0) {
-                    log_msg(LOG_DEBUG, "Retry successful: found %d peers for %s", peer_count, hash_buf);
-                } else {
-                    log_msg(LOG_DEBUG, "Retry also returned 0 peers for %s", hash_buf);
-                }
+            if (peer_count > 0) {
+                log_msg(LOG_DEBUG, "Retry successful: found %d peers for %s", peer_count, hash_buf);
+            } else {
+                log_msg(LOG_DEBUG, "Retry also returned 0 peers for %s", hash_buf);
             }
         }
     }
 
-    /* Remove query from store by pointer (critical for thread safety) */
+    /* Remove query from store and unref */
     refresh_query_remove_ptr(api->dht_manager->refresh_query_store, query);
+    refresh_query_unref(query);
 
-    /* Build JSON response */
+    /* Build JSON response (matching old format) */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "info_hash", hash_buf);
     cJSON_AddNumberToObject(root, "total_peers", peer_count);
@@ -681,7 +704,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddStringToObject(root, "warning",
             retry_attempted ?
             "Both queries timed out with no peers - torrent may have no active peers" :
-            "Query timed out with no peers found - torrent may have no active peers");
+            "Query timed out with no peers - torrent may have no active peers");
     } else if (timed_out) {
         cJSON_AddStringToObject(root, "warning",
             "Query timed out - partial peer count returned");
@@ -706,7 +729,8 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     return 200;
 }
 
-/* Search handler - Perform FTS5 search and return JSON or HTML */
+
+
 static int search_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
 

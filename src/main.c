@@ -10,6 +10,7 @@
 #include "config.h"
 #include "supervisor.h"
 #include "batch_writer.h"
+#include "refresh_thread.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -26,6 +27,7 @@ static bloom_filter_t *g_bloom = NULL;
 /* Stage 6: Thread tree architecture globals */
 static supervisor_t *g_supervisor = NULL;
 static batch_writer_t *g_batch_writer = NULL;  /* Shared batch writer for thread trees */
+static refresh_thread_t *g_refresh_thread = NULL;  /* Refresh thread for /refresh endpoint */
 
 /* Signal handler for graceful shutdown */
 static void signal_handler(int signum) {
@@ -288,12 +290,52 @@ int main(int argc, char *argv[]) {
         /* Start supervisor (spawns all trees) */
         supervisor_start(g_supervisor);
 
+        /* Create and start refresh thread */
+        log_msg(LOG_DEBUG, "Creating refresh thread...");
+        refresh_thread_config_t refresh_config = {
+            .bootstrap_sample_size = config.refresh_bootstrap_sample_size,
+            .routing_table_target = config.refresh_routing_table_target,
+            .ping_worker_count = config.refresh_ping_workers,
+            .find_node_worker_count = config.refresh_find_node_workers,
+            .get_peers_worker_count = config.refresh_get_peers_workers,
+            .request_queue_capacity = config.refresh_request_queue_capacity,
+            .get_peers_timeout_ms = config.refresh_get_peers_timeout_ms,
+            .max_iterations = config.refresh_max_iterations
+        };
+
+        g_refresh_thread = refresh_thread_create(&refresh_config,
+                                                  g_supervisor->shared_node_pool,
+                                                  g_dht_mgr.refresh_query_store);
+        if (!g_refresh_thread) {
+            log_msg(LOG_ERROR, "Failed to create refresh thread");
+            supervisor_stop(g_supervisor);
+            supervisor_destroy(g_supervisor);
+            batch_writer_cleanup(g_batch_writer);
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
+        rc = refresh_thread_start(g_refresh_thread);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "Failed to start refresh thread");
+            refresh_thread_destroy(g_refresh_thread);
+            supervisor_stop(g_supervisor);
+            supervisor_destroy(g_supervisor);
+            batch_writer_cleanup(g_batch_writer);
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
         /* Initialize HTTP API (minimal - no DHT manager in thread tree mode) */
         log_msg(LOG_DEBUG, "Initializing HTTP API for thread tree mode...");
         rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, NULL,
                            g_batch_writer, NULL, HTTP_API_PORT);
         if (rc != 0) {
             log_msg(LOG_ERROR, "Failed to initialize HTTP API: %d", rc);
+            refresh_thread_request_shutdown(g_refresh_thread);
+            refresh_thread_destroy(g_refresh_thread);
             supervisor_stop(g_supervisor);
             supervisor_destroy(g_supervisor);
             batch_writer_cleanup(g_batch_writer);
@@ -304,6 +346,9 @@ int main(int argc, char *argv[]) {
 
         /* Set supervisor reference for stats */
         http_api_set_supervisor(&g_http_api, g_supervisor);
+
+        /* Set refresh thread for /refresh endpoint */
+        http_api_set_refresh_thread(&g_http_api, g_refresh_thread);
 
         /* Start HTTP API */
         log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
@@ -337,10 +382,15 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
         http_api_stop(&g_http_api);
 
-        log_msg(LOG_DEBUG, "Step 2: Stopping supervisor (stops all trees)...");
+        log_msg(LOG_DEBUG, "Step 2: Stopping refresh thread...");
+        if (g_refresh_thread) {
+            refresh_thread_request_shutdown(g_refresh_thread);
+        }
+
+        log_msg(LOG_DEBUG, "Step 3: Stopping supervisor (stops all trees)...");
         supervisor_stop(g_supervisor);
 
-        log_msg(LOG_DEBUG, "Step 3: Flushing batch writer...");
+        log_msg(LOG_DEBUG, "Step 4: Flushing batch writer...");
         batch_writer_flush(g_batch_writer);
 
         log_msg(LOG_DEBUG, "=== Thread tree shutdown complete, beginning cleanup ===");
@@ -357,6 +407,9 @@ int main(int argc, char *argv[]) {
 
         /* Cleanup */
         http_api_cleanup(&g_http_api);
+        if (g_refresh_thread) {
+            refresh_thread_destroy(g_refresh_thread);
+        }
         supervisor_destroy(g_supervisor);
         batch_writer_cleanup(g_batch_writer);
         database_cleanup(&g_database);

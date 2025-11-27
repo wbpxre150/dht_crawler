@@ -118,6 +118,16 @@ typedef struct {
 
     /* Keyspace partitioning settings */
     int use_keyspace_partitioning;       /* Enable keyspace partitioning (0=random node IDs, 1=partitioned, default: 1) */
+
+    /* Refresh thread settings (for /refresh HTTP endpoint) */
+    int refresh_bootstrap_sample_size;   /* Nodes to sample from shared pool (default: 1000) */
+    int refresh_routing_table_target;    /* Target routing table size (default: 500) */
+    int refresh_ping_workers;            /* Ping workers (default: 1) */
+    int refresh_find_node_workers;       /* Find_node workers (default: 1) */
+    int refresh_get_peers_workers;       /* Get_peers workers (default: 1) */
+    int refresh_request_queue_capacity;  /* Request queue capacity (default: 100) */
+    int refresh_get_peers_timeout_ms;    /* Get_peers response timeout (default: 500) */
+    int refresh_max_iterations;          /* Max get_peers iterations (default: 3) */
 } crawler_config_t;
 
 /* Initialize config with default values */

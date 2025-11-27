@@ -9,6 +9,7 @@
 /* Forward declarations */
 struct batch_writer;
 struct supervisor;
+struct refresh_thread;
 
 /* HTTP server configuration */
 #define HTTP_API_PORT 8080
@@ -23,6 +24,7 @@ typedef struct {
     struct batch_writer *batch_writer;
     metadata_fetcher_t *metadata_fetcher;
     struct supervisor *supervisor;  /* Stage 6: Thread tree supervisor */
+    struct refresh_thread *refresh_thread;  /* Refresh thread for /refresh endpoint */
     int port;
     int running;
 } http_api_t;
@@ -49,6 +51,9 @@ void http_api_cleanup(http_api_t *api);
 
 /* Stage 6: Set supervisor for thread tree mode stats */
 void http_api_set_supervisor(http_api_t *api, struct supervisor *supervisor);
+
+/* Set refresh thread for /refresh endpoint */
+void http_api_set_refresh_thread(http_api_t *api, struct refresh_thread *refresh_thread);
 
 /* Search functions */
 int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count);
