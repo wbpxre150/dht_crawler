@@ -71,12 +71,7 @@ typedef struct tree_config {
     int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
 
     /* Stage 5: Metadata fetcher settings */
-    double min_metadata_rate;       /* Minimum metadata/sec before shutdown (default: 0.5) */
-    int rate_check_interval_sec;    /* Rate check interval (default: 10) */
-    int rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int min_lifetime_minutes;       /* Minimum lifetime before rate checks apply (default: 10) */
-    int require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
     /* Bloom-based respawn settings */
     double max_bloom_duplicate_rate;    /* Max bloom duplicate rate before respawn (default: 0.70) */
@@ -124,12 +119,7 @@ typedef struct thread_tree {
     int get_peers_timeout_ms;
 
     /* Stage 5 config */
-    double min_metadata_rate;
-    int rate_check_interval_sec;
-    int rate_grace_period_sec;
     int tcp_connect_timeout_ms;
-    int min_lifetime_sec;           /* Minimum lifetime before rate checks apply */
-    bool require_empty_queue;       /* Only shutdown if queue is empty */
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;
@@ -159,7 +149,6 @@ typedef struct thread_tree {
     pthread_t *bep51_threads;
     pthread_t *get_peers_threads;
     pthread_t *metadata_threads;
-    pthread_t rate_monitor_thread;  /* Stage 5: Rate monitor thread */
     pthread_t bloom_monitor_thread; /* Bloom duplicate rate monitor */
     pthread_t throttle_monitor_thread;  /* Monitors queue size for throttling */
 

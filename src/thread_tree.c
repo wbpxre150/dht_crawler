@@ -60,7 +60,6 @@ static void generate_random_target(uint8_t *target) {
 static void tree_start_find_node_workers(thread_tree_t *tree);
 static void tree_start_get_peers_workers(thread_tree_t *tree);
 static void tree_start_metadata_workers(thread_tree_t *tree);
-static void tree_start_rate_monitor(thread_tree_t *tree);
 
 /* find_node worker context */
 typedef struct find_node_worker_ctx {
@@ -920,9 +919,6 @@ static void tree_start_metadata_workers(thread_tree_t *tree) {
         }
     }
 
-    /* Also start the rate monitor thread */
-    tree_start_rate_monitor(tree);
-
     /* Start the bloom monitor thread */
     tree_start_bloom_monitor(tree);
 }
@@ -935,31 +931,6 @@ static void tree_start_metadata_workers_OLD(thread_tree_t *tree) {
     (void)tree;
 }
 #endif
-
-/* Stage 5: Start rate monitor thread */
-static void tree_start_rate_monitor(thread_tree_t *tree) {
-    rate_monitor_ctx_t *ctx = malloc(sizeof(rate_monitor_ctx_t));
-    if (!ctx) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to allocate rate monitor context", tree->tree_id);
-        return;
-    }
-
-    ctx->tree = tree;
-    ctx->min_metadata_rate = tree->min_metadata_rate;
-    ctx->check_interval_sec = tree->rate_check_interval_sec;
-    ctx->grace_period_sec = tree->rate_grace_period_sec;
-    ctx->min_lifetime_sec = tree->min_lifetime_sec;
-    ctx->require_empty_queue = tree->require_empty_queue;
-
-    int rc = pthread_create(&tree->rate_monitor_thread, NULL, tree_rate_monitor_func, ctx);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to create rate monitor thread: %d", tree->tree_id, rc);
-        free(ctx);
-    } else {
-        log_msg(LOG_DEBUG, "[tree %u] Rate monitor started (min_rate=%.2f/s)",
-                tree->tree_id, tree->min_metadata_rate);
-    }
-}
 
 /* OLD placeholder for get_peers workers - disabled, kept for reference */
 #if 0
@@ -1103,12 +1074,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 3000;
 
     /* Stage 5 config */
-    tree->min_metadata_rate = config->min_metadata_rate > 0 ? config->min_metadata_rate : 0.5;
-    tree->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 10;
-    tree->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
-    tree->min_lifetime_sec = (config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10) * 60;
-    tree->require_empty_queue = config->require_empty_queue;
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
@@ -1331,13 +1297,6 @@ void thread_tree_destroy(thread_tree_t *tree) {
         free(tree->metadata_threads);
     }
     log_msg(LOG_DEBUG, "[tree %u] Metadata workers joined", tree->tree_id);
-
-    /* Stage 5: Join rate monitor thread */
-    log_msg(LOG_DEBUG, "[tree %u] Joining rate monitor thread...", tree->tree_id);
-    if (tree->rate_monitor_thread) {
-        pthread_join(tree->rate_monitor_thread, NULL);
-    }
-    log_msg(LOG_DEBUG, "[tree %u] Rate monitor thread joined", tree->tree_id);
 
     /* Join throttle monitor thread */
     log_msg(LOG_DEBUG, "[tree %u] Joining throttle monitor thread...", tree->tree_id);

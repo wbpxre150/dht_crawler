@@ -74,7 +74,6 @@ typedef struct {
 
     /* Thread tree settings (Stage 1) */
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */
-    double min_metadata_rate;            /* Minimum metadata/sec before tree restart (default: 0.5) */
 
     /* Thread tree Stage 2 settings (Global Bootstrap - NEW) */
     int global_bootstrap_target;         /* Target nodes for shared pool (default: 5000) */
@@ -105,11 +104,7 @@ typedef struct {
 
     /* Thread tree Stage 5 settings (metadata) */
     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
-    int tree_rate_check_interval_sec;    /* Rate check interval (default: 10) */
-    int tree_rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int tree_min_lifetime_minutes;       /* Minimum lifetime before rate checks apply (default: 10) */
-    int tree_require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
     /* Thread tree bloom-based respawn settings */
     double tree_max_bloom_duplicate_rate;   /* Max bloom duplicate rate before respawn (default: 0.70) */

@@ -82,7 +82,6 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
-    config->min_metadata_rate = 0.5;                /* Min 0.5 metadata/sec before restart */
 
     /* Thread tree Stage 2 defaults (Global Bootstrap - NEW) */
     config->global_bootstrap_target = 5000;         /* Target 5000 nodes in shared pool */
@@ -113,11 +112,7 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Thread tree Stage 5 defaults (metadata) */
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
-    config->tree_rate_check_interval_sec = 10;      /* 10 second rate check interval */
-    config->tree_rate_grace_period_sec = 30;        /* 30 second grace period */
     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
-    config->tree_min_lifetime_minutes = 10;         /* 10 minute minimum lifetime */
-    config->tree_require_empty_queue = 1;           /* Require empty queue for shutdown */
 
     /* Thread tree bloom-based respawn defaults */
     config->tree_max_bloom_duplicate_rate = 0.70;      /* 70% duplicate rate threshold */
@@ -312,9 +307,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->num_trees = atoi(value);
             if (config->num_trees < 1) config->num_trees = 1;
             if (config->num_trees > 64) config->num_trees = 64;
-        } else if (strcmp(key, "min_metadata_rate") == 0) {
-            config->min_metadata_rate = atof(value);
-            if (config->min_metadata_rate < 0.0) config->min_metadata_rate = 0.0;
         }
         /* Thread tree Stage 2 settings (Global Bootstrap - NEW) */
         else if (strcmp(key, "global_bootstrap_target") == 0) {
@@ -384,20 +376,9 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         else if (strcmp(key, "tree_metadata_workers") == 0) {
             config->tree_metadata_workers = atoi(value);
             if (config->tree_metadata_workers < 1) config->tree_metadata_workers = 1;
-        } else if (strcmp(key, "tree_rate_check_interval_sec") == 0) {
-            config->tree_rate_check_interval_sec = atoi(value);
-            if (config->tree_rate_check_interval_sec < 5) config->tree_rate_check_interval_sec = 5;
-        } else if (strcmp(key, "tree_rate_grace_period_sec") == 0) {
-            config->tree_rate_grace_period_sec = atoi(value);
-            if (config->tree_rate_grace_period_sec < 10) config->tree_rate_grace_period_sec = 10;
         } else if (strcmp(key, "tree_tcp_connect_timeout_ms") == 0) {
             config->tree_tcp_connect_timeout_ms = atoi(value);
             if (config->tree_tcp_connect_timeout_ms < 1000) config->tree_tcp_connect_timeout_ms = 1000;
-        } else if (strcmp(key, "tree_min_lifetime_minutes") == 0) {
-            config->tree_min_lifetime_minutes = atoi(value);
-            if (config->tree_min_lifetime_minutes < 0) config->tree_min_lifetime_minutes = 0;
-        } else if (strcmp(key, "tree_require_empty_queue") == 0) {
-            config->tree_require_empty_queue = atoi(value);
         }
         /* Thread tree bloom-based respawn settings */
         else if (strcmp(key, "tree_max_bloom_duplicate_rate") == 0) {

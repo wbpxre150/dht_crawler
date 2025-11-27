@@ -23,7 +23,6 @@ struct shared_node_pool;
 /* Configuration for supervisor */
 typedef struct supervisor_config {
     int max_trees;                  /* Maximum number of concurrent trees */
-    double min_metadata_rate;       /* Minimum metadata/sec before tree restart */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (default: true) */
 
     /* Worker counts per tree */
@@ -55,11 +54,7 @@ typedef struct supervisor_config {
     int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
 
     /* Stage 5 settings */
-    int rate_check_interval_sec;    /* Rate check interval (default: 10) */
-    int rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int min_lifetime_minutes;       /* Minimum lifetime before rate checks (default: 10) */
-    int require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
     /* Bloom-based respawn settings */
     double max_bloom_duplicate_rate;   /* Max bloom duplicate rate before respawn (default: 0.70) */
@@ -89,7 +84,6 @@ typedef struct supervisor {
     struct shared_node_pool *shared_node_pool;  /* NEW: Shared bootstrap node pool */
 
     /* Configuration */
-    double min_metadata_rate;
     int num_find_node_workers;
     int num_bep51_workers;
     int num_get_peers_workers;
@@ -118,11 +112,7 @@ typedef struct supervisor {
     int peers_resume_threshold;
 
     /* Stage 5 settings */
-    int rate_check_interval_sec;
-    int rate_grace_period_sec;
     int tcp_connect_timeout_ms;
-    int min_lifetime_minutes;
-    int require_empty_queue;
 
     /* Bloom-based respawn settings */
     double max_bloom_duplicate_rate;

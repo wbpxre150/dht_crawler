@@ -77,31 +77,11 @@ typedef struct metadata_worker_ctx {
 } metadata_worker_ctx_t;
 
 /**
- * Rate monitor context
- */
-typedef struct rate_monitor_ctx {
-    struct thread_tree *tree;
-    double min_metadata_rate;
-    int check_interval_sec;
-    int grace_period_sec;
-    int min_lifetime_sec;           /* Minimum lifetime before rate checks apply */
-    bool require_empty_queue;       /* Only shutdown if queue is empty */
-} rate_monitor_ctx_t;
-
-/**
  * Metadata worker thread function
  *
  * @param arg metadata_worker_ctx_t pointer (will be freed by worker)
  * @return NULL
  */
 void *tree_metadata_worker_func(void *arg);
-
-/**
- * Rate monitor thread function
- *
- * @param arg rate_monitor_ctx_t pointer (will be freed by monitor)
- * @return NULL
- */
-void *tree_rate_monitor_func(void *arg);
 
 #endif /* TREE_METADATA_H */

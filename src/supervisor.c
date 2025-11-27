@@ -57,7 +57,6 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->shared_node_pool = NULL;  /* Will be created during bootstrap */
 
     /* Store worker counts */
-    sup->min_metadata_rate = config->min_metadata_rate;
     sup->num_find_node_workers = config->num_find_node_workers > 0 ? config->num_find_node_workers : 10;
     sup->num_bep51_workers = config->num_bep51_workers;
     sup->num_get_peers_workers = config->num_get_peers_workers;
@@ -86,11 +85,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->peers_resume_threshold = config->peers_resume_threshold > 0 ? config->peers_resume_threshold : 1000;
 
     /* Stage 5 settings */
-    sup->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 10;
-    sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
-    sup->min_lifetime_minutes = config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10;
-    sup->require_empty_queue = config->require_empty_queue;
 
     /* Bloom-based respawn settings */
     sup->max_bloom_duplicate_rate = config->max_bloom_duplicate_rate > 0 ? config->max_bloom_duplicate_rate : 0.70;
@@ -115,8 +110,8 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
-    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, min_rate=%.2f, bootstrap_target=%d",
-            sup->max_trees, sup->min_metadata_rate, sup->global_bootstrap_target);
+    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_target=%d",
+            sup->max_trees, sup->global_bootstrap_target);
 
     return sup;
 }
@@ -157,12 +152,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .peers_pause_threshold = sup->peers_pause_threshold,
         .peers_resume_threshold = sup->peers_resume_threshold,
         /* Stage 5 settings */
-        .min_metadata_rate = sup->min_metadata_rate,
-        .rate_check_interval_sec = sup->rate_check_interval_sec,
-        .rate_grace_period_sec = sup->rate_grace_period_sec,
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
-        .min_lifetime_minutes = sup->min_lifetime_minutes,
-        .require_empty_queue = sup->require_empty_queue,
         /* Bloom-based respawn settings */
         .max_bloom_duplicate_rate = sup->max_bloom_duplicate_rate,
         .bloom_check_interval_sec = sup->bloom_check_interval_sec,

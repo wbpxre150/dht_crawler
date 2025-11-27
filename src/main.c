@@ -242,7 +242,6 @@ int main(int argc, char *argv[]) {
         /* Create supervisor config */
         supervisor_config_t sup_config = {
             .max_trees = config.num_trees,
-            .min_metadata_rate = config.min_metadata_rate,
             .use_keyspace_partitioning = config.use_keyspace_partitioning,
             .batch_writer = g_batch_writer,
             .bloom_filter = g_bloom,
@@ -268,11 +267,7 @@ int main(int argc, char *argv[]) {
             .peers_pause_threshold = config.tree_peers_pause_threshold,
             .peers_resume_threshold = config.tree_peers_resume_threshold,
             /* Stage 5 settings */
-            .rate_check_interval_sec = config.tree_rate_check_interval_sec,
-            .rate_grace_period_sec = config.tree_rate_grace_period_sec,
             .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
-            .min_lifetime_minutes = config.tree_min_lifetime_minutes,
-            .require_empty_queue = config.tree_require_empty_queue,
             /* Bloom-based respawn settings */
             .max_bloom_duplicate_rate = config.tree_max_bloom_duplicate_rate,
             .bloom_check_interval_sec = config.tree_bloom_check_interval_sec,
