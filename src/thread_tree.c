@@ -272,7 +272,7 @@ static void *throttle_monitor_func(void *arg) {
 
         if (!currently_paused && queue_size >= tree->infohash_pause_threshold) {
             /* Pause discovery workers (find_node + BEP51) */
-            log_msg(LOG_INFO, "[tree %u] PAUSING discovery workers (find_node + BEP51) (queue=%d >= %d)",
+            log_msg(LOG_DEBUG, "[tree %u] PAUSING discovery workers (find_node + BEP51) (queue=%d >= %d)",
                     tree->tree_id, queue_size, tree->infohash_pause_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
@@ -283,7 +283,7 @@ static void *throttle_monitor_func(void *arg) {
 
         } else if (currently_paused && queue_size < tree->infohash_resume_threshold) {
             /* Resume discovery workers (find_node + BEP51) */
-            log_msg(LOG_INFO, "[tree %u] RESUMING discovery workers (find_node + BEP51) (queue=%d < %d)",
+            log_msg(LOG_DEBUG, "[tree %u] RESUMING discovery workers (find_node + BEP51) (queue=%d < %d)",
                     tree->tree_id, queue_size, tree->infohash_resume_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);

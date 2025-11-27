@@ -202,7 +202,7 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
             if (lru_node == NULL) {
                 static int thrash_warning_count = 0;
                 if (++thrash_warning_count % 10000 == 0) {
-                    log_msg(LOG_WARN, "Routing table: bucket %d full, all nodes too fresh to evict (warning #%d)",
+                    log_msg(LOG_DEBUG, "Routing table: bucket %d full, all nodes too fresh to evict (warning #%d)",
                             bucket_idx, thrash_warning_count);
                 }
                 pthread_rwlock_unlock(&rt->rwlock);
