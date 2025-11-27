@@ -111,6 +111,13 @@ typedef struct {
     int tree_min_lifetime_minutes;       /* Minimum lifetime before rate checks apply (default: 10) */
     int tree_require_empty_queue;        /* Only shutdown if queue empty (default: 1) */
 
+    /* Thread tree bloom-based respawn settings */
+    double tree_max_bloom_duplicate_rate;   /* Max bloom duplicate rate before respawn (default: 0.70) */
+    int tree_bloom_check_interval_sec;      /* Bloom rate check interval (default: 60) */
+    int tree_bloom_check_sample_size;       /* Min samples before check (default: 100) */
+    int tree_bloom_grace_period_sec;        /* Grace period before respawn (default: 120) */
+    int tree_bloom_min_lifetime_minutes;    /* Min lifetime before bloom checks (default: 10) */
+
     /* Thread tree mode toggle */
     int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
 

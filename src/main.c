@@ -272,7 +272,13 @@ int main(int argc, char *argv[]) {
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,
             .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
             .min_lifetime_minutes = config.tree_min_lifetime_minutes,
-            .require_empty_queue = config.tree_require_empty_queue
+            .require_empty_queue = config.tree_require_empty_queue,
+            /* Bloom-based respawn settings */
+            .max_bloom_duplicate_rate = config.tree_max_bloom_duplicate_rate,
+            .bloom_check_interval_sec = config.tree_bloom_check_interval_sec,
+            .bloom_check_sample_size = config.tree_bloom_check_sample_size,
+            .bloom_grace_period_sec = config.tree_bloom_grace_period_sec,
+            .bloom_min_lifetime_minutes = config.tree_bloom_min_lifetime_minutes
         };
 
         g_supervisor = supervisor_create(&sup_config);

@@ -364,6 +364,137 @@ static void tree_start_throttle_monitor(thread_tree_t *tree) {
     }
 }
 
+/* Bloom monitor context */
+typedef struct bloom_monitor_ctx {
+    thread_tree_t *tree;
+    double max_duplicate_rate;
+    int check_interval_sec;
+    int sample_size;
+    int grace_period_sec;
+    int min_lifetime_sec;
+} bloom_monitor_ctx_t;
+
+/* Bloom monitor thread function */
+static void *bloom_monitor_func(void *arg) {
+    bloom_monitor_ctx_t *ctx = (bloom_monitor_ctx_t *)arg;
+    thread_tree_t *tree = ctx->tree;
+
+    log_msg(LOG_DEBUG, "[tree %u] Bloom monitor started (max_dup_rate=%.2f, min_lifetime=%ds)",
+            tree->tree_id, ctx->max_duplicate_rate, ctx->min_lifetime_sec);
+
+    uint64_t last_checks = 0;
+    uint64_t last_duplicates = 0;
+
+    while (!atomic_load(&tree->shutdown_requested)) {
+        /* Sleep in 1-second chunks for responsiveness */
+        for (int i = 0; i < ctx->check_interval_sec && !atomic_load(&tree->shutdown_requested); i++) {
+            sleep(1);
+        }
+
+        if (atomic_load(&tree->shutdown_requested)) break;
+
+        time_t now = time(NULL);
+        double tree_age = difftime(now, tree->creation_time);
+
+        /* Check minimum lifetime immunity */
+        if (tree_age < ctx->min_lifetime_sec) {
+            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE to bloom checks",
+                    tree->tree_id, tree_age, ctx->min_lifetime_sec);
+            continue;
+        }
+
+        /* Get current counters */
+        uint64_t checks = atomic_load(&tree->bloom_checks);
+        uint64_t duplicates = atomic_load(&tree->bloom_duplicates);
+
+        /* Calculate incremental counts since last check */
+        uint64_t checks_delta = checks - last_checks;
+        uint64_t duplicates_delta = duplicates - last_duplicates;
+
+        /* Require minimum sample size */
+        if (checks_delta < (uint64_t)ctx->sample_size) {
+            log_msg(LOG_DEBUG, "[tree %u] Bloom checks: %lu (delta=%lu < min=%d) - insufficient samples",
+                    tree->tree_id, (unsigned long)checks, (unsigned long)checks_delta, ctx->sample_size);
+            last_checks = checks;
+            last_duplicates = duplicates;
+            continue;
+        }
+
+        /* Calculate duplicate rate */
+        double duplicate_rate = (double)duplicates_delta / (double)checks_delta;
+        tree->bloom_duplicate_rate = duplicate_rate;
+
+        log_msg(LOG_DEBUG, "[tree %u] Bloom stats: checks=%lu, duplicates=%lu, rate=%.2f%% (threshold=%.2f%%)",
+                tree->tree_id, (unsigned long)checks_delta, (unsigned long)duplicates_delta,
+                duplicate_rate * 100.0, ctx->max_duplicate_rate * 100.0);
+
+        /* Check threshold */
+        if (duplicate_rate >= ctx->max_duplicate_rate) {
+            log_msg(LOG_WARN, "[tree %u] Bloom duplicate rate %.2f%% >= threshold %.2f%%, entering grace period",
+                    tree->tree_id, duplicate_rate * 100.0, ctx->max_duplicate_rate * 100.0);
+
+            /* Grace period - sleep in 1s chunks */
+            for (int i = 0; i < ctx->grace_period_sec && !atomic_load(&tree->shutdown_requested); i++) {
+                sleep(1);
+            }
+
+            if (atomic_load(&tree->shutdown_requested)) break;
+
+            /* Re-check after grace period */
+            uint64_t checks2 = atomic_load(&tree->bloom_checks);
+            uint64_t duplicates2 = atomic_load(&tree->bloom_duplicates);
+            uint64_t checks_delta2 = checks2 - checks;
+            uint64_t duplicates_delta2 = duplicates2 - duplicates;
+
+            if (checks_delta2 >= (uint64_t)ctx->sample_size) {
+                double duplicate_rate2 = (double)duplicates_delta2 / (double)checks_delta2;
+
+                if (duplicate_rate2 >= ctx->max_duplicate_rate) {
+                    log_msg(LOG_INFO, "[tree %u] Bloom duplicate rate SUSTAINED at %.2f%% after grace period - REQUESTING SHUTDOWN",
+                            tree->tree_id, duplicate_rate2 * 100.0);
+                    thread_tree_request_shutdown(tree);
+                    break;
+                } else {
+                    log_msg(LOG_DEBUG, "[tree %u] Bloom duplicate rate improved to %.2f%% - CONTINUING",
+                            tree->tree_id, duplicate_rate2 * 100.0);
+                }
+            }
+        }
+
+        last_checks = checks;
+        last_duplicates = duplicates;
+    }
+
+    free(ctx);
+    log_msg(LOG_DEBUG, "[tree %u] Bloom monitor exiting", tree->tree_id);
+    return NULL;
+}
+
+/* Start bloom monitor thread */
+static void tree_start_bloom_monitor(thread_tree_t *tree) {
+    bloom_monitor_ctx_t *ctx = malloc(sizeof(bloom_monitor_ctx_t));
+    if (!ctx) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to allocate bloom monitor context", tree->tree_id);
+        return;
+    }
+
+    ctx->tree = tree;
+    ctx->max_duplicate_rate = tree->max_bloom_duplicate_rate;
+    ctx->check_interval_sec = tree->bloom_check_interval_sec;
+    ctx->sample_size = tree->bloom_check_sample_size;
+    ctx->grace_period_sec = tree->bloom_grace_period_sec;
+    ctx->min_lifetime_sec = tree->bloom_min_lifetime_sec;
+
+    int rc = pthread_create(&tree->bloom_monitor_thread, NULL, bloom_monitor_func, ctx);
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to create bloom monitor thread: %d", tree->tree_id, rc);
+        free(ctx);
+    } else {
+        log_msg(LOG_DEBUG, "[tree %u] Bloom monitor started (max_dup_rate=%.2f%%)",
+                tree->tree_id, tree->max_bloom_duplicate_rate * 100.0);
+    }
+}
+
 /* Start find_node workers */
 static void tree_start_find_node_workers(thread_tree_t *tree) {
     if (tree->num_find_node_workers <= 0) {
@@ -512,8 +643,13 @@ static void *bep51_worker_func(void *arg) {
                                                        &response_pkt.from, &response) == 0) {
                 /* 6. Push infohashes to queue (with bloom check) */
                 for (int i = 0; i < response.infohash_count; i++) {
+                    /* Increment bloom check counter */
+                    atomic_fetch_add(&tree->bloom_checks, 1);
+
                     /* Check bloom filter (shared, thread-safe) */
                     if (tree->shared_bloom && bloom_filter_check(tree->shared_bloom, response.infohashes[i])) {
+                        /* Increment duplicate counter */
+                        atomic_fetch_add(&tree->bloom_duplicates, 1);
                         continue;  /* Already seen */
                     }
 
@@ -786,6 +922,9 @@ static void tree_start_metadata_workers(thread_tree_t *tree) {
 
     /* Also start the rate monitor thread */
     tree_start_rate_monitor(tree);
+
+    /* Start the bloom monitor thread */
+    tree_start_bloom_monitor(tree);
 }
 
 /* OLD placeholder for metadata workers - disabled, kept for reference */
@@ -1007,6 +1146,19 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->metadata_rate = 0.0;
     atomic_init(&tree->active_connections, 0);
 
+    /* Initialize bloom filter duplicate tracking */
+    atomic_store(&tree->bloom_checks, 0);
+    atomic_store(&tree->bloom_duplicates, 0);
+    atomic_store(&tree->last_bloom_checks, 0);
+    tree->bloom_duplicate_rate = 0.0;
+
+    /* Bloom monitor configuration from config */
+    tree->max_bloom_duplicate_rate = config->max_bloom_duplicate_rate > 0 ? config->max_bloom_duplicate_rate : 0.70;
+    tree->bloom_check_interval_sec = config->bloom_check_interval_sec > 0 ? config->bloom_check_interval_sec : 60;
+    tree->bloom_check_sample_size = config->bloom_check_sample_size > 0 ? config->bloom_check_sample_size : 100;
+    tree->bloom_grace_period_sec = config->bloom_grace_period_sec > 0 ? config->bloom_grace_period_sec : 120;
+    tree->bloom_min_lifetime_sec = (config->bloom_min_lifetime_minutes > 0 ? config->bloom_min_lifetime_minutes : 10) * 60;
+
     /* Initialize lifecycle tracking */
     tree->creation_time = time(NULL);
 
@@ -1193,6 +1345,13 @@ void thread_tree_destroy(thread_tree_t *tree) {
         pthread_join(tree->throttle_monitor_thread, NULL);
     }
     log_msg(LOG_DEBUG, "[tree %u] Throttle monitor thread joined", tree->tree_id);
+
+    /* Join bloom monitor thread */
+    log_msg(LOG_DEBUG, "[tree %u] Joining bloom monitor thread...", tree->tree_id);
+    if (tree->bloom_monitor_thread) {
+        pthread_join(tree->bloom_monitor_thread, NULL);
+    }
+    log_msg(LOG_DEBUG, "[tree %u] Bloom monitor thread joined", tree->tree_id);
 
     /* Close socket BEFORE cleanup to unblock any pending recv() calls
      * This is critical - workers may be blocked in poll() */

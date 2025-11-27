@@ -92,6 +92,13 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->min_lifetime_minutes = config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10;
     sup->require_empty_queue = config->require_empty_queue;
 
+    /* Bloom-based respawn settings */
+    sup->max_bloom_duplicate_rate = config->max_bloom_duplicate_rate > 0 ? config->max_bloom_duplicate_rate : 0.70;
+    sup->bloom_check_interval_sec = config->bloom_check_interval_sec > 0 ? config->bloom_check_interval_sec : 60;
+    sup->bloom_check_sample_size = config->bloom_check_sample_size > 0 ? config->bloom_check_sample_size : 100;
+    sup->bloom_grace_period_sec = config->bloom_grace_period_sec > 0 ? config->bloom_grace_period_sec : 120;
+    sup->bloom_min_lifetime_minutes = config->bloom_min_lifetime_minutes > 0 ? config->bloom_min_lifetime_minutes : 10;
+
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
         log_msg(LOG_ERROR, "[supervisor] Failed to init mutex");
@@ -156,6 +163,12 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
         .min_lifetime_minutes = sup->min_lifetime_minutes,
         .require_empty_queue = sup->require_empty_queue,
+        /* Bloom-based respawn settings */
+        .max_bloom_duplicate_rate = sup->max_bloom_duplicate_rate,
+        .bloom_check_interval_sec = sup->bloom_check_interval_sec,
+        .bloom_check_sample_size = sup->bloom_check_sample_size,
+        .bloom_grace_period_sec = sup->bloom_grace_period_sec,
+        .bloom_min_lifetime_minutes = sup->bloom_min_lifetime_minutes,
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,
