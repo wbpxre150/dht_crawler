@@ -11,7 +11,7 @@
 typedef struct shared_node_pool shared_node_pool_t;
 typedef struct tree_routing_table tree_routing_table_t;
 typedef struct tree_socket tree_socket_t;
-typedef struct tree_dispatcher tree_dispatcher_t;
+typedef struct refresh_dispatcher refresh_dispatcher_t;
 typedef struct refresh_request_queue refresh_request_queue_t;
 
 typedef struct refresh_thread_config {
@@ -35,7 +35,7 @@ typedef struct refresh_thread {
     /* Core components */
     tree_routing_table_t *routing_table;
     tree_socket_t *socket;
-    tree_dispatcher_t *dispatcher;
+    refresh_dispatcher_t *dispatcher;
     refresh_request_queue_t *request_queue;
 
     /* External references (not owned) */

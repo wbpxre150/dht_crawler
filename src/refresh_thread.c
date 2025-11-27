@@ -5,7 +5,8 @@
 #include "tree_routing.h"
 #include "tree_socket.h"
 #include "tree_protocol.h"
-#include "tree_dispatcher.h"
+#include "refresh_protocol.h"
+#include "refresh_dispatcher.h"
 #include "tree_response_queue.h"
 #include "shared_node_pool.h"
 #include "refresh_query.h"
@@ -98,8 +99,8 @@ refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
         return NULL;
     }
 
-    /* Create dispatcher (NULL for thread_tree since this is standalone refresh thread) */
-    thread->dispatcher = tree_dispatcher_create(NULL, thread->socket);
+    /* Create dispatcher (standalone refresh dispatcher) */
+    thread->dispatcher = refresh_dispatcher_create(thread->socket);
     if (!thread->dispatcher) {
         log_msg(LOG_ERROR, "refresh_thread_create: failed to create dispatcher");
         tree_socket_destroy(thread->socket);
@@ -112,7 +113,7 @@ refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
     thread->request_queue = refresh_request_queue_create(config->request_queue_capacity);
     if (!thread->request_queue) {
         log_msg(LOG_ERROR, "refresh_thread_create: failed to create request queue");
-        tree_dispatcher_destroy(thread->dispatcher);
+        refresh_dispatcher_destroy(thread->dispatcher);
         tree_socket_destroy(thread->socket);
         tree_routing_destroy(thread->routing_table);
         free(thread);
@@ -125,7 +126,7 @@ refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
         if (!thread->ping_workers) {
             log_msg(LOG_ERROR, "refresh_thread_create: failed to allocate ping workers");
             refresh_request_queue_destroy(thread->request_queue);
-            tree_dispatcher_destroy(thread->dispatcher);
+            refresh_dispatcher_destroy(thread->dispatcher);
             tree_socket_destroy(thread->socket);
             tree_routing_destroy(thread->routing_table);
             free(thread);
@@ -140,7 +141,7 @@ refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
             log_msg(LOG_ERROR, "refresh_thread_create: failed to allocate find_node workers");
             free(thread->ping_workers);
             refresh_request_queue_destroy(thread->request_queue);
-            tree_dispatcher_destroy(thread->dispatcher);
+            refresh_dispatcher_destroy(thread->dispatcher);
             tree_socket_destroy(thread->socket);
             tree_routing_destroy(thread->routing_table);
             free(thread);
@@ -156,7 +157,7 @@ refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
             free(thread->find_node_workers);
             free(thread->ping_workers);
             refresh_request_queue_destroy(thread->request_queue);
-            tree_dispatcher_destroy(thread->dispatcher);
+            refresh_dispatcher_destroy(thread->dispatcher);
             tree_socket_destroy(thread->socket);
             tree_routing_destroy(thread->routing_table);
             free(thread);
@@ -182,7 +183,7 @@ int refresh_thread_start(refresh_thread_t *thread) {
     }
 
     /* Start dispatcher */
-    if (tree_dispatcher_start(thread->dispatcher) < 0) {
+    if (refresh_dispatcher_start(thread->dispatcher) < 0) {
         log_msg(LOG_ERROR, "refresh_thread_start: failed to start dispatcher");
         return -1;
     }
@@ -264,7 +265,7 @@ void refresh_thread_destroy(refresh_thread_t *thread) {
 
     /* Destroy components */
     if (thread->dispatcher) {
-        tree_dispatcher_destroy(thread->dispatcher);
+        refresh_dispatcher_destroy(thread->dispatcher);
     }
     if (thread->request_queue) {
         refresh_request_queue_destroy(thread->request_queue);
@@ -416,7 +417,7 @@ static void *ping_worker_func(void *arg) {
         }
 
         /* Send ping query */
-        tree_send_ping((void*)thread, thread->socket, &node.addr);
+        refresh_send_ping(thread->node_id, thread->socket, &node.addr);
     }
 
     log_msg(LOG_DEBUG, "Refresh thread ping worker %d stopped", ctx->worker_id);
@@ -469,26 +470,32 @@ static void *find_node_worker_func(void *arg) {
         /* Generate TID and register */
         uint8_t tid[4];
         int tid_len = tree_protocol_gen_tid(tid);
-        tree_dispatcher_register_tid(thread->dispatcher, tid, tid_len, my_queue);
+        refresh_dispatcher_register_tid(thread->dispatcher, tid, tid_len, my_queue);
 
         /* Send find_node query */
-        tree_send_find_node((void*)thread, thread->socket, tid, tid_len, target, &nodes[0].addr);
+        refresh_send_find_node(thread->node_id, thread->socket, tid, tid_len, target, &nodes[0].addr);
 
         /* Wait for response */
         tree_response_t response_pkt;
         if (tree_response_queue_pop(my_queue, &response_pkt, 500) == 0) {
             /* Parse response */
-            tree_find_node_response_t response;
-            tree_handle_response((void*)thread, response_pkt.data, response_pkt.len,
-                               &response_pkt.from, &response);
+            refresh_find_node_response_t response;
+            if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
+                                                 &response_pkt.from, &response) == 0) {
+                /* Add sender if present */
+                if (response.has_sender_id) {
+                    tree_routing_add_node(thread->routing_table, response.sender_id,
+                                        &response_pkt.from);
+                }
 
-            /* Add discovered nodes to routing table */
-            for (int i = 0; i < response.node_count; i++) {
-                tree_routing_add_node(thread->routing_table, response.nodes[i], &response.addrs[i]);
+                /* Add discovered nodes to routing table */
+                for (int i = 0; i < response.node_count; i++) {
+                    tree_routing_add_node(thread->routing_table, response.nodes[i], &response.addrs[i]);
+                }
             }
         }
 
-        tree_dispatcher_unregister_tid(thread->dispatcher, tid, tid_len);
+        refresh_dispatcher_unregister_tid(thread->dispatcher, tid, tid_len);
     }
 
     log_msg(LOG_DEBUG, "Refresh thread find_node worker %d stopped", ctx->worker_id);
@@ -539,18 +546,23 @@ static void *get_peers_worker_func(void *arg) {
                 uint8_t tid[4];
                 int tid_len = tree_protocol_gen_tid(tid);
 
-                tree_dispatcher_register_tid(thread->dispatcher, tid, tid_len, my_queue);
+                refresh_dispatcher_register_tid(thread->dispatcher, tid, tid_len, my_queue);
 
-                tree_send_get_peers((void*)thread, thread->socket, tid, tid_len,
-                                   request.infohash, &closest[i].addr);
+                refresh_send_get_peers(thread->node_id, thread->socket, tid, tid_len,
+                                      request.infohash, &closest[i].addr);
 
                 tree_response_t response_pkt;
                 if (tree_response_queue_pop(my_queue, &response_pkt,
                                            thread->config.get_peers_timeout_ms) == 0) {
-                    tree_get_peers_response_t response;
-                    if (tree_handle_get_peers_response((void*)thread, response_pkt.data,
-                                                       response_pkt.len, &response_pkt.from,
-                                                       &response) == 0) {
+                    refresh_get_peers_response_t response;
+                    if (refresh_parse_get_peers_response(response_pkt.data, response_pkt.len,
+                                                         &response_pkt.from, &response) == 0) {
+                        /* Add sender if present */
+                        if (response.has_sender_id) {
+                            tree_routing_add_node(thread->routing_table, response.sender_id,
+                                                &response_pkt.from);
+                        }
+
                         total_peers += response.peer_count;
 
                         /* Report peers to waiting HTTP handler */
@@ -565,7 +577,7 @@ static void *get_peers_worker_func(void *arg) {
                     }
                 }
 
-                tree_dispatcher_unregister_tid(thread->dispatcher, tid, tid_len);
+                refresh_dispatcher_unregister_tid(thread->dispatcher, tid, tid_len);
             }
         }
 
