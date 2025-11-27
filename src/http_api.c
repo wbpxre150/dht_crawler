@@ -695,7 +695,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     /* Remove query from store and unref */
-    refresh_query_remove_ptr(api->dht_manager->refresh_query_store, query);
+    refresh_query_remove_ptr(api->refresh_query_store, query);
     refresh_query_unref(query);
 
     /* Build JSON response (matching old format) */
