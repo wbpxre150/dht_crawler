@@ -235,13 +235,24 @@ int batch_writer_flush(batch_writer_t *writer) {
     /* Count successes (database_insert_batch handles logging) */
     size_t written = (ret == 0) ? count : 0;
 
-    /* CRITICAL: Save bloom filter to disk after successful batch write
-     * This ensures the bloom filter on disk stays synchronized with the database.
+    /* CRITICAL: Update bloom filter in memory and save to disk after successful batch write
+     * This ensures the bloom filter stays synchronized with the database.
+     * Steps:
+     * 1. Add all successfully written infohashes to bloom filter (in-memory)
+     * 2. Save bloom filter to disk
      * If the application crashes, the bloom filter will accurately reflect
      * all info_hashes that were successfully written to the database. */
-    if (ret == 0 && written > 0 && writer->bloom && writer->bloom_path) {
-        if (bloom_filter_save(writer->bloom, writer->bloom_path) != 0) {
-            log_msg(LOG_WARN, "Failed to save bloom filter after batch write");
+    if (ret == 0 && written > 0 && writer->bloom) {
+        /* Add all infohashes to bloom filter in memory */
+        for (size_t i = 0; i < count; i++) {
+            bloom_filter_add(writer->bloom, batch_copy[i]->info_hash);
+        }
+
+        /* Save bloom filter to disk */
+        if (writer->bloom_path) {
+            if (bloom_filter_save(writer->bloom, writer->bloom_path) != 0) {
+                log_msg(LOG_WARN, "Failed to save bloom filter after batch write");
+            }
         }
     }
 
