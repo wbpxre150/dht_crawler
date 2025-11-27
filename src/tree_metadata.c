@@ -750,11 +750,13 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
  * Convert tree metadata format to database format
  * @param tree_meta Tree metadata structure (will NOT be freed)
  * @param db_meta Output database metadata structure (caller must free)
+ * @param peer_count Number of peers that had this infohash
  * @return 0 on success, -1 on error
  */
 static int tree_metadata_to_database_format(
     const tree_torrent_metadata_t *tree_meta,
-    torrent_metadata_t *db_meta
+    torrent_metadata_t *db_meta,
+    int peer_count
 ) {
     if (!tree_meta || !db_meta) {
         return -1;
@@ -773,7 +775,7 @@ static int tree_metadata_to_database_format(
 
     /* Copy size and metadata */
     db_meta->size_bytes = tree_meta->total_size;
-    db_meta->total_peers = 0;  /* Not tracked in tree architecture */
+    db_meta->total_peers = peer_count;
     db_meta->added_timestamp = time(NULL);
 
     /* Convert file arrays to file_info_t array */
@@ -877,13 +879,13 @@ void *tree_metadata_worker_func(void *arg) {
             atomic_fetch_add(&tree->metadata_count, 1);
             atomic_store(&tree->last_metadata_time, time(NULL));
 
-            log_msg(LOG_DEBUG, "[tree %u] Fetched metadata: %s (%lld bytes, %d files)",
+            log_msg(LOG_DEBUG, "[tree %u] Fetched metadata: %s (%lld bytes, %d files, %d peers)",
                     tree->tree_id, metadata->name,
-                    (long long)metadata->total_size, metadata->file_count);
+                    (long long)metadata->total_size, metadata->file_count, entry.peer_count);
 
             /* Convert to database format */
             torrent_metadata_t db_meta;
-            int rc = tree_metadata_to_database_format(metadata, &db_meta);
+            int rc = tree_metadata_to_database_format(metadata, &db_meta, entry.peer_count);
 
             if (rc == 0 && tree->shared_batch_writer) {
                 /* Add to batch writer (batch_writer makes deep copy) */
