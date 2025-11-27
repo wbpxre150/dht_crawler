@@ -587,7 +587,10 @@ void supervisor_stop(supervisor_t *sup) {
 
     /* Destroy trees WITHOUT holding lock (pthread_join can block) */
     for (int i = 0; i < num_trees; i++) {
-        log_msg(LOG_DEBUG, "[supervisor] Destroying tree %u...", trees_to_destroy[i]->tree_id);
+        /* Save tree_id before destroying (avoid use-after-free) */
+        uint32_t tree_id = trees_to_destroy[i]->tree_id;
+
+        log_msg(LOG_DEBUG, "[supervisor] Destroying tree %u...", tree_id);
 
         /* Track time to detect hanging threads */
         time_t start = time(NULL);
@@ -596,7 +599,7 @@ void supervisor_stop(supervisor_t *sup) {
 
         if (elapsed > 2) {
             log_msg(LOG_WARN, "[supervisor] Tree %u took %ld seconds to destroy (possible hang)",
-                    trees_to_destroy[i]->tree_id, elapsed);
+                    tree_id, elapsed);
         }
         log_msg(LOG_DEBUG, "[supervisor] Tree destroyed");
     }

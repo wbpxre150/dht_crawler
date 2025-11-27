@@ -659,7 +659,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     if (rc != 0) {
         log_msg(LOG_WARN, "Failed to submit refresh request, queue may be full");
         refresh_query_complete(api->refresh_query_store, info_hash);
-        refresh_query_unref(query);
+        refresh_query_remove_ptr(api->refresh_query_store, query);
         const char *error = "{\"error\":\"Refresh queue full, try again later\"}";
         mg_printf(conn,
                   "HTTP/1.1 503 Service Unavailable\r\n"
@@ -694,9 +694,8 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         }
     }
 
-    /* Remove query from store and unref */
+    /* Remove query from store (this also unrefs) */
     refresh_query_remove_ptr(api->refresh_query_store, query);
-    refresh_query_unref(query);
 
     /* Build JSON response (matching old format) */
     cJSON *root = cJSON_CreateObject();
