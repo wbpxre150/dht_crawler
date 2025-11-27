@@ -516,6 +516,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         /* Add aggregate stats */
         cJSON *aggregate = cJSON_CreateObject();
         cJSON_AddNumberToObject(aggregate, "total_metadata_fetched", (double)total_metadata);
+        cJSON_AddNumberToObject(aggregate, "active_connections", metadata_stats.active_count);
         cJSON_AddItemToObject(root, "aggregate", aggregate);
     }
 
