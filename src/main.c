@@ -11,6 +11,7 @@
 #include "supervisor.h"
 #include "batch_writer.h"
 #include "refresh_thread.h"
+#include "refresh_query.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -28,6 +29,7 @@ static bloom_filter_t *g_bloom = NULL;
 static supervisor_t *g_supervisor = NULL;
 static batch_writer_t *g_batch_writer = NULL;  /* Shared batch writer for thread trees */
 static refresh_thread_t *g_refresh_thread = NULL;  /* Refresh thread for /refresh endpoint */
+static refresh_query_store_t *g_refresh_query_store = NULL;  /* Shared refresh query store */
 
 /* Signal handler for graceful shutdown */
 static void signal_handler(int signum) {
@@ -290,6 +292,19 @@ int main(int argc, char *argv[]) {
         /* Start supervisor (spawns all trees) */
         supervisor_start(g_supervisor);
 
+        /* Create shared refresh query store for HTTP API */
+        log_msg(LOG_DEBUG, "Creating refresh query store...");
+        g_refresh_query_store = refresh_query_store_init(1009, 10);
+        if (!g_refresh_query_store) {
+            log_msg(LOG_ERROR, "Failed to create refresh query store");
+            supervisor_stop(g_supervisor);
+            supervisor_destroy(g_supervisor);
+            batch_writer_cleanup(g_batch_writer);
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            return 1;
+        }
+
         /* Create and start refresh thread */
         log_msg(LOG_DEBUG, "Creating refresh thread...");
         refresh_thread_config_t refresh_config = {
@@ -305,7 +320,7 @@ int main(int argc, char *argv[]) {
 
         g_refresh_thread = refresh_thread_create(&refresh_config,
                                                   g_supervisor->shared_node_pool,
-                                                  g_dht_mgr.refresh_query_store);
+                                                  g_refresh_query_store);
         if (!g_refresh_thread) {
             log_msg(LOG_ERROR, "Failed to create refresh thread");
             supervisor_stop(g_supervisor);
@@ -349,6 +364,9 @@ int main(int argc, char *argv[]) {
 
         /* Set refresh thread for /refresh endpoint */
         http_api_set_refresh_thread(&g_http_api, g_refresh_thread);
+
+        /* Set refresh query store for /refresh endpoint */
+        http_api_set_refresh_query_store(&g_http_api, g_refresh_query_store);
 
         /* Start HTTP API */
         log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
@@ -412,6 +430,9 @@ int main(int argc, char *argv[]) {
         }
         supervisor_destroy(g_supervisor);
         batch_writer_cleanup(g_batch_writer);
+        if (g_refresh_query_store) {
+            refresh_query_store_cleanup(g_refresh_query_store);
+        }
         database_cleanup(&g_database);
         torrent_search_cleanup();
         porn_filter_cleanup();

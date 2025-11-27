@@ -25,10 +25,11 @@ static int search_handler(struct mg_connection *conn, void *cbdata);
 static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int root_handler(struct mg_connection *conn, void *cbdata);
 static int refresh_handler(struct mg_connection *conn, void *cbdata);
+static void format_hex(const uint8_t *data, size_t len, char *out);
+static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
-static void format_hex(const uint8_t *data, size_t len, char *out);
 
 /* Helper: Format info_hash as hex */
 static void format_hex(const uint8_t *data, size_t len, char *out) {
@@ -143,6 +144,12 @@ void http_api_set_supervisor(http_api_t *api, struct supervisor *supervisor) {
 void http_api_set_refresh_thread(http_api_t *api, struct refresh_thread *refresh_thread) {
     if (api) {
         api->refresh_thread = refresh_thread;
+    }
+}
+
+void http_api_set_refresh_query_store(http_api_t *api, refresh_query_store_t *query_store) {
+    if (api) {
+        api->refresh_query_store = query_store;
     }
 }
 
@@ -620,9 +627,9 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         return 503;
     }
 
-    /* Check refresh query store availability (from dht_manager) */
-    if (!api->dht_manager || !api->dht_manager->refresh_query_store) {
-        const char *error = "{\"error\":\"DHT query system not available\"}";
+    /* Check refresh query store availability */
+    if (!api->refresh_query_store) {
+        const char *error = "{\"error\":\"Refresh query system not available\"}";
         mg_printf(conn,
                   "HTTP/1.1 503 Service Unavailable\r\n"
                   "Content-Type: application/json\r\n"
@@ -634,7 +641,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     /* Create pending query */
-    refresh_query_t *query = refresh_query_create(api->dht_manager->refresh_query_store, info_hash);
+    refresh_query_t *query = refresh_query_create(api->refresh_query_store, info_hash);
     if (!query) {
         const char *error = "{\"error\":\"Failed to create DHT query\"}";
         mg_printf(conn,
@@ -651,7 +658,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     int rc = refresh_thread_submit_request(api->refresh_thread, info_hash);
     if (rc != 0) {
         log_msg(LOG_WARN, "Failed to submit refresh request, queue may be full");
-        refresh_query_complete(api->dht_manager->refresh_query_store, info_hash);
+        refresh_query_complete(api->refresh_query_store, info_hash);
         refresh_query_unref(query);
         const char *error = "{\"error\":\"Refresh queue full, try again later\"}";
         mg_printf(conn,

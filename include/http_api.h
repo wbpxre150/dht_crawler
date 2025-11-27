@@ -5,6 +5,7 @@
 #include "database.h"
 #include "dht_manager.h"
 #include "metadata_fetcher.h"
+#include "refresh_query.h"
 
 /* Forward declarations */
 struct batch_writer;
@@ -25,6 +26,7 @@ typedef struct {
     metadata_fetcher_t *metadata_fetcher;
     struct supervisor *supervisor;  /* Stage 6: Thread tree supervisor */
     struct refresh_thread *refresh_thread;  /* Refresh thread for /refresh endpoint */
+    refresh_query_store_t *refresh_query_store;  /* Direct access for /refresh endpoint */
     int port;
     int running;
 } http_api_t;
@@ -54,6 +56,9 @@ void http_api_set_supervisor(http_api_t *api, struct supervisor *supervisor);
 
 /* Set refresh thread for /refresh endpoint */
 void http_api_set_refresh_thread(http_api_t *api, struct refresh_thread *refresh_thread);
+
+/* Set refresh query store for /refresh endpoint */
+void http_api_set_refresh_query_store(http_api_t *api, refresh_query_store_t *query_store);
 
 /* Search functions */
 int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count);
