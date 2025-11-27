@@ -243,6 +243,7 @@ int main(int argc, char *argv[]) {
         supervisor_config_t sup_config = {
             .max_trees = config.num_trees,
             .min_metadata_rate = config.min_metadata_rate,
+            .use_keyspace_partitioning = config.use_keyspace_partitioning,
             .batch_writer = g_batch_writer,
             .bloom_filter = g_bloom,
             .num_find_node_workers = config.tree_find_node_workers,

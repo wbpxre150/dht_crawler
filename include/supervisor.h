@@ -24,6 +24,7 @@ struct shared_node_pool;
 typedef struct supervisor_config {
     int max_trees;                  /* Maximum number of concurrent trees */
     double min_metadata_rate;       /* Minimum metadata/sec before tree restart */
+    bool use_keyspace_partitioning; /* Enable keyspace partitioning (default: true) */
 
     /* Worker counts per tree */
     int num_find_node_workers;
@@ -71,6 +72,9 @@ typedef struct supervisor {
     int max_trees;
     int active_trees;
     pthread_mutex_t trees_lock;
+
+    /* Keyspace partitioning */
+    bool use_keyspace_partitioning; /* Enable keyspace partitioning */
 
     /* Shared resources (only these are shared between trees) */
     struct batch_writer *batch_writer;

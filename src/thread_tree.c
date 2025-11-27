@@ -13,6 +13,7 @@
 #include "shared_node_pool.h"
 #include "supervisor.h"
 #include "dht_crawler.h"
+#include "keyspace.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -934,7 +935,20 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     }
 
     tree->tree_id = tree_id;
-    generate_random_node_id(tree->node_id);
+
+    /* Store keyspace partition info */
+    tree->partition_index = config->partition_index;
+    tree->num_partitions = config->num_partitions;
+
+    /* Generate node ID using keyspace partitioning or random */
+    if (config->use_keyspace_partitioning && config->num_partitions > 0) {
+        keyspace_generate_node_id(config->partition_index, config->num_partitions, tree->node_id);
+        log_msg(LOG_DEBUG, "[tree %u] Using keyspace partition %u/%u",
+                tree_id, config->partition_index, config->num_partitions);
+    } else {
+        generate_random_node_id(tree->node_id);
+        log_msg(LOG_DEBUG, "[tree %u] Using random node ID", tree_id);
+    }
 
     /* Stage 2 config */
     tree->bootstrap_timeout_sec = config->bootstrap_timeout_sec > 0 ? config->bootstrap_timeout_sec : 30;

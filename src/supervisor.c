@@ -9,6 +9,7 @@
 #include "tree_protocol.h"
 #include "tree_routing.h"
 #include "wbpxre_dht.h"
+#include "keyspace.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -26,7 +27,7 @@ static const char *BOOTSTRAP_NODES[] = {
 static const int BOOTSTRAP_PORT = 6881;
 
 /* Forward declaration of internal helpers */
-static thread_tree_t *spawn_tree(supervisor_t *sup);
+static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree);
 static void *monitor_thread_func(void *arg);
 static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec, int num_workers);
 
@@ -46,6 +47,9 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->active_trees = 0;
     sup->next_tree_id = 1;
     sup->monitor_running = 0;
+
+    /* Keyspace partitioning (default: enabled) */
+    sup->use_keyspace_partitioning = config->use_keyspace_partitioning;
 
     /* Store shared resources */
     sup->batch_writer = config->batch_writer;
@@ -110,8 +114,20 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     return sup;
 }
 
-static thread_tree_t *spawn_tree(supervisor_t *sup) {
+/**
+ * Spawn a new tree for the given slot
+ * @param sup Supervisor instance
+ * @param slot_index Slot index (0 to max_trees-1), used as partition index
+ * @param old_tree Previous tree in this slot (NULL for first spawn, non-NULL for respawn)
+ * @return Pointer to new tree, or NULL on error
+ */
+static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree) {
     tree_config_t config = {
+        /* Keyspace partitioning */
+        .use_keyspace_partitioning = sup->use_keyspace_partitioning,
+        .partition_index = (uint32_t)slot_index,
+        .num_partitions = (uint32_t)sup->max_trees,
+
         /* Stage 2 settings (Bootstrap) - using configurable find_node workers */
         .num_bootstrap_workers = sup->num_find_node_workers,
         .num_find_node_workers = sup->num_find_node_workers,  /* Continuous find_node workers */
@@ -156,6 +172,22 @@ static thread_tree_t *spawn_tree(supervisor_t *sup) {
 
     /* Set supervisor backlink */
     tree->supervisor = sup;
+
+    /* If respawning (old_tree != NULL), perturb the node ID to explore different neighborhood */
+    if (old_tree && sup->use_keyspace_partitioning) {
+        log_msg(LOG_DEBUG, "[supervisor] Respawning tree in slot %d, perturbing node ID within partition %u/%u",
+                slot_index, tree->partition_index, tree->num_partitions);
+
+        keyspace_perturb_node_id(old_tree->node_id,
+                                tree->partition_index,
+                                tree->num_partitions,
+                                tree->node_id);
+
+        /* Verify the new node ID is in the correct partition */
+        if (!keyspace_verify_partition(tree->node_id, tree->partition_index, tree->num_partitions)) {
+            log_msg(LOG_WARN, "[supervisor] Perturbed node ID failed partition verification");
+        }
+    }
 
     return tree;
 }
@@ -477,7 +509,7 @@ void supervisor_start(supervisor_t *sup) {
 
     /* Spawn all trees (they will sample from the shared pool) */
     for (int i = 0; i < sup->max_trees; i++) {
-        sup->trees[i] = spawn_tree(sup);
+        sup->trees[i] = spawn_tree(sup, i, NULL);  /* NULL = first spawn, not a respawn */
         if (sup->trees[i]) {
             thread_tree_start(sup->trees[i]);
             sup->active_trees++;
@@ -611,19 +643,26 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree) {
     }
 
     if (slot >= 0) {
-        /* Destroy old tree */
-        thread_tree_destroy(sup->trees[slot]);
+        /* Save reference to old tree for perturbation */
+        thread_tree_t *old_tree = sup->trees[slot];
+
+        /* Spawn replacement BEFORE destroying old tree (so we can perturb its node ID) */
+        thread_tree_t *new_tree = NULL;
+        if (sup->monitor_running) {
+            log_msg(LOG_DEBUG, "[supervisor] Spawning replacement tree for slot %d", slot);
+            new_tree = spawn_tree(sup, slot, old_tree);  /* Pass old_tree for perturbation */
+        }
+
+        /* Now destroy old tree */
+        thread_tree_destroy(old_tree);
         sup->trees[slot] = NULL;
         sup->active_trees--;
 
-        /* Spawn replacement if monitor is still running */
-        if (sup->monitor_running) {
-            log_msg(LOG_DEBUG, "[supervisor] Spawning replacement tree for slot %d", slot);
-            sup->trees[slot] = spawn_tree(sup);
-            if (sup->trees[slot]) {
-                thread_tree_start(sup->trees[slot]);
-                sup->active_trees++;
-            }
+        /* Start new tree if we created one */
+        if (new_tree) {
+            sup->trees[slot] = new_tree;
+            thread_tree_start(new_tree);
+            sup->active_trees++;
         }
     }
 

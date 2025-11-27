@@ -39,6 +39,11 @@ typedef enum {
 
 /* Configuration for a thread tree */
 typedef struct tree_config {
+    /* Keyspace partitioning */
+    uint32_t partition_index;       /* Keyspace partition for this tree */
+    uint32_t num_partitions;        /* Total partitions in the system */
+    bool use_keyspace_partitioning; /* Enable keyspace partitioning (vs random node ID) */
+
     int num_bootstrap_workers;      /* Stage 2: Find_node workers for bootstrap (default: 10) */
     int num_find_node_workers;      /* Continuous find_node workers (default: 30) */
     int num_bep51_workers;
@@ -86,6 +91,8 @@ typedef struct tree_config {
 typedef struct thread_tree {
     uint32_t tree_id;
     uint8_t node_id[20];           /* Private node_id for this tree */
+    uint32_t partition_index;      /* Keyspace partition this tree belongs to */
+    uint32_t num_partitions;       /* Total number of partitions in the system */
 
     /* Private data structures (no sharing between trees) */
     void *routing_table;           /* Private routing table (tree_routing_table_t*) */

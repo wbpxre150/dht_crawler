@@ -113,6 +113,9 @@ typedef struct {
 
     /* Thread tree mode toggle */
     int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
+
+    /* Keyspace partitioning settings */
+    int use_keyspace_partitioning;       /* Enable keyspace partitioning (0=random node IDs, 1=partitioned, default: 1) */
 } crawler_config_t;
 
 /* Initialize config with default values */

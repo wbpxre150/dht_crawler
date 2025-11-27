@@ -121,6 +121,9 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Thread tree mode toggle - disabled by default for safety */
     config->use_thread_trees = 0;                   /* 0=old architecture */
+
+    /* Keyspace partitioning - enabled by default */
+    config->use_keyspace_partitioning = 1;          /* 1=enabled (evenly distributed node IDs) */
 }
 
 /* Load config from INI-style file */
@@ -392,6 +395,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Thread tree mode toggle */
         else if (strcmp(key, "use_thread_trees") == 0) {
             config->use_thread_trees = atoi(value);
+        }
+        /* Keyspace partitioning toggle */
+        else if (strcmp(key, "use_keyspace_partitioning") == 0) {
+            config->use_keyspace_partitioning = atoi(value);
         }
     }
 
