@@ -148,6 +148,7 @@ typedef struct thread_tree {
     atomic_uint_fast64_t metadata_count;
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
+    atomic_int active_connections;  /* Track active TCP connections */
 
     /* Lifecycle tracking */
     time_t creation_time;           /* When tree was created */

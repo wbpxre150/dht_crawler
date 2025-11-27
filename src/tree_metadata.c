@@ -516,14 +516,21 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     int tcp_timeout = config ? config->tcp_connect_timeout_ms : DEFAULT_TCP_TIMEOUT_MS;
     int metadata_timeout = config ? config->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS;
     int max_metadata = config ? config->max_metadata_size : MAX_METADATA_SIZE_DEFAULT;
+    thread_tree_t *tree = config ? config->tree : NULL;
 
     /* Create socket */
     int family = peer->ss_family;
     int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
 
+    /* Track active connection */
+    if (tree) {
+        atomic_fetch_add(&tree->active_connections, 1);
+    }
+
     /* Set non-blocking and options */
     if (set_nonblocking(fd) < 0) {
+        if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
         return NULL;
     }
@@ -534,6 +541,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     /* Connect */
     socklen_t addrlen = (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
     if (connect_with_timeout(fd, (const struct sockaddr *)peer, addrlen, tcp_timeout) < 0) {
+        if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
         return NULL;
     }
@@ -543,6 +551,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     generate_peer_id(peer_id);
 
     if (send_handshake(fd, infohash, peer_id) < 0) {
+        if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
         return NULL;
     }
@@ -729,6 +738,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     }
 
     /* Cleanup */
+    if (tree) atomic_fetch_sub(&tree->active_connections, 1);
     close(fd);
     if (metadata_buffer) free(metadata_buffer);
     if (pieces_bitmap) free(pieces_bitmap);
@@ -843,7 +853,8 @@ void *tree_metadata_worker_func(void *arg) {
     tree_metadata_config_t config = {
         .tcp_connect_timeout_ms = 5000,
         .metadata_timeout_ms = 30000,
-        .max_metadata_size = 10 * 1024 * 1024
+        .max_metadata_size = 10 * 1024 * 1024,
+        .tree = tree
     };
 
     while (!atomic_load(&tree->shutdown_requested)) {

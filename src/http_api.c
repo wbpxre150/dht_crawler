@@ -472,6 +472,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(tree->current_phase));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
+                cJSON_AddNumberToObject(tree_json, "active_connections", (int)atomic_load(&tree->active_connections));
                 cJSON_AddBoolToObject(tree_json, "discovery_paused", atomic_load(&tree->discovery_paused));
 
                 /* Add queue sizes for monitoring and tuning */
@@ -516,7 +517,11 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         /* Add aggregate stats */
         cJSON *aggregate = cJSON_CreateObject();
         cJSON_AddNumberToObject(aggregate, "total_metadata_fetched", (double)total_metadata);
-        cJSON_AddNumberToObject(aggregate, "active_connections", metadata_stats.active_count);
+
+        /* Get total active connections across all trees */
+        int total_connections = supervisor_get_total_connections(api->supervisor);
+        cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
+
         cJSON_AddItemToObject(root, "aggregate", aggregate);
     }
 

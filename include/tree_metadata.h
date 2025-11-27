@@ -35,6 +35,7 @@ typedef struct tree_metadata_config {
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
     int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 30000) */
     int max_metadata_size;          /* Max metadata size in bytes (default: 10MB) */
+    struct thread_tree *tree;       /* Tree pointer for connection tracking (optional) */
 } tree_metadata_config_t;
 
 /**

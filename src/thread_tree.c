@@ -929,6 +929,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->metadata_count, 0);
     atomic_store(&tree->last_metadata_time, 0);
     tree->metadata_rate = 0.0;
+    atomic_init(&tree->active_connections, 0);
 
     /* Initialize lifecycle tracking */
     tree->creation_time = time(NULL);

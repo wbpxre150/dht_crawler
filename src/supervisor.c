@@ -691,3 +691,19 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
         *out_total_metadata = total_metadata;
     }
 }
+
+int supervisor_get_total_connections(supervisor_t *sup) {
+    if (!sup) {
+        return 0;
+    }
+
+    int total = 0;
+    pthread_mutex_lock(&sup->trees_lock);
+    for (int i = 0; i < sup->max_trees; i++) {
+        if (sup->trees[i]) {
+            total += atomic_load(&sup->trees[i]->active_connections);
+        }
+    }
+    pthread_mutex_unlock(&sup->trees_lock);
+    return total;
+}

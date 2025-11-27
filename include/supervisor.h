@@ -152,4 +152,11 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree);
  */
 void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata);
 
+/**
+ * Get total active connections across all trees
+ * @param sup Supervisor instance
+ * @return Total active connections
+ */
+int supervisor_get_total_connections(supervisor_t *sup);
+
 #endif /* SUPERVISOR_H */
