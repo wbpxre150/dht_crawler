@@ -77,6 +77,10 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
     sup->infohash_resume_threshold = config->infohash_resume_threshold > 0 ? config->infohash_resume_threshold : 1000;
 
+    /* Get_peers throttling settings */
+    sup->peers_pause_threshold = config->peers_pause_threshold > 0 ? config->peers_pause_threshold : 2000;
+    sup->peers_resume_threshold = config->peers_resume_threshold > 0 ? config->peers_resume_threshold : 1000;
+
     /* Stage 5 settings */
     sup->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 10;
     sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
@@ -126,6 +130,9 @@ static thread_tree_t *spawn_tree(supervisor_t *sup) {
         /* Find_node throttling settings */
         .infohash_pause_threshold = sup->infohash_pause_threshold,
         .infohash_resume_threshold = sup->infohash_resume_threshold,
+        /* Get_peers throttling settings */
+        .peers_pause_threshold = sup->peers_pause_threshold,
+        .peers_resume_threshold = sup->peers_resume_threshold,
         /* Stage 5 settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,

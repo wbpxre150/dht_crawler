@@ -61,6 +61,10 @@ typedef struct tree_config {
     int infohash_pause_threshold;   /* Queue size to pause find_node (default: 2000) */
     int infohash_resume_threshold;  /* Queue size to resume find_node (default: 1000) */
 
+    /* Get_peers throttling settings */
+    int peers_pause_threshold;      /* Peers queue size to pause get_peers (default: 2000) */
+    int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
+
     /* Stage 5: Metadata fetcher settings */
     double min_metadata_rate;       /* Minimum metadata/sec before shutdown (default: 0.5) */
     int rate_check_interval_sec;    /* Rate check interval (default: 10) */
@@ -126,6 +130,13 @@ typedef struct thread_tree {
     pthread_cond_t throttle_resume;         /* Condition variable for resuming workers */
     int infohash_pause_threshold;           /* Queue size to pause (default: 2000) */
     int infohash_resume_threshold;          /* Queue size to resume (default: 1000) */
+
+    /* Get_peers throttling state (separate from discovery throttling) */
+    atomic_bool get_peers_paused;           /* Signal to pause get_peers workers */
+    pthread_mutex_t get_peers_throttle_lock;/* Protects get_peers throttle state */
+    pthread_cond_t get_peers_throttle_resume; /* Condition variable for resuming get_peers */
+    int peers_pause_threshold;              /* Peers queue size to pause (default: 2000) */
+    int peers_resume_threshold;             /* Peers queue size to resume (default: 1000) */
 
     /* Thread handles */
     pthread_t bootstrap_thread;

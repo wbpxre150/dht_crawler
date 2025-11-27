@@ -49,6 +49,10 @@ typedef struct supervisor_config {
     int infohash_pause_threshold;   /* Queue size to pause find_node (default: 2000) */
     int infohash_resume_threshold;  /* Queue size to resume find_node (default: 1000) */
 
+    /* Get_peers throttling settings */
+    int peers_pause_threshold;      /* Peers queue size to pause get_peers (default: 2000) */
+    int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
+
     /* Stage 5 settings */
     int rate_check_interval_sec;    /* Rate check interval (default: 10) */
     int rate_grace_period_sec;      /* Grace period before shutdown (default: 30) */
@@ -97,6 +101,10 @@ typedef struct supervisor {
     /* Find_node throttling settings */
     int infohash_pause_threshold;
     int infohash_resume_threshold;
+
+    /* Get_peers throttling settings */
+    int peers_pause_threshold;
+    int peers_resume_threshold;
 
     /* Stage 5 settings */
     int rate_check_interval_sec;

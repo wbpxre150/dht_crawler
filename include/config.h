@@ -99,6 +99,10 @@ typedef struct {
     int tree_infohash_pause_threshold;   /* Queue size to pause find_node workers (default: 2000) */
     int tree_infohash_resume_threshold;  /* Queue size to resume find_node workers (default: 1000) */
 
+    /* Get_peers throttling settings */
+    int tree_peers_pause_threshold;      /* Peers queue size to pause get_peers workers (default: 2000) */
+    int tree_peers_resume_threshold;     /* Peers queue size to resume get_peers workers (default: 1000) */
+
     /* Thread tree Stage 5 settings (metadata) */
     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
     int tree_rate_check_interval_sec;    /* Rate check interval (default: 10) */

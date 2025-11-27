@@ -263,6 +263,9 @@ int main(int argc, char *argv[]) {
             /* Find_node throttling settings */
             .infohash_pause_threshold = config.tree_infohash_pause_threshold,
             .infohash_resume_threshold = config.tree_infohash_resume_threshold,
+            /* Get_peers throttling settings */
+            .peers_pause_threshold = config.tree_peers_pause_threshold,
+            .peers_resume_threshold = config.tree_peers_resume_threshold,
             /* Stage 5 settings */
             .rate_check_interval_sec = config.tree_rate_check_interval_sec,
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,

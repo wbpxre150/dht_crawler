@@ -257,41 +257,70 @@ typedef struct throttle_monitor_ctx {
     thread_tree_t *tree;
 } throttle_monitor_ctx_t;
 
-/* Throttle monitor thread - checks infohash queue size and pauses/resumes discovery workers (find_node + BEP51) */
+/* Throttle monitor thread - checks queue sizes and pauses/resumes workers */
 static void *throttle_monitor_func(void *arg) {
     throttle_monitor_ctx_t *ctx = (throttle_monitor_ctx_t *)arg;
     thread_tree_t *tree = ctx->tree;
 
     log_msg(LOG_DEBUG, "[tree %u] Throttle monitor started", tree->tree_id);
 
-    bool currently_paused = false;
+    bool discovery_currently_paused = false;
+    bool get_peers_currently_paused = false;
 
     while (!atomic_load(&tree->shutdown_requested)) {
-        /* Check infohash queue size */
-        int queue_size = tree_infohash_queue_count(tree->infohash_queue);
+        /* Check infohash queue size (for discovery workers: find_node + BEP51) */
+        int infohash_queue_size = tree_infohash_queue_count(tree->infohash_queue);
 
-        if (!currently_paused && queue_size >= tree->infohash_pause_threshold) {
+        if (!discovery_currently_paused && infohash_queue_size >= tree->infohash_pause_threshold) {
             /* Pause discovery workers (find_node + BEP51) */
-            log_msg(LOG_DEBUG, "[tree %u] PAUSING discovery workers (find_node + BEP51) (queue=%d >= %d)",
-                    tree->tree_id, queue_size, tree->infohash_pause_threshold);
+            log_msg(LOG_DEBUG, "[tree %u] PAUSING discovery workers (find_node + BEP51) (infohash_queue=%d >= %d)",
+                    tree->tree_id, infohash_queue_size, tree->infohash_pause_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
             atomic_store(&tree->discovery_paused, true);
             pthread_mutex_unlock(&tree->throttle_lock);
 
-            currently_paused = true;
+            discovery_currently_paused = true;
 
-        } else if (currently_paused && queue_size < tree->infohash_resume_threshold) {
+        } else if (discovery_currently_paused && infohash_queue_size < tree->infohash_resume_threshold) {
             /* Resume discovery workers (find_node + BEP51) */
-            log_msg(LOG_DEBUG, "[tree %u] RESUMING discovery workers (find_node + BEP51) (queue=%d < %d)",
-                    tree->tree_id, queue_size, tree->infohash_resume_threshold);
+            log_msg(LOG_DEBUG, "[tree %u] RESUMING discovery workers (find_node + BEP51) (infohash_queue=%d < %d)",
+                    tree->tree_id, infohash_queue_size, tree->infohash_resume_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
             atomic_store(&tree->discovery_paused, false);
             pthread_cond_broadcast(&tree->throttle_resume);  /* Wake all workers */
             pthread_mutex_unlock(&tree->throttle_lock);
 
-            currently_paused = false;
+            discovery_currently_paused = false;
+        }
+
+        /* Check peers queue size (for get_peers workers) */
+        tree_peers_queue_t *peers_queue = (tree_peers_queue_t *)tree->peers_queue;
+        int peers_queue_size = tree_peers_queue_count(peers_queue);
+
+        if (!get_peers_currently_paused && peers_queue_size >= tree->peers_pause_threshold) {
+            /* Pause get_peers workers */
+            log_msg(LOG_DEBUG, "[tree %u] PAUSING get_peers workers (peers_queue=%d >= %d)",
+                    tree->tree_id, peers_queue_size, tree->peers_pause_threshold);
+
+            pthread_mutex_lock(&tree->get_peers_throttle_lock);
+            atomic_store(&tree->get_peers_paused, true);
+            pthread_mutex_unlock(&tree->get_peers_throttle_lock);
+
+            get_peers_currently_paused = true;
+
+        } else if (get_peers_currently_paused && peers_queue_size < tree->peers_resume_threshold) {
+            /* Resume get_peers workers */
+            log_msg(LOG_DEBUG, "[tree %u] RESUMING get_peers workers (peers_queue=%d < %d)",
+                    tree->tree_id, peers_queue_size, tree->peers_resume_threshold);
+
+            pthread_mutex_lock(&tree->get_peers_throttle_lock);
+            atomic_store(&tree->get_peers_paused, false);
+            pthread_cond_broadcast(&tree->get_peers_throttle_resume);  /* Wake all workers */
+            pthread_mutex_unlock(&tree->get_peers_throttle_lock);
+
+            get_peers_currently_paused = false;
         }
 
         /* Check every 2 seconds (responsive but not too aggressive) */
@@ -299,11 +328,17 @@ static void *throttle_monitor_func(void *arg) {
     }
 
     /* On shutdown, resume all workers so they can exit cleanly */
-    if (currently_paused) {
+    if (discovery_currently_paused) {
         pthread_mutex_lock(&tree->throttle_lock);
         atomic_store(&tree->discovery_paused, false);
         pthread_cond_broadcast(&tree->throttle_resume);
         pthread_mutex_unlock(&tree->throttle_lock);
+    }
+    if (get_peers_currently_paused) {
+        pthread_mutex_lock(&tree->get_peers_throttle_lock);
+        atomic_store(&tree->get_peers_paused, false);
+        pthread_cond_broadcast(&tree->get_peers_throttle_resume);
+        pthread_mutex_unlock(&tree->get_peers_throttle_lock);
     }
 
     free(ctx);
@@ -568,6 +603,26 @@ static void *get_peers_worker_func(void *arg) {
     unsigned long timeouts = 0;
 
     while (!atomic_load(&tree->shutdown_requested)) {
+        /* 0. Check if we should pause (peers queue is full enough) */
+        if (atomic_load(&tree->get_peers_paused)) {
+            log_msg(LOG_DEBUG, "[tree %u] get_peers worker %d PAUSED (peers_queue >= %d)",
+                    tree->tree_id, worker_id, tree->peers_pause_threshold);
+
+            pthread_mutex_lock(&tree->get_peers_throttle_lock);
+            while (atomic_load(&tree->get_peers_paused) && !atomic_load(&tree->shutdown_requested)) {
+                pthread_cond_wait(&tree->get_peers_throttle_resume, &tree->get_peers_throttle_lock);
+            }
+            pthread_mutex_unlock(&tree->get_peers_throttle_lock);
+
+            log_msg(LOG_DEBUG, "[tree %u] get_peers worker %d RESUMED",
+                    tree->tree_id, worker_id);
+
+            /* Re-check shutdown after waking */
+            if (atomic_load(&tree->shutdown_requested)) {
+                break;
+            }
+        }
+
         /* 1. Pop infohash from queue (with timeout) */
         uint8_t infohash[20];
         if (tree_infohash_queue_pop(tree->infohash_queue, infohash, 1000) < 0) {
@@ -925,6 +980,13 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
     tree->infohash_resume_threshold = config->infohash_resume_threshold > 0 ? config->infohash_resume_threshold : 1000;
 
+    /* Initialize get_peers throttling */
+    atomic_store(&tree->get_peers_paused, false);
+    pthread_mutex_init(&tree->get_peers_throttle_lock, NULL);
+    pthread_cond_init(&tree->get_peers_throttle_resume, NULL);
+    tree->peers_pause_threshold = config->peers_pause_threshold > 0 ? config->peers_pause_threshold : 2000;
+    tree->peers_resume_threshold = config->peers_resume_threshold > 0 ? config->peers_resume_threshold : 1000;
+
     /* Initialize statistics */
     atomic_store(&tree->metadata_count, 0);
     atomic_store(&tree->last_metadata_time, 0);
@@ -1158,6 +1220,8 @@ void thread_tree_destroy(thread_tree_t *tree) {
     /* Cleanup throttling synchronization primitives */
     pthread_mutex_destroy(&tree->throttle_lock);
     pthread_cond_destroy(&tree->throttle_resume);
+    pthread_mutex_destroy(&tree->get_peers_throttle_lock);
+    pthread_cond_destroy(&tree->get_peers_throttle_resume);
 
     log_msg(LOG_DEBUG, "[tree %u] Destroyed (metadata_count=%lu)",
             tree->tree_id, (unsigned long)atomic_load(&tree->metadata_count));
