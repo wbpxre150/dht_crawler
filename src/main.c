@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <errno.h>
 #include <libgen.h>
 
@@ -148,6 +149,24 @@ int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
     int rc;
+
+    /* Increase file descriptor limit to support max_concurrent_connections
+     * The default soft limit is often 1024, which is too low for high-concurrency crawling.
+     * We raise it to the hard limit (typically 524288 on modern systems). */
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+        rlim_t old_soft = rlim.rlim_cur;
+        /* Set soft limit to hard limit */
+        rlim.rlim_cur = rlim.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+            log_msg(LOG_DEBUG, "Increased file descriptor limit from %lu to %lu",
+                   (unsigned long)old_soft, (unsigned long)rlim.rlim_cur);
+        } else {
+            log_msg(LOG_WARN, "Failed to increase file descriptor limit: %s", strerror(errno));
+        }
+    } else {
+        log_msg(LOG_WARN, "Failed to get file descriptor limit: %s", strerror(errno));
+    }
 
     log_msg(LOG_DEBUG, "DHT Crawler v%s starting...", DHT_CRAWLER_VERSION);
 

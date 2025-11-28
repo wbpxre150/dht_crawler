@@ -19,6 +19,7 @@ struct batch_writer {
 
     uv_mutex_t mutex;
     bool running;
+    bool flush_in_progress;  /* Prevents concurrent flush operations */
 
     uint64_t total_written;
     uint64_t total_flushes;
@@ -64,6 +65,7 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->batch_size = 0;
     writer->flush_interval_sec = flush_interval_sec;
     writer->running = true;
+    writer->flush_in_progress = false;
     writer->total_written = 0;
     writer->total_flushes = 0;
     
@@ -209,24 +211,35 @@ int batch_writer_flush(batch_writer_t *writer) {
     if (!writer) {
         return -1;
     }
-    
+
     uv_mutex_lock(&writer->mutex);
-    
+
+    /* Prevent concurrent flushes - if one is already in progress, skip this one */
+    if (writer->flush_in_progress) {
+        uv_mutex_unlock(&writer->mutex);
+        log_msg(LOG_DEBUG, "Skipping flush - another flush already in progress");
+        return 0;
+    }
+
     if (writer->batch_size == 0) {
         uv_mutex_unlock(&writer->mutex);
         return 0;
     }
-    
+
+    /* Mark flush as in progress */
+    writer->flush_in_progress = true;
+
     size_t count = writer->batch_size;
     torrent_metadata_t **batch_copy = malloc(count * sizeof(torrent_metadata_t*));
     if (!batch_copy) {
+        writer->flush_in_progress = false;
         uv_mutex_unlock(&writer->mutex);
         return -1;
     }
-    
+
     memcpy(batch_copy, writer->batch, count * sizeof(torrent_metadata_t*));
     writer->batch_size = 0;
-    
+
     uv_mutex_unlock(&writer->mutex);
 
     /* Use optimized batch insert (single transaction, single mutex lock) */
@@ -295,6 +308,9 @@ int batch_writer_flush(batch_writer_t *writer) {
             writer->hourly_stats[bucket].count += written;
         }
     }
+
+    /* Clear flush-in-progress flag */
+    writer->flush_in_progress = false;
 
     uv_mutex_unlock(&writer->mutex);
 
