@@ -50,6 +50,21 @@ typedef struct get_peers_worker_ctx {
     tree_response_queue_t *response_queue;
 } get_peers_worker_ctx_t;
 
+/* Candidate node for iterative get_peers lookup */
+typedef struct candidate_node {
+    uint8_t node_id[20];
+    struct sockaddr_storage addr;
+    uint8_t distance[20];  /* XOR distance to target infohash */
+    bool queried;          /* Has this node been queried yet? */
+} candidate_node_t;
+
+/* Candidate list for managing iterative lookup state */
+typedef struct candidate_list {
+    candidate_node_t *nodes;
+    int count;
+    int capacity;
+} candidate_list_t;
+
 /* Forward declarations */
 static void *bootstrap_thread_func(void *arg);
 static void *ping_worker_func(void *arg);
@@ -505,6 +520,111 @@ static void *find_node_worker_func(void *arg) {
 }
 
 /* ========================================================================== */
+/*                  CANDIDATE LIST MANAGEMENT (for iterative lookup)         */
+/* ========================================================================== */
+
+/* Calculate XOR distance between node_id and target */
+static void calculate_distance(const uint8_t *node_id, const uint8_t *target, uint8_t *out) {
+    for (int i = 0; i < 20; i++) {
+        out[i] = node_id[i] ^ target[i];
+    }
+}
+
+/* Compare two distances (for qsort) - returns <0 if d1 < d2, >0 if d1 > d2 */
+static int compare_distances(const void *a, const void *b) {
+    const candidate_node_t *n1 = (const candidate_node_t *)a;
+    const candidate_node_t *n2 = (const candidate_node_t *)b;
+    return memcmp(n1->distance, n2->distance, 20);
+}
+
+/* Create a new candidate list with initial capacity */
+static candidate_list_t *candidate_list_create(int initial_capacity) {
+    candidate_list_t *list = malloc(sizeof(candidate_list_t));
+    if (!list) {
+        return NULL;
+    }
+
+    list->nodes = calloc(initial_capacity, sizeof(candidate_node_t));
+    if (!list->nodes) {
+        free(list);
+        return NULL;
+    }
+
+    list->count = 0;
+    list->capacity = initial_capacity;
+    return list;
+}
+
+/* Free candidate list resources */
+static void candidate_list_destroy(candidate_list_t *list) {
+    if (!list) {
+        return;
+    }
+    free(list->nodes);
+    free(list);
+}
+
+/* Add a node to candidate list (no duplicates, maintains sorted order by distance) */
+static int candidate_list_add(candidate_list_t *list, const uint8_t *node_id,
+                               const struct sockaddr_storage *addr,
+                               const uint8_t *target_infohash) {
+    if (!list || !node_id || !addr) {
+        return -1;
+    }
+
+    /* Check for duplicates (O(n) scan - acceptable for small lists) */
+    for (int i = 0; i < list->count; i++) {
+        if (memcmp(list->nodes[i].node_id, node_id, 20) == 0) {
+            return 0;  /* Already have this node */
+        }
+    }
+
+    /* Expand capacity if needed (double size) */
+    if (list->count >= list->capacity) {
+        int new_capacity = list->capacity * 2;
+        candidate_node_t *new_nodes = realloc(list->nodes,
+                                               new_capacity * sizeof(candidate_node_t));
+        if (!new_nodes) {
+            return -1;
+        }
+        list->nodes = new_nodes;
+        list->capacity = new_capacity;
+    }
+
+    /* Add new candidate */
+    candidate_node_t *node = &list->nodes[list->count];
+    memcpy(node->node_id, node_id, 20);
+    memcpy(&node->addr, addr, sizeof(struct sockaddr_storage));
+    calculate_distance(node_id, target_infohash, node->distance);
+    node->queried = false;
+    list->count++;
+
+    /* Sort by distance to maintain closest-first order */
+    qsort(list->nodes, list->count, sizeof(candidate_node_t), compare_distances);
+
+    return 0;
+}
+
+/* Get up to 'count' unqueried candidates closest to target
+ * Returns number of candidates found */
+static int candidate_list_get_unqueried(candidate_list_t *list,
+                                         candidate_node_t **out,
+                                         int count) {
+    if (!list || !out || count <= 0) {
+        return 0;
+    }
+
+    int found = 0;
+    for (int i = 0; i < list->count && found < count; i++) {
+        if (!list->nodes[i].queried) {
+            out[found++] = &list->nodes[i];
+        }
+    }
+
+    return found;
+}
+
+/* ========================================================================== */
 /*                          GET_PEERS WORKER                                  */
 /* ========================================================================== */
 
@@ -529,57 +649,133 @@ static void *get_peers_worker_func(void *arg) {
             continue;
         }
 
-        /* Get 8 closest nodes */
-        tree_node_t closest[8];
-        int n = tree_routing_get_closest(thread->routing_table, request.infohash, closest, 8);
+        log_msg(LOG_DEBUG, "[get_peers] Starting iterative lookup for infohash");
 
-        if (n == 0) {
-            log_msg(LOG_WARN, "Refresh thread has no nodes for get_peers query");
+        /* STEP 1: Initialize candidate list from routing table */
+        candidate_list_t *candidates = candidate_list_create(50);
+        if (!candidates) {
+            log_msg(LOG_ERROR, "[get_peers] Failed to create candidate list");
             refresh_query_complete(thread->refresh_query_store, request.infohash);
             continue;
         }
 
-        /* Iterative lookup */
+        /* Seed with K closest nodes from routing table */
+        tree_node_t initial_nodes[8];
+        int initial_count = tree_routing_get_closest(thread->routing_table,
+                                                     request.infohash,
+                                                     initial_nodes, 8);
+
+        if (initial_count == 0) {
+            log_msg(LOG_ERROR, "[get_peers] No nodes in routing table");
+            candidate_list_destroy(candidates);
+            refresh_query_complete(thread->refresh_query_store, request.infohash);
+            continue;
+        }
+
+        for (int i = 0; i < initial_count; i++) {
+            candidate_list_add(candidates, initial_nodes[i].node_id,
+                              &initial_nodes[i].addr, request.infohash);
+        }
+
+        log_msg(LOG_DEBUG, "[get_peers] Initialized with %d candidates from routing table",
+                initial_count);
+
+        /* STEP 2: Iterative lookup loop */
         int total_peers = 0;
-        for (int iter = 0; iter < thread->config.max_iterations && total_peers < 50; iter++) {
-            for (int i = 0; i < n && total_peers < 50; i++) {
+        int total_queries = 0;
+        const int MAX_ITERATIONS = thread->config.max_iterations;
+        const int ALPHA = 3;  /* Standard Kademlia concurrency factor */
+        const int MIN_PEERS = 10; /* Minimum peers before stopping */
+
+        for (int iter = 0; iter < MAX_ITERATIONS && total_peers < MIN_PEERS; iter++) {
+            /* Get ALPHA unqueried candidates closest to target */
+            candidate_node_t *to_query[ALPHA];
+            int num_to_query = candidate_list_get_unqueried(candidates, to_query, ALPHA);
+
+            if (num_to_query == 0) {
+                log_msg(LOG_DEBUG, "[get_peers] No unqueried candidates, converged");
+                break;
+            }
+
+            log_msg(LOG_DEBUG, "[get_peers] Iteration %d: querying %d candidates",
+                    iter, num_to_query);
+
+            int new_candidates_added = 0;
+
+            /* Query each candidate */
+            for (int i = 0; i < num_to_query; i++) {
+                candidate_node_t *candidate = to_query[i];
+
+                /* Generate TID and register */
                 uint8_t tid[4];
                 int tid_len = tree_protocol_gen_tid(tid);
-
                 refresh_dispatcher_register_tid(thread->dispatcher, tid, tid_len, my_queue);
 
+                /* Send get_peers query */
                 refresh_send_get_peers(thread->node_id, thread->socket, tid, tid_len,
-                                      request.infohash, &closest[i].addr);
+                                      request.infohash, &candidate->addr);
+                total_queries++;
 
+                /* Mark as queried immediately (don't retry on timeout) */
+                candidate->queried = true;
+
+                /* Wait for response */
                 tree_response_t response_pkt;
                 if (tree_response_queue_pop(my_queue, &response_pkt,
                                            thread->config.get_peers_timeout_ms) == 0) {
                     refresh_get_peers_response_t response;
                     if (refresh_parse_get_peers_response(response_pkt.data, response_pkt.len,
                                                          &response_pkt.from, &response) == 0) {
-                        /* Add sender if present */
+                        /* Add responding node to routing table (for long-term DHT health) */
                         if (response.has_sender_id) {
                             tree_routing_add_node(thread->routing_table, response.sender_id,
                                                 &response_pkt.from);
                         }
 
-                        total_peers += response.peer_count;
+                        /* Found peers! */
+                        if (response.peer_count > 0) {
+                            total_peers += response.peer_count;
+                            refresh_query_add_peers(thread->refresh_query_store,
+                                                  request.infohash, response.peer_count);
 
-                        /* Report peers to waiting HTTP handler */
-                        refresh_query_add_peers(thread->refresh_query_store,
-                                              request.infohash, response.peer_count);
+                            log_msg(LOG_INFO, "[get_peers] Found %d peers (total: %d) on iteration %d",
+                                    response.peer_count, total_peers, iter);
+                        }
 
-                        /* Add closer nodes for next iteration */
-                        for (int j = 0; j < response.node_count && j < 8; j++) {
-                            tree_routing_add_node(thread->routing_table,
-                                                response.nodes[j], &response.node_addrs[j]);
+                        /* Add returned nodes to candidate list (NOT routing table) */
+                        for (int j = 0; j < response.node_count; j++) {
+                            if (candidate_list_add(candidates, response.nodes[j],
+                                                  &response.node_addrs[j],
+                                                  request.infohash) == 0) {
+                                new_candidates_added++;
+                            }
                         }
                     }
                 }
 
                 refresh_dispatcher_unregister_tid(thread->dispatcher, tid, tid_len);
+
+                /* Stop querying this iteration if we have enough peers */
+                if (total_peers >= MIN_PEERS) {
+                    break;
+                }
+            }
+
+            log_msg(LOG_DEBUG, "[get_peers] Iteration %d complete: %d peers, %d new candidates",
+                    iter, total_peers, new_candidates_added);
+
+            /* Stop if no new candidates discovered (converged) */
+            if (new_candidates_added == 0) {
+                log_msg(LOG_DEBUG, "[get_peers] Converged - no new candidates");
+                break;
             }
         }
+
+        log_msg(LOG_INFO, "[get_peers] Query complete: %d peers found after %d queries",
+                total_peers, total_queries);
+
+        /* Cleanup */
+        candidate_list_destroy(candidates);
 
         /* Mark query complete */
         refresh_query_complete(thread->refresh_query_store, request.infohash);
