@@ -342,6 +342,9 @@ int main(int argc, char *argv[]) {
             .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
             .global_bootstrap_workers = config.global_bootstrap_workers,
             .per_tree_sample_size = config.per_tree_sample_size,
+            /* BEP51 cache settings */
+            .bep51_cache_capacity = config.bep51_cache_capacity,
+            .bep51_cache_submit_percent = config.bep51_cache_submit_percent,
             /* Stage 3 settings (BEP51) */
             .infohash_queue_capacity = config.tree_infohash_queue_capacity,
             .bep51_query_interval_ms = config.tree_bep51_query_interval_ms,
@@ -365,6 +368,8 @@ int main(int argc, char *argv[]) {
             /* Porn filter settings */
             .porn_filter_enabled = config.porn_filter_enabled
         };
+        /* Copy BEP51 cache path (can't use string literal in struct initializer) */
+        strncpy(sup_config.bep51_cache_path, config.bep51_cache_path, sizeof(sup_config.bep51_cache_path) - 1);
 
         g_supervisor = supervisor_create(&sup_config);
         if (!g_supervisor) {
