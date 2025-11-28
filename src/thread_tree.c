@@ -247,6 +247,7 @@ static void *find_node_worker_func(void *arg) {
         }
     }
 
+    tree_response_queue_destroy(ctx->response_queue);
     free(ctx);
     log_msg(LOG_DEBUG, "[tree %u] find_node worker %d exiting", tree->tree_id, worker_id);
     return NULL;
@@ -679,6 +680,7 @@ static void *bep51_worker_func(void *arg) {
         }
     }
 
+    tree_response_queue_destroy(ctx->response_queue);
     free(ctx);
     log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d exiting", tree->tree_id, worker_id);
     return NULL;
@@ -862,6 +864,7 @@ static void *get_peers_worker_func(void *arg) {
             tree->tree_id, worker_id, queries_sent, responses_received, timeouts,
             queries_sent > 0 ? (100.0 * responses_received / queries_sent) : 0.0);
 
+    tree_response_queue_destroy(ctx->response_queue);
     free(ctx);
     return NULL;
 }
