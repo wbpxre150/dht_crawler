@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include "uthash.h"
 
 /**
  * Thread-safe infohash queue for Stage 3
@@ -16,6 +17,12 @@ typedef struct infohash_entry {
     uint8_t infohash[20];
 } infohash_entry_t;
 
+/* Hash set entry for duplicate detection */
+typedef struct infohash_set_entry {
+    uint8_t infohash[20];       /* Key: 20-byte infohash */
+    UT_hash_handle hh;          /* uthash handle */
+} infohash_set_entry_t;
+
 typedef struct tree_infohash_queue {
     infohash_entry_t *entries;
     int capacity;
@@ -26,6 +33,13 @@ typedef struct tree_infohash_queue {
     pthread_cond_t not_empty;
     pthread_cond_t not_full;
     bool shutdown;
+
+    /* Hash set for O(1) duplicate detection */
+    infohash_set_entry_t *infohash_set;  /* uthash table (NULL = empty) */
+
+    /* Statistics */
+    uint64_t total_push_attempts;   /* Total push/try_push calls */
+    uint64_t duplicates_rejected;   /* Duplicates caught by hash table */
 } tree_infohash_queue_t;
 
 /**
@@ -78,5 +92,15 @@ void tree_infohash_queue_signal_shutdown(tree_infohash_queue_t *q);
  * @return Number of items in queue
  */
 int tree_infohash_queue_count(tree_infohash_queue_t *q);
+
+/**
+ * Get queue statistics
+ * @param q Queue
+ * @param out_total Total push attempts (can be NULL)
+ * @param out_duplicates Duplicates rejected (can be NULL)
+ */
+void tree_infohash_queue_get_stats(tree_infohash_queue_t *q,
+                                    uint64_t *out_total,
+                                    uint64_t *out_duplicates);
 
 #endif /* TREE_INFOHASH_QUEUE_H */

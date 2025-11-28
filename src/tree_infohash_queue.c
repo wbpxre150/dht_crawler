@@ -26,6 +26,9 @@ tree_infohash_queue_t *tree_infohash_queue_create(int capacity) {
     q->tail = 0;
     q->count = 0;
     q->shutdown = false;
+    q->infohash_set = NULL;  /* Initialize empty hash table */
+    q->total_push_attempts = 0;
+    q->duplicates_rejected = 0;
 
     if (pthread_mutex_init(&q->lock, NULL) != 0) {
         free(q->entries);
@@ -60,6 +63,15 @@ void tree_infohash_queue_destroy(tree_infohash_queue_t *q) {
     tree_infohash_queue_signal_shutdown(q);
 
     pthread_mutex_lock(&q->lock);
+
+    /* Free hash table entries */
+    infohash_set_entry_t *entry, *tmp;
+    HASH_ITER(hh, q->infohash_set, entry, tmp) {
+        HASH_DEL(q->infohash_set, entry);
+        free(entry);
+    }
+    q->infohash_set = NULL;
+
     pthread_mutex_unlock(&q->lock);
 
     pthread_cond_destroy(&q->not_full);
@@ -77,6 +89,18 @@ int tree_infohash_queue_push(tree_infohash_queue_t *q, const uint8_t *infohash) 
 
     pthread_mutex_lock(&q->lock);
 
+    q->total_push_attempts++;
+
+    /* Check for duplicates in hash table (O(1) lookup) */
+    infohash_set_entry_t *existing = NULL;
+    HASH_FIND(hh, q->infohash_set, infohash, 20, existing);
+    if (existing) {
+        /* Duplicate detected - already in queue */
+        q->duplicates_rejected++;
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
+
     /* Wait for space */
     while (q->count >= q->capacity && !q->shutdown) {
         pthread_cond_wait(&q->not_full, &q->lock);
@@ -87,10 +111,19 @@ int tree_infohash_queue_push(tree_infohash_queue_t *q, const uint8_t *infohash) 
         return -1;
     }
 
-    /* Add to queue */
+    /* Add to circular buffer */
     memcpy(q->entries[q->tail].infohash, infohash, 20);
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
+
+    /* Add to hash table for duplicate tracking */
+    infohash_set_entry_t *new_entry = malloc(sizeof(infohash_set_entry_t));
+    if (new_entry) {
+        memcpy(new_entry->infohash, infohash, 20);
+        HASH_ADD(hh, q->infohash_set, infohash, 20, new_entry);
+    }
+    /* Note: If malloc fails, we still added to queue but lose duplicate detection
+     * for this entry. This is acceptable degradation - won't corrupt state. */
 
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
@@ -136,10 +169,20 @@ int tree_infohash_queue_pop(tree_infohash_queue_t *q, uint8_t *infohash, int tim
         return -1;
     }
 
-    /* Pop from queue */
+    /* Pop from circular buffer */
     memcpy(infohash, q->entries[q->head].infohash, 20);
     q->head = (q->head + 1) % q->capacity;
     q->count--;
+
+    /* Remove from hash table (synchronize with queue state) */
+    infohash_set_entry_t *entry = NULL;
+    HASH_FIND(hh, q->infohash_set, infohash, 20, entry);
+    if (entry) {
+        HASH_DEL(q->infohash_set, entry);
+        free(entry);
+    }
+    /* Note: If not found in hash (malloc failed during push), that's ok -
+     * just means we lost duplicate detection for this entry. */
 
     pthread_cond_signal(&q->not_full);
     pthread_mutex_unlock(&q->lock);
@@ -154,15 +197,34 @@ int tree_infohash_queue_try_push(tree_infohash_queue_t *q, const uint8_t *infoha
 
     pthread_mutex_lock(&q->lock);
 
+    q->total_push_attempts++;
+
+    /* Check for duplicates in hash table (O(1) lookup) */
+    infohash_set_entry_t *existing = NULL;
+    HASH_FIND(hh, q->infohash_set, infohash, 20, existing);
+    if (existing) {
+        /* Duplicate detected - already in queue */
+        q->duplicates_rejected++;
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
+
     if (q->shutdown || q->count >= q->capacity) {
         pthread_mutex_unlock(&q->lock);
         return -1;
     }
 
-    /* Add to queue */
+    /* Add to circular buffer */
     memcpy(q->entries[q->tail].infohash, infohash, 20);
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
+
+    /* Add to hash table for duplicate tracking */
+    infohash_set_entry_t *new_entry = malloc(sizeof(infohash_set_entry_t));
+    if (new_entry) {
+        memcpy(new_entry->infohash, infohash, 20);
+        HASH_ADD(hh, q->infohash_set, infohash, 20, new_entry);
+    }
 
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
@@ -192,4 +254,21 @@ int tree_infohash_queue_count(tree_infohash_queue_t *q) {
     pthread_mutex_unlock(&q->lock);
 
     return count;
+}
+
+void tree_infohash_queue_get_stats(tree_infohash_queue_t *q,
+                                    uint64_t *out_total,
+                                    uint64_t *out_duplicates) {
+    if (!q) {
+        return;
+    }
+
+    pthread_mutex_lock(&q->lock);
+    if (out_total) {
+        *out_total = q->total_push_attempts;
+    }
+    if (out_duplicates) {
+        *out_duplicates = q->duplicates_rejected;
+    }
+    pthread_mutex_unlock(&q->lock);
 }
