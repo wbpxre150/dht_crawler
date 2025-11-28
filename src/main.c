@@ -15,6 +15,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <libgen.h>
 
 /* Global application context */
 static app_context_t g_app_ctx;
@@ -65,6 +68,52 @@ void log_msg(log_level_t level, const char *format, ...) {
 
     fprintf(stderr, "\n");
     fflush(stderr);
+}
+
+/* Ensure directory exists, create if needed */
+static int ensure_directory_exists(const char *path) {
+    struct stat st;
+
+    /* Check if path exists */
+    if (stat(path, &st) == 0) {
+        /* Path exists, check if it's a directory */
+        if (S_ISDIR(st.st_mode)) {
+            return 0;  /* Success - directory exists */
+        } else {
+            log_msg(LOG_ERROR, "Path exists but is not a directory: %s", path);
+            return -1;
+        }
+    }
+
+    /* Path doesn't exist, try to create it */
+    if (mkdir(path, 0755) == 0) {
+        log_msg(LOG_DEBUG, "Created directory: %s", path);
+        return 0;
+    }
+
+    /* Failed to create directory */
+    if (errno == EEXIST) {
+        /* Race condition - another thread/process created it */
+        return 0;
+    }
+
+    log_msg(LOG_ERROR, "Failed to create directory %s (errno=%d: %s)",
+            path, errno, strerror(errno));
+    return -1;
+}
+
+/* Ensure parent directory of a file path exists */
+static int ensure_parent_directory_exists(const char *filepath) {
+    char *path_copy = strdup(filepath);
+    if (!path_copy) {
+        log_msg(LOG_ERROR, "Failed to allocate memory for path copy");
+        return -1;
+    }
+
+    char *dir = dirname(path_copy);
+    int ret = ensure_directory_exists(dir);
+    free(path_copy);
+    return ret;
 }
 
 /* Initialize application context */
@@ -120,6 +169,13 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* Ensure data directory exists for database and bloom filter */
+    log_msg(LOG_DEBUG, "Ensuring data directory exists...");
+    if (ensure_parent_directory_exists(g_app_ctx.db_path) != 0) {
+        log_msg(LOG_ERROR, "Failed to create data directory for database");
+        return 1;
+    }
+
     /* Initialize infohash queue */
     log_msg(LOG_DEBUG, "Initializing infohash queue (capacity: %d)...", INFOHASH_QUEUE_SIZE);
     rc = infohash_queue_init(&g_queue, INFOHASH_QUEUE_SIZE);
@@ -130,6 +186,15 @@ int main(int argc, char *argv[]) {
 
     /* Initialize bloom filter for duplicate detection */
     if (config.bloom_enabled) {
+        /* Ensure bloom filter directory exists if persistence is enabled */
+        if (config.bloom_persist) {
+            if (ensure_parent_directory_exists(config.bloom_path) != 0) {
+                log_msg(LOG_ERROR, "Failed to create directory for bloom filter");
+                infohash_queue_cleanup(&g_queue);
+                return 1;
+            }
+        }
+
         log_msg(LOG_DEBUG, "Initializing bloom filter (capacity: %lu, error rate: %.3f%%)...",
                 config.bloom_capacity, config.bloom_error_rate * 100.0);
         g_bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);

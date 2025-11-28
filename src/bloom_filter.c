@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <uv.h>
 
 struct bloom_filter {
@@ -111,7 +112,8 @@ int bloom_filter_save(bloom_filter_t *filter, const char *path) {
 
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        log_msg(LOG_ERROR, "Failed to open bloom filter file for writing: %s", path);
+        log_msg(LOG_ERROR, "Failed to open bloom filter file for writing: %s (errno=%d: %s)",
+                path, errno, strerror(errno));
         return -1;
     }
 
@@ -124,7 +126,8 @@ int bloom_filter_save(bloom_filter_t *filter, const char *path) {
         fwrite(&filter->bloom.bytes, sizeof(uint64_t), 1, fp) != 1 ||
         fwrite(&filter->bloom.bits, sizeof(uint64_t), 1, fp) != 1 ||
         fwrite(&filter->bloom.hashes, sizeof(uint32_t), 1, fp) != 1) {
-        log_msg(LOG_ERROR, "Failed to write bloom filter metadata");
+        log_msg(LOG_ERROR, "Failed to write bloom filter metadata (errno=%d: %s)",
+                errno, strerror(errno));
         uv_mutex_unlock(&filter->mutex);
         fclose(fp);
         return -1;
@@ -134,7 +137,17 @@ int bloom_filter_save(bloom_filter_t *filter, const char *path) {
     size_t bytes = filter->bloom.bytes;
     uint64_t items = filter->items_added;
     if (fwrite(filter->bloom.bf, 1, bytes, fp) != bytes) {
-        log_msg(LOG_ERROR, "Failed to write bloom filter data");
+        log_msg(LOG_ERROR, "Failed to write bloom filter data (errno=%d: %s)",
+                errno, strerror(errno));
+        uv_mutex_unlock(&filter->mutex);
+        fclose(fp);
+        return -1;
+    }
+
+    // Flush and sync to ensure data is written to disk
+    if (fflush(fp) != 0) {
+        log_msg(LOG_ERROR, "Failed to flush bloom filter file (errno=%d: %s)",
+                errno, strerror(errno));
         uv_mutex_unlock(&filter->mutex);
         fclose(fp);
         return -1;
