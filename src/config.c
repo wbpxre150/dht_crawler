@@ -136,6 +136,11 @@ void config_init_defaults(crawler_config_t *config) {
     config->refresh_request_queue_capacity = 100;   /* 100 request queue capacity */
     config->refresh_get_peers_timeout_ms = 500;     /* 500ms get_peers timeout */
     config->refresh_max_iterations = 3;             /* 3 iterations max */
+
+    /* BEP51 cache defaults */
+    strncpy(config->bep51_cache_path, "data/bep51_cache.dat", sizeof(config->bep51_cache_path) - 1);
+    config->bep51_cache_capacity = 10000;           /* 10000 nodes max */
+    config->bep51_cache_submit_percent = 5;         /* 5% submission rate */
 }
 
 /* Load config from INI-style file */
@@ -447,6 +452,18 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->refresh_max_iterations = atoi(value);
             if (config->refresh_max_iterations < 1) config->refresh_max_iterations = 1;
             if (config->refresh_max_iterations > 10) config->refresh_max_iterations = 10;
+        }
+        /* BEP51 cache settings */
+        else if (strcmp(key, "bep51_cache_path") == 0) {
+            strncpy(config->bep51_cache_path, value, sizeof(config->bep51_cache_path) - 1);
+        } else if (strcmp(key, "bep51_cache_capacity") == 0) {
+            config->bep51_cache_capacity = atoi(value);
+            if (config->bep51_cache_capacity < 1000) config->bep51_cache_capacity = 1000;
+            if (config->bep51_cache_capacity > 100000) config->bep51_cache_capacity = 100000;
+        } else if (strcmp(key, "bep51_cache_submit_percent") == 0) {
+            config->bep51_cache_submit_percent = atoi(value);
+            if (config->bep51_cache_submit_percent < 1) config->bep51_cache_submit_percent = 1;
+            if (config->bep51_cache_submit_percent > 100) config->bep51_cache_submit_percent = 100;
         }
     }
 

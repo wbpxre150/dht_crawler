@@ -41,6 +41,7 @@ typedef struct {
     int node_count;
     int interval;                     /* Suggested query interval */
     int num;                          /* Total infohashes node claims to have */
+    const uint8_t *sender_id;         /* Sender's node ID (20 bytes, NOT owned) */
 } tree_sample_response_t;
 
 /* Parsed get_peers response (Stage 4) */

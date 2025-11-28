@@ -175,6 +175,9 @@ typedef struct thread_tree {
     atomic_uint_fast64_t last_bloom_checks; /* Last check count (for rate calculation) */
     double bloom_duplicate_rate;            /* Current duplicate rate (0.0 - 1.0) */
 
+    /* BEP51 cache statistics */
+    atomic_uint_fast64_t bep51_nodes_cached; /* Nodes submitted to BEP51 cache */
+
     /* Bloom monitor configuration */
     double max_bloom_duplicate_rate;        /* Threshold for respawn (e.g., 0.70 = 70%) */
     int bloom_check_interval_sec;           /* How often to check bloom rate (default: 60s) */

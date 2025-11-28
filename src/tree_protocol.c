@@ -585,6 +585,7 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
                         } else if (rkeylen == 2 && memcmp(rkey, "id", 2) == 0 && type == BENCODE_STRING) {
                             if (bc.toklen == 20) {
                                 sender_id = bc.tok;
+                                out_response->sender_id = sender_id;  /* NEW: Store in response */
                             }
                         } else if (rkeylen == 8 && memcmp(rkey, "interval", 8) == 0 && type == BENCODE_INTEGER) {
                             /* Parse integer from token */

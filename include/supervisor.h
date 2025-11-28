@@ -37,6 +37,11 @@ typedef struct supervisor_config {
     int global_bootstrap_workers;        /* Bootstrap worker threads (default: 50) */
     int per_tree_sample_size;            /* Nodes each tree samples from pool (default: 1000) */
 
+    /* BEP51 cache settings */
+    char bep51_cache_path[512];          /* Cache file path */
+    int bep51_cache_capacity;            /* Max nodes in cache */
+    int bep51_cache_submit_percent;      /* % of BEP51 responses to cache */
+
     /* Stage 3 settings (BEP51) */
     int infohash_queue_capacity;    /* Infohash queue capacity per tree (default: 5000) */
     int bep51_query_interval_ms;    /* BEP51 query interval (default: 10) */
@@ -84,7 +89,8 @@ typedef struct supervisor {
     /* Shared resources (only these are shared between trees) */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
-    struct shared_node_pool *shared_node_pool;  /* NEW: Shared bootstrap node pool */
+    struct shared_node_pool *shared_node_pool;  /* Shared bootstrap node pool */
+    struct bep51_cache *bep51_cache;            /* BEP51 node cache for persistent bootstrap */
 
     /* Configuration */
     int num_find_node_workers;
@@ -97,6 +103,11 @@ typedef struct supervisor {
     int global_bootstrap_timeout_sec;
     int global_bootstrap_workers;
     int per_tree_sample_size;
+
+    /* BEP51 cache settings */
+    char bep51_cache_path[512];
+    int bep51_cache_capacity;
+    int bep51_cache_submit_percent;
 
     /* Stage 3 settings (BEP51) */
     int infohash_queue_capacity;

@@ -5,6 +5,7 @@
 #include "batch_writer.h"
 #include "bloom_filter.h"
 #include "shared_node_pool.h"
+#include "bep51_cache.h"
 #include "tree_socket.h"
 #include "tree_protocol.h"
 #include "tree_routing.h"
@@ -96,6 +97,11 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Porn filter settings */
     sup->porn_filter_enabled = config->porn_filter_enabled;
+
+    /* BEP51 cache settings */
+    sup->bep51_cache_capacity = config->bep51_cache_capacity > 0 ? config->bep51_cache_capacity : 10000;
+    sup->bep51_cache_submit_percent = config->bep51_cache_submit_percent > 0 ? config->bep51_cache_submit_percent : 5;
+    strncpy(sup->bep51_cache_path, config->bep51_cache_path, sizeof(sup->bep51_cache_path) - 1);
 
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
@@ -491,27 +497,56 @@ void supervisor_start(supervisor_t *sup) {
 
     log_msg(LOG_DEBUG, "[supervisor] Starting with %d trees", sup->max_trees);
 
+    /* Create BEP51 cache */
+    log_msg(LOG_DEBUG, "[supervisor] Creating BEP51 cache (capacity: %d)", sup->bep51_cache_capacity);
+    sup->bep51_cache = bep51_cache_create(sup->bep51_cache_capacity);
+    if (!sup->bep51_cache) {
+        log_msg(LOG_ERROR, "[supervisor] Failed to create BEP51 cache");
+        return;
+    }
+
     /* Create shared node pool for global bootstrap */
     sup->shared_node_pool = shared_node_pool_create(sup->global_bootstrap_target);
     if (!sup->shared_node_pool) {
         log_msg(LOG_ERROR, "[supervisor] Failed to create shared node pool");
+        bep51_cache_destroy(sup->bep51_cache);
         return;
     }
 
-    /* Perform global bootstrap ONCE before spawning trees */
-    log_msg(LOG_DEBUG, "[supervisor] Starting global bootstrap (target: %d nodes, timeout: %ds, workers: %d)",
-            sup->global_bootstrap_target, sup->global_bootstrap_timeout_sec, sup->global_bootstrap_workers);
+    /* Try to load cache and populate shared pool */
+    log_msg(LOG_DEBUG, "[supervisor] Attempting to load BEP51 cache from %s", sup->bep51_cache_path);
+    int cache_loaded = bep51_cache_load_from_file(sup->bep51_cache, sup->bep51_cache_path);
 
-    int rc = global_bootstrap(sup, sup->global_bootstrap_target,
-                             sup->global_bootstrap_timeout_sec,
-                             sup->global_bootstrap_workers);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "[supervisor] Global bootstrap failed");
-        /* Continue anyway with whatever nodes we got */
+    if (cache_loaded == 0) {
+        /* Cache loaded successfully, populate shared_node_pool */
+        int populated = bep51_cache_populate_shared_pool(sup->bep51_cache,
+                                                          sup->shared_node_pool,
+                                                          sup->global_bootstrap_target);
+        log_msg(LOG_DEBUG, "[supervisor] Populated %d nodes from cache into shared pool", populated);
+    }
+
+    size_t nodes_from_cache = shared_node_pool_get_count(sup->shared_node_pool);
+    log_msg(LOG_DEBUG, "[supervisor] Shared pool has %zu nodes from cache", nodes_from_cache);
+
+    /* Only run URL bootstrap if we don't have enough nodes from cache */
+    if (nodes_from_cache < 1000) {
+        log_msg(LOG_DEBUG, "[supervisor] Insufficient cache nodes (%zu), running URL bootstrap",
+                nodes_from_cache);
+
+        int rc = global_bootstrap(sup, sup->global_bootstrap_target,
+                                 sup->global_bootstrap_timeout_sec,
+                                 sup->global_bootstrap_workers);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "[supervisor] Global bootstrap failed");
+            /* Continue anyway with whatever nodes we got */
+        }
+    } else {
+        log_msg(LOG_DEBUG, "[supervisor] Using %zu cached nodes, skipping URL bootstrap",
+                nodes_from_cache);
     }
 
     size_t nodes_collected = shared_node_pool_get_count(sup->shared_node_pool);
-    log_msg(LOG_DEBUG, "[supervisor] Global bootstrap finished: %zu nodes available", nodes_collected);
+    log_msg(LOG_DEBUG, "[supervisor] Bootstrap finished: %zu nodes available", nodes_collected);
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -619,6 +654,18 @@ void supervisor_destroy(supervisor_t *sup) {
 
     /* Ensure stopped */
     supervisor_stop(sup);
+
+    /* Save BEP51 cache to disk */
+    if (sup->bep51_cache) {
+        log_msg(LOG_DEBUG, "[supervisor] Saving BEP51 cache to %s", sup->bep51_cache_path);
+        if (bep51_cache_save_to_file(sup->bep51_cache, sup->bep51_cache_path) == 0) {
+            log_msg(LOG_DEBUG, "[supervisor] BEP51 cache saved successfully");
+        } else {
+            log_msg(LOG_WARN, "[supervisor] Failed to save BEP51 cache");
+        }
+        bep51_cache_destroy(sup->bep51_cache);
+        sup->bep51_cache = NULL;
+    }
 
     /* Cleanup shared node pool */
     if (sup->shared_node_pool) {

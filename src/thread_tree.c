@@ -11,6 +11,7 @@
 #include "tree_response_queue.h"
 #include "bloom_filter.h"
 #include "shared_node_pool.h"
+#include "bep51_cache.h"
 #include "supervisor.h"
 #include "dht_crawler.h"
 #include "keyspace.h"
@@ -641,6 +642,20 @@ static void *bep51_worker_func(void *arg) {
             tree_sample_response_t response;
             if (tree_handle_sample_infohashes_response(tree, response_pkt.data, response_pkt.len,
                                                        &response_pkt.from, &response) == 0) {
+                /* NEW: Submit sender to BEP51 cache with configured percentage */
+                supervisor_t *sup = (supervisor_t *)tree->supervisor_ctx;
+                if (sup && sup->bep51_cache && sup->bep51_cache_submit_percent > 0) {
+                    /* Random sampling: 5% = rand() % 100 < 5 */
+                    int random_pct = rand() % 100;
+                    if (random_pct < sup->bep51_cache_submit_percent) {
+                        /* Extract sender node ID from response (already parsed) */
+                        if (response.sender_id) {
+                            bep51_cache_add_node(sup->bep51_cache, response.sender_id, &response_pkt.from);
+                            atomic_fetch_add(&tree->bep51_nodes_cached, 1);  /* Stats counter */
+                        }
+                    }
+                }
+
                 /* 6. Push infohashes to queue (with bloom check) */
                 for (int i = 0; i < response.infohash_count; i++) {
                     /* Increment bloom check counter */
@@ -1121,6 +1136,9 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->bloom_duplicates, 0);
     atomic_store(&tree->last_bloom_checks, 0);
     tree->bloom_duplicate_rate = 0.0;
+
+    /* Initialize BEP51 cache statistics */
+    atomic_store(&tree->bep51_nodes_cached, 0);
 
     /* Bloom monitor configuration from config */
     tree->max_bloom_duplicate_rate = config->max_bloom_duplicate_rate > 0 ? config->max_bloom_duplicate_rate : 0.70;

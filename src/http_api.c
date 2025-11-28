@@ -9,6 +9,7 @@
 #include "torrent_search.h"
 #include "supervisor.h"
 #include "thread_tree.h"
+#include "bep51_cache.h"
 #include <civetweb.h>
 
 /* Forward declarations for tree queue functions to avoid type conflicts */
@@ -476,6 +477,16 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(supervisor_json, "total_trees_spawned", (double)api->supervisor->next_tree_id - 1);
         cJSON_AddItemToObject(root, "supervisor", supervisor_json);
 
+        /* BEP51 cache global stats */
+        cJSON *cache_obj = cJSON_CreateObject();
+        if (api->supervisor->bep51_cache) {
+            size_t cache_count = bep51_cache_get_count(api->supervisor->bep51_cache);
+            cJSON_AddNumberToObject(cache_obj, "cached_nodes", (double)cache_count);
+            cJSON_AddNumberToObject(cache_obj, "capacity", api->supervisor->bep51_cache_capacity);
+            cJSON_AddNumberToObject(cache_obj, "submit_percent", api->supervisor->bep51_cache_submit_percent);
+        }
+        cJSON_AddItemToObject(root, "bep51_cache", cache_obj);
+
         /* Add per-tree stats */
         cJSON *trees_array = cJSON_CreateArray();
         pthread_mutex_lock(&api->supervisor->trees_lock);
@@ -496,6 +507,9 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(tree_json, "bloom_duplicates", (double)atomic_load(&tree->bloom_duplicates));
                 cJSON_AddNumberToObject(tree_json, "bloom_duplicate_rate", tree->bloom_duplicate_rate * 100.0);
                 cJSON_AddNumberToObject(tree_json, "bloom_rate_threshold", tree->max_bloom_duplicate_rate * 100.0);
+
+                /* BEP51 cache statistics */
+                cJSON_AddNumberToObject(tree_json, "bep51_nodes_cached", (double)atomic_load(&tree->bep51_nodes_cached));
 
                 /* Add queue sizes for monitoring and tuning */
                 cJSON *queues = cJSON_CreateObject();

@@ -128,6 +128,11 @@ typedef struct {
     int refresh_request_queue_capacity;  /* Request queue capacity (default: 100) */
     int refresh_get_peers_timeout_ms;    /* Get_peers response timeout (default: 500) */
     int refresh_max_iterations;          /* Max get_peers iterations (default: 3) */
+
+    /* BEP51 cache settings */
+    char bep51_cache_path[512];          /* Cache file path (default: "data/bep51_cache.dat") */
+    int bep51_cache_capacity;            /* Max nodes in cache (default: 10000) */
+    int bep51_cache_submit_percent;      /* % of BEP51 responses to cache (default: 5) */
 } crawler_config_t;
 
 /* Initialize config with default values */
