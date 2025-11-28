@@ -8,6 +8,7 @@
 #include "bloom_filter.h"
 #include "dht_crawler.h"
 #include "database.h"
+#include "porn_filter.h"
 #include "../lib/bencode-c/bencode.h"
 
 #include <openssl/sha.h>
@@ -887,27 +888,36 @@ void *tree_metadata_worker_func(void *arg) {
             torrent_metadata_t db_meta;
             int rc = tree_metadata_to_database_format(metadata, &db_meta, entry.peer_count);
 
-            if (rc == 0 && tree->shared_batch_writer) {
-                /* Add to batch writer (batch_writer makes deep copy) */
-                rc = batch_writer_add(tree->shared_batch_writer, &db_meta);
-                if (rc != 0) {
-                    char hex[41];
-                    for (int i = 0; i < 20; i++) {
-                        snprintf(hex + i * 2, 3, "%02x", metadata->infohash[i]);
-                    }
-                    log_msg(LOG_ERROR, "[tree %u] Failed to add torrent %s to batch writer",
-                            tree->tree_id, hex);
-                }
+            if (rc == 0) {
+                /* Check porn filter if enabled */
+                if (tree->porn_filter_enabled && porn_filter_check(&db_meta)) {
+                    /* Update filtered count statistics */
+                    atomic_fetch_add(&tree->filtered_count, 1);
 
-                /* Free our temporary conversion (batch_writer has its own copy) */
-                free_database_metadata(&db_meta);
-            } else {
-                log_msg(LOG_ERROR, "[tree %u] Failed to convert metadata or batch_writer unavailable",
-                        tree->tree_id);
-                if (rc == 0) {
-                    /* Conversion succeeded but batch_writer missing - clean up */
+                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent: %s", tree->tree_id, metadata->name);
+
+                    /* Free the metadata and skip database insertion */
+                    free_database_metadata(&db_meta);
+                } else if (tree->shared_batch_writer) {
+                    /* Add to batch writer (batch_writer makes deep copy) */
+                    rc = batch_writer_add(tree->shared_batch_writer, &db_meta);
+                    if (rc != 0) {
+                        char hex[41];
+                        for (int i = 0; i < 20; i++) {
+                            snprintf(hex + i * 2, 3, "%02x", metadata->infohash[i]);
+                        }
+                        log_msg(LOG_ERROR, "[tree %u] Failed to add torrent %s to batch writer",
+                                tree->tree_id, hex);
+                    }
+
+                    /* Free our temporary conversion (batch_writer has its own copy) */
+                    free_database_metadata(&db_meta);
+                } else {
+                    log_msg(LOG_ERROR, "[tree %u] batch_writer unavailable", tree->tree_id);
                     free_database_metadata(&db_meta);
                 }
+            } else {
+                log_msg(LOG_ERROR, "[tree %u] Failed to convert metadata", tree->tree_id);
             }
 
             /* Free original tree metadata */

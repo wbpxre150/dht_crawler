@@ -486,6 +486,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(tree_json, "tree_id", tree->tree_id);
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(tree->current_phase));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
+                cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
                 cJSON_AddNumberToObject(tree_json, "active_connections", (int)atomic_load(&tree->active_connections));
                 cJSON_AddBoolToObject(tree_json, "discovery_paused", atomic_load(&tree->discovery_paused));

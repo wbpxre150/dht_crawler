@@ -1111,6 +1111,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Initialize statistics */
     atomic_store(&tree->metadata_count, 0);
+    atomic_store(&tree->filtered_count, 0);
     atomic_store(&tree->last_metadata_time, 0);
     tree->metadata_rate = 0.0;
     atomic_init(&tree->active_connections, 0);
@@ -1127,6 +1128,9 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->bloom_check_sample_size = config->bloom_check_sample_size > 0 ? config->bloom_check_sample_size : 100;
     tree->bloom_grace_period_sec = config->bloom_grace_period_sec > 0 ? config->bloom_grace_period_sec : 120;
     tree->bloom_min_lifetime_sec = (config->bloom_min_lifetime_minutes > 0 ? config->bloom_min_lifetime_minutes : 10) * 60;
+
+    /* Porn filter configuration */
+    tree->porn_filter_enabled = config->porn_filter_enabled;
 
     /* Initialize lifecycle tracking */
     tree->creation_time = time(NULL);

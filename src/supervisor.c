@@ -94,6 +94,9 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->bloom_grace_period_sec = config->bloom_grace_period_sec > 0 ? config->bloom_grace_period_sec : 120;
     sup->bloom_min_lifetime_minutes = config->bloom_min_lifetime_minutes > 0 ? config->bloom_min_lifetime_minutes : 10;
 
+    /* Porn filter settings */
+    sup->porn_filter_enabled = config->porn_filter_enabled;
+
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
         log_msg(LOG_ERROR, "[supervisor] Failed to init mutex");
@@ -159,6 +162,8 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .bloom_check_sample_size = sup->bloom_check_sample_size,
         .bloom_grace_period_sec = sup->bloom_grace_period_sec,
         .bloom_min_lifetime_minutes = sup->bloom_min_lifetime_minutes,
+        /* Porn filter settings */
+        .porn_filter_enabled = sup->porn_filter_enabled,
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,

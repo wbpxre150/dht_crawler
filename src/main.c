@@ -277,7 +277,9 @@ int main(int argc, char *argv[]) {
             .bloom_check_interval_sec = config.tree_bloom_check_interval_sec,
             .bloom_check_sample_size = config.tree_bloom_check_sample_size,
             .bloom_grace_period_sec = config.tree_bloom_grace_period_sec,
-            .bloom_min_lifetime_minutes = config.tree_bloom_min_lifetime_minutes
+            .bloom_min_lifetime_minutes = config.tree_bloom_min_lifetime_minutes,
+            /* Porn filter settings */
+            .porn_filter_enabled = config.porn_filter_enabled
         };
 
         g_supervisor = supervisor_create(&sup_config);

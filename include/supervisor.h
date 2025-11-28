@@ -63,6 +63,9 @@ typedef struct supervisor_config {
     int bloom_grace_period_sec;        /* Grace period before respawn (default: 120) */
     int bloom_min_lifetime_minutes;    /* Min lifetime before bloom checks (default: 10) */
 
+    /* Porn filter settings */
+    int porn_filter_enabled;           /* Enable porn filter (0=disabled, 1=enabled) */
+
     /* Shared resources */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
@@ -120,6 +123,9 @@ typedef struct supervisor {
     int bloom_check_sample_size;
     int bloom_grace_period_sec;
     int bloom_min_lifetime_minutes;
+
+    /* Porn filter settings */
+    int porn_filter_enabled;           /* Enable porn filter */
 
     /* Tree ID counter */
     uint32_t next_tree_id;

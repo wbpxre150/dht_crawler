@@ -80,6 +80,9 @@ typedef struct tree_config {
     int bloom_grace_period_sec;         /* Grace period before respawn (default: 120) */
     int bloom_min_lifetime_minutes;     /* Min lifetime before bloom checks (default: 10) */
 
+    /* Porn filter settings */
+    int porn_filter_enabled;            /* Enable porn filter (0=disabled, 1=enabled) */
+
     /* Shared resources from supervisor */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
@@ -161,6 +164,7 @@ typedef struct thread_tree {
 
     /* Statistics */
     atomic_uint_fast64_t metadata_count;
+    atomic_uint_fast64_t filtered_count;    /* Filtered by porn filter */
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */
@@ -177,6 +181,9 @@ typedef struct thread_tree {
     int bloom_check_sample_size;            /* Minimum samples before rate check (default: 100) */
     int bloom_grace_period_sec;             /* Grace period before respawn (default: 120s) */
     int bloom_min_lifetime_sec;             /* Minimum lifetime before bloom checks (default: 600s = 10min) */
+
+    /* Porn filter settings */
+    int porn_filter_enabled;                /* Enable porn filter (0=disabled, 1=enabled) */
 
     /* Lifecycle tracking */
     time_t creation_time;           /* When tree was created */
