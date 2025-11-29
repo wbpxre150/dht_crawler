@@ -604,7 +604,7 @@ void supervisor_stop(supervisor_t *sup) {
     pthread_mutex_lock(&sup->trees_lock);
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
-            thread_tree_request_shutdown(sup->trees[i]);
+            thread_tree_request_shutdown(sup->trees[i], SHUTDOWN_REASON_SUPERVISOR);
         }
     }
     pthread_mutex_unlock(&sup->trees_lock);

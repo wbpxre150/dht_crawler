@@ -931,9 +931,9 @@ shutdown:
             tree->tree_id, tree->routing_table ? tree_routing_get_count(tree->routing_table) : 0);
 
     /* Notify supervisor of shutdown completion
-     * ONLY if we're NOT in global shutdown (avoid deadlock on trees_lock)
-     * During shutdown, supervisor already knows it's destroying the tree */
-    if (tree->on_shutdown && tree->current_phase != TREE_PHASE_SHUTTING_DOWN) {
+     * Only for voluntary shutdowns (rate-based), not supervisor-requested shutdowns
+     * to avoid deadlock on trees_lock during global shutdown */
+    if (tree->on_shutdown && tree->shutdown_reason == SHUTDOWN_REASON_RATE_BASED) {
         tree->on_shutdown(tree);
     }
 
@@ -998,6 +998,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Initialize phase and shutdown flag */
     tree->current_phase = TREE_PHASE_BOOTSTRAP;
+    tree->shutdown_reason = SHUTDOWN_REASON_NONE;
     atomic_store(&tree->shutdown_requested, false);
 
     /* Initialize discovery throttling (find_node + BEP51) */
@@ -1138,7 +1139,7 @@ void thread_tree_destroy(thread_tree_t *tree) {
     log_msg(LOG_DEBUG, "[tree %u] Destroying", tree->tree_id);
 
     /* Request shutdown if not already done */
-    thread_tree_request_shutdown(tree);
+    thread_tree_request_shutdown(tree, SHUTDOWN_REASON_SUPERVISOR);
 
     /* Join bootstrap thread */
     log_msg(LOG_DEBUG, "[tree %u] Joining bootstrap thread...", tree->tree_id);
@@ -1292,14 +1293,18 @@ void thread_tree_start(thread_tree_t *tree) {
     }
 }
 
-void thread_tree_request_shutdown(thread_tree_t *tree) {
+void thread_tree_request_shutdown(thread_tree_t *tree, shutdown_reason_t reason) {
     if (!tree) {
         return;
     }
 
     bool expected = false;
     if (atomic_compare_exchange_strong(&tree->shutdown_requested, &expected, true)) {
-        log_msg(LOG_DEBUG, "[tree %u] Shutdown requested", tree->tree_id);
+        log_msg(LOG_DEBUG, "[tree %u] Shutdown requested (reason: %s)",
+                tree->tree_id,
+                reason == SHUTDOWN_REASON_RATE_BASED ? "rate-based" :
+                reason == SHUTDOWN_REASON_SUPERVISOR ? "supervisor" : "unknown");
+        tree->shutdown_reason = reason;
         tree->current_phase = TREE_PHASE_SHUTTING_DOWN;
 
         /* Stage 3: Signal infohash queue to wake up waiting threads */

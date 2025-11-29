@@ -37,6 +37,13 @@ typedef enum {
     TREE_PHASE_SHUTTING_DOWN    /* Graceful shutdown in progress */
 } tree_phase_t;
 
+/* Reason for shutdown */
+typedef enum {
+    SHUTDOWN_REASON_NONE,           /* Not shutting down */
+    SHUTDOWN_REASON_RATE_BASED,     /* Low metadata rate (voluntary) */
+    SHUTDOWN_REASON_SUPERVISOR      /* Supervisor requested (forced) */
+} shutdown_reason_t;
+
 /* Configuration for a thread tree */
 typedef struct tree_config {
     /* Keyspace partitioning */
@@ -129,6 +136,7 @@ typedef struct thread_tree {
 
     /* Phase management */
     tree_phase_t current_phase;
+    shutdown_reason_t shutdown_reason;  /* Reason for shutdown */
     atomic_bool shutdown_requested;
 
     /* Discovery throttling state (find_node + BEP51) */
@@ -214,8 +222,9 @@ void thread_tree_start(thread_tree_t *tree);
 /**
  * Request graceful shutdown of thread tree
  * @param tree Thread tree to shut down
+ * @param reason Reason for shutdown (rate-based or supervisor-initiated)
  */
-void thread_tree_request_shutdown(thread_tree_t *tree);
+void thread_tree_request_shutdown(thread_tree_t *tree, shutdown_reason_t reason);
 
 /**
  * Get phase name as string

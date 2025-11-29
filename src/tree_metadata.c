@@ -1018,7 +1018,7 @@ void *tree_rate_monitor_func(void *arg) {
 
                 log_msg(LOG_INFO, "[tree %u] Metadata rate SUSTAINED at %.4f < %.4f after grace period - REQUESTING SHUTDOWN",
                         tree->tree_id, metadata_rate2, ctx->min_metadata_rate);
-                thread_tree_request_shutdown(tree);
+                thread_tree_request_shutdown(tree, SHUTDOWN_REASON_RATE_BASED);
                 break;
             } else {
                 log_msg(LOG_DEBUG, "[tree %u] Metadata rate improved to %.4f - CONTINUING",
