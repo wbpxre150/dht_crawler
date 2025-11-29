@@ -929,3 +929,108 @@ void *tree_metadata_worker_func(void *arg) {
     log_msg(LOG_DEBUG, "[tree %u] Metadata worker %d exiting", tree->tree_id, worker_id);
     return NULL;
 }
+
+/* Rate monitor thread function */
+void *tree_rate_monitor_func(void *arg) {
+    rate_monitor_ctx_t *ctx = (rate_monitor_ctx_t *)arg;
+    thread_tree_t *tree = ctx->tree;
+
+    log_msg(LOG_DEBUG, "[tree %u] Rate monitor started (min_rate=%.4f, check_interval=%ds)",
+            tree->tree_id, ctx->min_metadata_rate, ctx->check_interval_sec);
+
+    uint64_t last_metadata_count = 0;
+    time_t last_check_time = time(NULL);
+
+    while (!atomic_load(&tree->shutdown_requested)) {
+        /* Sleep in 1-second chunks for responsiveness */
+        for (int i = 0; i < ctx->check_interval_sec && !atomic_load(&tree->shutdown_requested); i++) {
+            sleep(1);
+        }
+
+        if (atomic_load(&tree->shutdown_requested)) break;
+
+        time_t now = time(NULL);
+        double tree_age = difftime(now, tree->creation_time);
+
+        /* Check minimum lifetime immunity */
+        if (tree_age < ctx->min_lifetime_sec) {
+            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE to rate checks",
+                    tree->tree_id, tree_age, ctx->min_lifetime_sec);
+            continue;
+        }
+
+        /* Get current metadata count */
+        uint64_t current_metadata_count = atomic_load(&tree->metadata_count);
+        double time_delta = difftime(now, last_check_time);
+
+        /* Calculate metadata rate */
+        uint64_t metadata_delta = current_metadata_count - last_metadata_count;
+        double metadata_rate = (time_delta > 0) ? (double)metadata_delta / time_delta : 0.0;
+        tree->metadata_rate = metadata_rate;
+
+        log_msg(LOG_DEBUG, "[tree %u] Metadata rate: %.4f/sec (threshold: %.4f/sec, delta=%lu in %.0fs)",
+                tree->tree_id, metadata_rate, ctx->min_metadata_rate,
+                (unsigned long)metadata_delta, time_delta);
+
+        /* Check if rate is below threshold */
+        if (metadata_rate < ctx->min_metadata_rate) {
+            /* Check queue requirement */
+            if (ctx->require_empty_queue) {
+                int queue_size = tree_infohash_queue_count(tree->infohash_queue);
+                if (queue_size > 0) {
+                    log_msg(LOG_DEBUG, "[tree %u] Metadata rate %.4f < %.4f, but queue not empty (%d) - CONTINUING",
+                            tree->tree_id, metadata_rate, ctx->min_metadata_rate, queue_size);
+                    last_metadata_count = current_metadata_count;
+                    last_check_time = now;
+                    continue;
+                }
+            }
+
+            log_msg(LOG_WARN, "[tree %u] Metadata rate %.4f < threshold %.4f, entering grace period (%ds)",
+                    tree->tree_id, metadata_rate, ctx->min_metadata_rate, ctx->grace_period_sec);
+
+            /* Grace period - sleep in 1s chunks */
+            for (int i = 0; i < ctx->grace_period_sec && !atomic_load(&tree->shutdown_requested); i++) {
+                sleep(1);
+            }
+
+            if (atomic_load(&tree->shutdown_requested)) break;
+
+            /* Re-check after grace period */
+            time_t now2 = time(NULL);
+            uint64_t current_metadata_count2 = atomic_load(&tree->metadata_count);
+            double time_delta2 = difftime(now2, last_check_time);
+            uint64_t metadata_delta2 = current_metadata_count2 - last_metadata_count;
+            double metadata_rate2 = (time_delta2 > 0) ? (double)metadata_delta2 / time_delta2 : 0.0;
+
+            if (metadata_rate2 < ctx->min_metadata_rate) {
+                /* Check queue requirement again */
+                if (ctx->require_empty_queue) {
+                    int queue_size = tree_infohash_queue_count(tree->infohash_queue);
+                    if (queue_size > 0) {
+                        log_msg(LOG_DEBUG, "[tree %u] Metadata rate STILL %.4f < %.4f after grace period, but queue not empty (%d) - CONTINUING",
+                                tree->tree_id, metadata_rate2, ctx->min_metadata_rate, queue_size);
+                        last_metadata_count = current_metadata_count2;
+                        last_check_time = now2;
+                        continue;
+                    }
+                }
+
+                log_msg(LOG_INFO, "[tree %u] Metadata rate SUSTAINED at %.4f < %.4f after grace period - REQUESTING SHUTDOWN",
+                        tree->tree_id, metadata_rate2, ctx->min_metadata_rate);
+                thread_tree_request_shutdown(tree);
+                break;
+            } else {
+                log_msg(LOG_DEBUG, "[tree %u] Metadata rate improved to %.4f - CONTINUING",
+                        tree->tree_id, metadata_rate2);
+            }
+        }
+
+        last_metadata_count = current_metadata_count;
+        last_check_time = now;
+    }
+
+    free(ctx);
+    log_msg(LOG_DEBUG, "[tree %u] Rate monitor exiting", tree->tree_id);
+    return NULL;
+}

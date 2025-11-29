@@ -114,12 +114,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
 
-    /* Thread tree bloom-based respawn defaults */
-    config->tree_max_bloom_duplicate_rate = 0.70;      /* 70% duplicate rate threshold */
-    config->tree_bloom_check_interval_sec = 60;        /* Check every 60 seconds */
-    config->tree_bloom_check_sample_size = 100;        /* Require 100+ samples */
-    config->tree_bloom_grace_period_sec = 120;         /* 2 minute grace period */
-    config->tree_bloom_min_lifetime_minutes = 10;      /* 10 minute minimum lifetime */
+    /* Thread tree metadata rate-based respawn defaults */
+    config->min_metadata_rate = 0.01;                  /* 0.01 metadata/sec threshold */
+    config->tree_rate_check_interval_sec = 60;         /* Check every 60 seconds */
+    config->tree_rate_grace_period_sec = 30;           /* 30 second grace period */
+    config->tree_min_lifetime_minutes = 10;            /* 10 minute minimum lifetime */
+    config->tree_require_empty_queue = 1;              /* Require empty queue before respawn */
 
     /* Thread tree mode toggle - disabled by default for safety */
     config->use_thread_trees = 0;                   /* 0=old architecture */
@@ -395,23 +395,21 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->tree_tcp_connect_timeout_ms = atoi(value);
             if (config->tree_tcp_connect_timeout_ms < 1000) config->tree_tcp_connect_timeout_ms = 1000;
         }
-        /* Thread tree bloom-based respawn settings */
-        else if (strcmp(key, "tree_max_bloom_duplicate_rate") == 0) {
-            config->tree_max_bloom_duplicate_rate = atof(value);
-            if (config->tree_max_bloom_duplicate_rate < 0.0) config->tree_max_bloom_duplicate_rate = 0.0;
-            if (config->tree_max_bloom_duplicate_rate > 1.0) config->tree_max_bloom_duplicate_rate = 1.0;
-        } else if (strcmp(key, "tree_bloom_check_interval_sec") == 0) {
-            config->tree_bloom_check_interval_sec = atoi(value);
-            if (config->tree_bloom_check_interval_sec < 10) config->tree_bloom_check_interval_sec = 10;
-        } else if (strcmp(key, "tree_bloom_check_sample_size") == 0) {
-            config->tree_bloom_check_sample_size = atoi(value);
-            if (config->tree_bloom_check_sample_size < 10) config->tree_bloom_check_sample_size = 10;
-        } else if (strcmp(key, "tree_bloom_grace_period_sec") == 0) {
-            config->tree_bloom_grace_period_sec = atoi(value);
-            if (config->tree_bloom_grace_period_sec < 10) config->tree_bloom_grace_period_sec = 10;
-        } else if (strcmp(key, "tree_bloom_min_lifetime_minutes") == 0) {
-            config->tree_bloom_min_lifetime_minutes = atoi(value);
-            if (config->tree_bloom_min_lifetime_minutes < 0) config->tree_bloom_min_lifetime_minutes = 0;
+        /* Thread tree metadata rate-based respawn settings */
+        else if (strcmp(key, "min_metadata_rate") == 0) {
+            config->min_metadata_rate = atof(value);
+            if (config->min_metadata_rate < 0.0) config->min_metadata_rate = 0.0;
+        } else if (strcmp(key, "tree_rate_check_interval_sec") == 0) {
+            config->tree_rate_check_interval_sec = atoi(value);
+            if (config->tree_rate_check_interval_sec < 10) config->tree_rate_check_interval_sec = 10;
+        } else if (strcmp(key, "tree_rate_grace_period_sec") == 0) {
+            config->tree_rate_grace_period_sec = atoi(value);
+            if (config->tree_rate_grace_period_sec < 10) config->tree_rate_grace_period_sec = 10;
+        } else if (strcmp(key, "tree_min_lifetime_minutes") == 0) {
+            config->tree_min_lifetime_minutes = atoi(value);
+            if (config->tree_min_lifetime_minutes < 0) config->tree_min_lifetime_minutes = 0;
+        } else if (strcmp(key, "tree_require_empty_queue") == 0) {
+            config->tree_require_empty_queue = atoi(value);
         }
         /* Thread tree mode toggle */
         else if (strcmp(key, "use_thread_trees") == 0) {

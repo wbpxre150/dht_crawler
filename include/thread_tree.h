@@ -73,12 +73,12 @@ typedef struct tree_config {
     /* Stage 5: Metadata fetcher settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
 
-    /* Bloom-based respawn settings */
-    double max_bloom_duplicate_rate;    /* Max bloom duplicate rate before respawn (default: 0.70) */
-    int bloom_check_interval_sec;       /* Bloom rate check interval (default: 60) */
-    int bloom_check_sample_size;        /* Min samples before check (default: 100) */
-    int bloom_grace_period_sec;         /* Grace period before respawn (default: 120) */
-    int bloom_min_lifetime_minutes;     /* Min lifetime before bloom checks (default: 10) */
+    /* Metadata rate-based respawn settings */
+    double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
+    int rate_check_interval_sec;        /* Rate check interval (default: 60) */
+    int rate_grace_period_sec;          /* Grace period before respawn (default: 30) */
+    int min_lifetime_minutes;           /* Min lifetime before rate checks (default: 10) */
+    bool require_empty_queue;           /* Only respawn if queue empty (default: true) */
 
     /* Porn filter settings */
     int porn_filter_enabled;            /* Enable porn filter (0=disabled, 1=enabled) */
@@ -152,7 +152,7 @@ typedef struct thread_tree {
     pthread_t *bep51_threads;
     pthread_t *get_peers_threads;
     pthread_t *metadata_threads;
-    pthread_t bloom_monitor_thread; /* Bloom duplicate rate monitor */
+    pthread_t rate_monitor_thread;      /* Metadata rate monitor */
     pthread_t throttle_monitor_thread;  /* Monitors queue size for throttling */
 
     /* Thread counts */
@@ -169,21 +169,15 @@ typedef struct thread_tree {
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */
 
-    /* Bloom filter duplicate tracking */
-    atomic_uint_fast64_t bloom_checks;      /* Total infohashes checked against bloom */
-    atomic_uint_fast64_t bloom_duplicates;  /* Infohashes rejected by bloom (already seen) */
-    atomic_uint_fast64_t last_bloom_checks; /* Last check count (for rate calculation) */
-    double bloom_duplicate_rate;            /* Current duplicate rate (0.0 - 1.0) */
-
     /* BEP51 cache statistics */
     atomic_uint_fast64_t bep51_nodes_cached; /* Nodes submitted to BEP51 cache */
 
-    /* Bloom monitor configuration */
-    double max_bloom_duplicate_rate;        /* Threshold for respawn (e.g., 0.70 = 70%) */
-    int bloom_check_interval_sec;           /* How often to check bloom rate (default: 60s) */
-    int bloom_check_sample_size;            /* Minimum samples before rate check (default: 100) */
-    int bloom_grace_period_sec;             /* Grace period before respawn (default: 120s) */
-    int bloom_min_lifetime_sec;             /* Minimum lifetime before bloom checks (default: 600s = 10min) */
+    /* Metadata rate-based respawn settings */
+    double min_metadata_rate;               /* Min metadata rate before respawn (0.01 = 1 metadata per 100 seconds) */
+    int rate_check_interval_sec;            /* How often to check rate (default: 60s) */
+    int rate_grace_period_sec;              /* Grace period before respawn (default: 30s) */
+    int min_lifetime_sec;                   /* Minimum lifetime before rate checks (default: 600s = 10min) */
+    bool require_empty_queue;               /* Only respawn if infohash queue empty */
 
     /* Porn filter settings */
     int porn_filter_enabled;                /* Enable porn filter (0=disabled, 1=enabled) */

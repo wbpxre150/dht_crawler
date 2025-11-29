@@ -88,12 +88,12 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
 
-    /* Bloom-based respawn settings */
-    sup->max_bloom_duplicate_rate = config->max_bloom_duplicate_rate > 0 ? config->max_bloom_duplicate_rate : 0.70;
-    sup->bloom_check_interval_sec = config->bloom_check_interval_sec > 0 ? config->bloom_check_interval_sec : 60;
-    sup->bloom_check_sample_size = config->bloom_check_sample_size > 0 ? config->bloom_check_sample_size : 100;
-    sup->bloom_grace_period_sec = config->bloom_grace_period_sec > 0 ? config->bloom_grace_period_sec : 120;
-    sup->bloom_min_lifetime_minutes = config->bloom_min_lifetime_minutes > 0 ? config->bloom_min_lifetime_minutes : 10;
+    /* Metadata rate-based respawn settings */
+    sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
+    sup->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 60;
+    sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
+    sup->min_lifetime_minutes = config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10;
+    sup->require_empty_queue = config->require_empty_queue;
 
     /* Porn filter settings */
     sup->porn_filter_enabled = config->porn_filter_enabled;
@@ -162,12 +162,12 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .peers_resume_threshold = sup->peers_resume_threshold,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
-        /* Bloom-based respawn settings */
-        .max_bloom_duplicate_rate = sup->max_bloom_duplicate_rate,
-        .bloom_check_interval_sec = sup->bloom_check_interval_sec,
-        .bloom_check_sample_size = sup->bloom_check_sample_size,
-        .bloom_grace_period_sec = sup->bloom_grace_period_sec,
-        .bloom_min_lifetime_minutes = sup->bloom_min_lifetime_minutes,
+        /* Metadata rate-based respawn settings */
+        .min_metadata_rate = sup->min_metadata_rate,
+        .rate_check_interval_sec = sup->rate_check_interval_sec,
+        .rate_grace_period_sec = sup->rate_grace_period_sec,
+        .min_lifetime_minutes = sup->min_lifetime_minutes,
+        .require_empty_queue = sup->require_empty_queue,
         /* Porn filter settings */
         .porn_filter_enabled = sup->porn_filter_enabled,
         /* Shared resources */

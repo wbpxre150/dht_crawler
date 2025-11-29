@@ -502,12 +502,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(tree_json, "active_connections", (int)atomic_load(&tree->active_connections));
                 cJSON_AddBoolToObject(tree_json, "discovery_paused", atomic_load(&tree->discovery_paused));
 
-                /* Bloom filter statistics */
-                cJSON_AddNumberToObject(tree_json, "bloom_checks", (double)atomic_load(&tree->bloom_checks));
-                cJSON_AddNumberToObject(tree_json, "bloom_duplicates", (double)atomic_load(&tree->bloom_duplicates));
-                cJSON_AddNumberToObject(tree_json, "bloom_duplicate_rate", tree->bloom_duplicate_rate * 100.0);
-                cJSON_AddNumberToObject(tree_json, "bloom_rate_threshold", tree->max_bloom_duplicate_rate * 100.0);
-
                 /* BEP51 cache statistics */
                 cJSON_AddNumberToObject(tree_json, "bep51_nodes_cached", (double)atomic_load(&tree->bep51_nodes_cached));
 

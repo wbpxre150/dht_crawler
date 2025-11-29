@@ -61,12 +61,12 @@ typedef struct supervisor_config {
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
 
-    /* Bloom-based respawn settings */
-    double max_bloom_duplicate_rate;   /* Max bloom duplicate rate before respawn (default: 0.70) */
-    int bloom_check_interval_sec;      /* Bloom rate check interval (default: 60) */
-    int bloom_check_sample_size;       /* Min samples before check (default: 100) */
-    int bloom_grace_period_sec;        /* Grace period before respawn (default: 120) */
-    int bloom_min_lifetime_minutes;    /* Min lifetime before bloom checks (default: 10) */
+    /* Metadata rate-based respawn settings */
+    double min_metadata_rate;          /* Min metadata rate before respawn (default: 0.01) */
+    int rate_check_interval_sec;       /* Rate check interval (default: 60) */
+    int rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
+    int min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
+    int require_empty_queue;           /* Only respawn if queue empty (default: 1) */
 
     /* Porn filter settings */
     int porn_filter_enabled;           /* Enable porn filter (0=disabled, 1=enabled) */
@@ -128,12 +128,12 @@ typedef struct supervisor {
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
 
-    /* Bloom-based respawn settings */
-    double max_bloom_duplicate_rate;
-    int bloom_check_interval_sec;
-    int bloom_check_sample_size;
-    int bloom_grace_period_sec;
-    int bloom_min_lifetime_minutes;
+    /* Metadata rate-based respawn settings */
+    double min_metadata_rate;
+    int rate_check_interval_sec;
+    int rate_grace_period_sec;
+    int min_lifetime_minutes;
+    int require_empty_queue;
 
     /* Porn filter settings */
     int porn_filter_enabled;           /* Enable porn filter */

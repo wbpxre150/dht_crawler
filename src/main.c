@@ -359,12 +359,12 @@ int main(int argc, char *argv[]) {
             .peers_resume_threshold = config.tree_peers_resume_threshold,
             /* Stage 5 settings */
             .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
-            /* Bloom-based respawn settings */
-            .max_bloom_duplicate_rate = config.tree_max_bloom_duplicate_rate,
-            .bloom_check_interval_sec = config.tree_bloom_check_interval_sec,
-            .bloom_check_sample_size = config.tree_bloom_check_sample_size,
-            .bloom_grace_period_sec = config.tree_bloom_grace_period_sec,
-            .bloom_min_lifetime_minutes = config.tree_bloom_min_lifetime_minutes,
+            /* Metadata rate-based respawn settings */
+            .min_metadata_rate = config.min_metadata_rate,
+            .rate_check_interval_sec = config.tree_rate_check_interval_sec,
+            .rate_grace_period_sec = config.tree_rate_grace_period_sec,
+            .min_lifetime_minutes = config.tree_min_lifetime_minutes,
+            .require_empty_queue = config.tree_require_empty_queue,
             /* Porn filter settings */
             .porn_filter_enabled = config.porn_filter_enabled
         };
