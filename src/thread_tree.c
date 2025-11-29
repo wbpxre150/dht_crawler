@@ -740,7 +740,7 @@ static void *get_peers_worker_func(void *arg) {
     }
 
     /* Log worker statistics on exit */
-    log_msg(LOG_INFO, "[tree %u] get_peers worker %d exiting: queries=%lu, responses=%lu, timeouts=%lu (%.1f%% success)",
+    log_msg(LOG_DEBUG, "[tree %u] get_peers worker %d exiting: queries=%lu, responses=%lu, timeouts=%lu (%.1f%% success)",
             tree->tree_id, worker_id, queries_sent, responses_received, timeouts,
             queries_sent > 0 ? (100.0 * responses_received / queries_sent) : 0.0);
 
