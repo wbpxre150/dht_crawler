@@ -273,8 +273,8 @@ static void *throttle_monitor_func(void *arg) {
         /* Check infohash queue size (for discovery workers: find_node + BEP51) */
         int infohash_queue_size = tree_infohash_queue_count(tree->infohash_queue);
 
-        /* HARD-CODED THRESHOLDS: Pause BEP51 at 2500, resume at 1000 */
-        const int INFOHASH_PAUSE_THRESHOLD = 2500;
+        /* HARD-CODED THRESHOLDS: Pause BEP51 at 2000, resume at 1000 */
+        const int INFOHASH_PAUSE_THRESHOLD = 2000;
         const int INFOHASH_RESUME_THRESHOLD = 1000;
 
         if (!discovery_currently_paused && infohash_queue_size >= INFOHASH_PAUSE_THRESHOLD) {
@@ -305,8 +305,8 @@ static void *throttle_monitor_func(void *arg) {
         tree_peers_queue_t *peers_queue = (tree_peers_queue_t *)tree->peers_queue;
         int peers_queue_size = tree_peers_queue_count(peers_queue);
 
-        /* HARD-CODED THRESHOLDS: Pause get_peers at 2500, resume at 1000 */
-        const int PEERS_PAUSE_THRESHOLD = 2500;
+        /* HARD-CODED THRESHOLDS: Pause get_peers at 2000, resume at 1000 */
+        const int PEERS_PAUSE_THRESHOLD = 2000;
         const int PEERS_RESUME_THRESHOLD = 1000;
 
         if (!get_peers_currently_paused && peers_queue_size >= PEERS_PAUSE_THRESHOLD) {
