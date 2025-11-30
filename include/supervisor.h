@@ -192,8 +192,11 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree);
  * @param sup Supervisor instance
  * @param out_active_trees Output: number of active trees
  * @param out_total_metadata Output: total metadata fetched across all trees
+ * @param out_first_strike Output: total first-strike failures (optional, can be NULL)
+ * @param out_second_strike Output: total second-strike failures (optional, can be NULL)
  */
-void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata);
+void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata,
+                     uint64_t *out_first_strike, uint64_t *out_second_strike);
 
 /**
  * Get total active connections across all trees

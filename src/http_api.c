@@ -471,12 +471,18 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     if (api->supervisor) {
         int active_trees = 0;
         uint64_t total_metadata = 0;
-        supervisor_stats(api->supervisor, &active_trees, &total_metadata);
+        uint64_t first_strike_failures = 0;
+        uint64_t second_strike_failures = 0;
+        supervisor_stats(api->supervisor, &active_trees, &total_metadata,
+                        &first_strike_failures, &second_strike_failures);
 
         cJSON *supervisor_json = cJSON_CreateObject();
         cJSON_AddNumberToObject(supervisor_json, "active_trees", active_trees);
         cJSON_AddNumberToObject(supervisor_json, "max_trees", api->supervisor->max_trees);
         cJSON_AddNumberToObject(supervisor_json, "total_trees_spawned", (double)api->supervisor->next_tree_id - 1);
+        cJSON_AddNumberToObject(supervisor_json, "total_metadata_fetched", (double)total_metadata);
+        cJSON_AddNumberToObject(supervisor_json, "first_strike_failures", (double)first_strike_failures);
+        cJSON_AddNumberToObject(supervisor_json, "second_strike_failures", (double)second_strike_failures);
         cJSON_AddItemToObject(root, "supervisor", supervisor_json);
 
         /* BEP51 cache global stats */

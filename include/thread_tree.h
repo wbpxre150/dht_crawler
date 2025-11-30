@@ -176,6 +176,8 @@ typedef struct thread_tree {
     atomic_uint_fast64_t metadata_count;
     atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
     atomic_uint_fast64_t filtered_count;    /* Filtered by porn filter */
+    atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
+    atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */

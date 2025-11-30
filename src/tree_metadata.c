@@ -877,6 +877,34 @@ void *tree_metadata_worker_func(void *arg) {
             metadata = tree_fetch_metadata_from_peer(entry.infohash, &entry.peers[i], &config);
         }
 
+        /* Handle failure with two-strike bloom filtering */
+        if (!metadata && tree->failure_bloom && tree->shared_bloom) {
+            /* All peers exhausted - apply two-strike logic */
+            if (bloom_filter_check(tree->failure_bloom, entry.infohash)) {
+                /* Second strike - add to main bloom (permanent block) */
+                bloom_filter_add(tree->shared_bloom, entry.infohash);
+                atomic_fetch_add(&tree->second_strike_failures, 1);
+
+                char hex[41];
+                for (int i = 0; i < 20; i++) {
+                    snprintf(hex + i * 2, 3, "%02x", entry.infohash[i]);
+                }
+                log_msg(LOG_DEBUG, "[tree %u] Second failure for %s - permanently blocked",
+                        tree->tree_id, hex);
+            } else {
+                /* First strike - add to failure bloom (allow retry) */
+                bloom_filter_add(tree->failure_bloom, entry.infohash);
+                atomic_fetch_add(&tree->first_strike_failures, 1);
+
+                char hex[41];
+                for (int i = 0; i < 20; i++) {
+                    snprintf(hex + i * 2, 3, "%02x", entry.infohash[i]);
+                }
+                log_msg(LOG_DEBUG, "[tree %u] First failure for %s - retry allowed",
+                        tree->tree_id, hex);
+            }
+        }
+
         /* If successful, submit to batch writer */
         if (metadata) {
             /* Update stats */

@@ -813,14 +813,19 @@ static void *monitor_thread_func(void *arg) {
     return NULL;
 }
 
-void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata) {
+void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata,
+                     uint64_t *out_first_strike, uint64_t *out_second_strike) {
     if (!sup) {
         if (out_active_trees) *out_active_trees = 0;
         if (out_total_metadata) *out_total_metadata = 0;
+        if (out_first_strike) *out_first_strike = 0;
+        if (out_second_strike) *out_second_strike = 0;
         return;
     }
 
     uint64_t total_metadata = 0;
+    uint64_t total_first_strike = 0;
+    uint64_t total_second_strike = 0;
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -831,6 +836,8 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
             total_metadata += atomic_load(&sup->trees[i]->metadata_count);
+            total_first_strike += atomic_load(&sup->trees[i]->first_strike_failures);
+            total_second_strike += atomic_load(&sup->trees[i]->second_strike_failures);
         }
     }
 
@@ -838,6 +845,12 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
 
     if (out_total_metadata) {
         *out_total_metadata = total_metadata;
+    }
+    if (out_first_strike) {
+        *out_first_strike = total_first_strike;
+    }
+    if (out_second_strike) {
+        *out_second_strike = total_second_strike;
     }
 }
 
