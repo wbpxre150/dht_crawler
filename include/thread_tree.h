@@ -172,6 +172,7 @@ typedef struct thread_tree {
 
     /* Statistics */
     atomic_uint_fast64_t metadata_count;
+    atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
     atomic_uint_fast64_t filtered_count;    /* Filtered by porn filter */
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;

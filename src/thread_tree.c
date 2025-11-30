@@ -1025,6 +1025,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Initialize statistics */
     atomic_store(&tree->metadata_count, 0);
+    atomic_store(&tree->metadata_attempts, 0);
     atomic_store(&tree->filtered_count, 0);
     atomic_store(&tree->last_metadata_time, 0);
     tree->metadata_rate = 0.0;

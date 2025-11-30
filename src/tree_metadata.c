@@ -867,6 +867,9 @@ void *tree_metadata_worker_func(void *arg) {
             continue;
         }
 
+        /* Track that we're attempting to fetch this infohash */
+        atomic_fetch_add(&tree->metadata_attempts, 1);
+
         /* Try each peer until metadata fetched */
         tree_torrent_metadata_t *metadata = NULL;
         for (int i = 0; i < entry.peer_count && !metadata; i++) {
