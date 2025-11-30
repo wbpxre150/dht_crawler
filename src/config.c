@@ -31,6 +31,7 @@ void config_init_defaults(crawler_config_t *config) {
     /* Phase 2: Bloom Filter defaults */
     config->bloom_enabled = 1;
     config->bloom_capacity = 10000000;
+    config->failure_bloom_capacity = 30000000;  /* 30M entries (same as main bloom) */
     config->bloom_error_rate = 0.001;
     config->bloom_persist = 1;
     strncpy(config->bloom_path, "data/bloom.dat", sizeof(config->bloom_path) - 1);
@@ -221,6 +222,8 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->bloom_enabled = atoi(value);
         } else if (strcmp(key, "bloom_capacity") == 0) {
             config->bloom_capacity = strtoull(value, NULL, 10);
+        } else if (strcmp(key, "failure_bloom_capacity") == 0) {
+            config->failure_bloom_capacity = strtoull(value, NULL, 10);
         } else if (strcmp(key, "bloom_error_rate") == 0) {
             config->bloom_error_rate = atof(value);
         } else if (strcmp(key, "bloom_persist") == 0) {

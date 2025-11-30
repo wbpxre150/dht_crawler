@@ -160,6 +160,10 @@ typedef struct {
     /* Batch writer for high-throughput database writes */
     struct batch_writer *batch_writer;
 
+    /* Bloom filters for two-strike failure tracking */
+    struct bloom_filter *main_bloom;      /* Main bloom filter (successes + double-failed infohashes) */
+    struct bloom_filter *failure_bloom;   /* Failure bloom filter (first-attempt failures) */
+
     /* Async handle for cross-thread communication */
     uv_async_t async_handle;
 
@@ -192,6 +196,10 @@ typedef struct {
     uint64_t total_failed;             /* Total failures (legacy, may be removed) */
     uint64_t filtered_count;           /* Filtered by porn filter */
 
+    /* Two-strike bloom filter statistics */
+    uint64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
+    uint64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
+
     /* Configuration reference */
     crawler_config_t *config;
 
@@ -222,6 +230,8 @@ typedef struct {
     uint64_t hash_mismatch;
     uint64_t total_fetched;
     uint64_t filtered_count;
+    uint64_t first_strike_failures;
+    uint64_t second_strike_failures;
     int active_count;
 } metadata_fetcher_stats_t;
 
@@ -233,6 +243,9 @@ int metadata_fetcher_start(metadata_fetcher_t *fetcher);
 void metadata_fetcher_stop(metadata_fetcher_t *fetcher);
 void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher);
 void metadata_fetcher_set_bloom_filter(metadata_fetcher_t *fetcher, bloom_filter_t *bloom, const char *bloom_path);
+void metadata_fetcher_set_bloom_filters(metadata_fetcher_t *fetcher,
+                                       bloom_filter_t *main_bloom,
+                                       bloom_filter_t *failure_bloom);
 void metadata_fetcher_get_stats(metadata_fetcher_t *fetcher, metadata_fetcher_stats_t *stats);
 
 /* Internal functions */

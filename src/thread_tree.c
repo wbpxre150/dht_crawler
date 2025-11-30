@@ -976,6 +976,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->infohash_queue_capacity = config->infohash_queue_capacity > 0 ? config->infohash_queue_capacity : 5000;
     tree->bep51_query_interval_ms = config->bep51_query_interval_ms >= 0 ? config->bep51_query_interval_ms : 10;
     tree->shared_bloom = config->bloom_filter;
+    tree->failure_bloom = config->failure_bloom;
 
     /* Stage 4 config */
     tree->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;

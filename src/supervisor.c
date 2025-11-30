@@ -55,7 +55,13 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Store shared resources */
     sup->batch_writer = config->batch_writer;
     sup->bloom_filter = config->bloom_filter;
+    sup->failure_bloom = NULL;  /* Will be initialized during start */
+    sup->failure_bloom_path = "data/failure_bloom.dat";
     sup->shared_node_pool = NULL;  /* Will be created during bootstrap */
+
+    /* Store bloom filter configuration */
+    sup->failure_bloom_capacity = config->failure_bloom_capacity > 0 ? config->failure_bloom_capacity : 30000000;
+    sup->bloom_error_rate = config->bloom_error_rate > 0 ? config->bloom_error_rate : 0.001;
 
     /* Store worker counts */
     sup->num_find_node_workers = config->num_find_node_workers > 0 ? config->num_find_node_workers : 10;
@@ -173,6 +179,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,
+        .failure_bloom = sup->failure_bloom,
         .supervisor_ctx = sup,
         .on_shutdown = supervisor_on_tree_shutdown
     };
@@ -497,11 +504,32 @@ void supervisor_start(supervisor_t *sup) {
 
     log_msg(LOG_DEBUG, "[supervisor] Starting with %d trees", sup->max_trees);
 
+    /* Initialize failure bloom filter for two-strike filtering */
+    log_msg(LOG_DEBUG, "[supervisor] Initializing failure bloom filter (capacity: %llu, error rate: %.4f)",
+            (unsigned long long)sup->failure_bloom_capacity, sup->bloom_error_rate);
+    sup->failure_bloom = bloom_filter_init(sup->failure_bloom_capacity, sup->bloom_error_rate);
+    if (!sup->failure_bloom) {
+        log_msg(LOG_ERROR, "[supervisor] Failed to initialize failure bloom filter");
+        return;
+    }
+
+    /* Try to load failure bloom filter from disk */
+    bloom_filter_t *loaded_failure = bloom_filter_load(sup->failure_bloom_path);
+    if (loaded_failure) {
+        bloom_filter_cleanup(sup->failure_bloom);
+        sup->failure_bloom = loaded_failure;
+        log_msg(LOG_DEBUG, "[supervisor] Loaded failure bloom filter from disk");
+    } else {
+        log_msg(LOG_DEBUG, "[supervisor] Created new failure bloom filter (capacity: %llu, error rate: %.4f)",
+                (unsigned long long)sup->failure_bloom_capacity, sup->bloom_error_rate);
+    }
+
     /* Create BEP51 cache */
     log_msg(LOG_DEBUG, "[supervisor] Creating BEP51 cache (capacity: %d)", sup->bep51_cache_capacity);
     sup->bep51_cache = bep51_cache_create(sup->bep51_cache_capacity);
     if (!sup->bep51_cache) {
         log_msg(LOG_ERROR, "[supervisor] Failed to create BEP51 cache");
+        bloom_filter_cleanup(sup->failure_bloom);
         return;
     }
 
@@ -509,6 +537,7 @@ void supervisor_start(supervisor_t *sup) {
     sup->shared_node_pool = shared_node_pool_create(sup->global_bootstrap_target);
     if (!sup->shared_node_pool) {
         log_msg(LOG_ERROR, "[supervisor] Failed to create shared node pool");
+        bloom_filter_cleanup(sup->failure_bloom);
         bep51_cache_destroy(sup->bep51_cache);
         return;
     }
@@ -655,6 +684,16 @@ void supervisor_destroy(supervisor_t *sup) {
     /* Ensure stopped */
     supervisor_stop(sup);
 
+    /* Save failure bloom filter to disk */
+    if (sup->failure_bloom && sup->failure_bloom_path) {
+        log_msg(LOG_DEBUG, "[supervisor] Saving failure bloom filter to %s", sup->failure_bloom_path);
+        if (bloom_filter_save(sup->failure_bloom, sup->failure_bloom_path) == 0) {
+            log_msg(LOG_DEBUG, "[supervisor] Failure bloom filter saved successfully");
+        } else {
+            log_msg(LOG_ERROR, "[supervisor] Failed to save failure bloom filter to %s", sup->failure_bloom_path);
+        }
+    }
+
     /* Save BEP51 cache to disk */
     if (sup->bep51_cache) {
         log_msg(LOG_DEBUG, "[supervisor] Saving BEP51 cache to %s", sup->bep51_cache_path);
@@ -665,6 +704,12 @@ void supervisor_destroy(supervisor_t *sup) {
         }
         bep51_cache_destroy(sup->bep51_cache);
         sup->bep51_cache = NULL;
+    }
+
+    /* Cleanup failure bloom filter */
+    if (sup->failure_bloom) {
+        bloom_filter_cleanup(sup->failure_bloom);
+        sup->failure_bloom = NULL;
     }
 
     /* Cleanup shared node pool */

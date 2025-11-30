@@ -93,6 +93,7 @@ typedef struct tree_config {
     /* Shared resources from supervisor */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
+    struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
 
     /* Supervisor callback context */
     void *supervisor_ctx;
@@ -114,7 +115,8 @@ typedef struct thread_tree {
     struct tree_dispatcher *dispatcher;  /* UDP response dispatcher */
 
     /* Shared resources (from supervisor) */
-    struct bloom_filter *shared_bloom;  /* Stage 3: Shared bloom filter (thread-safe) */
+    struct bloom_filter *shared_bloom;     /* Stage 3: Shared bloom filter (thread-safe) */
+    struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
 
     /* Stage 2 config */
     int bootstrap_timeout_sec;

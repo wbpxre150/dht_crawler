@@ -333,6 +333,9 @@ int main(int argc, char *argv[]) {
             .use_keyspace_partitioning = config.use_keyspace_partitioning,
             .batch_writer = g_batch_writer,
             .bloom_filter = g_bloom,
+            /* Bloom filter settings for failure tracking */
+            .failure_bloom_capacity = config.failure_bloom_capacity,
+            .bloom_error_rate = config.bloom_error_rate,
             .num_find_node_workers = config.tree_find_node_workers,
             .num_bep51_workers = config.tree_bep51_workers,
             .num_get_peers_workers = config.tree_get_peers_workers,

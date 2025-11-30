@@ -194,6 +194,12 @@ int metadata_fetcher_init(metadata_fetcher_t *fetcher, app_context_t *app_ctx,
     fetcher->max_concurrent = 2;  /* Parallel peer attempts - 2 at a time per infohash */
     fetcher->running = 0;
 
+    /* Initialize bloom filter pointers to NULL */
+    fetcher->main_bloom = NULL;
+    fetcher->failure_bloom = NULL;
+    fetcher->first_strike_failures = 0;
+    fetcher->second_strike_failures = 0;
+
     /* Initialize async callback state flag to prevent event loop starvation */
     fetcher->connection_queue_blocked = 0;
 
@@ -400,6 +406,21 @@ void metadata_fetcher_set_bloom_filter(metadata_fetcher_t *fetcher, bloom_filter
     }
 }
 
+/* Set bloom filter references for failure tracking */
+void metadata_fetcher_set_bloom_filters(metadata_fetcher_t *fetcher,
+                                       bloom_filter_t *main_bloom,
+                                       bloom_filter_t *failure_bloom) {
+    if (!fetcher) {
+        return;
+    }
+
+    fetcher->main_bloom = main_bloom;
+    fetcher->failure_bloom = failure_bloom;
+
+    log_msg(LOG_DEBUG, "Bloom filters set for metadata fetcher (main: %p, failure: %p)",
+            (void*)main_bloom, (void*)failure_bloom);
+}
+
 void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
     if (!fetcher) {
         return;
@@ -485,6 +506,10 @@ void metadata_fetcher_cleanup(metadata_fetcher_t *fetcher) {
     log_msg(LOG_DEBUG, "  Filtered by porn filter: %llu (%.1f%%)",
             (unsigned long long)fetcher->filtered_count,
             fetcher->total_fetched > 0 ? (fetcher->filtered_count * 100.0 / fetcher->total_fetched) : 0.0);
+    log_msg(LOG_DEBUG, "  First-strike failures: %llu",
+            (unsigned long long)fetcher->first_strike_failures);
+    log_msg(LOG_DEBUG, "  Second-strike failures: %llu",
+            (unsigned long long)fetcher->second_strike_failures);
     log_msg(LOG_DEBUG, "===================================");
 }
 
@@ -508,6 +533,8 @@ void metadata_fetcher_get_stats(metadata_fetcher_t *fetcher, metadata_fetcher_st
     stats->hash_mismatch = fetcher->hash_mismatch;
     stats->total_fetched = fetcher->total_fetched;
     stats->filtered_count = fetcher->filtered_count;
+    stats->first_strike_failures = fetcher->first_strike_failures;
+    stats->second_strike_failures = fetcher->second_strike_failures;
     stats->active_count = fetcher->active_count;
 
     uv_mutex_unlock(&fetcher->mutex);
@@ -2169,11 +2196,30 @@ static void handle_infohash_failure(metadata_fetcher_t *fetcher, infohash_attemp
 
     /* Count this attempt as a failure in statistics */
     uv_mutex_lock(&fetcher->mutex);
-    fetcher->total_attempts++;  /* Count attempt on failure */
-    uv_mutex_unlock(&fetcher->mutex);
+    fetcher->total_attempts++;
 
-    /* All failures are discarded immediately since retry is disabled */
-    /* No additional action needed - failure is simply not retried */
+    /* Two-strike bloom filtering */
+    if (fetcher->failure_bloom && fetcher->main_bloom) {
+        if (bloom_filter_check(fetcher->failure_bloom, attempt->info_hash)) {
+            /* Second strike - add to main bloom (permanent block) */
+            bloom_filter_add(fetcher->main_bloom, attempt->info_hash);
+            fetcher->second_strike_failures++;
+
+            char hex[41];
+            format_infohash_hex(attempt->info_hash, hex);
+            log_msg(LOG_DEBUG, "Second failure for %s - added to main bloom filter", hex);
+        } else {
+            /* First strike - add to failure bloom (allow one retry) */
+            bloom_filter_add(fetcher->failure_bloom, attempt->info_hash);
+            fetcher->first_strike_failures++;
+
+            char hex[41];
+            format_infohash_hex(attempt->info_hash, hex);
+            log_msg(LOG_DEBUG, "First failure for %s - added to failure bloom filter", hex);
+        }
+    }
+
+    uv_mutex_unlock(&fetcher->mutex);
 }
 
 /* Free metadata result */

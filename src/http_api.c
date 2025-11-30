@@ -418,6 +418,8 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(metadata, "hash_mismatch", (double)metadata_stats.hash_mismatch);
         cJSON_AddNumberToObject(metadata, "fetched", (double)metadata_stats.total_fetched);
         cJSON_AddNumberToObject(metadata, "filtered", (double)metadata_stats.filtered_count);
+        cJSON_AddNumberToObject(metadata, "first_strike_failures", (double)metadata_stats.first_strike_failures);
+        cJSON_AddNumberToObject(metadata, "second_strike_failures", (double)metadata_stats.second_strike_failures);
         cJSON_AddNumberToObject(metadata, "active_connections", metadata_stats.active_count);
 
         /* Calculate success rate */

@@ -23,6 +23,7 @@ typedef struct {
     /* Phase 2: Bloom Filter settings */
     int bloom_enabled;
     uint64_t bloom_capacity;
+    uint64_t failure_bloom_capacity;  /* NEW: Capacity for failure bloom filter */
     double bloom_error_rate;
     int bloom_persist;
     char bloom_path[512];
