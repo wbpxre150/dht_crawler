@@ -305,11 +305,6 @@ static void metadata_worker_fn(void *task_data, void *closure) {
     /* Signal main thread via uv_async_send (THREAD-SAFE) */
     uv_async_send(&fetcher->async_handle);
 
-    /* Update statistics */
-    uv_mutex_lock(&fetcher->mutex);
-    fetcher->total_attempts++;
-    uv_mutex_unlock(&fetcher->mutex);
-
     free(task);
 }
 
@@ -1626,6 +1621,7 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
     /* Update statistics */
     uv_mutex_lock(&fetcher->mutex);
     fetcher->total_fetched++;
+    fetcher->total_attempts++;  /* Count attempt on success */
     uv_mutex_unlock(&fetcher->mutex);
 
     /* Close all other connections for this info_hash */
@@ -2170,6 +2166,11 @@ static void handle_infohash_failure(metadata_fetcher_t *fetcher, infohash_attemp
     if (!fetcher || !attempt) {
         return;
     }
+
+    /* Count this attempt as a failure in statistics */
+    uv_mutex_lock(&fetcher->mutex);
+    fetcher->total_attempts++;  /* Count attempt on failure */
+    uv_mutex_unlock(&fetcher->mutex);
 
     /* All failures are discarded immediately since retry is disabled */
     /* No additional action needed - failure is simply not retried */
