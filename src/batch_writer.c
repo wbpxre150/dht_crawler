@@ -191,18 +191,42 @@ int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata)
         }
     }
 
-    /* Add to batch */
+    /* Check if batch is full BEFORE writing - prevent buffer overflow */
+    if (writer->batch_size >= writer->batch_capacity) {
+        /* Batch is full, need to flush first */
+        log_msg(LOG_DEBUG, "Batch full, flushing %zu items before adding new item", writer->batch_capacity);
+        uv_mutex_unlock(&writer->mutex);
+
+        int flush_result = batch_writer_flush(writer);
+
+        /* Re-acquire lock and add the item after flush */
+        uv_mutex_lock(&writer->mutex);
+
+        if (!writer->running) {
+            /* Writer was shut down during flush, cleanup and fail */
+            if (copy->name) free(copy->name);
+            if (copy->files) {
+                for (int32_t j = 0; j < copy->num_files; j++) {
+                    if (copy->files[j].path) free(copy->files[j].path);
+                }
+                free(copy->files);
+            }
+            free(copy);
+            uv_mutex_unlock(&writer->mutex);
+            return -1;
+        }
+
+        /* Add to batch after flush (batch_size should now be < capacity) */
+        writer->batch[writer->batch_size++] = copy;
+        uv_mutex_unlock(&writer->mutex);
+
+        return flush_result;
+    }
+
+    /* Add to batch - we've verified there's space */
     writer->batch[writer->batch_size++] = copy;
 
-    /* Auto-flush if batch is full */
-    bool should_flush = (writer->batch_size >= writer->batch_capacity);
-
     uv_mutex_unlock(&writer->mutex);
-
-    if (should_flush) {
-        log_msg(LOG_DEBUG, "Batch full, flushing %zu items", writer->batch_capacity);
-        return batch_writer_flush(writer);
-    }
 
     return 0;
 }
