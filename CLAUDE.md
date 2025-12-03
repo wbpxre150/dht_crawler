@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A high-performance BitTorrent DHT crawler written in C that discovers and catalogs torrents from the BitTorrent DHT network. The crawler passively monitors DHT traffic, actively fetches metadata from peers, and stores results in an SQLite database with full-text search capabilities.
+A high-performance BitTorrent DHT crawler written in C that discovers and collects torrent metadata from the DHT network. The project implements a multi-threaded architecture optimized for Android/Termux environments with thread limits, capable of discovering thousands of torrents per hour.
 
 ## Build Commands
 
 ```bash
-# Standard build
+# Build the project
 make
 
 # Clean build artifacts
@@ -18,361 +18,293 @@ make clean
 # Build with debug symbols
 make debug
 
-# Build with AddressSanitizer (recommended for development)
+# Build with AddressSanitizer (memory safety)
 make asan
 
-# Build with ThreadSanitizer (for concurrency debugging)
+# Build with ThreadSanitizer (thread safety)
 make tsan
 
 # Run with Valgrind memory checker
 make valgrind
-
-# Run the crawler
-./dht_crawler
 ```
 
-## System Dependencies
+## Dependencies
 
-Required libraries (use package manager to install):
-- `libuv` - Async I/O event loop
-- `libsqlite3` - Embedded database
-- `libssl/libcrypto` - SHA-1 hashing (OpenSSL)
-- `liburcu` - Read-Copy-Update synchronization (userspace-rcu)
-- `libpthread` - POSIX threads
+Required system packages:
+- libuv-dev (async I/O)
+- libsqlite3-dev (database)
+- libssl-dev (OpenSSL for crypto)
+- build-essential (compiler toolchain)
+- liburcu (userspace-rcu on Arch, liburcu-dev on Debian/Ubuntu)
 
-## Core Architecture
+The Makefile automatically builds submodule dependencies (libbloom) and applies patches (bencode-cap-fix.patch).
 
-### Thread Tree Architecture (Current)
+## High-Level Architecture
 
-The crawler uses a **supervisor-managed thread tree** architecture where multiple isolated DHT crawler units run concurrently:
+### Thread Tree Supervisor Model
 
-```
-Supervisor
-├── Thread Tree 1 (Node ID A)
-│   ├── Routing Table
-│   ├── Infohash Queue
-│   ├── Peers Queue
-│   ├── Worker Threads (find_node, BEP51, get_peers, metadata)
-│   └── UDP Socket
-├── Thread Tree 2 (Node ID B)
-│   └── [same structure]
-└── Thread Tree N...
+The crawler uses a **supervisor pattern** that manages multiple independent "thread trees" (isolated DHT crawler units). This architecture solves Android's thread limit constraints while maintaining high throughput.
 
-Shared Resources (supervisor-owned):
-├── Batch Writer (SQLite transaction batching)
-├── Bloom Filter (duplicate detection)
-└── Shared Node Pool (global bootstrap)
-```
+**Key concept**: Instead of one massive multi-threaded crawler, the supervisor spawns 16-32 small thread trees, each with ~300 threads. Trees are isolated with private state but share critical resources.
 
-**Key Files:**
-- `src/supervisor.c` / `include/supervisor.h` - Manages multiple thread trees
-- `src/thread_tree.c` / `include/thread_tree.h` - Isolated DHT crawler unit
-- `src/shared_node_pool.c` / `include/shared_node_pool.h` - Global bootstrap node pool
+- **Supervisor** (`supervisor.h`, `supervisor.c`): Manages lifecycle of all thread trees
+  - Monitors metadata fetch rates per tree
+  - Respawns underperforming trees (exhausted keyspace regions)
+  - Provides shared resources: `batch_writer`, `bloom_filter`, `failure_bloom`, `shared_node_pool`, `bep51_cache`
 
-**Thread Tree Lifecycle:**
-1. **Bootstrap Phase** (`TREE_PHASE_BOOTSTRAP`): Samples nodes from shared pool, runs find_node workers to populate routing table
-2. **BEP51 Phase** (`TREE_PHASE_BEP51`): Sends `sample_infohashes` queries to discover infohashes
-3. **Get Peers Phase** (`TREE_PHASE_GET_PEERS`): Queries DHT for peer addresses for each infohash
-4. **Metadata Phase** (`TREE_PHASE_METADATA`): Connects to peers via BitTorrent protocol to fetch torrent metadata
-5. **Shutdown Phase** (`TREE_PHASE_SHUTTING_DOWN`): Graceful shutdown if metadata rate falls below threshold
+- **Thread Tree** (`thread_tree.h`, `thread_tree.c`): Isolated DHT crawler unit
+  - Private state: node_id, routing table, infohash queue, peers queue, UDP socket
+  - Shares: batch writer, bloom filters, node pool
+  - Lifecycle phases: BOOTSTRAP → BEP51 → GET_PEERS → METADATA → SHUTTING_DOWN
+  - Keyspace partitioning: Each tree claims a partition of the DHT keyspace for comprehensive coverage
 
-The supervisor monitors tree performance and replaces underperforming trees automatically.
+### Five-Stage Pipeline (Per Thread Tree)
 
-### Data Flow Pipeline
+Each thread tree implements a concurrent pipeline:
 
-```
-DHT Network → Thread Tree → Infohash Queue → Get Peers Workers → Peers Queue
-                                                                      ↓
-                                                            Metadata Workers
-                                                                      ↓
-                                                        Bloom Filter Check
-                                                                      ↓
-                                                              Batch Writer
-                                                                      ↓
-                                                               SQLite DB
-```
+1. **Bootstrap Stage** (`tree_socket.c`, `shared_node_pool.c`)
+   - Global bootstrap pool: Shared across all trees for fast startup
+   - Each tree samples 1000 nodes from shared pool
+   - BEP51 cache: Persists high-quality BEP51-capable nodes to disk for instant bootstrap
 
-### Threading Model
+2. **Find_Node Workers** (`thread_tree.c:find_node_worker_func`)
+   - Continuously discover DHT nodes to populate routing table
+   - Adaptive throttling: Slows down when routing table reaches target size (1500 nodes)
+   - Pauses when infohash queue is full to reduce mutex contention
 
-**Main Thread:**
-- Runs libuv event loop
-- Handles UDP socket I/O for all thread trees
-- Manages HTTP API server (CivetWeb)
-- Owns batch writer timer for periodic flushes
+3. **BEP51 Workers** (`thread_tree.c:bep51_worker_func`)
+   - Query DHT nodes with `sample_infohashes` (BEP 51) to discover infohashes
+   - Populates infohash queue for stage 4
+   - Submit high-quality BEP51 nodes to shared cache (5% sample rate)
+   - Throttling: Pauses with find_node workers when queue full
 
-**Per Thread Tree:**
-- Bootstrap workers: find_node queries to populate routing table
-- Continuous find_node workers: maintain routing table
-- BEP51 workers: `sample_infohashes` queries for infohash discovery
-- Get peers workers: Query DHT for peer addresses
-- Metadata workers: Connect to BitTorrent peers and fetch metadata
-- Rate monitor thread: Monitors metadata fetch rate, triggers shutdown if too low
-- Throttle monitor thread: Pauses/resumes discovery workers based on queue size
+4. **Get_Peers Workers** (`thread_tree.c:get_peers_worker_func`)
+   - Consume infohashes from queue
+   - Query DHT for peers that have each infohash
+   - Populates peers queue for metadata fetching
+   - Separate throttling: Pauses when peers queue full
 
-**Synchronization:**
-- Routing tables use RCU (Read-Copy-Update) for lock-free reads
-- Queues use mutexes and condition variables (MPSC pattern)
-- Bloom filter is thread-safe with internal locking
-- Batch writer uses mutex for thread-safe metadata submission
+5. **Metadata Workers** (`tree_metadata.c`)
+   - Connect to peers via TCP and fetch torrent metadata (BEP 9/10)
+   - Handles BitTorrent extension protocol (ut_metadata)
+   - Connection pooling with configurable limits
+   - Writes to database via shared batch writer
 
-### Key Components
+### Shared Resources (Cross-Tree)
 
-**DHT Implementation (wbpxre-dht):**
-- Custom DHT library in `lib/wbpxre-dht/`
-- Multi-threaded worker pools for concurrent DHT queries
-- Supports BEP 5 (Kademlia), BEP 51 (`sample_infohashes`)
-- RCU-based routing table for lock-free lookups
-- Files: `wbpxre_dht.c`, `wbpxre_routing.c`, `wbpxre_protocol.c`, `wbpxre_worker.c`
+- **Batch Writer** (`batch_writer.h`, `batch_writer.c`)
+  - Thread-safe batched database writes
+  - Flushes every 60s or when batch reaches 500 torrents
+  - 10-100x performance improvement over individual INSERTs
+  - Tracks hourly statistics for monitoring
 
-**Metadata Fetcher:**
-- Implements BitTorrent protocol (BEP 3, BEP 9, BEP 10)
-- Connects to peers via TCP, performs extended handshake
-- Uses `ut_metadata` extension to request metadata pieces
-- Assembles multi-piece metadata, verifies SHA-1 hash
-- Files: `src/metadata_fetcher.c`, `src/tree_metadata.c`
+- **Bloom Filters** (`bloom_filter.h`, `bloom_filter.c`)
+  - Main bloom: Tracks seen infohashes (30M capacity, 0.1% error rate)
+  - Failure bloom: Tracks failed infohashes with two-strike policy
+    - First failure: Marked in failure bloom, retry allowed
+    - Second failure: Permanently blocked from retry
+  - Persisted to disk for restarts
 
-**Batch Writer:**
-- Batches multiple torrent inserts into single SQLite transactions
-- Provides 10-100x write throughput improvement
-- Auto-flushes based on batch size (default: 1000) or time interval (default: 60s)
-- Persists bloom filter to disk after each flush
-- Files: `src/batch_writer.c`
+- **Shared Node Pool** (`shared_node_pool.h`)
+  - Global bootstrap pool shared across all trees
+  - Populated once at startup with 5000 nodes
+  - Trees sample 1000 nodes for fast bootstrap
 
-**Bloom Filter:**
-- Probabilistic duplicate detection (30M capacity, 0.1% error rate)
-- Reduces database queries by ~90%
-- Persisted to disk for resume across restarts
-- Files: `src/bloom_filter.c`, `lib/libbloom/`
+- **BEP51 Cache** (`bep51_cache.h`)
+  - Persists BEP51-capable nodes to disk
+  - 5000 node capacity
+  - Trees submit 5% of BEP51 responses
+  - Enables instant bootstrap on restarts
 
-**Database:**
-- SQLite with FTS5 full-text search
-- Three-table normalized schema: `torrents`, `torrent_files`, `path_prefixes`
-- Path deduplication: common directory prefixes stored once
-- 32KB page size for better compression
-- 60-70% size reduction vs naive schema (~9-12GB per million torrents)
-- Files: `src/database.c`
+### Supporting Components
 
-**HTTP API:**
-- CivetWeb embedded HTTP server (port 8080)
-- Endpoints: `/` (search UI), `/search?q=<query>`, `/stats`, `/refresh`
-- JSON statistics with DHT metrics, connection rates, database info
-- Files: `src/http_api.c`
+- **Tree Routing Table** (`tree_routing.h`, `tree_routing.c`)
+  - Per-tree DHT routing table (Kademlia structure)
+  - Target: 1500 nodes per tree
+  - Supports keyspace partitioning for comprehensive coverage
 
-**Porn Filter:**
-- Three-layer hybrid filtering: hash set keywords, regex patterns, heuristic scoring
-- Configurable thresholds in `config.ini`
-- Keyword file: `porn_filter_keywords.txt`
-- Files: `src/porn_filter.c`
+- **Tree Dispatcher** (`tree_dispatcher.h`)
+  - Maps UDP response transaction IDs (TIDs) to per-worker response queues
+  - Enables concurrent DHT queries without blocking
 
-### Protocol Implementation Details
+- **Infohash Queue** (`tree_infohash_queue.h`)
+  - Lock-free queue (3000-5000 capacity per tree)
+  - Feeds get_peers workers
 
-**BEP 51 (sample_infohashes):**
-- Extension for efficiently discovering active infohashes
-- Queries return random samples from a node's routing table
-- Each thread tree sends queries at configurable interval (default: 5ms)
-- Dramatically more efficient than traditional DHT scraping
+- **Peers Queue** (`tree_peers_queue.h`)
+  - Lock-free queue (3000 capacity per tree)
+  - Feeds metadata workers
 
-**BitTorrent Metadata Exchange (BEP 9/10):**
-1. TCP connect to peer
-2. Send BitTorrent handshake with extension protocol flag
-3. Receive handshake, parse reserved bytes for extension support
-4. Send extended handshake with `ut_metadata` support
-5. Receive extended handshake, get peer's `ut_metadata` extension ID and metadata size
-6. Request metadata pieces (16KB each) sequentially
-7. Assemble pieces, verify SHA-1 hash against infohash
-8. Parse bencode metadata to extract torrent name, files, sizes
+- **Porn Filter** (`porn_filter.h`, `porn_filter.c`)
+  - Three-layer filtering: keyword hash set, regex patterns, heuristics
+  - Filters discovered torrents before database insertion
+  - Configurable thresholds in config.ini
 
-**Connection Management:**
-- Global connection limit across all trees (default: 6000)
-- Per-tree active connection tracking
-- TCP connect timeout: 2s (default)
-- Idle timeout: 8s (resets on data reception)
-- Max lifetime: 15s (hard limit to prevent indefinite holds)
+- **HTTP API** (`http_api.h`, `http_api.c`)
+  - REST API for statistics and on-demand queries
+  - `/stats` - Overall crawler statistics
+  - `/refresh?infohash=<hex>` - On-demand get_peers query via refresh thread
+
+- **Refresh Thread** (`refresh_thread.h`)
+  - Lightweight singleton thread for on-demand queries
+  - Separate from main crawler trees
+  - Maintains small routing table (500 nodes)
+  - Processes `/refresh` HTTP endpoint requests
 
 ## Configuration
 
-All settings in `config.ini`. Critical settings:
+All settings are in `config.ini`. Key parameters:
 
-**Thread Tree Settings:**
-```ini
-use_thread_trees=1              # Enable thread tree architecture
-num_trees=16                    # Number of concurrent thread trees
+- **Thread counts** (per tree, multiplied by num_trees):
+  - `tree_find_node_workers=5` (160 total for 32 trees)
+  - `tree_bep51_workers=10` (320 total)
+  - `tree_get_peers_workers=125` (4000 total)
+  - `tree_metadata_workers=110` (3520 total)
+
+- **Queue capacities** (per tree):
+  - `tree_infohash_queue_capacity=3000`
+  - `tree_peers_queue_capacity=3000`
+
+- **Throttling thresholds**:
+  - `tree_infohash_pause_threshold=2500` (pause find_node+BEP51)
+  - `tree_infohash_resume_threshold=1000`
+  - `tree_peers_pause_threshold=2500` (pause get_peers)
+  - `tree_peers_resume_threshold=1000`
+
+- **Tree respawn settings**:
+  - `min_metadata_rate=0.08` (metadata/sec before respawn)
+  - `tree_min_lifetime_minutes=20` (grace period before rate checks)
+
+## Code Organization
+
+```
+include/          - Public header files
+src/              - Implementation files
+lib/              - Third-party libraries (git submodules)
+  ├── bencode-c/  - Bencode parser (patched)
+  ├── cJSON/      - JSON library
+  ├── libbloom/   - Bloom filter
+  ├── uthash/     - Hash table macros
+  └── civetweb/   - HTTP server
+patches/          - Submodule patches
+data/             - Runtime data (database, bloom filters, caches)
+build/            - Build artifacts
 ```
 
-**Global Bootstrap Settings:**
-```ini
-global_bootstrap_target=5000         # Target nodes for shared pool
-global_bootstrap_timeout_sec=120     # Bootstrap timeout
-global_bootstrap_workers=50          # Bootstrap worker threads
-per_tree_sample_size=1000            # Nodes each tree samples
-```
+## Important Implementation Details
 
-**Worker Pool Settings (per tree):**
-```ini
-tree_find_node_workers=15       # Continuous routing table maintenance
-tree_bep51_workers=50           # BEP51 sample_infohashes queries
-tree_get_peers_workers=1000     # Get peers for infohashes
-tree_metadata_workers=300       # Metadata fetch from peers
-```
+### Keyspace Partitioning
 
-**Performance Tuning:**
-```ini
-max_concurrent_connections=6000      # Global TCP connection limit
-batch_size=1000                      # Torrents per database batch
-bloom_capacity=30000000              # 30M infohash bloom filter
-tree_infohash_queue_capacity=20000   # Per-tree infohash queue size
-```
+Each thread tree is assigned a partition of the DHT keyspace:
+- `partition_index`: Tree's partition number (0 to num_partitions-1)
+- `num_partitions`: Total partitions (equal to num_trees)
+- Node IDs are generated to place trees in specific keyspace regions
+- Prevents trees from competing for the same infohashes
 
-**Rate-Based Tree Restart:**
-```ini
-min_metadata_rate=0.01               # Metadata/sec threshold for tree restart
-tree_rate_check_interval_sec=60      # How often to check rate
-tree_rate_grace_period_sec=30        # Wait time before restart
-tree_min_lifetime_minutes=10         # Immunity period for new trees
-tree_require_empty_queue=1           # Only restart if queue empty
-```
+### Throttling Mechanisms
 
-## Adding New Features
+Two independent throttling systems prevent queue overflow:
 
-### Adding DHT Statistics
+1. **Discovery throttling** (find_node + BEP51 workers):
+   - Controlled by `discovery_paused` atomic flag
+   - Uses `throttle_lock` mutex + `throttle_resume` condition variable
+   - Triggered when infohash queue ≥ pause threshold
 
-1. Add counter to `dht_stats_t` in `include/dht_manager.h` or thread tree stats
-2. Increment counter in appropriate callback/worker
-3. Expose in `/stats` endpoint in `src/http_api.c` (search for `cJSON_AddNumberToObject`)
+2. **Get_peers throttling**:
+   - Controlled by `get_peers_paused` atomic flag
+   - Uses `get_peers_throttle_lock` mutex + `get_peers_throttle_resume` condition variable
+   - Triggered when peers queue ≥ pause threshold
 
-### Adding New Configuration Options
+### Two-Strike Failure Policy
 
-1. Add field to `crawler_config_t` in `include/config.h`
-2. Add parser in `src/config.c` (`config_parse_ini`)
-3. Add default value in `src/config.c` (`set_default_config`)
-4. Document in `config.ini` with comment
+Infohashes get two chances before permanent blocking:
+- First failure: Marked in `failure_bloom`, can be retried by different tree
+- Second failure: Permanently blocked (bloom filter check rejects)
+- Prevents wasting resources on consistently failing infohashes
 
-### Extending HTTP API
+### Metadata Fetching Flow
 
-1. Add route handler in `src/http_api.c` (`http_api_request_handler`)
-2. Parse query parameters using `mg_get_var`
-3. Return JSON using `cJSON` library or HTML string
-
-### Modifying Thread Tree Lifecycle
-
-1. Thread tree phases are in `include/thread_tree.h` (`tree_phase_t` enum)
-2. Phase transitions happen in worker threads in `src/thread_tree.c`
-3. Each phase has dedicated worker threads that spawn/join on phase entry/exit
-4. Supervisor monitors trees in `src/supervisor.c` monitor thread
-
-## Common Debugging Patterns
-
-**Enable Debug Logging:**
-```ini
-# In config.ini
-log_level=DEBUG  # or 0
-```
-
-**Check Thread Tree Health:**
-- Access `/stats` endpoint to see active trees, metadata rates, connection counts
-- Look for trees with low metadata rates (may indicate stuck workers)
-- Check `active_connections` vs `max_concurrent_connections`
-
-**Memory Leaks:**
-```bash
-make valgrind
-# Check for "definitely lost" and "indirectly lost" blocks
-# All libuv handles must be properly closed before uv_loop_close
-```
-
-**Data Race Detection:**
-```bash
-make tsan
-# ThreadSanitizer will report data races
-# Common issues: unprotected access to shared state, missing mutexes
-```
-
-**Worker Thread Hangs:**
-- Check for deadlocks: mutexes acquired in different order
-- Check for condition variable misuse: missing signals, spurious wakeups
-- Enable debug logging to see worker progress
-- Use `gdb` to attach and inspect thread backtraces: `thread apply all bt`
+1. Worker dequeues (infohash, peers[]) from peers queue
+2. Creates `infohash_attempt_t` tracking structure
+3. Attempts 2 peers in parallel (configurable)
+4. TCP handshake → Extended handshake → Request metadata pieces
+5. On success: Write to batch writer, mark in main bloom
+6. On all peers fail: Mark in failure bloom (first strike) or permanently block (second strike)
 
 ## Database Schema
 
-**Normalized Three-Table Design:**
+SQLite database with single table:
 
 ```sql
--- Path prefixes (deduplication)
-CREATE TABLE path_prefixes (
-    prefix_id INTEGER PRIMARY KEY,
-    prefix TEXT NOT NULL UNIQUE
-);
-
--- Torrents
 CREATE TABLE torrents (
-    info_hash BLOB(20) PRIMARY KEY,
-    name TEXT NOT NULL,
-    total_size INTEGER NOT NULL,
-    discovered_at INTEGER NOT NULL
-);
-
--- Files
-CREATE TABLE torrent_files (
-    info_hash BLOB(20),
-    file_index SMALLINT,        -- 50% smaller than INTEGER
-    prefix_id INTEGER,          -- Reference to path_prefixes
-    filename TEXT,              -- Just the filename, not full path
-    file_size INTEGER,
-    FOREIGN KEY(info_hash) REFERENCES torrents(info_hash),
-    FOREIGN KEY(prefix_id) REFERENCES path_prefixes(prefix_id)
-);
-
--- FTS5 full-text search (trigram tokenizer)
-CREATE VIRTUAL TABLE torrents_fts USING fts5(
-    info_hash UNINDEXED,
-    name,
-    tokenize='trigram'
-);
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    info_hash TEXT UNIQUE NOT NULL,
+    name TEXT,
+    discovered_at INTEGER NOT NULL,
+    file_count INTEGER,
+    file_info TEXT
+)
 ```
 
-**Path Normalization:**
-- Directory paths extracted and deduplicated in `path_prefixes` table
-- `torrent_files.filename` stores only the filename, not full path
-- Reconstructed at query time: `path_prefixes.prefix || '/' || filename`
-- Reduces redundancy for torrents with many files in same directories
+`file_info` column stores JSON array of file objects.
 
-## Vendored Libraries
+## Common Development Tasks
 
-- `lib/wbpxre-dht/` - Custom DHT implementation
-- `lib/cJSON/` - JSON parsing/generation
-- `lib/bencode-c/` - Bencode encoding/decoding (patched via `patches/bencode-cap-fix.patch`)
-- `lib/civetweb/` - Embedded HTTP server
-- `lib/libbloom/` - Bloom filter implementation
-- `lib/uthash/` - Hash table macros for C
+### Adding a new configuration parameter
 
-**Important:** `bencode-c` is patched during build. The patch is automatically applied by the Makefile target `patch-bencode`.
+1. Add to `config.ini` with comment
+2. Add field to `app_config_t` in `include/config.h`
+3. Parse in `config_load()` in `src/config.c`
+4. Pass to relevant component (supervisor_config_t, tree_config_t, etc.)
 
-## Code Standards
+### Modifying thread tree behavior
 
-- **C99 standard** with POSIX extensions (`-std=c99 -D_POSIX_C_SOURCE=200809L`)
-- **Thread-safe:** All shared data protected by mutexes, atomics, or RCU
-- **POSIX-compliant:** Use `localtime_r`, `strtok_r`, etc. (thread-safe variants)
-- **Error handling:** Check all syscall return values, log errors before returning
-- **Memory management:** Free all allocations, close all file descriptors/handles
-- **Naming conventions:**
-  - Functions: `module_action()` (e.g., `thread_tree_create`)
-  - Structs: `module_name_t` (e.g., `thread_tree_t`)
-  - Files: `module_name.c/h` (e.g., `thread_tree.c`)
+Thread tree lifecycle is in `src/thread_tree.c`:
+- Bootstrap: `bootstrap_main_thread()`
+- Worker functions: `find_node_worker_func()`, `bep51_worker_func()`, `get_peers_worker_func()`
+- Phase transitions: Check `current_phase` and `shutdown_requested`
+
+### Debugging thread issues
+
+Use sanitizers:
+```bash
+make tsan  # ThreadSanitizer
+./dht_crawler
+```
+
+Enable debug logging in config.ini:
+```ini
+log_level=DEBUG
+```
+
+### Testing protocol changes
+
+The DHT protocol layer is in:
+- `tree_protocol.h/c` - Packet construction/parsing
+- `tree_socket.h/c` - UDP I/O
+- `tree_dispatcher.h/c` - Response routing
+
+Metadata protocol (BEP 9/10) is in `tree_metadata.c`.
+
+## External Libraries
+
+- **libuv**: Event loop for async I/O (metadata fetcher)
+- **wbpxre-dht**: Custom DHT library (in lib/, not external)
+- **bencode-c**: Requires patch (`patches/bencode-cap-fix.patch`) for capacity bug
+- **cJSON**: JSON parsing for file_info
+- **libbloom**: Probabilistic duplicate detection
+- **uthash**: Hash table macros for lookup tables
+- **civetweb**: Embedded HTTP server for API
 
 ## Performance Characteristics
 
-- **Discovery Rate:** 500-2000 infohashes/minute (varies by DHT neighborhood and number of trees)
-- **Metadata Fetch Rate:** 50-200 torrents/minute per tree (depends on peer availability)
-- **Database Write Throughput:** 1000+ torrents/minute (with batch writing)
-- **Memory Usage:** ~500MB-2GB (varies with routing table size, connection count, number of trees)
-- **Disk Usage:** ~9-12GB per million torrents (optimized schema with path deduplication)
+Typical performance on Android (32 trees, config.ini settings):
+- 10-50 torrents/minute sustained
+- 6,000-9,000 total threads
+- 5,000 concurrent TCP connections
+- 30M infohash bloom capacity
 
-**Optimization Features:**
-- Lock-free MPSC queues for cross-thread communication
-- RCU-based routing table for lock-free DHT lookups
-- Async I/O via libuv event loop
-- Connection pooling and reuse (within metadata workers)
-- Bloom filter reduces database queries by 90%
-- Batch writer provides 10-100x write speedup
-- Multiple thread trees explore different DHT neighborhoods concurrently
+Bottlenecks:
+- Metadata fetching (TCP latency, peer availability)
+- SQLite write performance (mitigated by batch writer)
+- Bloom filter size (memory)
