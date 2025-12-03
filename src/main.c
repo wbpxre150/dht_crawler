@@ -517,12 +517,14 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Cleanup */
+        /* Cleanup - cleanup_app_context must be called before batch_writer_cleanup
+         * to avoid use-after-free in uv_loop_close() */
         http_api_cleanup(&g_http_api);
         if (g_refresh_thread) {
             refresh_thread_destroy(g_refresh_thread);
         }
         supervisor_destroy(g_supervisor);
+        cleanup_app_context(&g_app_ctx);
         batch_writer_cleanup(g_batch_writer);
         if (g_refresh_query_store) {
             refresh_query_store_cleanup(g_refresh_query_store);
@@ -531,7 +533,6 @@ int main(int argc, char *argv[]) {
         torrent_search_cleanup();
         porn_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
-        cleanup_app_context(&g_app_ctx);
 
         log_msg(LOG_DEBUG, "DHT Crawler (thread tree mode) stopped.");
         return 0;

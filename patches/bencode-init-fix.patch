@@ -1,0 +1,18 @@
+--- a/lib/bencode-c/bencode.c
++++ b/lib/bencode-c/bencode.c
+@@ -64,8 +64,15 @@ bencode_push(struct bencode *ctx)
+         }
+         bytes = newcap * sizeof(ctx->stack[0]);
+         if (!bytes) return -1;
++
++        /* Calculate old size before realloc for zeroing new memory */
++        size_t old_bytes = ctx->cap * sizeof(ctx->stack[0]);
++
+         newstack = realloc(ctx->stack, bytes);
+         if (!newstack) return -1;
++
++        /* Zero initialize the newly allocated portion to prevent uninitialized reads */
++        memset((char*)newstack + old_bytes, 0, bytes - old_bytes);
+         ctx->stack = newstack;
+         ctx->cap = newcap;
+     }

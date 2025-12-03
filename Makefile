@@ -35,8 +35,12 @@ all: dirs patch-bencode libbloom $(TARGET)
 # Apply patches to submodules
 patch-bencode:
 	@if ! grep -q "ctx->cap = newcap" $(LIB_DIR)/bencode-c/bencode.c 2>/dev/null; then \
-		echo "Applying bencode-c patch..."; \
+		echo "Applying bencode-c capacity fix patch..."; \
 		patch -p1 -d . < patches/bencode-cap-fix.patch || true; \
+	fi
+	@if ! grep -q "Zero initialize the newly allocated portion" $(LIB_DIR)/bencode-c/bencode.c 2>/dev/null; then \
+		echo "Applying bencode-c initialization fix patch..."; \
+		patch -p1 -d . < patches/bencode-init-fix.patch || true; \
 	fi
 
 dirs:
