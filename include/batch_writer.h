@@ -45,6 +45,16 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
 void batch_writer_set_bloom(batch_writer_t *writer, bloom_filter_t *bloom, const char *bloom_path);
 
 /**
+ * Set failure bloom filter for persistence after batch writes
+ * @param writer Batch writer instance
+ * @param failure_bloom Failure bloom filter instance
+ * @param failure_bloom_path Path to save failure bloom filter to disk
+ */
+void batch_writer_set_failure_bloom(batch_writer_t *writer,
+                                     bloom_filter_t *failure_bloom,
+                                     const char *failure_bloom_path);
+
+/**
  * Add torrent metadata to batch
  * @param writer Batch writer instance
  * @param metadata Torrent metadata to write

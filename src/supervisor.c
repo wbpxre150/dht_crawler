@@ -524,6 +524,9 @@ void supervisor_start(supervisor_t *sup) {
                 (unsigned long long)sup->failure_bloom_capacity, sup->bloom_error_rate);
     }
 
+    /* Connect failure bloom to batch writer for periodic persistence */
+    batch_writer_set_failure_bloom(sup->batch_writer, sup->failure_bloom, sup->failure_bloom_path);
+
     /* Create BEP51 cache */
     log_msg(LOG_DEBUG, "[supervisor] Creating BEP51 cache (capacity: %d)", sup->bep51_cache_capacity);
     sup->bep51_cache = bep51_cache_create(sup->bep51_cache_capacity);

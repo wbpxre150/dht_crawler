@@ -9,6 +9,8 @@ struct batch_writer {
     database_t *db;
     bloom_filter_t *bloom;  /* For persisting bloom filter after batch writes */
     const char *bloom_path; /* Path to save bloom filter */
+    bloom_filter_t *failure_bloom;      /* Failure bloom filter for persistence */
+    const char *failure_bloom_path;     /* Path to save failure bloom */
 
     torrent_metadata_t **batch;
     size_t batch_size;
@@ -61,6 +63,8 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->db = db;
     writer->bloom = NULL;
     writer->bloom_path = NULL;
+    writer->failure_bloom = NULL;
+    writer->failure_bloom_path = NULL;
     writer->batch_capacity = batch_capacity;
     writer->batch_size = 0;
     writer->flush_interval_sec = flush_interval_sec;
@@ -119,6 +123,18 @@ void batch_writer_set_bloom(batch_writer_t *writer, bloom_filter_t *bloom, const
     writer->bloom_path = bloom_path;
     log_msg(LOG_DEBUG, "Bloom filter connected to batch writer for persistence (path: %s)",
             bloom_path ? bloom_path : "(null)");
+}
+
+void batch_writer_set_failure_bloom(batch_writer_t *writer,
+                                     bloom_filter_t *failure_bloom,
+                                     const char *failure_bloom_path) {
+    if (!writer) {
+        return;
+    }
+    writer->failure_bloom = failure_bloom;
+    writer->failure_bloom_path = failure_bloom_path;
+    log_msg(LOG_DEBUG, "Failure bloom filter connected to batch writer for persistence (path: %s)",
+            failure_bloom_path ? failure_bloom_path : "(null)");
 }
 
 int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata) {
@@ -289,6 +305,13 @@ int batch_writer_flush(batch_writer_t *writer) {
         if (writer->bloom_path) {
             if (bloom_filter_save(writer->bloom, writer->bloom_path) != 0) {
                 log_msg(LOG_WARN, "Failed to save bloom filter after batch write");
+            }
+        }
+
+        /* Save failure bloom filter to disk */
+        if (writer->failure_bloom && writer->failure_bloom_path) {
+            if (bloom_filter_save(writer->failure_bloom, writer->failure_bloom_path) != 0) {
+                log_msg(LOG_WARN, "Failed to save failure bloom filter after batch write");
             }
         }
     }
