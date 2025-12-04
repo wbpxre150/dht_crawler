@@ -219,11 +219,12 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
             }
 
             /* Log LRU eviction periodically (every 1000 evictions) */
-            static int lru_eviction_count = 0;
-            if (++lru_eviction_count % 1000 == 0) {
+            static atomic_int lru_eviction_count = 0;
+            int count = atomic_fetch_add(&lru_eviction_count, 1) + 1;
+            if (count % 1000 == 0) {
                 time_t age = now - oldest_time;
                 log_msg(LOG_DEBUG, "Routing table: LRU eviction #%d, bucket %d full, evicted node age %ld sec",
-                        lru_eviction_count, bucket_idx, (long)age);
+                        count, bucket_idx, (long)age);
             }
 
             /* Remove from hash map */
