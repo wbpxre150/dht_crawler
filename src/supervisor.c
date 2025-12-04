@@ -805,7 +805,7 @@ static void *monitor_thread_func(void *arg) {
             /* For now, just log status */
             log_msg(LOG_DEBUG, "[supervisor] Tree %u phase=%s metadata=%lu",
                     tree->tree_id,
-                    thread_tree_phase_name(tree->current_phase),
+                    thread_tree_phase_name(atomic_load(&tree->current_phase)),
                     (unsigned long)atomic_load(&tree->metadata_count));
         }
 

@@ -2,6 +2,7 @@
 #include "dht_crawler.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define K_BUCKET_SIZE 100  /* Increased to 100 to allow ~3000 nodes (100 * ~30 active buckets) */
 #define MAX_FAIL_COUNT 3
@@ -200,10 +201,11 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
 
             /* If no evictable node found (all nodes too fresh), don't add new node */
             if (lru_node == NULL) {
-                static int thrash_warning_count = 0;
-                if (++thrash_warning_count % 10000 == 0) {
+                static atomic_int thrash_warning_count = 0;
+                int count = atomic_fetch_add(&thrash_warning_count, 1) + 1;
+                if (count % 10000 == 0) {
                     log_msg(LOG_DEBUG, "Routing table: bucket %d full, all nodes too fresh to evict (warning #%d)",
-                            bucket_idx, thrash_warning_count);
+                            bucket_idx, count);
                 }
                 pthread_rwlock_unlock(&rt->rwlock);
                 return 0;  /* Not an error, just can't add right now */

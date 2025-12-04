@@ -137,7 +137,7 @@ typedef struct thread_tree {
     struct batch_writer *shared_batch_writer;
 
     /* Phase management */
-    tree_phase_t current_phase;
+    atomic_int current_phase;  /* Use atomic_int to store tree_phase_t enum values */
     shutdown_reason_t shutdown_reason;  /* Reason for shutdown */
     atomic_bool shutdown_requested;
 

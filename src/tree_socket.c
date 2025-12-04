@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <stdatomic.h>
 
 tree_socket_t *tree_socket_create(int port) {
     tree_socket_t *sock = calloc(1, sizeof(tree_socket_t));
@@ -121,8 +122,8 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
         port = ntohs(sin->sin_port);
     }
 
-    static unsigned long send_count = 0;
-    send_count++;
+    static atomic_ulong send_count = 0;
+    atomic_fetch_add(&send_count, 1);
 
     ssize_t sent = sendto(sock->fd, data, len, 0, (const struct sockaddr *)dest, addrlen);
 
@@ -135,9 +136,10 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
     }
 
     /* DEBUG: Log successful sends (first 10, then every 100) */
-    if (send_count <= 10 || send_count % 100 == 0) {
+    unsigned long count = atomic_load(&send_count);
+    if (count <= 10 || count % 100 == 0) {
         log_msg(LOG_DEBUG, "[tree_socket] sendto SUCCESS #%lu: fd=%d, sent=%zd bytes to %s:%u",
-                send_count, sock->fd, sent, ip_str, port);
+                count, sock->fd, sent, ip_str, port);
     }
 
     return (int)sent;
@@ -151,10 +153,10 @@ int tree_socket_recv(tree_socket_t *sock, void *buf, size_t buflen,
         return -1;
     }
 
-    static unsigned long recv_call_count = 0;
-    static unsigned long recv_timeout_count = 0;
-    static unsigned long recv_success_count = 0;
-    recv_call_count++;
+    static atomic_ulong recv_call_count = 0;
+    static atomic_ulong recv_timeout_count = 0;
+    static atomic_ulong recv_success_count = 0;
+    atomic_fetch_add(&recv_call_count, 1);
 
     /* Use poll for timeout */
     if (timeout_ms >= 0) {
@@ -166,10 +168,12 @@ int tree_socket_recv(tree_socket_t *sock, void *buf, size_t buflen,
         int ret = poll(&pfd, 1, timeout_ms);
         if (ret == 0) {
             /* Timeout - this is normal */
-            recv_timeout_count++;
-            if (recv_call_count <= 10 || (recv_timeout_count % 1000 == 0)) {
+            atomic_fetch_add(&recv_timeout_count, 1);
+            unsigned long call_count = atomic_load(&recv_call_count);
+            unsigned long timeout_count = atomic_load(&recv_timeout_count);
+            if (call_count <= 10 || (timeout_count % 1000 == 0)) {
                 log_msg(LOG_DEBUG, "[tree_socket] poll TIMEOUT: fd=%d, timeout_ms=%d (call #%lu, timeouts=%lu)",
-                        sock->fd, timeout_ms, recv_call_count, recv_timeout_count);
+                        sock->fd, timeout_ms, call_count, timeout_count);
             }
             return 0;  /* Timeout */
         }
@@ -184,7 +188,9 @@ int tree_socket_recv(tree_socket_t *sock, void *buf, size_t buflen,
         }
 
         /* DEBUG: Log when poll() indicates data is ready */
-        if (recv_call_count <= 10 || recv_success_count % 100 == 0) {
+        unsigned long call_count = atomic_load(&recv_call_count);
+        unsigned long success_count = atomic_load(&recv_success_count);
+        if (call_count <= 10 || success_count % 100 == 0) {
             log_msg(LOG_DEBUG, "[tree_socket] poll says DATA READY: fd=%d, revents=0x%x",
                     sock->fd, pfd.revents);
         }
@@ -206,7 +212,7 @@ int tree_socket_recv(tree_socket_t *sock, void *buf, size_t buflen,
     }
 
     /* DEBUG: Log successful receives */
-    recv_success_count++;
+    atomic_fetch_add(&recv_success_count, 1);
     char from_ip[INET6_ADDRSTRLEN] = {0};
     uint16_t from_port = 0;
     if (from && from->ss_family == AF_INET) {
@@ -215,9 +221,10 @@ int tree_socket_recv(tree_socket_t *sock, void *buf, size_t buflen,
         from_port = ntohs(sin->sin_port);
     }
 
-    if (recv_success_count <= 10 || recv_success_count % 100 == 0) {
+    unsigned long success_count = atomic_load(&recv_success_count);
+    if (success_count <= 10 || success_count % 100 == 0) {
         log_msg(LOG_DEBUG, "[tree_socket] recvfrom SUCCESS #%lu: fd=%d, received=%zd bytes from %s:%u",
-                recv_success_count, sock->fd, received, from_ip, from_port);
+                success_count, sock->fd, received, from_ip, from_port);
     }
 
     return (int)received;

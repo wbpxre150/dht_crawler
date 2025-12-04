@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -232,7 +233,9 @@ static void *find_node_worker_func(void *arg) {
                     }
 
                     /* Log discovery occasionally (every 100 queries) with routing table stats */
-                    if (++query_count % 100 == 0) {
+                    static atomic_int query_count = 0;
+                    int count = atomic_fetch_add(&query_count, 1) + 1;
+                    if (count % 100 == 0) {
                         int rt_count = tree_routing_get_count(rt);
                         log_msg(LOG_DEBUG, "[tree %u] find_node worker %d: discovered %d nodes (total: %d, target: ~1500)",
                                 tree->tree_id, worker_id, response.node_count, rt_count);
@@ -537,9 +540,9 @@ static void *bep51_worker_func(void *arg) {
                     if (tree_infohash_queue_try_push(tree->infohash_queue, response.infohashes[i]) == 0) {
                         if (!first_infohash_found) {
                             first_infohash_found = true;
-                            /* Trigger get_peers phase (Stage 4) */
-                            if (tree->current_phase == TREE_PHASE_BEP51) {
-                                tree->current_phase = TREE_PHASE_GET_PEERS;
+                            /* Trigger get_peers phase (Stage 4) - use atomic compare-exchange */
+                            tree_phase_t expected = TREE_PHASE_BEP51;
+                            if (atomic_compare_exchange_strong((atomic_int*)&tree->current_phase, (int*)&expected, TREE_PHASE_GET_PEERS)) {
                                 tree_start_get_peers_workers(tree);
                             }
                         }
@@ -727,11 +730,11 @@ static void *get_peers_worker_func(void *arg) {
         /* 4. If peers found, push to peers queue */
         if (result.peer_count > 0) {
             if (tree_peers_queue_try_push(peers_queue, &result) == 0) {
-                /* Trigger metadata phase on first peers */
+                /* Trigger metadata phase on first peers - use atomic compare-exchange */
                 if (!first_peers_found) {
                     first_peers_found = true;
-                    if (tree->current_phase == TREE_PHASE_GET_PEERS) {
-                        tree->current_phase = TREE_PHASE_METADATA;
+                    tree_phase_t expected = TREE_PHASE_GET_PEERS;
+                    if (atomic_compare_exchange_strong((atomic_int*)&tree->current_phase, (int*)&expected, TREE_PHASE_METADATA)) {
                         tree_start_metadata_workers(tree);
                     }
                 }
@@ -853,7 +856,7 @@ static void tree_start_get_peers_workers_OLD(thread_tree_t *tree) {
 static void tree_start_bep51_phase(thread_tree_t *tree) {
     log_msg(LOG_DEBUG, "[tree %u] Transitioning to BEP51 phase with %d nodes",
             tree->tree_id, tree_routing_get_count(tree->routing_table));
-    tree->current_phase = TREE_PHASE_BEP51;
+    atomic_store(&tree->current_phase, TREE_PHASE_BEP51);
 
     /* Start BEP51 worker threads */
     tree_start_bep51_workers(tree);
@@ -917,7 +920,7 @@ static void *bootstrap_thread_func(void *arg) {
 
     /* Transition to BEP51 phase to discover infohashes */
     log_msg(LOG_DEBUG, "[tree %u] Transitioning to BEP51 phase (sample_infohashes)", tree->tree_id);
-    tree->current_phase = TREE_PHASE_BEP51;
+    atomic_store(&tree->current_phase, TREE_PHASE_BEP51);
     tree_start_bep51_workers(tree);
 
     /* Wait for shutdown */
@@ -998,7 +1001,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->supervisor_ctx = config->supervisor_ctx;
 
     /* Initialize phase and shutdown flag */
-    tree->current_phase = TREE_PHASE_BOOTSTRAP;
+    atomic_store(&tree->current_phase, TREE_PHASE_BOOTSTRAP);
     tree->shutdown_reason = SHUTDOWN_REASON_NONE;
     atomic_store(&tree->shutdown_requested, false);
 
@@ -1279,7 +1282,7 @@ void thread_tree_start(thread_tree_t *tree) {
     }
 
     log_msg(LOG_DEBUG, "[tree %u] Starting (phase: %s)",
-            tree->tree_id, thread_tree_phase_name(tree->current_phase));
+            tree->tree_id, thread_tree_phase_name(atomic_load(&tree->current_phase)));
 
     /* Start UDP response dispatcher FIRST before any workers send queries */
     if (tree_dispatcher_start(tree->dispatcher) != 0) {
@@ -1307,7 +1310,7 @@ void thread_tree_request_shutdown(thread_tree_t *tree, shutdown_reason_t reason)
                 reason == SHUTDOWN_REASON_RATE_BASED ? "rate-based" :
                 reason == SHUTDOWN_REASON_SUPERVISOR ? "supervisor" : "unknown");
         tree->shutdown_reason = reason;
-        tree->current_phase = TREE_PHASE_SHUTTING_DOWN;
+        atomic_store(&tree->current_phase, TREE_PHASE_SHUTTING_DOWN);
 
         /* Stage 3: Signal infohash queue to wake up waiting threads */
         if (tree->infohash_queue) {

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <stdatomic.h>
 
 /* Simple transaction ID counter */
 static uint32_t g_tid_counter = 0;
@@ -689,9 +690,9 @@ int tree_protocol_extract_tid(const uint8_t *data, size_t len,
     }
 
     /* DEBUG: Log all keys we see in the dict */
-    static int debug_count = 0;
-    debug_count++;
-    bool log_this = (debug_count <= 20);  /* Log first 20 failures */
+    static atomic_int debug_count = 0;
+    int count = atomic_fetch_add(&debug_count, 1) + 1;
+    bool log_this = (count <= 20);  /* Log first 20 failures */
 
     if (log_this) {
         log_msg(LOG_DEBUG, "[tree_protocol] Parsing bencode dict (len=%zu), scanning for 't' key...", len);
