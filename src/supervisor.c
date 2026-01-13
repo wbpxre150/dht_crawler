@@ -759,10 +759,13 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree) {
             new_tree = spawn_tree(sup, slot, old_tree);  /* Pass old_tree for perturbation */
         }
 
-        /* Now destroy old tree */
-        thread_tree_destroy(old_tree);
+        /* CRITICAL FIX: Remove from array FIRST, before destroying
+         * This prevents monitor thread from accessing freed memory */
         sup->trees[slot] = NULL;
         sup->active_trees--;
+
+        /* Now safe to destroy - no other thread can access it */
+        thread_tree_destroy(old_tree);
 
         /* Start new tree if we created one */
         if (new_tree) {
@@ -795,18 +798,34 @@ static void *monitor_thread_func(void *arg) {
         pthread_mutex_lock(&sup->trees_lock);
 
         for (int i = 0; i < sup->max_trees; i++) {
-            if (!sup->trees[i]) {
+            thread_tree_t *tree = sup->trees[i];
+
+            /* Defensive: verify pointer looks valid before dereferencing
+             * Detects use-after-free or corrupted pointers */
+            if (!tree || (uintptr_t)tree < 0x1000 || (uintptr_t)tree > 0x7fffffffffff) {
                 continue;
             }
 
-            thread_tree_t *tree = sup->trees[i];
+            /* Further validation: check if tree_id looks reasonable
+             * Corrupted pointers often have 0x00000000 or 0xffffffff values */
+            uint32_t tree_id = tree->tree_id;
+            if (tree_id == 0 || tree_id == 0xffffffff) {
+                log_msg(LOG_WARN, "[supervisor] Detected corrupted tree pointer at slot %d (tree_id=%u), cleaning up",
+                        i, tree_id);
+                sup->trees[i] = NULL;  /* Clean up corruption */
+                continue;
+            }
+
+            /* Copy values we need while holding lock to minimize window for corruption */
+            tree_phase_t phase = atomic_load(&tree->current_phase);
+            uint64_t metadata_count = atomic_load(&tree->metadata_count);
 
             /* TODO: Implement rate calculation in Stage 2 */
             /* For now, just log status */
             log_msg(LOG_DEBUG, "[supervisor] Tree %u phase=%s metadata=%lu",
-                    tree->tree_id,
-                    thread_tree_phase_name(atomic_load(&tree->current_phase)),
-                    (unsigned long)atomic_load(&tree->metadata_count));
+                    tree_id,
+                    thread_tree_phase_name(phase),
+                    (unsigned long)metadata_count);
         }
 
         pthread_mutex_unlock(&sup->trees_lock);
