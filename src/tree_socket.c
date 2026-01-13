@@ -37,6 +37,22 @@ tree_socket_t *tree_socket_create(int port) {
     int opt = 1;
     setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    /* Increase send buffer to handle high UDP traffic from multiple trees */
+    int sndbuf = 2 * 1024 * 1024;  /* 2MB send buffer */
+    if (setsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
+        log_msg(LOG_WARN, "[tree_socket] Failed to set SO_SNDBUF to %d: %s", sndbuf, strerror(errno));
+    } else {
+        log_msg(LOG_DEBUG, "[tree_socket] Set SO_SNDBUF to %d bytes", sndbuf);
+    }
+
+    /* Increase receive buffer for better reception */
+    int rcvbuf = 2 * 1024 * 1024;  /* 2MB receive buffer */
+    if (setsockopt(sock->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        log_msg(LOG_WARN, "[tree_socket] Failed to set SO_RCVBUF to %d: %s", rcvbuf, strerror(errno));
+    } else {
+        log_msg(LOG_DEBUG, "[tree_socket] Set SO_RCVBUF to %d bytes", rcvbuf);
+    }
+
     /* Bind to address */
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
