@@ -58,8 +58,9 @@ tree_socket_t *tree_socket_create(int port) {
     #endif
 #endif
 
-    /* Increase send buffer to handle high UDP traffic from multiple trees */
-    int sndbuf = 2 * 1024 * 1024;  /* 2MB send buffer */
+    /* Increase send buffer to handle high UDP traffic from multiple trees
+     * With shared socket mode: 32 trees * ~150 workers = ~4800 concurrent senders */
+    int sndbuf = 16 * 1024 * 1024;  /* 16MB send buffer for shared socket */
     if (setsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
         log_msg(LOG_WARN, "[tree_socket] Failed to set SO_SNDBUF to %d: %s", sndbuf, strerror(errno));
     }
@@ -67,18 +68,18 @@ tree_socket_t *tree_socket_create(int port) {
     int actual_sndbuf = 0;
     socklen_t optlen = sizeof(actual_sndbuf);
     if (getsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &optlen) == 0) {
-        if (actual_sndbuf < 262144) {  /* Warn if less than 256KB */
+        if (actual_sndbuf < 1048576) {  /* Warn if less than 1MB */
             log_msg(LOG_WARN, "[tree_socket] SO_SNDBUF too small: requested %d, got %d. "
-                    "On FreeBSD run: sysctl net.inet.udp.sendspace=2097152",
+                    "Try: sudo sysctl -w net.core.wmem_max=16777216",
                     sndbuf, actual_sndbuf);
         } else {
-            log_msg(LOG_DEBUG, "[tree_socket] SO_SNDBUF: requested %d, actual %d bytes",
+            log_msg(LOG_INFO, "[tree_socket] SO_SNDBUF: requested %d, actual %d bytes",
                     sndbuf, actual_sndbuf);
         }
     }
 
     /* Increase receive buffer for better reception */
-    int rcvbuf = 2 * 1024 * 1024;  /* 2MB receive buffer */
+    int rcvbuf = 16 * 1024 * 1024;  /* 16MB receive buffer for shared socket */
     if (setsockopt(sock->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
         log_msg(LOG_WARN, "[tree_socket] Failed to set SO_RCVBUF to %d: %s", rcvbuf, strerror(errno));
     }
@@ -86,12 +87,12 @@ tree_socket_t *tree_socket_create(int port) {
     int actual_rcvbuf = 0;
     optlen = sizeof(actual_rcvbuf);
     if (getsockopt(sock->fd, SOL_SOCKET, SO_RCVBUF, &actual_rcvbuf, &optlen) == 0) {
-        if (actual_rcvbuf < 262144) {  /* Warn if less than 256KB */
+        if (actual_rcvbuf < 1048576) {  /* Warn if less than 1MB */
             log_msg(LOG_WARN, "[tree_socket] SO_RCVBUF too small: requested %d, got %d. "
-                    "On FreeBSD run: sysctl net.inet.udp.recvspace=2097152",
+                    "Try: sudo sysctl -w net.core.rmem_max=16777216",
                     rcvbuf, actual_rcvbuf);
         } else {
-            log_msg(LOG_DEBUG, "[tree_socket] SO_RCVBUF: requested %d, actual %d bytes",
+            log_msg(LOG_INFO, "[tree_socket] SO_RCVBUF: requested %d, actual %d bytes",
                     rcvbuf, actual_rcvbuf);
         }
     }
@@ -186,19 +187,20 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
 
     ssize_t sent = sendto(sock->fd, data, len, 0, (const struct sockaddr *)dest, addrlen);
 
-    /* Handle ENOBUFS with backoff - buffer is full, wait and retry */
-    if (sent < 0 && errno == ENOBUFS) {
-        static atomic_ulong enobufs_count = 0;
-        unsigned long count = atomic_fetch_add(&enobufs_count, 1) + 1;
+    /* Handle EAGAIN/EWOULDBLOCK/ENOBUFS with backoff - send buffer is full */
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+        static atomic_ulong backoff_count = 0;
+        unsigned long count = atomic_fetch_add(&backoff_count, 1) + 1;
 
         /* Only log occasionally to avoid log spam */
         if (count == 1 || count % 1000 == 0) {
-            log_msg(LOG_WARN, "[tree_socket] ENOBUFS backoff (count=%lu), waiting briefly", count);
+            log_msg(LOG_WARN, "[tree_socket] Send buffer full (errno=%d: %s), backoff count=%lu",
+                    errno, strerror(errno), count);
         }
 
         pthread_mutex_unlock(&sock->send_lock);
 
-        /* Backoff: 1ms sleep to let buffer drain */
+        /* Brief backoff: 1ms sleep to let buffer drain */
         usleep(1000);
         return -1;  /* Caller should retry */
     }
