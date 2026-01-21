@@ -114,6 +114,12 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->bep51_cache_submit_percent = config->bep51_cache_submit_percent > 0 ? config->bep51_cache_submit_percent : 5;
     strncpy(sup->bep51_cache_path, config->bep51_cache_path, sizeof(sup->bep51_cache_path) - 1);
 
+    /* Initialize cumulative statistics */
+    atomic_init(&sup->cumulative_metadata_count, 0);
+    atomic_init(&sup->cumulative_first_strike_failures, 0);
+    atomic_init(&sup->cumulative_second_strike_failures, 0);
+    atomic_init(&sup->cumulative_filtered_count, 0);
+
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
         log_msg(LOG_ERROR, "[supervisor] Failed to init mutex");
@@ -817,6 +823,21 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree) {
         /* Save reference to old tree for perturbation */
         thread_tree_t *old_tree = sup->trees[slot];
 
+        /* Accumulate statistics from this tree before destroying it */
+        uint64_t tree_metadata = atomic_load(&old_tree->metadata_count);
+        uint64_t tree_first_strike = atomic_load(&old_tree->first_strike_failures);
+        uint64_t tree_second_strike = atomic_load(&old_tree->second_strike_failures);
+        uint64_t tree_filtered = atomic_load(&old_tree->filtered_count);
+
+        atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
+        atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
+        atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
+        atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
+
+        log_msg(LOG_DEBUG, "[supervisor] Tree %u final stats: metadata=%lu, first_strike=%lu, second_strike=%lu, filtered=%lu",
+                old_tree->tree_id, (unsigned long)tree_metadata, (unsigned long)tree_first_strike,
+                (unsigned long)tree_second_strike, (unsigned long)tree_filtered);
+
         /* Spawn replacement BEFORE destroying old tree (so we can perturb its node ID) */
         thread_tree_t *new_tree = NULL;
         if (sup->monitor_running) {
@@ -910,9 +931,15 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
         return;
     }
 
-    uint64_t total_metadata = 0;
-    uint64_t total_first_strike = 0;
-    uint64_t total_second_strike = 0;
+    /* Get cumulative counts from destroyed trees */
+    uint64_t cumulative_metadata = atomic_load(&sup->cumulative_metadata_count);
+    uint64_t cumulative_first_strike = atomic_load(&sup->cumulative_first_strike_failures);
+    uint64_t cumulative_second_strike = atomic_load(&sup->cumulative_second_strike_failures);
+
+    /* Add current active trees' counts */
+    uint64_t active_metadata = 0;
+    uint64_t active_first_strike = 0;
+    uint64_t active_second_strike = 0;
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -922,22 +949,23 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
 
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
-            total_metadata += atomic_load(&sup->trees[i]->metadata_count);
-            total_first_strike += atomic_load(&sup->trees[i]->first_strike_failures);
-            total_second_strike += atomic_load(&sup->trees[i]->second_strike_failures);
+            active_metadata += atomic_load(&sup->trees[i]->metadata_count);
+            active_first_strike += atomic_load(&sup->trees[i]->first_strike_failures);
+            active_second_strike += atomic_load(&sup->trees[i]->second_strike_failures);
         }
     }
 
     pthread_mutex_unlock(&sup->trees_lock);
 
+    /* Return cumulative + active totals */
     if (out_total_metadata) {
-        *out_total_metadata = total_metadata;
+        *out_total_metadata = cumulative_metadata + active_metadata;
     }
     if (out_first_strike) {
-        *out_first_strike = total_first_strike;
+        *out_first_strike = cumulative_first_strike + active_first_strike;
     }
     if (out_second_strike) {
-        *out_second_strike = total_second_strike;
+        *out_second_strike = cumulative_second_strike + active_second_strike;
     }
 }
 

@@ -164,6 +164,12 @@ typedef struct supervisor {
     /* Monitor thread */
     pthread_t monitor_thread;
     int monitor_running;
+
+    /* Cumulative statistics (persist across tree respawns) */
+    atomic_uint_least64_t cumulative_metadata_count;
+    atomic_uint_least64_t cumulative_first_strike_failures;
+    atomic_uint_least64_t cumulative_second_strike_failures;
+    atomic_uint_least64_t cumulative_filtered_count;
 } supervisor_t;
 
 /**
