@@ -143,6 +143,23 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
 
     ssize_t sent = sendto(sock->fd, data, len, 0, (const struct sockaddr *)dest, addrlen);
 
+    /* Handle ENOBUFS with backoff - buffer is full, wait and retry */
+    if (sent < 0 && errno == ENOBUFS) {
+        static atomic_ulong enobufs_count = 0;
+        unsigned long count = atomic_fetch_add(&enobufs_count, 1) + 1;
+
+        /* Only log occasionally to avoid log spam */
+        if (count == 1 || count % 1000 == 0) {
+            log_msg(LOG_WARN, "[tree_socket] ENOBUFS backoff (count=%lu), waiting briefly", count);
+        }
+
+        pthread_mutex_unlock(&sock->send_lock);
+
+        /* Backoff: 1ms sleep to let buffer drain */
+        usleep(1000);
+        return -1;  /* Caller should retry */
+    }
+
     pthread_mutex_unlock(&sock->send_lock);
 
     if (sent < 0) {
