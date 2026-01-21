@@ -79,12 +79,12 @@ int refresh_request_queue_push(refresh_request_queue_t *queue,
         }
     } else {
         /* Timed wait */
-        struct timeval now;
+        struct timespec now;
         struct timespec timeout;
-        gettimeofday(&now, NULL);
+        clock_gettime(CLOCK_REALTIME, &now);
 
         timeout.tv_sec = now.tv_sec + (timeout_ms / 1000);
-        timeout.tv_nsec = (now.tv_usec + (timeout_ms % 1000) * 1000) * 1000;
+        timeout.tv_nsec = now.tv_nsec + (timeout_ms % 1000) * 1000000;
 
         /* Handle nanosecond overflow */
         if (timeout.tv_nsec >= 1000000000) {
@@ -136,12 +136,12 @@ int refresh_request_queue_pop(refresh_request_queue_t *queue,
         }
     } else {
         /* Timed wait */
-        struct timeval now;
+        struct timespec now;
         struct timespec timeout;
-        gettimeofday(&now, NULL);
+        clock_gettime(CLOCK_REALTIME, &now);
 
         timeout.tv_sec = now.tv_sec + (timeout_ms / 1000);
-        timeout.tv_nsec = (now.tv_usec + (timeout_ms % 1000) * 1000) * 1000;
+        timeout.tv_nsec = now.tv_nsec + (timeout_ms % 1000) * 1000000;
 
         /* Handle nanosecond overflow */
         if (timeout.tv_nsec >= 1000000000) {
