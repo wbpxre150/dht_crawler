@@ -1,6 +1,7 @@
 #include "protocol_utils.h"
 #include <string.h>
 #include <stdio.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 
 /* Build a bencode ping query manually */
