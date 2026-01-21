@@ -1,7 +1,7 @@
 # DHT Crawler Makefile
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -D_BSD_SOURCE
+CFLAGS = -Wall -Wextra -O2 -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -D__BSD_VISIBLE=1
 INCLUDES = -Iinclude -Ilib/wbpxre-dht -Ilib/bencode-c -Ilib/cJSON -Ilib/civetweb/include -Ilib/libbloom -Ilib/uthash/src
 LDFLAGS = -luv -lsqlite3 -lpthread -lssl -lcrypto -ldl -lm -lurcu lib/libbloom/build/libbloom.a
 
