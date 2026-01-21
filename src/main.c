@@ -403,7 +403,7 @@ int main(int argc, char *argv[]) {
         /* Create and start refresh thread */
         log_msg(LOG_DEBUG, "Creating refresh thread...");
         refresh_thread_config_t refresh_config = {
-            .dht_port = config.dht_port,
+            .dht_port = 0,  /* Use ephemeral port (not 6881) to avoid conflict with shared socket */
             .bootstrap_sample_size = config.refresh_bootstrap_sample_size,
             .routing_table_target = config.refresh_routing_table_target,
             .ping_worker_count = config.refresh_ping_workers,
