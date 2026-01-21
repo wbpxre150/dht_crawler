@@ -275,6 +275,154 @@ int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
     return 0;
 }
 
+int tree_routing_add_node_if_new(tree_routing_table_t *rt, const uint8_t *node_id,
+                                  const struct sockaddr_storage *addr) {
+    if (!rt || !node_id || !addr) {
+        return -1;
+    }
+
+    /* Don't add ourselves */
+    if (memcmp(node_id, rt->our_node_id, 20) == 0) {
+        return 0;
+    }
+
+    pthread_rwlock_wrlock(&rt->rwlock);
+
+    int bucket_idx = get_bucket_index(rt->our_node_id, node_id);
+    tree_bucket_t *bucket = &rt->buckets[bucket_idx];
+
+    /* Check if node already exists - if so, do NOT update last_seen */
+    tree_node_hash_entry_t *hash_entry = NULL;
+    HASH_FIND(hh, rt->node_hash, node_id, 20, hash_entry);
+
+    if (hash_entry) {
+        /* Node already exists - do nothing (don't refresh last_seen) */
+        pthread_rwlock_unlock(&rt->rwlock);
+        return 0;
+    }
+
+    /* Check if bucket is full */
+    if (bucket->count >= bucket->max_nodes) {
+        /* Strategy 1: Try to evict a failed node first */
+        tree_node_t **prev = &bucket->nodes;
+        tree_node_t *curr = bucket->nodes;
+        tree_node_t *evicted = NULL;
+
+        while (curr) {
+            if (curr->fail_count >= MAX_FAIL_COUNT) {
+                *prev = curr->next;
+                evicted = curr;
+
+                /* Remove from hash map */
+                tree_node_hash_entry_t *evict_hash_entry = NULL;
+                HASH_FIND(hh, rt->node_hash, evicted->node_id, 20, evict_hash_entry);
+                if (evict_hash_entry) {
+                    HASH_DEL(rt->node_hash, evict_hash_entry);
+                    free(evict_hash_entry);
+                }
+
+                /* Remove from flat index */
+                HASH_DELETE(hh_flat, rt->flat_index_head, evicted);
+
+                free(evicted);
+                bucket->count--;
+                rt->total_nodes--;
+                break;
+            }
+            prev = &curr->next;
+            curr = curr->next;
+        }
+
+        /* Strategy 2: If no failed nodes, evict least-recently-seen (LRU) node */
+        if (bucket->count >= bucket->max_nodes) {
+            tree_node_t **lru_prev = NULL;
+            tree_node_t **prev_ptr = &bucket->nodes;
+            tree_node_t *node = bucket->nodes;
+            tree_node_t *lru_node = NULL;
+            time_t oldest_time = 0;
+            time_t now = time(NULL);
+
+            /* Find LRU node that's old enough to evict */
+            int nodes_checked = 0;
+            int max_nodes_to_check = 10;
+
+            while (node) {
+                time_t node_age = now - node->last_seen;
+                if (node_age >= MIN_NODE_AGE_FOR_EVICTION) {
+                    if (lru_node == NULL || node->last_seen < oldest_time) {
+                        oldest_time = node->last_seen;
+                        lru_node = node;
+                        lru_prev = prev_ptr;
+                    }
+                    if (++nodes_checked >= max_nodes_to_check && lru_node != NULL) {
+                        break;
+                    }
+                }
+                prev_ptr = &node->next;
+                node = node->next;
+            }
+
+            /* If no evictable node found, don't add new node */
+            if (lru_node == NULL) {
+                pthread_rwlock_unlock(&rt->rwlock);
+                return 0;
+            }
+
+            /* Evict LRU node */
+            if (lru_prev) {
+                *lru_prev = lru_node->next;
+            } else {
+                bucket->nodes = lru_node->next;
+            }
+
+            /* Remove from hash map */
+            tree_node_hash_entry_t *lru_hash_entry = NULL;
+            HASH_FIND(hh, rt->node_hash, lru_node->node_id, 20, lru_hash_entry);
+            if (lru_hash_entry) {
+                HASH_DEL(rt->node_hash, lru_hash_entry);
+                free(lru_hash_entry);
+            }
+
+            /* Remove from flat index */
+            HASH_DELETE(hh_flat, rt->flat_index_head, lru_node);
+
+            free(lru_node);
+            bucket->count--;
+            rt->total_nodes--;
+        }
+    }
+
+    /* Add new node */
+    tree_node_t *new_node = calloc(1, sizeof(tree_node_t));
+    if (!new_node) {
+        pthread_rwlock_unlock(&rt->rwlock);
+        return -1;
+    }
+
+    memcpy(new_node->node_id, node_id, 20);
+    memcpy(&new_node->addr, addr, sizeof(struct sockaddr_storage));
+    new_node->last_seen = time(NULL);
+    new_node->fail_count = 0;
+    new_node->next = bucket->nodes;
+    bucket->nodes = new_node;
+    bucket->count++;
+    rt->total_nodes++;
+
+    /* Add to hash map for O(1) future lookups */
+    tree_node_hash_entry_t *new_hash_entry = malloc(sizeof(tree_node_hash_entry_t));
+    if (new_hash_entry) {
+        memcpy(new_hash_entry->node_id, node_id, 20);
+        new_hash_entry->node_ptr = new_node;
+        HASH_ADD(hh, rt->node_hash, node_id, 20, new_hash_entry);
+    }
+
+    /* Add to flat index for fast iteration */
+    HASH_ADD_KEYPTR(hh_flat, rt->flat_index_head, new_node->node_id, 20, new_node);
+
+    pthread_rwlock_unlock(&rt->rwlock);
+    return 0;
+}
+
 int tree_routing_get_closest(tree_routing_table_t *rt, const uint8_t *target,
                               tree_node_t *out, int count) {
     if (!rt || !target || !out || count <= 0) {

@@ -217,9 +217,9 @@ static void *find_node_worker_func(void *arg) {
                 tree_find_node_response_t response;
                 if (tree_handle_response(tree, response_pkt.data, response_pkt.len,
                                         &response_pkt.from, &response) == TREE_RESP_FIND_NODE) {
-                    /* Add all discovered nodes to routing table */
+                    /* Add all discovered nodes to routing table (if_new to avoid refreshing last_seen) */
                     for (int j = 0; j < response.node_count; j++) {
-                        tree_routing_add_node(rt, response.nodes[j], &response.addrs[j]);
+                        tree_routing_add_node_if_new(rt, response.nodes[j], &response.addrs[j]);
                     }
 
                     /* Log discovery occasionally (every 100 queries) with routing table stats */
@@ -539,9 +539,9 @@ static void *bep51_worker_func(void *arg) {
                     }
                 }
 
-                /* 7. Update routing table with new nodes from response */
+                /* 7. Update routing table with new nodes from response (if_new to avoid refreshing last_seen) */
                 for (int i = 0; i < response.node_count; i++) {
-                    tree_routing_add_node(rt, response.nodes[i], &response.addrs[i]);
+                    tree_routing_add_node_if_new(rt, response.nodes[i], &response.addrs[i]);
                 }
             }
         }
@@ -695,9 +695,9 @@ static void *get_peers_worker_func(void *arg) {
                             result.peer_count++;
                         }
 
-                        /* Add closer nodes for next iteration */
+                        /* Add closer nodes for next iteration (if_new to avoid refreshing last_seen) */
                         for (int ni = 0; ni < response.node_count && queries_this_round < 8; ni++) {
-                            tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
+                            tree_routing_add_node_if_new(rt, response.nodes[ni], &response.node_addrs[ni]);
                             /* Could track these for next iteration, but keeping it simple */
                         }
                     }

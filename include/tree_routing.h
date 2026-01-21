@@ -70,7 +70,9 @@ tree_routing_table_t *tree_routing_create(const uint8_t *our_node_id);
 void tree_routing_destroy(tree_routing_table_t *rt);
 
 /**
- * Add or update a node in the routing table
+ * Add or update a node in the routing table.
+ * Use this when we DIRECTLY received a response from this node.
+ * Updates last_seen for existing nodes (proves node is alive).
  * @param rt Routing table
  * @param node_id 20-byte node ID to add
  * @param addr Address of the node
@@ -78,6 +80,19 @@ void tree_routing_destroy(tree_routing_table_t *rt);
  */
 int tree_routing_add_node(tree_routing_table_t *rt, const uint8_t *node_id,
                           const struct sockaddr_storage *addr);
+
+/**
+ * Add a node only if it doesn't already exist (no update if exists).
+ * Use this for nodes we "heard about" in someone else's response.
+ * Does NOT update last_seen for existing nodes (we didn't talk to them).
+ * This allows LRU eviction to work properly for stale nodes.
+ * @param rt Routing table
+ * @param node_id 20-byte node ID to add
+ * @param addr Address of the node
+ * @return 0 on success (added or already exists), -1 on error
+ */
+int tree_routing_add_node_if_new(tree_routing_table_t *rt, const uint8_t *node_id,
+                                  const struct sockaddr_storage *addr);
 
 /**
  * Get closest nodes to a target ID
