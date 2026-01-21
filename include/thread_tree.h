@@ -73,6 +73,7 @@ typedef struct tree_config {
     /* Stage 3: BEP51 settings */
     int infohash_queue_capacity;    /* Infohash queue size (default: 5000) */
     int bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 10) */
+    int bep51_node_cooldown_sec;    /* Cooldown between BEP51 queries to same node (default: 30) */
 
     /* Stage 4: Get_peers settings */
     int peers_queue_capacity;       /* Peers queue size (default: 2000) */
@@ -136,6 +137,7 @@ typedef struct thread_tree {
     /* Stage 3 config */
     int infohash_queue_capacity;
     int bep51_query_interval_ms;
+    int bep51_node_cooldown_sec;     /* Cooldown between BEP51 queries to same node */
 
     /* Stage 4 config */
     int peers_queue_capacity;

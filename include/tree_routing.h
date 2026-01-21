@@ -30,6 +30,7 @@ typedef struct tree_node {
     uint8_t node_id[20];
     struct sockaddr_storage addr;
     time_t last_seen;
+    time_t last_queried;          /* Last time this node was queried for BEP51 */
     int fail_count;
     bep51_status_t bep51_status;  /* BEP51 capability tracking */
     struct tree_node *next;  /* For bucket linked list */
@@ -145,15 +146,19 @@ int tree_routing_get_count(tree_routing_table_t *rt);
 void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity);
 
 /**
- * Get random nodes that are known to be BEP51-capable.
+ * Get random nodes that are known to be BEP51-capable and not on cooldown.
  * Uses reservoir sampling like get_random_nodes() but filters to BEP51_CAPABLE only.
+ * Nodes that have been queried within cooldown_sec seconds are skipped.
+ * Selected nodes have their last_queried timestamp updated atomically.
  * @param rt Routing table
  * @param out Array to fill with nodes (caller allocates)
  * @param count Max number of nodes to return
- * @return Number of nodes returned (may be less than count if not enough capable nodes)
+ * @param cooldown_sec Minimum seconds since last query (0 = no cooldown)
+ * @return Number of nodes returned (may be less than count if not enough eligible nodes)
  */
 int tree_routing_get_random_bep51_nodes(tree_routing_table_t *rt,
-                                         tree_node_t *out, int count);
+                                         tree_node_t *out, int count,
+                                         int cooldown_sec);
 
 /**
  * Mark a node as BEP51-capable (responded to sample_infohashes).

@@ -142,6 +142,7 @@ void config_init_defaults(crawler_config_t *config) {
     strncpy(config->bep51_cache_path, "data/bep51_cache.dat", sizeof(config->bep51_cache_path) - 1);
     config->bep51_cache_capacity = 10000;           /* 10000 nodes max */
     config->bep51_cache_submit_percent = 5;         /* 5% submission rate */
+    config->bep51_node_cooldown_sec = 30;           /* 30 second cooldown per node */
 }
 
 /* Load config from INI-style file */
@@ -465,6 +466,9 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->bep51_cache_submit_percent = atoi(value);
             if (config->bep51_cache_submit_percent < 1) config->bep51_cache_submit_percent = 1;
             if (config->bep51_cache_submit_percent > 100) config->bep51_cache_submit_percent = 100;
+        } else if (strcmp(key, "bep51_node_cooldown_sec") == 0) {
+            config->bep51_node_cooldown_sec = atoi(value);
+            if (config->bep51_node_cooldown_sec < 0) config->bep51_node_cooldown_sec = 0;
         }
     }
 

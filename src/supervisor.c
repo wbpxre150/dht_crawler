@@ -82,6 +82,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Stage 3 settings (BEP51) */
     sup->infohash_queue_capacity = config->infohash_queue_capacity > 0 ? config->infohash_queue_capacity : 5000;
     sup->bep51_query_interval_ms = config->bep51_query_interval_ms >= 0 ? config->bep51_query_interval_ms : 10;
+    sup->bep51_node_cooldown_sec = config->bep51_node_cooldown_sec > 0 ? config->bep51_node_cooldown_sec : 30;
 
     /* Stage 4 settings (get_peers) */
     sup->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
@@ -162,6 +163,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Stage 3 settings */
         .infohash_queue_capacity = sup->infohash_queue_capacity,
         .bep51_query_interval_ms = sup->bep51_query_interval_ms,
+        .bep51_node_cooldown_sec = sup->bep51_node_cooldown_sec,
         /* Stage 4 settings */
         .peers_queue_capacity = sup->peers_queue_capacity,
         .get_peers_timeout_ms = sup->get_peers_timeout_ms,

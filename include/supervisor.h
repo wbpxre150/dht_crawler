@@ -48,6 +48,7 @@ typedef struct supervisor_config {
     /* Stage 3 settings (BEP51) */
     int infohash_queue_capacity;    /* Infohash queue capacity per tree (default: 5000) */
     int bep51_query_interval_ms;    /* BEP51 query interval (default: 10) */
+    int bep51_node_cooldown_sec;    /* Cooldown between BEP51 queries to same node (default: 30) */
 
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
@@ -130,6 +131,7 @@ typedef struct supervisor {
     /* Stage 3 settings (BEP51) */
     int infohash_queue_capacity;
     int bep51_query_interval_ms;
+    int bep51_node_cooldown_sec;
 
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;

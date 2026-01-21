@@ -352,6 +352,7 @@ int main(int argc, char *argv[]) {
             /* Stage 3 settings (BEP51) */
             .infohash_queue_capacity = config.tree_infohash_queue_capacity,
             .bep51_query_interval_ms = config.tree_bep51_query_interval_ms,
+            .bep51_node_cooldown_sec = config.bep51_node_cooldown_sec,
             /* Stage 4 settings (get_peers) */
             .peers_queue_capacity = config.tree_peers_queue_capacity,
             .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,

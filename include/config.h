@@ -134,6 +134,7 @@ typedef struct {
     char bep51_cache_path[512];          /* Cache file path (default: "data/bep51_cache.dat") */
     int bep51_cache_capacity;            /* Max nodes in cache (default: 10000) */
     int bep51_cache_submit_percent;      /* % of BEP51 responses to cache (default: 5) */
+    int bep51_node_cooldown_sec;         /* Cooldown between queries to same node (default: 30) */
 } crawler_config_t;
 
 /* Initialize config with default values */

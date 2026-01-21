@@ -615,50 +615,65 @@ void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity) {
 }
 
 int tree_routing_get_random_bep51_nodes(tree_routing_table_t *rt,
-                                         tree_node_t *out, int count) {
+                                         tree_node_t *out, int count,
+                                         int cooldown_sec) {
     if (!rt || !out || count <= 0) {
         return 0;
     }
 
-    pthread_rwlock_rdlock(&rt->rwlock);
+    time_t now = time(NULL);
+    pthread_rwlock_wrlock(&rt->rwlock);  /* Write lock - we update last_queried */
 
-    /* Count BEP51-capable nodes first for reservoir sampling */
-    int bep51_capable_count = 0;
+    /* Count eligible BEP51-capable nodes (not on cooldown) */
+    int eligible_count = 0;
     tree_node_t *node, *tmp;
     HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
-        if (node->bep51_status == BEP51_CAPABLE) {
-            bep51_capable_count++;
+        if (node->bep51_status == BEP51_CAPABLE &&
+            (cooldown_sec <= 0 || (now - node->last_queried) >= cooldown_sec)) {
+            eligible_count++;
         }
     }
 
-    if (bep51_capable_count == 0) {
+    if (eligible_count == 0) {
         pthread_rwlock_unlock(&rt->rwlock);
         return 0;
     }
 
     /* Reservoir sampling - O(N) time, O(K) space
-     * Only select nodes where bep51_status == BEP51_CAPABLE */
-    int result_count = (bep51_capable_count < count) ? bep51_capable_count : count;
-    int capable_seen = 0;
+     * Only select nodes where bep51_status == BEP51_CAPABLE and not on cooldown */
+    int result_count = (eligible_count < count) ? eligible_count : count;
+    int eligible_seen = 0;
 
     HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
         if (node->bep51_status != BEP51_CAPABLE) {
             continue;  /* Skip non-capable nodes */
         }
+        if (cooldown_sec > 0 && (now - node->last_queried) < cooldown_sec) {
+            continue;  /* Skip nodes on cooldown */
+        }
 
-        capable_seen++;
+        eligible_seen++;
 
-        if (capable_seen <= result_count) {
-            /* Fill reservoir: copy first K capable nodes */
-            memcpy(&out[capable_seen - 1], node, sizeof(tree_node_t));
-            out[capable_seen - 1].next = NULL;
+        if (eligible_seen <= result_count) {
+            /* Fill reservoir: copy first K eligible nodes */
+            memcpy(&out[eligible_seen - 1], node, sizeof(tree_node_t));
+            out[eligible_seen - 1].next = NULL;
         } else {
             /* Randomly replace elements with decreasing probability */
-            int j = rand() % capable_seen;
+            int j = rand() % eligible_seen;
             if (j < result_count) {
                 memcpy(&out[j], node, sizeof(tree_node_t));
                 out[j].next = NULL;
             }
+        }
+    }
+
+    /* Mark selected nodes as queried to prevent immediate re-selection */
+    for (int i = 0; i < result_count; i++) {
+        tree_node_hash_entry_t *hash_entry = NULL;
+        HASH_FIND(hh, rt->node_hash, out[i].node_id, 20, hash_entry);
+        if (hash_entry) {
+            hash_entry->node_ptr->last_queried = now;
         }
     }
 
