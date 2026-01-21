@@ -158,30 +158,14 @@ void http_api_set_refresh_query_store(http_api_t *api, refresh_query_store_t *qu
 static int root_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
 
-    /* Get database statistics */
-    sqlite3_stmt *stmt;
-    int torrent_count = 0;
-    int file_count = 0;
+    /* Get cached database statistics (fast - no COUNT(*) queries) */
+    uint64_t torrent_count = 0;
+    uint64_t file_count = 0;
     size_t hourly_count = 0;
 
-    const char *count_sql = "SELECT COUNT(*) FROM torrents";
-    if (sqlite3_prepare_v2(api->database->db, count_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            torrent_count = sqlite3_column_int(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
-
-    const char *files_sql = "SELECT COUNT(*) FROM torrent_files";
-    if (sqlite3_prepare_v2(api->database->db, files_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            file_count = sqlite3_column_int(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
-
-    /* Get hourly count from batch writer */
     if (api->batch_writer) {
+        torrent_count = batch_writer_get_torrent_count(api->batch_writer);
+        file_count = batch_writer_get_file_count(api->batch_writer);
         hourly_count = batch_writer_get_hourly_count(api->batch_writer);
     }
 
@@ -197,23 +181,31 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
     char uptime_str[32];
 
     if (torrent_count >= 1000000) {
-        snprintf(torrent_count_str, sizeof(torrent_count_str), "%d,%03d,%03d",
-                 torrent_count / 1000000, (torrent_count / 1000) % 1000, torrent_count % 1000);
+        snprintf(torrent_count_str, sizeof(torrent_count_str), "%llu,%03llu,%03llu",
+                 (unsigned long long)(torrent_count / 1000000),
+                 (unsigned long long)((torrent_count / 1000) % 1000),
+                 (unsigned long long)(torrent_count % 1000));
     } else if (torrent_count >= 1000) {
-        snprintf(torrent_count_str, sizeof(torrent_count_str), "%d,%03d",
-                 torrent_count / 1000, torrent_count % 1000);
+        snprintf(torrent_count_str, sizeof(torrent_count_str), "%llu,%03llu",
+                 (unsigned long long)(torrent_count / 1000),
+                 (unsigned long long)(torrent_count % 1000));
     } else {
-        snprintf(torrent_count_str, sizeof(torrent_count_str), "%d", torrent_count);
+        snprintf(torrent_count_str, sizeof(torrent_count_str), "%llu",
+                 (unsigned long long)torrent_count);
     }
 
     if (file_count >= 1000000) {
-        snprintf(file_count_str, sizeof(file_count_str), "%d,%03d,%03d",
-                 file_count / 1000000, (file_count / 1000) % 1000, file_count % 1000);
+        snprintf(file_count_str, sizeof(file_count_str), "%llu,%03llu,%03llu",
+                 (unsigned long long)(file_count / 1000000),
+                 (unsigned long long)((file_count / 1000) % 1000),
+                 (unsigned long long)(file_count % 1000));
     } else if (file_count >= 1000) {
-        snprintf(file_count_str, sizeof(file_count_str), "%d,%03d",
-                 file_count / 1000, file_count % 1000);
+        snprintf(file_count_str, sizeof(file_count_str), "%llu,%03llu",
+                 (unsigned long long)(file_count / 1000),
+                 (unsigned long long)(file_count % 1000));
     } else {
-        snprintf(file_count_str, sizeof(file_count_str), "%d", file_count);
+        snprintf(file_count_str, sizeof(file_count_str), "%llu",
+                 (unsigned long long)file_count);
     }
 
     if (hourly_count >= 1000000) {
@@ -347,30 +339,14 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
 static int stats_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
 
-    /* Get database statistics */
-    sqlite3_stmt *stmt;
-    int torrent_count = 0;
-    int file_count = 0;
+    /* Get cached database statistics (fast - no COUNT(*) queries) */
+    uint64_t torrent_count = 0;
+    uint64_t file_count = 0;
     size_t hourly_count = 0;
 
-    const char *count_sql = "SELECT COUNT(*) FROM torrents";
-    if (sqlite3_prepare_v2(api->database->db, count_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            torrent_count = sqlite3_column_int(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
-
-    const char *files_sql = "SELECT COUNT(*) FROM torrent_files";
-    if (sqlite3_prepare_v2(api->database->db, files_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            file_count = sqlite3_column_int(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
-
-    /* Get hourly count from batch writer */
     if (api->batch_writer) {
+        torrent_count = batch_writer_get_torrent_count(api->batch_writer);
+        file_count = batch_writer_get_file_count(api->batch_writer);
         hourly_count = batch_writer_get_hourly_count(api->batch_writer);
     }
 

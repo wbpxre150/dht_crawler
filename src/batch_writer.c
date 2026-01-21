@@ -26,6 +26,10 @@ struct batch_writer {
     uint64_t total_written;
     uint64_t total_flushes;
 
+    /* Cached database counts for fast HTTP API responses */
+    uint64_t cached_torrent_count;
+    uint64_t cached_file_count;
+
     /* Rolling 60-minute window for hourly statistics */
     minute_stat_t hourly_stats[60];
 };
@@ -102,6 +106,26 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
 
     /* Initialize hourly stats array (zero out) */
     memset(writer->hourly_stats, 0, sizeof(writer->hourly_stats));
+
+    /* Initialize cached counts from database (one-time query at startup) */
+    writer->cached_torrent_count = 0;
+    writer->cached_file_count = 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, "SELECT COUNT(*) FROM torrents", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            writer->cached_torrent_count = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (sqlite3_prepare_v2(db->db, "SELECT COUNT(*) FROM torrent_files", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            writer->cached_file_count = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    log_msg(LOG_DEBUG, "Cached counts initialized: %llu torrents, %llu files",
+            (unsigned long long)writer->cached_torrent_count,
+            (unsigned long long)writer->cached_file_count);
 
     /* Start periodic flush timer */
     if (flush_interval_sec > 0) {
@@ -316,6 +340,15 @@ int batch_writer_flush(batch_writer_t *writer) {
         }
     }
 
+    /* Count total files in successfully written batch for cached count update
+     * Must be done BEFORE freeing batch_copy */
+    size_t files_written = 0;
+    if (ret == 0 && written > 0) {
+        for (size_t i = 0; i < count; i++) {
+            files_written += batch_copy[i]->num_files;
+        }
+    }
+
     /* Free all batch copies */
     for (size_t i = 0; i < count; i++) {
         /* Free metadata copy */
@@ -341,6 +374,12 @@ int batch_writer_flush(batch_writer_t *writer) {
     uv_mutex_lock(&writer->mutex);
     writer->total_written += written;
     writer->total_flushes++;
+
+    /* Update cached counts for fast HTTP API responses */
+    if (written > 0) {
+        writer->cached_torrent_count += written;
+        writer->cached_file_count += files_written;
+    }
 
     /* Update hourly statistics - record torrents written in current minute */
     if (written > 0) {
@@ -412,6 +451,30 @@ size_t batch_writer_get_hourly_count(batch_writer_t *writer) {
     uv_mutex_unlock(&writer->mutex);
 
     return total_count;
+}
+
+uint64_t batch_writer_get_torrent_count(batch_writer_t *writer) {
+    if (!writer) {
+        return 0;
+    }
+
+    uv_mutex_lock(&writer->mutex);
+    uint64_t count = writer->cached_torrent_count;
+    uv_mutex_unlock(&writer->mutex);
+
+    return count;
+}
+
+uint64_t batch_writer_get_file_count(batch_writer_t *writer) {
+    if (!writer) {
+        return 0;
+    }
+
+    uv_mutex_lock(&writer->mutex);
+    uint64_t count = writer->cached_file_count;
+    uv_mutex_unlock(&writer->mutex);
+
+    return count;
 }
 
 void batch_writer_shutdown(batch_writer_t *writer) {

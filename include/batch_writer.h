@@ -89,6 +89,20 @@ void batch_writer_stats(batch_writer_t *writer, size_t *out_batch_size,
 size_t batch_writer_get_hourly_count(batch_writer_t *writer);
 
 /**
+ * Get cached torrent count (for fast HTTP API responses)
+ * @param writer Batch writer instance
+ * @return Total number of torrents in database (cached, updated on batch writes)
+ */
+uint64_t batch_writer_get_torrent_count(batch_writer_t *writer);
+
+/**
+ * Get cached file count (for fast HTTP API responses)
+ * @param writer Batch writer instance
+ * @return Total number of files in database (cached, updated on batch writes)
+ */
+uint64_t batch_writer_get_file_count(batch_writer_t *writer);
+
+/**
  * Shutdown batch writer (flush pending writes)
  * @param writer Batch writer instance
  */
