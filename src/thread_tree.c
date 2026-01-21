@@ -215,25 +215,11 @@ static void *find_node_worker_func(void *arg) {
             if (rc == 0) {
                 /* 4. Parse response and insert discovered nodes */
                 tree_find_node_response_t response;
-                tree_response_type_t parse_result = tree_handle_response(tree, response_pkt.data, response_pkt.len,
-                                        &response_pkt.from, &response);
-
-                /* DEBUG: Log parse result */
-                static atomic_int parse_success = 0;
-                static atomic_int parse_fail = 0;
-
-                if (parse_result == TREE_RESP_FIND_NODE) {
-                    atomic_fetch_add(&parse_success, 1);
-
+                if (tree_handle_response(tree, response_pkt.data, response_pkt.len,
+                                        &response_pkt.from, &response) == TREE_RESP_FIND_NODE) {
                     /* Add all discovered nodes to routing table */
-                    static atomic_int nodes_discovered = 0;
-                    static atomic_int nodes_added = 0;
                     for (int j = 0; j < response.node_count; j++) {
-                        atomic_fetch_add(&nodes_discovered, 1);
-                        int add_result = tree_routing_add_node(rt, response.nodes[j], &response.addrs[j]);
-                        if (add_result == 0) {
-                            atomic_fetch_add(&nodes_added, 1);
-                        }
+                        tree_routing_add_node(rt, response.nodes[j], &response.addrs[j]);
                     }
 
                     /* Log discovery occasionally (every 100 queries) with routing table stats */
@@ -241,29 +227,9 @@ static void *find_node_worker_func(void *arg) {
                     int count = atomic_fetch_add(&query_count, 1) + 1;
                     if (count % 100 == 0) {
                         int rt_count = tree_routing_get_count(rt);
-                        log_msg(LOG_DEBUG, "[tree %u] find_node worker %d: discovered %d nodes (total: %d, target: ~1500), cumulative: discovered=%d, added=%d",
-                                tree->tree_id, worker_id, response.node_count, rt_count,
-                                atomic_load(&nodes_discovered), atomic_load(&nodes_added));
+                        log_msg(LOG_DEBUG, "[tree %u] find_node worker %d: discovered %d nodes (total: %d, target: ~1500)",
+                                tree->tree_id, worker_id, response.node_count, rt_count);
                     }
-                } else {
-                    atomic_fetch_add(&parse_fail, 1);
-                    int fail_count = atomic_load(&parse_fail);
-                    if (fail_count <= 20 || fail_count % 100 == 0) {
-                        log_msg(LOG_WARN, "[tree %u] find_node worker %d: Failed to parse find_node response (fail #%d, type=%d)",
-                                tree->tree_id, worker_id, fail_count, parse_result);
-                    }
-                }
-
-                /* Periodic stats */
-                static time_t last_stats = 0;
-                time_t now = time(NULL);
-                if (now - last_stats >= 30) {
-                    log_msg(LOG_INFO, "[tree %u] find_node stats: parse_success=%d, parse_fail=%d, routing_table_size=%d",
-                            tree->tree_id,
-                            atomic_load(&parse_success),
-                            atomic_load(&parse_fail),
-                            tree_routing_get_count(rt));
-                    last_stats = now;
                 }
             }
 
@@ -537,28 +503,8 @@ static void *bep51_worker_func(void *arg) {
         if (rc == 0) {
             /* 5. Parse response, extract infohashes */
             tree_sample_response_t response;
-            int parse_result = tree_handle_sample_infohashes_response(tree, response_pkt.data, response_pkt.len,
-                                                       &response_pkt.from, &response);
-
-            /* DEBUG: Log parse result */
-            if (parse_result != 0) {
-                static atomic_int parse_fail_count = 0;
-                int fail_count = atomic_fetch_add(&parse_fail_count, 1) + 1;
-                if (fail_count <= 20 || fail_count % 100 == 0) {
-                    log_msg(LOG_WARN, "[tree %u] BEP51 worker %d: Failed to parse BEP51 response (fail #%d)",
-                            tree->tree_id, worker_id, fail_count);
-                }
-            } else {
-                /* DEBUG: Log successful parse with infohash count */
-                static atomic_int parse_success_count = 0;
-                int success_count = atomic_fetch_add(&parse_success_count, 1) + 1;
-                if (success_count <= 20 || success_count % 100 == 0) {
-                    log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: Parsed BEP51 response (success #%d): infohash_count=%d, node_count=%d",
-                            tree->tree_id, worker_id, success_count, response.infohash_count, response.node_count);
-                }
-            }
-
-            if (parse_result == 0) {
+            if (tree_handle_sample_infohashes_response(tree, response_pkt.data, response_pkt.len,
+                                                       &response_pkt.from, &response) == 0) {
                 /* NEW: Submit sender to BEP51 cache with configured percentage */
                 supervisor_t *sup = (supervisor_t *)tree->supervisor_ctx;
                 if (sup && sup->bep51_cache && sup->bep51_cache_submit_percent > 0) {
@@ -573,67 +519,24 @@ static void *bep51_worker_func(void *arg) {
                     }
                 }
 
-                /* DEBUG: Log infohash processing */
-                static atomic_int infohash_processed = 0;
-                static atomic_int infohash_bloom_filtered = 0;
-                static atomic_int infohash_queued = 0;
-                static atomic_int infohash_queue_failed = 0;
-
                 /* 6. Push infohashes to queue (with bloom check) */
                 for (int i = 0; i < response.infohash_count; i++) {
-                    atomic_fetch_add(&infohash_processed, 1);
-
                     /* Check bloom filter (shared, thread-safe) */
                     if (tree->shared_bloom && bloom_filter_check(tree->shared_bloom, response.infohashes[i])) {
-                        atomic_fetch_add(&infohash_bloom_filtered, 1);
                         continue;  /* Already seen */
                     }
 
                     /* Try to push to queue (non-blocking) */
-                    int push_result = tree_infohash_queue_try_push(tree->infohash_queue, response.infohashes[i]);
-                    if (push_result == 0) {
-                        atomic_fetch_add(&infohash_queued, 1);
-
-                        /* Log first successful queue */
-                        int queued_count = atomic_load(&infohash_queued);
-                        if (queued_count == 1 || queued_count % 100 == 0) {
-                            log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: Successfully queued infohash #%d (queue_size=%d)",
-                                    tree->tree_id, worker_id, queued_count, tree_infohash_queue_count(tree->infohash_queue));
-                        }
-
+                    if (tree_infohash_queue_try_push(tree->infohash_queue, response.infohashes[i]) == 0) {
                         if (!first_infohash_found) {
                             first_infohash_found = true;
-                            log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: FIRST infohash queued, triggering get_peers phase",
-                                    tree->tree_id, worker_id);
                             /* Trigger get_peers phase (Stage 4) - use atomic compare-exchange */
                             tree_phase_t expected = TREE_PHASE_BEP51;
                             if (atomic_compare_exchange_strong((atomic_int*)&tree->current_phase, (int*)&expected, TREE_PHASE_GET_PEERS)) {
                                 tree_start_get_peers_workers(tree);
                             }
                         }
-                    } else {
-                        atomic_fetch_add(&infohash_queue_failed, 1);
-                        int failed_count = atomic_load(&infohash_queue_failed);
-                        if (failed_count <= 20 || failed_count % 100 == 0) {
-                            log_msg(LOG_WARN, "[tree %u] BEP51 worker %d: Failed to queue infohash #%d (queue_size=%d, capacity=%d)",
-                                    tree->tree_id, worker_id, failed_count,
-                                    tree_infohash_queue_count(tree->infohash_queue),
-                                    tree->infohash_queue_capacity);
-                        }
                     }
-                }
-
-                /* Periodic stats logging */
-                static time_t last_stats_log = 0;
-                time_t now = time(NULL);
-                if (now - last_stats_log >= 30) {
-                    log_msg(LOG_INFO, "[tree %u] BEP51 infohash stats: processed=%d, bloom_filtered=%d, queued=%d, queue_failed=%d",
-                            tree->tree_id,
-                            atomic_load(&infohash_processed),
-                            atomic_load(&infohash_bloom_filtered),
-                            atomic_load(&infohash_queued),
-                            atomic_load(&infohash_queue_failed));
-                    last_stats_log = now;
                 }
 
                 /* 7. Update routing table with new nodes from response */
