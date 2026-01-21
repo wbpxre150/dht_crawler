@@ -98,24 +98,11 @@ static void *find_node_worker_func(void *arg) {
     unsigned long timeouts = 0;
 
     while (!atomic_load(&tree->shutdown_requested)) {
-        /* 0. Check if we should pause (infohash queue is full enough) */
-        if (atomic_load(&tree->discovery_paused)) {
-            log_msg(LOG_DEBUG, "[tree %u] find_node worker %d PAUSED (queue >= %d)",
-                    tree->tree_id, worker_id, tree->infohash_pause_threshold);
-
-            /* Wait on condition variable until resumed */
-            pthread_mutex_lock(&tree->throttle_lock);
-            while (atomic_load(&tree->discovery_paused) &&
-                   !atomic_load(&tree->shutdown_requested)) {
-                pthread_cond_wait(&tree->throttle_resume, &tree->throttle_lock);
-            }
-            pthread_mutex_unlock(&tree->throttle_lock);
-
-            log_msg(LOG_DEBUG, "[tree %u] find_node worker %d RESUMED (queue < %d)",
-                    tree->tree_id, worker_id, tree->infohash_resume_threshold);
-
-            if (atomic_load(&tree->shutdown_requested)) break;
-        }
+        /* NOTE: find_node workers do NOT check discovery_paused.
+         * They must continue maintaining the routing table even when BEP51 is paused,
+         * otherwise the routing table degrades and BEP51 workers find stale nodes
+         * when they resume, causing a downward spiral of timeouts and empty queues.
+         * find_node workers have their own throttling based on routing table size below. */
 
         /* 1. Check routing table size and throttle aggressively when full */
         int current_nodes = tree_routing_get_count(rt);
@@ -280,8 +267,8 @@ static void *throttle_monitor_func(void *arg) {
         int infohash_queue_size = tree_infohash_queue_count(tree->infohash_queue);
 
         if (!discovery_currently_paused && infohash_queue_size >= tree->infohash_pause_threshold) {
-            /* Pause discovery workers (find_node + BEP51) */
-            log_msg(LOG_DEBUG, "[tree %u] PAUSING discovery workers (find_node + BEP51) (infohash_queue=%d >= %d)",
+            /* Pause BEP51 workers (find_node workers continue for routing table maintenance) */
+            log_msg(LOG_DEBUG, "[tree %u] PAUSING BEP51 workers (infohash_queue=%d >= %d)",
                     tree->tree_id, infohash_queue_size, tree->infohash_pause_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
@@ -291,8 +278,8 @@ static void *throttle_monitor_func(void *arg) {
             discovery_currently_paused = true;
 
         } else if (discovery_currently_paused && infohash_queue_size < tree->infohash_resume_threshold) {
-            /* Resume discovery workers (find_node + BEP51) */
-            log_msg(LOG_DEBUG, "[tree %u] RESUMING discovery workers (find_node + BEP51) (infohash_queue=%d < %d)",
+            /* Resume BEP51 workers */
+            log_msg(LOG_DEBUG, "[tree %u] RESUMING BEP51 workers (infohash_queue=%d < %d)",
                     tree->tree_id, infohash_queue_size, tree->infohash_resume_threshold);
 
             pthread_mutex_lock(&tree->throttle_lock);
