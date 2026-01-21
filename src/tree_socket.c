@@ -39,14 +39,16 @@ tree_socket_t *tree_socket_create(int port) {
 
     /* Enable port sharing with load balancing (for shared DHT port) */
 #if defined(__FreeBSD__)
-    #ifdef SO_REUSEPORT_LB
-        int reuseport = 1;
-        if (setsockopt(sock->fd, SOL_SOCKET, SO_REUSEPORT_LB, &reuseport, sizeof(reuseport)) < 0) {
-            log_msg(LOG_WARN, "[tree_socket] Failed to set SO_REUSEPORT_LB: %s", strerror(errno));
-        } else {
-            log_msg(LOG_DEBUG, "[tree_socket] SO_REUSEPORT_LB enabled for fd=%d", sock->fd);
-        }
-    #endif
+    /* FreeBSD NOTE: SO_REUSEPORT_LB is NOT used because:
+     * 1. Shared socket mode uses ONE socket for all trees (no need for load balancing)
+     * 2. SO_REUSEPORT_LB can cause TID-based response routing issues
+     * 3. If this socket creation is for per-tree mode (shared socket failed),
+     *    we want binding to FAIL so the issue is visible rather than silently using broken load balancing
+     *
+     * Shared socket mode is the only supported configuration on FreeBSD.
+     */
+    log_msg(LOG_INFO, "[tree_socket] FreeBSD: SO_REUSEPORT_LB disabled, using shared socket mode");
+
 #elif defined(__linux__)
     #ifdef SO_REUSEPORT
         int reuseport = 1;
