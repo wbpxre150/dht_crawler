@@ -331,6 +331,7 @@ int main(int argc, char *argv[]) {
         supervisor_config_t sup_config = {
             .max_trees = config.num_trees,
             .use_keyspace_partitioning = config.use_keyspace_partitioning,
+            .dht_port = config.dht_port,
             .batch_writer = g_batch_writer,
             .bloom_filter = g_bloom,
             /* Bloom filter settings for failure tracking */
@@ -402,6 +403,7 @@ int main(int argc, char *argv[]) {
         /* Create and start refresh thread */
         log_msg(LOG_DEBUG, "Creating refresh thread...");
         refresh_thread_config_t refresh_config = {
+            .dht_port = config.dht_port,
             .bootstrap_sample_size = config.refresh_bootstrap_sample_size,
             .routing_table_target = config.refresh_routing_table_target,
             .ping_worker_count = config.refresh_ping_workers,

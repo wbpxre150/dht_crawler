@@ -50,6 +50,7 @@ typedef struct tree_config {
     uint32_t partition_index;       /* Keyspace partition for this tree */
     uint32_t num_partitions;        /* Total partitions in the system */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (vs random node ID) */
+    int dht_port;                   /* DHT UDP port (0 = ephemeral) */
 
     int num_bootstrap_workers;      /* Stage 2: Find_node workers for bootstrap (default: 10) */
     int num_find_node_workers;      /* Continuous find_node workers (default: 30) */

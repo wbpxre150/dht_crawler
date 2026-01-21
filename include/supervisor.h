@@ -24,6 +24,7 @@ struct shared_node_pool;
 typedef struct supervisor_config {
     int max_trees;                  /* Maximum number of concurrent trees */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (default: true) */
+    int dht_port;                   /* DHT UDP port (0 = ephemeral, otherwise shared with SO_REUSEPORT) */
 
     /* Worker counts per tree */
     int num_find_node_workers;
@@ -89,6 +90,7 @@ typedef struct supervisor {
 
     /* Keyspace partitioning */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning */
+    int dht_port;                   /* DHT UDP port for all trees */
 
     /* Shared resources (only these are shared between trees) */
     struct batch_writer *batch_writer;

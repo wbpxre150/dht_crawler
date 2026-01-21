@@ -15,6 +15,7 @@ typedef struct refresh_dispatcher refresh_dispatcher_t;
 typedef struct refresh_request_queue refresh_request_queue_t;
 
 typedef struct refresh_thread_config {
+    int dht_port;                     /* DHT UDP port (0 = ephemeral) */
     int bootstrap_sample_size;        /* Default: 1000 */
     int routing_table_target;         /* Default: 500 */
     int ping_worker_count;            /* Default: 1 */

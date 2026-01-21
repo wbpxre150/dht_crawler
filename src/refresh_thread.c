@@ -105,8 +105,8 @@ refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
         return NULL;
     }
 
-    /* Create UDP socket (port 0 = auto-assign) */
-    thread->socket = tree_socket_create(0);
+    /* Create UDP socket (dht_port from config, 0 = ephemeral) */
+    thread->socket = tree_socket_create(config->dht_port);
     if (!thread->socket) {
         log_msg(LOG_ERROR, "refresh_thread_create: failed to create socket");
         tree_routing_destroy(thread->routing_table);

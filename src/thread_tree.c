@@ -1087,8 +1087,8 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
         return NULL;
     }
 
-    /* Stage 2: Create private UDP socket (port 0 = random) */
-    tree->socket = tree_socket_create(0);
+    /* Stage 2: Create private UDP socket (dht_port from config, 0 = ephemeral) */
+    tree->socket = tree_socket_create(config->dht_port);
     if (!tree->socket) {
         log_msg(LOG_ERROR, "[tree %u] Failed to create socket", tree_id);
         thread_tree_destroy(tree);

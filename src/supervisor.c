@@ -51,6 +51,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Keyspace partitioning (default: enabled) */
     sup->use_keyspace_partitioning = config->use_keyspace_partitioning;
+    sup->dht_port = config->dht_port;
 
     /* Store shared resources */
     sup->batch_writer = config->batch_writer;
@@ -144,6 +145,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .use_keyspace_partitioning = sup->use_keyspace_partitioning,
         .partition_index = (uint32_t)slot_index,
         .num_partitions = (uint32_t)sup->max_trees,
+        .dht_port = sup->dht_port,
 
         /* Stage 2 settings (Bootstrap) - using configurable find_node workers */
         .num_bootstrap_workers = sup->num_find_node_workers,

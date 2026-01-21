@@ -37,6 +37,27 @@ tree_socket_t *tree_socket_create(int port) {
     int opt = 1;
     setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    /* Enable port sharing with load balancing (for shared DHT port) */
+#if defined(__FreeBSD__)
+    #ifdef SO_REUSEPORT_LB
+        int reuseport = 1;
+        if (setsockopt(sock->fd, SOL_SOCKET, SO_REUSEPORT_LB, &reuseport, sizeof(reuseport)) < 0) {
+            log_msg(LOG_WARN, "[tree_socket] Failed to set SO_REUSEPORT_LB: %s", strerror(errno));
+        } else {
+            log_msg(LOG_DEBUG, "[tree_socket] SO_REUSEPORT_LB enabled for fd=%d", sock->fd);
+        }
+    #endif
+#elif defined(__linux__)
+    #ifdef SO_REUSEPORT
+        int reuseport = 1;
+        if (setsockopt(sock->fd, SOL_SOCKET, SO_REUSEPORT, &reuseport, sizeof(reuseport)) < 0) {
+            log_msg(LOG_WARN, "[tree_socket] Failed to set SO_REUSEPORT: %s", strerror(errno));
+        } else {
+            log_msg(LOG_DEBUG, "[tree_socket] SO_REUSEPORT enabled for fd=%d", sock->fd);
+        }
+    #endif
+#endif
+
     /* Increase send buffer to handle high UDP traffic from multiple trees */
     int sndbuf = 2 * 1024 * 1024;  /* 2MB send buffer */
     if (setsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
