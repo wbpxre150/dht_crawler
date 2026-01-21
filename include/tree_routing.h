@@ -18,12 +18,20 @@
  * - No RCU, no triple buffering - simple and reliable
  */
 
+/* BEP51 capability status for routing table nodes */
+typedef enum {
+    BEP51_UNKNOWN = 0,    /* Not yet tested */
+    BEP51_CAPABLE = 1,    /* Confirmed BEP51 support */
+    BEP51_INCAPABLE = 2   /* Confirmed no BEP51 support */
+} bep51_status_t;
+
 /* Node in the routing table */
 typedef struct tree_node {
     uint8_t node_id[20];
     struct sockaddr_storage addr;
     time_t last_seen;
     int fail_count;
+    bep51_status_t bep51_status;  /* BEP51 capability tracking */
     struct tree_node *next;  /* For bucket linked list */
     UT_hash_handle hh_flat;  /* uthash handle for flat index (fast iteration) */
 } tree_node_t;
@@ -135,5 +143,41 @@ int tree_routing_get_count(tree_routing_table_t *rt);
  * @param capacity New max_nodes per bucket (default 8, bootstrap 20)
  */
 void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity);
+
+/**
+ * Get random nodes that are known to be BEP51-capable.
+ * Uses reservoir sampling like get_random_nodes() but filters to BEP51_CAPABLE only.
+ * @param rt Routing table
+ * @param out Array to fill with nodes (caller allocates)
+ * @param count Max number of nodes to return
+ * @return Number of nodes returned (may be less than count if not enough capable nodes)
+ */
+int tree_routing_get_random_bep51_nodes(tree_routing_table_t *rt,
+                                         tree_node_t *out, int count);
+
+/**
+ * Mark a node as BEP51-capable (responded to sample_infohashes).
+ * O(1) hash lookup by node_id.
+ * @param rt Routing table
+ * @param node_id 20-byte node ID to mark
+ */
+void tree_routing_mark_bep51_capable(tree_routing_table_t *rt,
+                                      const uint8_t *node_id);
+
+/**
+ * Mark a node as BEP51-incapable (timeout/error on sample_infohashes).
+ * O(1) hash lookup by node_id.
+ * @param rt Routing table
+ * @param node_id 20-byte node ID to mark
+ */
+void tree_routing_mark_bep51_incapable(tree_routing_table_t *rt,
+                                        const uint8_t *node_id);
+
+/**
+ * Get count of BEP51-capable nodes in the routing table.
+ * @param rt Routing table
+ * @return Number of nodes with bep51_status == BEP51_CAPABLE
+ */
+int tree_routing_get_bep51_capable_count(tree_routing_table_t *rt);
 
 #endif /* TREE_ROUTING_H */

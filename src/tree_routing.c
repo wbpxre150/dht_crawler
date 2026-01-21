@@ -613,3 +613,113 @@ void tree_routing_set_bucket_capacity(tree_routing_table_t *rt, int capacity) {
     }
     pthread_rwlock_unlock(&rt->rwlock);
 }
+
+int tree_routing_get_random_bep51_nodes(tree_routing_table_t *rt,
+                                         tree_node_t *out, int count) {
+    if (!rt || !out || count <= 0) {
+        return 0;
+    }
+
+    pthread_rwlock_rdlock(&rt->rwlock);
+
+    /* Count BEP51-capable nodes first for reservoir sampling */
+    int bep51_capable_count = 0;
+    tree_node_t *node, *tmp;
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
+        if (node->bep51_status == BEP51_CAPABLE) {
+            bep51_capable_count++;
+        }
+    }
+
+    if (bep51_capable_count == 0) {
+        pthread_rwlock_unlock(&rt->rwlock);
+        return 0;
+    }
+
+    /* Reservoir sampling - O(N) time, O(K) space
+     * Only select nodes where bep51_status == BEP51_CAPABLE */
+    int result_count = (bep51_capable_count < count) ? bep51_capable_count : count;
+    int capable_seen = 0;
+
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
+        if (node->bep51_status != BEP51_CAPABLE) {
+            continue;  /* Skip non-capable nodes */
+        }
+
+        capable_seen++;
+
+        if (capable_seen <= result_count) {
+            /* Fill reservoir: copy first K capable nodes */
+            memcpy(&out[capable_seen - 1], node, sizeof(tree_node_t));
+            out[capable_seen - 1].next = NULL;
+        } else {
+            /* Randomly replace elements with decreasing probability */
+            int j = rand() % capable_seen;
+            if (j < result_count) {
+                memcpy(&out[j], node, sizeof(tree_node_t));
+                out[j].next = NULL;
+            }
+        }
+    }
+
+    pthread_rwlock_unlock(&rt->rwlock);
+    return result_count;
+}
+
+void tree_routing_mark_bep51_capable(tree_routing_table_t *rt,
+                                      const uint8_t *node_id) {
+    if (!rt || !node_id) {
+        return;
+    }
+
+    pthread_rwlock_wrlock(&rt->rwlock);
+
+    /* O(1) hash lookup by node_id */
+    tree_node_hash_entry_t *hash_entry = NULL;
+    HASH_FIND(hh, rt->node_hash, node_id, 20, hash_entry);
+
+    if (hash_entry) {
+        hash_entry->node_ptr->bep51_status = BEP51_CAPABLE;
+        hash_entry->node_ptr->last_seen = time(NULL);  /* Node is responsive */
+    }
+
+    pthread_rwlock_unlock(&rt->rwlock);
+}
+
+void tree_routing_mark_bep51_incapable(tree_routing_table_t *rt,
+                                        const uint8_t *node_id) {
+    if (!rt || !node_id) {
+        return;
+    }
+
+    pthread_rwlock_wrlock(&rt->rwlock);
+
+    /* O(1) hash lookup by node_id */
+    tree_node_hash_entry_t *hash_entry = NULL;
+    HASH_FIND(hh, rt->node_hash, node_id, 20, hash_entry);
+
+    if (hash_entry) {
+        hash_entry->node_ptr->bep51_status = BEP51_INCAPABLE;
+    }
+
+    pthread_rwlock_unlock(&rt->rwlock);
+}
+
+int tree_routing_get_bep51_capable_count(tree_routing_table_t *rt) {
+    if (!rt) {
+        return 0;
+    }
+
+    pthread_rwlock_rdlock(&rt->rwlock);
+
+    int count = 0;
+    tree_node_t *node, *tmp;
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
+        if (node->bep51_status == BEP51_CAPABLE) {
+            count++;
+        }
+    }
+
+    pthread_rwlock_unlock(&rt->rwlock);
+    return count;
+}

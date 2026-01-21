@@ -438,16 +438,31 @@ static void *bep51_worker_func(void *arg) {
             if (atomic_load(&tree->shutdown_requested)) break;
         }
 
-        /* 1. Get random node from routing table */
+        /* 1. Try to get a known BEP51-capable node first, with 10% discovery ratio */
         tree_node_t node;
-        if (tree_routing_get_random_nodes(rt, &node, 1) < 1) {
-            /* DEBUG: Log when we have no nodes */
-            if (queries_sent == 0) {
-                log_msg(LOG_WARN, "[tree %u] BEP51 worker %d: NO NODES in routing table (count=%d)",
-                        tree->tree_id, worker_id, tree_routing_get_count(rt));
+        bool is_discovery_query = false;
+
+        /* 10% of queries go to unknown nodes for continuous discovery */
+        bool force_discovery = (rand() % 10 == 0);
+
+        int got = 0;
+        if (!force_discovery) {
+            got = tree_routing_get_random_bep51_nodes(rt, &node, 1);
+        }
+
+        if (got < 1) {
+            /* No known BEP51 nodes (or forced discovery) - fall back to random nodes */
+            got = tree_routing_get_random_nodes(rt, &node, 1);
+            if (got < 1) {
+                /* DEBUG: Log when we have no nodes */
+                if (queries_sent == 0) {
+                    log_msg(LOG_WARN, "[tree %u] BEP51 worker %d: NO NODES in routing table (count=%d)",
+                            tree->tree_id, worker_id, tree_routing_get_count(rt));
+                }
+                usleep(100000);  /* 100ms backoff if no nodes */
+                continue;
             }
-            usleep(100000);  /* 100ms backoff if no nodes */
-            continue;
+            is_discovery_query = true;
         }
 
         /* 2. Generate TID and register with dispatcher BEFORE sending */
@@ -498,6 +513,9 @@ static void *bep51_worker_func(void *arg) {
                 log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: TIMEOUT #%lu (TID=%02x%02x%02x)",
                         tree->tree_id, worker_id, timeouts, tid[0], tid[1], tid[2]);
             }
+
+            /* Mark node as BEP51-incapable on timeout */
+            tree_routing_mark_bep51_incapable(rt, node.node_id);
         }
 
         if (rc == 0) {
@@ -505,6 +523,8 @@ static void *bep51_worker_func(void *arg) {
             tree_sample_response_t response;
             if (tree_handle_sample_infohashes_response(tree, response_pkt.data, response_pkt.len,
                                                        &response_pkt.from, &response) == 0) {
+                /* Mark node as BEP51-capable (responded successfully, even if 0 infohashes) */
+                tree_routing_mark_bep51_capable(rt, node.node_id);
                 /* NEW: Submit sender to BEP51 cache with configured percentage */
                 supervisor_t *sup = (supervisor_t *)tree->supervisor_ctx;
                 if (sup && sup->bep51_cache && sup->bep51_cache_submit_percent > 0) {
