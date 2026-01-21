@@ -9,6 +9,8 @@
 struct batch_writer;
 struct bloom_filter;
 struct shared_node_pool;
+struct tree_socket;
+struct tree_dispatcher;
 
 /**
  * Supervisor: Manages multiple thread trees for DHT crawling
@@ -99,6 +101,10 @@ typedef struct supervisor {
     const char *failure_bloom_path;            /* NEW: Persistence path for failure bloom */
     struct shared_node_pool *shared_node_pool;  /* Shared bootstrap node pool */
     struct bep51_cache *bep51_cache;            /* BEP51 node cache for persistent bootstrap */
+
+    /* Shared socket and dispatcher for all trees (when using fixed port) */
+    struct tree_socket *shared_socket;
+    struct tree_dispatcher *shared_dispatcher;
 
     /* Bloom filter configuration */
     uint64_t failure_bloom_capacity;           /* Failure bloom filter capacity */

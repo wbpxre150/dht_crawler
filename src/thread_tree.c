@@ -1087,12 +1087,23 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
         return NULL;
     }
 
-    /* Stage 2: Create private UDP socket (dht_port from config, 0 = ephemeral) */
-    tree->socket = tree_socket_create(config->dht_port);
-    if (!tree->socket) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to create socket", tree_id);
-        thread_tree_destroy(tree);
-        return NULL;
+    /* Stage 2: Use shared socket/dispatcher if provided, otherwise create private */
+    if (config->shared_socket && config->shared_dispatcher) {
+        tree->socket = config->shared_socket;
+        tree->dispatcher = config->shared_dispatcher;
+        tree->owns_socket = false;
+        tree->owns_dispatcher = false;
+        log_msg(LOG_DEBUG, "[tree %u] Using shared socket on port %d",
+                tree_id, tree_socket_get_port((tree_socket_t *)tree->socket));
+    } else {
+        tree->socket = tree_socket_create(config->dht_port);
+        if (!tree->socket) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create socket", tree_id);
+            thread_tree_destroy(tree);
+            return NULL;
+        }
+        tree->owns_socket = true;
+        tree->owns_dispatcher = true;  /* Will create dispatcher below */
     }
 
     /* Stage 3: Create private infohash queue */
@@ -1111,12 +1122,14 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
         return NULL;
     }
 
-    /* Create UDP response dispatcher */
-    tree->dispatcher = tree_dispatcher_create(tree, (tree_socket_t *)tree->socket);
-    if (!tree->dispatcher) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to create dispatcher", tree_id);
-        thread_tree_destroy(tree);
-        return NULL;
+    /* Create UDP response dispatcher (only if we own it, i.e. no shared dispatcher) */
+    if (tree->owns_dispatcher && !tree->dispatcher) {
+        tree->dispatcher = tree_dispatcher_create(tree, (tree_socket_t *)tree->socket);
+        if (!tree->dispatcher) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to create dispatcher", tree_id);
+            thread_tree_destroy(tree);
+            return NULL;
+        }
     }
 
     int port = tree_socket_get_port(tree->socket);
@@ -1218,24 +1231,25 @@ void thread_tree_destroy(thread_tree_t *tree) {
     log_msg(LOG_DEBUG, "[tree %u] Rate monitor thread joined", tree->tree_id);
 
     /* Close socket BEFORE cleanup to unblock any pending recv() calls
-     * This is critical - workers may be blocked in poll() */
-    log_msg(LOG_DEBUG, "[tree %u] Closing socket to unblock workers...", tree->tree_id);
-    if (tree->socket) {
-        /* Close the file descriptor but don't free the structure yet */
+     * This is critical - workers may be blocked in poll()
+     * Only close if we own the socket (don't close shared socket) */
+    if (tree->owns_socket && tree->socket) {
+        log_msg(LOG_DEBUG, "[tree %u] Closing socket to unblock workers...", tree->tree_id);
         tree_socket_t *sock = (tree_socket_t *)tree->socket;
         if (sock->fd >= 0) {
             shutdown(sock->fd, SHUT_RDWR);  /* Unblock pending recv/send */
             close(sock->fd);
             sock->fd = -1;
         }
+        log_msg(LOG_DEBUG, "[tree %u] Socket closed", tree->tree_id);
     }
-    log_msg(LOG_DEBUG, "[tree %u] Socket closed", tree->tree_id);
 
     /* Stage 2: Cleanup private data structures */
     if (tree->routing_table) {
         tree_routing_destroy(tree->routing_table);
     }
-    if (tree->socket) {
+    /* Only destroy socket if we own it */
+    if (tree->owns_socket && tree->socket) {
         tree_socket_destroy(tree->socket);
     }
 
@@ -1249,8 +1263,8 @@ void thread_tree_destroy(thread_tree_t *tree) {
         tree_peers_queue_destroy(tree->peers_queue);
     }
 
-    /* Cleanup dispatcher */
-    if (tree->dispatcher) {
+    /* Cleanup dispatcher (only if we own it) */
+    if (tree->owns_dispatcher && tree->dispatcher) {
         tree_dispatcher_destroy(tree->dispatcher);
     }
 
@@ -1274,10 +1288,13 @@ void thread_tree_start(thread_tree_t *tree) {
     log_msg(LOG_DEBUG, "[tree %u] Starting (phase: %s)",
             tree->tree_id, thread_tree_phase_name(atomic_load(&tree->current_phase)));
 
-    /* Start UDP response dispatcher FIRST before any workers send queries */
-    if (tree_dispatcher_start(tree->dispatcher) != 0) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to start dispatcher", tree->tree_id);
-        return;
+    /* Start UDP response dispatcher FIRST before any workers send queries
+     * Only start if we own it (shared dispatcher is already running) */
+    if (tree->owns_dispatcher) {
+        if (tree_dispatcher_start(tree->dispatcher) != 0) {
+            log_msg(LOG_ERROR, "[tree %u] Failed to start dispatcher", tree->tree_id);
+            return;
+        }
     }
 
     /* Spawn bootstrap thread */

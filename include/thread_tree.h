@@ -44,6 +44,10 @@ typedef enum {
     SHUTDOWN_REASON_SUPERVISOR      /* Supervisor requested (forced) */
 } shutdown_reason_t;
 
+/* Forward declarations for shared resources */
+struct tree_socket;
+struct tree_dispatcher;
+
 /* Configuration for a thread tree */
 typedef struct tree_config {
     /* Keyspace partitioning */
@@ -51,6 +55,10 @@ typedef struct tree_config {
     uint32_t num_partitions;        /* Total partitions in the system */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (vs random node ID) */
     int dht_port;                   /* DHT UDP port (0 = ephemeral) */
+
+    /* Shared socket/dispatcher from supervisor (NULL = create private) */
+    struct tree_socket *shared_socket;
+    struct tree_dispatcher *shared_dispatcher;
 
     int num_bootstrap_workers;      /* Stage 2: Find_node workers for bootstrap (default: 10) */
     int num_find_node_workers;      /* Continuous find_node workers (default: 30) */
@@ -114,6 +122,8 @@ typedef struct thread_tree {
     void *peers_queue;             /* Private peers queue */
     void *socket;                  /* Private UDP socket (tree_socket_t*) */
     struct tree_dispatcher *dispatcher;  /* UDP response dispatcher */
+    bool owns_socket;              /* true = destroy socket on cleanup */
+    bool owns_dispatcher;          /* true = destroy dispatcher on cleanup */
 
     /* Shared resources (from supervisor) */
     struct bloom_filter *shared_bloom;     /* Stage 3: Shared bloom filter (thread-safe) */

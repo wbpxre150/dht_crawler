@@ -7,6 +7,7 @@
 #include "shared_node_pool.h"
 #include "bep51_cache.h"
 #include "tree_socket.h"
+#include "tree_dispatcher.h"
 #include "tree_protocol.h"
 #include "tree_routing.h"
 #include "wbpxre_dht.h"
@@ -59,6 +60,8 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->failure_bloom = NULL;  /* Will be initialized during start */
     sup->failure_bloom_path = "data/failure_bloom.dat";
     sup->shared_node_pool = NULL;  /* Will be created during bootstrap */
+    sup->shared_socket = NULL;     /* Will be created if dht_port > 0 */
+    sup->shared_dispatcher = NULL; /* Will be created if dht_port > 0 */
 
     /* Store bloom filter configuration */
     sup->failure_bloom_capacity = config->failure_bloom_capacity > 0 ? config->failure_bloom_capacity : 30000000;
@@ -183,7 +186,10 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .bloom_filter = sup->bloom_filter,
         .failure_bloom = sup->failure_bloom,
         .supervisor_ctx = sup,
-        .on_shutdown = supervisor_on_tree_shutdown
+        .on_shutdown = supervisor_on_tree_shutdown,
+        /* Shared socket/dispatcher from supervisor (NULL = create private) */
+        .shared_socket = sup->shared_socket,
+        .shared_dispatcher = sup->shared_dispatcher
     };
 
     uint32_t tree_id = sup->next_tree_id++;
@@ -582,6 +588,44 @@ void supervisor_start(supervisor_t *sup) {
     size_t nodes_collected = shared_node_pool_get_count(sup->shared_node_pool);
     log_msg(LOG_DEBUG, "[supervisor] Bootstrap finished: %zu nodes available", nodes_collected);
 
+    /* Create shared socket and dispatcher when using fixed port */
+    if (sup->dht_port > 0) {
+        sup->shared_socket = tree_socket_create(sup->dht_port);
+        if (!sup->shared_socket) {
+            log_msg(LOG_ERROR, "[supervisor] Failed to create shared socket on port %d", sup->dht_port);
+            bloom_filter_cleanup(sup->failure_bloom);
+            bep51_cache_destroy(sup->bep51_cache);
+            shared_node_pool_destroy(sup->shared_node_pool);
+            return;
+        }
+
+        sup->shared_dispatcher = tree_dispatcher_create(NULL, sup->shared_socket);
+        if (!sup->shared_dispatcher) {
+            log_msg(LOG_ERROR, "[supervisor] Failed to create shared dispatcher");
+            tree_socket_destroy(sup->shared_socket);
+            sup->shared_socket = NULL;
+            bloom_filter_cleanup(sup->failure_bloom);
+            bep51_cache_destroy(sup->bep51_cache);
+            shared_node_pool_destroy(sup->shared_node_pool);
+            return;
+        }
+
+        if (tree_dispatcher_start(sup->shared_dispatcher) != 0) {
+            log_msg(LOG_ERROR, "[supervisor] Failed to start shared dispatcher");
+            tree_dispatcher_destroy(sup->shared_dispatcher);
+            tree_socket_destroy(sup->shared_socket);
+            sup->shared_socket = NULL;
+            sup->shared_dispatcher = NULL;
+            bloom_filter_cleanup(sup->failure_bloom);
+            bep51_cache_destroy(sup->bep51_cache);
+            shared_node_pool_destroy(sup->shared_node_pool);
+            return;
+        }
+
+        log_msg(LOG_INFO, "[supervisor] Shared socket/dispatcher ready on port %d",
+                tree_socket_get_port(sup->shared_socket));
+    }
+
     pthread_mutex_lock(&sup->trees_lock);
 
     /* Spawn all trees (they will sample from the shared pool) */
@@ -678,6 +722,13 @@ void supervisor_stop(supervisor_t *sup) {
         log_msg(LOG_DEBUG, "[supervisor] Tree destroyed");
     }
 
+    /* Stop shared dispatcher AFTER all trees are destroyed */
+    if (sup->shared_dispatcher) {
+        log_msg(LOG_DEBUG, "[supervisor] Stopping shared dispatcher...");
+        tree_dispatcher_stop(sup->shared_dispatcher);
+        log_msg(LOG_DEBUG, "[supervisor] Shared dispatcher stopped");
+    }
+
     log_msg(LOG_DEBUG, "[supervisor] Stopped");
 }
 
@@ -721,6 +772,16 @@ void supervisor_destroy(supervisor_t *sup) {
     if (sup->shared_node_pool) {
         shared_node_pool_destroy(sup->shared_node_pool);
         sup->shared_node_pool = NULL;
+    }
+
+    /* Cleanup shared dispatcher and socket */
+    if (sup->shared_dispatcher) {
+        tree_dispatcher_destroy(sup->shared_dispatcher);
+        sup->shared_dispatcher = NULL;
+    }
+    if (sup->shared_socket) {
+        tree_socket_destroy(sup->shared_socket);
+        sup->shared_socket = NULL;
     }
 
     pthread_mutex_destroy(&sup->trees_lock);

@@ -24,9 +24,10 @@ static void *dispatcher_thread_func(void *arg) {
     int sock_fd = sock ? sock->fd : -1;
     int sock_port = tree_socket_get_port(sock);
     uint32_t tree_id = dispatcher->tree ? dispatcher->tree->tree_id : 0;
+    const char *prefix = dispatcher->tree ? "" : "shared ";
 
-    log_msg(LOG_DEBUG, "[tree %u] ===== DISPATCHER THREAD STARTED ===== (socket_fd=%d, port=%d)",
-            tree_id, sock_fd, sock_port);
+    log_msg(LOG_DEBUG, "[%stree %u] ===== DISPATCHER THREAD STARTED ===== (socket_fd=%d, port=%d)",
+            prefix, tree_id, sock_fd, sock_port);
 
     time_t last_cleanup = time(NULL);
     time_t last_stats = time(NULL);
@@ -49,8 +50,8 @@ static void *dispatcher_thread_func(void *arg) {
 
             /* DEBUG: Log periodic timeout info */
             if (timeout_count % 100 == 1) {
-                log_msg(LOG_DEBUG, "[tree %u] Dispatcher: %lu consecutive timeouts (recv_len=%d, errno=%d)",
-                        tree_id, timeout_count, recv_len, errno);
+                log_msg(LOG_DEBUG, "[%stree %u] Dispatcher: %lu consecutive timeouts (recv_len=%d, errno=%d)",
+                        prefix, tree_id, timeout_count, recv_len, errno);
             }
 
             /* Timeout or error - check for cleanup */
@@ -58,8 +59,8 @@ static void *dispatcher_thread_func(void *arg) {
             if (now - last_cleanup >= CLEANUP_INTERVAL) {
                 int removed = tree_dispatcher_cleanup_stale_tids(dispatcher, TID_TIMEOUT);
                 if (removed > 0) {
-                    log_msg(LOG_DEBUG, "[tree %u] Dispatcher cleaned up %d stale TID registrations",
-                            tree_id, removed);
+                    log_msg(LOG_DEBUG, "[%stree %u] Dispatcher cleaned up %d stale TID registrations",
+                            prefix, tree_id, removed);
                 }
                 last_cleanup = now;
             }
@@ -71,8 +72,8 @@ static void *dispatcher_thread_func(void *arg) {
                 unsigned long dropped = atomic_load(&dispatcher->dropped_responses);
                 unsigned long queue_full = atomic_load(&dispatcher->queue_full_drops);
 
-                log_msg(LOG_DEBUG, "[tree %u] DISPATCHER STATS: loops=%lu, timeouts=%lu, packets=%lu, routed=%lu, dropped=%lu, queue_full=%lu",
-                        tree_id, loop_count, timeout_count, total, routed, dropped, queue_full);
+                log_msg(LOG_DEBUG, "[%stree %u] DISPATCHER STATS: loops=%lu, timeouts=%lu, packets=%lu, routed=%lu, dropped=%lu, queue_full=%lu",
+                        prefix, tree_id, loop_count, timeout_count, total, routed, dropped, queue_full);
                 last_stats = now;
             }
 
@@ -89,8 +90,8 @@ static void *dispatcher_thread_func(void *arg) {
             from_port = ntohs(sin->sin_port);
         }
 
-        log_msg(LOG_DEBUG, "[tree %u] Dispatcher RECEIVED packet: len=%d, from=%s:%u",
-                tree_id, recv_len, from_ip, from_port);
+        log_msg(LOG_DEBUG, "[%stree %u] Dispatcher RECEIVED packet: len=%d, from=%s:%u",
+                prefix, tree_id, recv_len, from_ip, from_port);
 
         atomic_fetch_add(&dispatcher->total_responses, 1);
 
@@ -99,15 +100,15 @@ static void *dispatcher_thread_func(void *arg) {
         int tid_len;
         if (tree_protocol_extract_tid(recv_buf, recv_len, tid, &tid_len) != 0) {
             /* Failed to extract TID - might be malformed packet or query (not response) */
-            log_msg(LOG_DEBUG, "[tree %u] Dispatcher: Failed to extract TID from packet (len=%d)",
-                    tree_id, recv_len);
+            log_msg(LOG_DEBUG, "[%stree %u] Dispatcher: Failed to extract TID from packet (len=%d)",
+                    prefix, tree_id, recv_len);
             atomic_fetch_add(&dispatcher->dropped_responses, 1);
             continue;
         }
 
         /* DEBUG: Log TID extraction success */
-        log_msg(LOG_DEBUG, "[tree %u] Dispatcher: Extracted TID (len=%d): %02x %02x %02x",
-                tree_id, tid_len, tid[0], tid[1], tid[2]);
+        log_msg(LOG_DEBUG, "[%stree %u] Dispatcher: Extracted TID (len=%d): %02x %02x %02x",
+                prefix, tree_id, tid_len, tid[0], tid[1], tid[2]);
 
         /* Find response queue for this TID using uthash O(1) lookup */
         pthread_rwlock_rdlock(&dispatcher->tid_map_lock);
@@ -125,15 +126,15 @@ static void *dispatcher_thread_func(void *arg) {
 
         if (!target_queue) {
             /* No registered worker for this TID - might be response to old query */
-            log_msg(LOG_DEBUG, "[tree %u] Dispatcher: No registered worker for TID %02x%02x%02x",
-                    tree_id, tid[0], tid[1], tid[2]);
+            log_msg(LOG_DEBUG, "[%stree %u] Dispatcher: No registered worker for TID %02x%02x%02x",
+                    prefix, tree_id, tid[0], tid[1], tid[2]);
             atomic_fetch_add(&dispatcher->dropped_responses, 1);
             continue;
         }
 
         /* DEBUG: Successfully found target queue */
-        log_msg(LOG_DEBUG, "[tree %u] Dispatcher: Routing to worker queue (TID=%02x%02x%02x)",
-                tree_id, tid[0], tid[1], tid[2]);
+        log_msg(LOG_DEBUG, "[%stree %u] Dispatcher: Routing to worker queue (TID=%02x%02x%02x)",
+                prefix, tree_id, tid[0], tid[1], tid[2]);
 
         /* Route response to worker queue */
         tree_response_t response;
@@ -146,18 +147,18 @@ static void *dispatcher_thread_func(void *arg) {
 
         if (tree_response_queue_try_push(target_queue, &response) == 0) {
             atomic_fetch_add(&dispatcher->routed_responses, 1);
-            log_msg(LOG_DEBUG, "[tree %u] Dispatcher: Successfully routed response to worker",
-                    tree_id);
+            log_msg(LOG_DEBUG, "[%stree %u] Dispatcher: Successfully routed response to worker",
+                    prefix, tree_id);
         } else {
             /* Worker queue full - drop response */
-            log_msg(LOG_WARN, "[tree %u] Dispatcher: Worker queue FULL, dropping response",
-                    tree_id);
+            log_msg(LOG_WARN, "[%stree %u] Dispatcher: Worker queue FULL, dropping response",
+                    prefix, tree_id);
             atomic_fetch_add(&dispatcher->queue_full_drops, 1);
         }
     }
 
-    log_msg(LOG_DEBUG, "[tree %u] Dispatcher thread exiting (total=%lu, routed=%lu, dropped=%lu, queue_full=%lu)",
-            dispatcher->tree ? dispatcher->tree->tree_id : 0,
+    log_msg(LOG_DEBUG, "[%stree %u] Dispatcher thread exiting (total=%lu, routed=%lu, dropped=%lu, queue_full=%lu)",
+            prefix, tree_id,
             (unsigned long)atomic_load(&dispatcher->total_responses),
             (unsigned long)atomic_load(&dispatcher->routed_responses),
             (unsigned long)atomic_load(&dispatcher->dropped_responses),
@@ -167,14 +168,16 @@ static void *dispatcher_thread_func(void *arg) {
 }
 
 tree_dispatcher_t *tree_dispatcher_create(struct thread_tree *tree, tree_socket_t *socket) {
-    if (!tree || !socket) {
-        log_msg(LOG_ERROR, "[dispatcher] Invalid arguments to create");
+    /* Socket required, tree can be NULL for shared dispatcher */
+    if (!socket) {
+        log_msg(LOG_ERROR, "[dispatcher] NULL socket");
         return NULL;
     }
 
     tree_dispatcher_t *dispatcher = calloc(1, sizeof(tree_dispatcher_t));
     if (!dispatcher) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to allocate dispatcher", tree->tree_id);
+        log_msg(LOG_ERROR, "[%sdispatcher] Failed to allocate dispatcher",
+                tree ? "" : "shared ");
         return NULL;
     }
 
@@ -185,7 +188,8 @@ tree_dispatcher_t *tree_dispatcher_create(struct thread_tree *tree, tree_socket_
     dispatcher->tid_map_head = NULL;  /* uthash: NULL = empty hash table */
 
     if (pthread_rwlock_init(&dispatcher->tid_map_lock, NULL) != 0) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to init TID map lock", tree->tree_id);
+        log_msg(LOG_ERROR, "[%sdispatcher] Failed to init TID map lock",
+                tree ? "" : "shared ");
         free(dispatcher);
         return NULL;
     }
@@ -196,7 +200,11 @@ tree_dispatcher_t *tree_dispatcher_create(struct thread_tree *tree, tree_socket_
     atomic_store(&dispatcher->dropped_responses, 0);
     atomic_store(&dispatcher->queue_full_drops, 0);
 
-    log_msg(LOG_DEBUG, "[tree %u] Dispatcher created", tree->tree_id);
+    if (tree) {
+        log_msg(LOG_DEBUG, "[tree %u] Dispatcher created", tree->tree_id);
+    } else {
+        log_msg(LOG_DEBUG, "[shared dispatcher] Created");
+    }
 
     return dispatcher;
 }
