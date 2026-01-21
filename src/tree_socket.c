@@ -41,16 +41,38 @@ tree_socket_t *tree_socket_create(int port) {
     int sndbuf = 2 * 1024 * 1024;  /* 2MB send buffer */
     if (setsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
         log_msg(LOG_WARN, "[tree_socket] Failed to set SO_SNDBUF to %d: %s", sndbuf, strerror(errno));
-    } else {
-        log_msg(LOG_DEBUG, "[tree_socket] Set SO_SNDBUF to %d bytes", sndbuf);
+    }
+    /* Verify actual buffer size granted (OS may cap it) */
+    int actual_sndbuf = 0;
+    socklen_t optlen = sizeof(actual_sndbuf);
+    if (getsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &optlen) == 0) {
+        if (actual_sndbuf < 262144) {  /* Warn if less than 256KB */
+            log_msg(LOG_WARN, "[tree_socket] SO_SNDBUF too small: requested %d, got %d. "
+                    "On FreeBSD run: sysctl net.inet.udp.sendspace=2097152",
+                    sndbuf, actual_sndbuf);
+        } else {
+            log_msg(LOG_DEBUG, "[tree_socket] SO_SNDBUF: requested %d, actual %d bytes",
+                    sndbuf, actual_sndbuf);
+        }
     }
 
     /* Increase receive buffer for better reception */
     int rcvbuf = 2 * 1024 * 1024;  /* 2MB receive buffer */
     if (setsockopt(sock->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
         log_msg(LOG_WARN, "[tree_socket] Failed to set SO_RCVBUF to %d: %s", rcvbuf, strerror(errno));
-    } else {
-        log_msg(LOG_DEBUG, "[tree_socket] Set SO_RCVBUF to %d bytes", rcvbuf);
+    }
+    /* Verify actual receive buffer size granted */
+    int actual_rcvbuf = 0;
+    optlen = sizeof(actual_rcvbuf);
+    if (getsockopt(sock->fd, SOL_SOCKET, SO_RCVBUF, &actual_rcvbuf, &optlen) == 0) {
+        if (actual_rcvbuf < 262144) {  /* Warn if less than 256KB */
+            log_msg(LOG_WARN, "[tree_socket] SO_RCVBUF too small: requested %d, got %d. "
+                    "On FreeBSD run: sysctl net.inet.udp.recvspace=2097152",
+                    rcvbuf, actual_rcvbuf);
+        } else {
+            log_msg(LOG_DEBUG, "[tree_socket] SO_RCVBUF: requested %d, actual %d bytes",
+                    rcvbuf, actual_rcvbuf);
+        }
     }
 
     /* Bind to address */

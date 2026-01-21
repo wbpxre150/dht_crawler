@@ -26,10 +26,13 @@
 
 /* Generate random node ID for DHT identity */
 static void generate_random_node_id(uint8_t *node_id) {
-    /* Seed with time and random */
-    srand((unsigned int)(time(NULL) ^ (uintptr_t)node_id));
-    for (int i = 0; i < 20; i++) {
-        node_id[i] = (uint8_t)(rand() % 256);
+    /* Use /dev/urandom for cryptographically strong randomness.
+     * This is critical when creating many trees rapidly - rand() seeded with
+     * time(NULL) would give identical node IDs to trees created in the same second. */
+    FILE *urandom = fopen("/dev/urandom", "rb");
+    if (urandom) {
+        fread(node_id, 1, 20, urandom);
+        fclose(urandom);
     }
 }
 
