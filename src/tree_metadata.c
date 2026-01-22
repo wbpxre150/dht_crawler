@@ -883,6 +883,11 @@ void *tree_metadata_worker_func(void *arg) {
             metadata = tree_fetch_metadata_from_peer(entry.infohash, &entry.peers[i], &config);
         }
 
+        /* Exit worker loop immediately on supervisor shutdown */
+        if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
+            break;
+        }
+
         /* Handle failure with two-strike bloom filtering */
         if (!metadata && tree->failure_bloom && tree->shared_bloom) {
             /* All peers exhausted - apply two-strike logic */
