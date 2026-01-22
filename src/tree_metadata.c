@@ -871,12 +871,15 @@ void *tree_metadata_worker_func(void *arg) {
         atomic_fetch_add(&tree->metadata_attempts, 1);
 
         /* Try each peer until metadata fetched
-         * IMPORTANT: Do NOT check shutdown_requested here - once we've dequeued
-         * an infohash, we must try ALL peers before giving up. Otherwise the
-         * infohash is lost when the tree respawns. The outer while loop will
-         * exit after this infohash is fully processed. */
+         * For RATE-BASED shutdowns (respawn): try ALL peers before giving up,
+         * so the infohash isn't lost when the tree respawns.
+         * For SUPERVISOR shutdowns (program exit): break immediately for fast exit. */
         tree_torrent_metadata_t *metadata = NULL;
         for (int i = 0; i < entry.peer_count && !metadata; i++) {
+            /* Allow immediate exit during program shutdown (Ctrl+C) */
+            if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
+                break;
+            }
             metadata = tree_fetch_metadata_from_peer(entry.infohash, &entry.peers[i], &config);
         }
 
