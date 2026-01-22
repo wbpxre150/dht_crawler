@@ -943,11 +943,11 @@ shutdown:
     log_msg(LOG_DEBUG, "[tree %u] Bootstrap thread exiting (final: %d nodes)",
             tree->tree_id, tree->routing_table ? tree_routing_get_count(tree->routing_table) : 0);
 
-    /* Notify supervisor of shutdown completion
-     * Only for voluntary shutdowns (rate-based), not supervisor-requested shutdowns
-     * to avoid deadlock on trees_lock during global shutdown */
-    if (tree->on_shutdown && tree->shutdown_reason == SHUTDOWN_REASON_RATE_BASED) {
-        tree->on_shutdown(tree);
+    /* Signal supervisor to respawn this tree (deferred destruction)
+     * Only for voluntary shutdowns (rate-based), not supervisor-requested shutdowns.
+     * The monitor thread will handle destruction asynchronously to avoid self-join deadlock. */
+    if (tree->shutdown_reason == SHUTDOWN_REASON_RATE_BASED) {
+        atomic_store(&tree->needs_respawn, true);
     }
 
     return NULL;
@@ -1015,6 +1015,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->current_phase, TREE_PHASE_BOOTSTRAP);
     tree->shutdown_reason = SHUTDOWN_REASON_NONE;
     atomic_store(&tree->shutdown_requested, false);
+    atomic_store(&tree->needs_respawn, false);
 
     /* Initialize discovery throttling (find_node + BEP51) */
     atomic_store(&tree->discovery_paused, false);

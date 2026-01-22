@@ -800,68 +800,13 @@ void supervisor_destroy(supervisor_t *sup) {
 }
 
 void supervisor_on_tree_shutdown(thread_tree_t *tree) {
-    if (!tree || !tree->supervisor_ctx) {
+    if (!tree) {
         return;
     }
-
-    supervisor_t *sup = (supervisor_t *)tree->supervisor_ctx;
-
-    log_msg(LOG_DEBUG, "[supervisor] Tree %u signaled shutdown", tree->tree_id);
-
-    pthread_mutex_lock(&sup->trees_lock);
-
-    /* Find and remove the tree */
-    int slot = -1;
-    for (int i = 0; i < sup->max_trees; i++) {
-        if (sup->trees[i] == tree) {
-            slot = i;
-            break;
-        }
-    }
-
-    if (slot >= 0) {
-        /* Save reference to old tree for perturbation */
-        thread_tree_t *old_tree = sup->trees[slot];
-
-        /* Accumulate statistics from this tree before destroying it */
-        uint64_t tree_metadata = atomic_load(&old_tree->metadata_count);
-        uint64_t tree_first_strike = atomic_load(&old_tree->first_strike_failures);
-        uint64_t tree_second_strike = atomic_load(&old_tree->second_strike_failures);
-        uint64_t tree_filtered = atomic_load(&old_tree->filtered_count);
-
-        atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
-        atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
-        atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
-        atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
-
-        log_msg(LOG_DEBUG, "[supervisor] Tree %u final stats: metadata=%lu, first_strike=%lu, second_strike=%lu, filtered=%lu",
-                old_tree->tree_id, (unsigned long)tree_metadata, (unsigned long)tree_first_strike,
-                (unsigned long)tree_second_strike, (unsigned long)tree_filtered);
-
-        /* Spawn replacement BEFORE destroying old tree (so we can perturb its node ID) */
-        thread_tree_t *new_tree = NULL;
-        if (sup->monitor_running) {
-            log_msg(LOG_DEBUG, "[supervisor] Spawning replacement tree for slot %d", slot);
-            new_tree = spawn_tree(sup, slot, old_tree);  /* Pass old_tree for perturbation */
-        }
-
-        /* CRITICAL FIX: Remove from array FIRST, before destroying
-         * This prevents monitor thread from accessing freed memory */
-        sup->trees[slot] = NULL;
-        sup->active_trees--;
-
-        /* Now safe to destroy - no other thread can access it */
-        thread_tree_destroy(old_tree);
-
-        /* Start new tree if we created one */
-        if (new_tree) {
-            sup->trees[slot] = new_tree;
-            thread_tree_start(new_tree);
-            sup->active_trees++;
-        }
-    }
-
-    pthread_mutex_unlock(&sup->trees_lock);
+    /* Just mark for respawn - monitor thread handles destruction asynchronously.
+     * This avoids the self-join deadlock that occurred when we tried to destroy
+     * the tree (and join bootstrap_thread) from within the bootstrap thread itself. */
+    atomic_store(&tree->needs_respawn, true);
 }
 
 static void *monitor_thread_func(void *arg) {
@@ -900,6 +845,51 @@ static void *monitor_thread_func(void *arg) {
                         i, tree_id);
                 sup->trees[i] = NULL;  /* Clean up corruption */
                 continue;
+            }
+
+            /* Check if tree needs respawn (deferred destruction) */
+            if (atomic_load(&tree->needs_respawn)) {
+                log_msg(LOG_DEBUG, "[supervisor] Tree %u marked for respawn - processing", tree_id);
+
+                /* Accumulate statistics from dying tree */
+                uint64_t tree_metadata = atomic_load(&tree->metadata_count);
+                uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
+                uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
+                uint64_t tree_filtered = atomic_load(&tree->filtered_count);
+
+                atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
+                atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
+                atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
+                atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
+
+                log_msg(LOG_DEBUG, "[supervisor] Tree %u final stats: metadata=%lu, first_strike=%lu, second_strike=%lu, filtered=%lu",
+                        tree_id, (unsigned long)tree_metadata, (unsigned long)tree_first_strike,
+                        (unsigned long)tree_second_strike, (unsigned long)tree_filtered);
+
+                /* Spawn replacement tree BEFORE destroying (to perturb node ID) */
+                thread_tree_t *new_tree = spawn_tree(sup, i, tree);
+
+                /* Remove old tree from array FIRST */
+                sup->trees[i] = NULL;
+                sup->active_trees--;
+
+                /* Release lock during destruction (pthread_join can block) */
+                pthread_mutex_unlock(&sup->trees_lock);
+
+                thread_tree_destroy(tree);
+
+                /* Re-acquire lock to add new tree */
+                pthread_mutex_lock(&sup->trees_lock);
+
+                if (new_tree) {
+                    sup->trees[i] = new_tree;
+                    thread_tree_start(new_tree);
+                    sup->active_trees++;
+                    log_msg(LOG_DEBUG, "[supervisor] Replacement tree %u started in slot %d",
+                            new_tree->tree_id, i);
+                }
+
+                continue;  /* Skip normal processing for this slot */
             }
 
             /* Copy values we need while holding lock to minimize window for corruption */
