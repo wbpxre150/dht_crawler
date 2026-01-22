@@ -36,6 +36,26 @@ static void generate_random_node_id(uint8_t *node_id) {
     }
 }
 
+/* Generate random double in range [min, max] using /dev/urandom.
+ * Uses /dev/urandom for thread-safe, high-quality randomness without seeding.
+ * Returns midpoint as fallback if /dev/urandom unavailable. */
+static double get_random_double(double min, double max) {
+    uint32_t random_val;
+    FILE *urandom = fopen("/dev/urandom", "rb");
+    if (urandom) {
+        if (fread(&random_val, sizeof(random_val), 1, urandom) == 1) {
+            fclose(urandom);
+            /* Normalize to [0.0, 1.0] then scale to [min, max] */
+            double normalized = (double)random_val / (double)UINT32_MAX;
+            return min + (normalized * (max - min));
+        }
+        fclose(urandom);
+    }
+    /* Fallback: return midpoint if /dev/urandom unavailable */
+    log_msg(LOG_WARN, "Failed to read /dev/urandom, using non-randomized value");
+    return (min + max) / 2.0;
+}
+
 const char *thread_tree_phase_name(tree_phase_t phase) {
     switch (phase) {
         case TREE_PHASE_BOOTSTRAP:     return "BOOTSTRAP";
@@ -1067,9 +1087,26 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Metadata rate-based respawn configuration */
     tree->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
+
+    /* Keep rate check interval fixed for consistent rate calculations */
     tree->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 60;
-    tree->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
-    tree->min_lifetime_sec = (config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10) * 60;
+
+    /* Randomize grace period (±25%) to prevent synchronized shutdowns */
+    int base_grace_period = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
+    double min_grace = base_grace_period * 0.75;
+    double max_grace = base_grace_period * 1.25;
+    tree->rate_grace_period_sec = (int)get_random_double(min_grace, max_grace);
+
+    /* Randomize minimum lifetime (±33%) to prevent synchronized respawning */
+    int base_lifetime_sec = (config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10) * 60;
+    double min_lifetime = base_lifetime_sec * 0.67;
+    double max_lifetime = base_lifetime_sec * 1.33;
+    tree->min_lifetime_sec = (int)get_random_double(min_lifetime, max_lifetime);
+
+    log_msg(LOG_DEBUG, "[tree %u] Randomized grace period: %ds (base: %ds), min lifetime: %ds (base: %ds)",
+            tree_id, tree->rate_grace_period_sec, base_grace_period,
+            tree->min_lifetime_sec, base_lifetime_sec);
+
     tree->require_empty_queue = config->require_empty_queue;
 
     /* Porn filter configuration */
