@@ -122,6 +122,11 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_min_lifetime_minutes = 10;            /* 10 minute minimum lifetime */
     config->tree_require_empty_queue = 1;              /* Require empty queue before respawn */
 
+    /* Tree respawn overlapping defaults */
+    config->respawn_spawn_threshold = 50;              /* Spawn replacement at 50 connections */
+    config->respawn_drain_timeout_sec = 120;           /* Force destroy after 120 seconds */
+    config->max_draining_trees = 8;                    /* Max 8 draining trees simultaneously */
+
     /* Thread tree mode toggle - disabled by default for safety */
     config->use_thread_trees = 0;                   /* 0=old architecture */
 
@@ -414,6 +419,18 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (config->tree_min_lifetime_minutes < 0) config->tree_min_lifetime_minutes = 0;
         } else if (strcmp(key, "tree_require_empty_queue") == 0) {
             config->tree_require_empty_queue = atoi(value);
+        }
+        /* Tree respawn overlapping configuration */
+        else if (strcmp(key, "respawn_spawn_threshold") == 0) {
+            config->respawn_spawn_threshold = atoi(value);
+            if (config->respawn_spawn_threshold < 0) config->respawn_spawn_threshold = 0;
+        } else if (strcmp(key, "respawn_drain_timeout_sec") == 0) {
+            config->respawn_drain_timeout_sec = atoi(value);
+            if (config->respawn_drain_timeout_sec < 10) config->respawn_drain_timeout_sec = 10;  /* Minimum 10s */
+        } else if (strcmp(key, "max_draining_trees") == 0) {
+            config->max_draining_trees = atoi(value);
+            if (config->max_draining_trees < 1) config->max_draining_trees = 1;
+            if (config->max_draining_trees > 32) config->max_draining_trees = 32;  /* Can't drain more than total trees */
         }
         /* Thread tree mode toggle */
         else if (strcmp(key, "use_thread_trees") == 0) {

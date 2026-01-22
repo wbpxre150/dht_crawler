@@ -114,6 +114,11 @@ typedef struct {
     int tree_min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
     int tree_require_empty_queue;           /* Only respawn if queue empty (default: 1) */
 
+    /* Tree respawn overlapping configuration */
+    int respawn_spawn_threshold;            /* Spawn replacement when connections drop below this (default: 50) */
+    int respawn_drain_timeout_sec;          /* Force destroy draining tree after this timeout (default: 120) */
+    int max_draining_trees;                 /* Maximum trees allowed in draining state (default: 8) */
+
     /* Thread tree mode toggle */
     int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
 

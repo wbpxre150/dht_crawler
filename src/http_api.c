@@ -459,6 +459,14 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(supervisor_json, "total_metadata_fetched", (double)total_metadata);
         cJSON_AddNumberToObject(supervisor_json, "first_strike_failures", (double)first_strike_failures);
         cJSON_AddNumberToObject(supervisor_json, "second_strike_failures", (double)second_strike_failures);
+
+        /* Add draining tree statistics */
+        int draining_count = 0, draining_max = 0, draining_connections = 0;
+        supervisor_get_draining_stats(api->supervisor, &draining_count, &draining_max, &draining_connections);
+        cJSON_AddNumberToObject(supervisor_json, "draining_trees_count", draining_count);
+        cJSON_AddNumberToObject(supervisor_json, "draining_trees_max", draining_max);
+        cJSON_AddNumberToObject(supervisor_json, "draining_trees_connections", draining_connections);
+
         cJSON_AddItemToObject(root, "supervisor", supervisor_json);
 
         /* BEP51 cache global stats */

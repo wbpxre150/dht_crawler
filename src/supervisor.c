@@ -136,8 +136,33 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
-    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_target=%d",
-            sup->max_trees, sup->global_bootstrap_target);
+    /* Store respawn overlapping configuration */
+    sup->respawn_spawn_threshold = config->respawn_spawn_threshold >= 0 ? config->respawn_spawn_threshold : 50;
+    sup->respawn_drain_timeout_sec = config->respawn_drain_timeout_sec > 0 ? config->respawn_drain_timeout_sec : 120;
+    sup->max_draining_trees = config->max_draining_trees > 0 ? config->max_draining_trees : 8;
+
+    /* Allocate draining trees array */
+    sup->draining_trees = calloc(sup->max_draining_trees, sizeof(draining_tree_t));
+    if (!sup->draining_trees) {
+        log_msg(LOG_ERROR, "[supervisor] Failed to allocate draining trees array");
+        free(sup->trees);
+        pthread_mutex_destroy(&sup->trees_lock);
+        free(sup);
+        return NULL;
+    }
+    sup->draining_count = 0;
+    if (pthread_mutex_init(&sup->draining_lock, NULL) != 0) {
+        log_msg(LOG_ERROR, "[supervisor] Failed to init draining_lock mutex");
+        free(sup->draining_trees);
+        free(sup->trees);
+        pthread_mutex_destroy(&sup->trees_lock);
+        free(sup);
+        return NULL;
+    }
+
+    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_target=%d, draining_slots=%d, spawn_threshold=%d, drain_timeout=%ds",
+            sup->max_trees, sup->global_bootstrap_target, sup->max_draining_trees,
+            sup->respawn_spawn_threshold, sup->respawn_drain_timeout_sec);
 
     return sup;
 }
@@ -227,6 +252,112 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
     }
 
     return tree;
+}
+
+/**
+ * Move a tree from active array to draining list
+ * Caller must hold trees_lock
+ * Returns 0 on success, -1 if draining slots full
+ */
+static int move_to_draining(supervisor_t *sup, int slot_index) {
+    thread_tree_t *tree = sup->trees[slot_index];
+    if (!tree) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&sup->draining_lock);
+
+    /* Check if draining slots available */
+    if (sup->draining_count >= sup->max_draining_trees) {
+        pthread_mutex_unlock(&sup->draining_lock);
+        log_msg(LOG_WARN, "[tree %u] Cannot move to draining: %d/%d slots full",
+                tree->tree_id, sup->draining_count, sup->max_draining_trees);
+        return -1;
+    }
+
+    /* Add to draining list */
+    sup->draining_trees[sup->draining_count].tree = tree;
+    sup->draining_trees[sup->draining_count].drain_start_time = time(NULL);
+    sup->draining_trees[sup->draining_count].original_slot = slot_index;
+    sup->draining_count++;
+
+    pthread_mutex_unlock(&sup->draining_lock);
+
+    /* Clear from active array */
+    sup->trees[slot_index] = NULL;
+    sup->active_trees--;
+
+    log_msg(LOG_INFO, "[tree %u] Moved to draining list (slot %d, draining=%d/%d, active_connections=%d)",
+            tree->tree_id, slot_index, sup->draining_count, sup->max_draining_trees,
+            (int)atomic_load(&tree->active_connections));
+
+    return 0;
+}
+
+/**
+ * Monitor draining trees and destroy when ready
+ * Called from monitor thread
+ */
+static void monitor_draining_trees(supervisor_t *sup) {
+    pthread_mutex_lock(&sup->draining_lock);
+
+    /* Check each draining tree */
+    for (int i = 0; i < sup->draining_count; i++) {
+        draining_tree_t *dt = &sup->draining_trees[i];
+        if (!dt->tree) {
+            continue;
+        }
+
+        int active_conns = atomic_load(&dt->tree->active_connections);
+        time_t now = time(NULL);
+        double drain_time = difftime(now, dt->drain_start_time);
+
+        bool should_destroy = false;
+        const char *reason = NULL;
+
+        /* Check destroy conditions */
+        if (active_conns == 0) {
+            should_destroy = true;
+            reason = "all connections drained";
+        } else if (drain_time >= sup->respawn_drain_timeout_sec) {
+            should_destroy = true;
+            reason = "drain timeout expired";
+        }
+
+        if (should_destroy) {
+            log_msg(LOG_INFO, "[tree %u] Destroying draining tree (reason: %s, drain_time=%.0fs, final_connections=%d)",
+                    dt->tree->tree_id, reason, drain_time, active_conns);
+
+            /* Get stats before destruction */
+            uint64_t metadata_count = atomic_load(&dt->tree->metadata_count);
+
+            /* Release lock before blocking destruction */
+            pthread_mutex_unlock(&sup->draining_lock);
+
+            /* Destroy tree (may block briefly on pthread_join) */
+            thread_tree_destroy(dt->tree);
+
+            /* Re-acquire lock and remove from list */
+            pthread_mutex_lock(&sup->draining_lock);
+
+            /* Shift remaining draining trees down */
+            for (int j = i; j < sup->draining_count - 1; j++) {
+                sup->draining_trees[j] = sup->draining_trees[j + 1];
+            }
+            sup->draining_count--;
+
+            /* Clear last slot */
+            memset(&sup->draining_trees[sup->draining_count], 0, sizeof(draining_tree_t));
+
+            log_msg(LOG_DEBUG, "Draining tree destroyed (metadata_count=%lu, remaining_draining=%d)",
+                    (unsigned long)metadata_count, sup->draining_count);
+
+            /* Adjust loop counter since we shifted array */
+            i--;
+        }
+    }
+
+    pthread_mutex_unlock(&sup->draining_lock);
 }
 
 /* Helper: resolve hostname to sockaddr_storage */
@@ -792,6 +923,21 @@ void supervisor_destroy(supervisor_t *sup) {
         sup->shared_socket = NULL;
     }
 
+    /* Destroy any remaining draining trees */
+    if (sup->draining_trees) {
+        pthread_mutex_lock(&sup->draining_lock);
+        for (int i = 0; i < sup->draining_count; i++) {
+            if (sup->draining_trees[i].tree) {
+                log_msg(LOG_WARN, "[supervisor] Destroying draining tree %u (slot %d) during supervisor cleanup",
+                        sup->draining_trees[i].tree->tree_id, sup->draining_trees[i].original_slot);
+                thread_tree_destroy(sup->draining_trees[i].tree);
+            }
+        }
+        pthread_mutex_unlock(&sup->draining_lock);
+        pthread_mutex_destroy(&sup->draining_lock);
+        free(sup->draining_trees);
+    }
+
     pthread_mutex_destroy(&sup->trees_lock);
     free(sup->trees);
     free(sup);
@@ -847,50 +993,83 @@ static void *monitor_thread_func(void *arg) {
                 continue;
             }
 
-            /* Check if tree needs respawn (deferred destruction) */
+            /* Check if tree needs respawn with overlapped spawning */
             if (atomic_load(&tree->needs_respawn)) {
-                log_msg(LOG_DEBUG, "[supervisor] Tree %u marked for respawn - processing", tree_id);
+                /* Check THIS specific tree's active connections (not global aggregate) */
+                int this_tree_active_conns = atomic_load(&tree->active_connections);
 
-                /* Accumulate statistics from dying tree */
-                uint64_t tree_metadata = atomic_load(&tree->metadata_count);
-                uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
-                uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
-                uint64_t tree_filtered = atomic_load(&tree->filtered_count);
+                /* Check if THIS tree is ready to spawn its replacement */
+                if (this_tree_active_conns <= sup->respawn_spawn_threshold) {
+                    /* Check if draining slots available */
+                    pthread_mutex_lock(&sup->draining_lock);
+                    bool draining_available = (sup->draining_count < sup->max_draining_trees);
+                    pthread_mutex_unlock(&sup->draining_lock);
 
-                atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
-                atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
-                atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
-                atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
+                    if (!draining_available) {
+                        /* Periodically log that we're waiting for draining slot */
+                        static time_t last_log_time[256] = {0};  /* Assume max 256 trees */
+                        time_t now = time(NULL);
+                        if (i < 256 && difftime(now, last_log_time[i]) >= 10) {
+                            log_msg(LOG_DEBUG, "[tree %u] Ready for respawn but draining slots full (%d/%d) - waiting",
+                                    tree_id, sup->draining_count, sup->max_draining_trees);
+                            last_log_time[i] = now;
+                        }
+                        continue;  /* Wait for draining slot to free up */
+                    }
 
-                log_msg(LOG_DEBUG, "[supervisor] Tree %u final stats: metadata=%lu, first_strike=%lu, second_strike=%lu, filtered=%lu",
-                        tree_id, (unsigned long)tree_metadata, (unsigned long)tree_first_strike,
-                        (unsigned long)tree_second_strike, (unsigned long)tree_filtered);
+                    log_msg(LOG_INFO, "[tree %u] Respawning (this_tree_active_connections=%d <= threshold=%d)",
+                            tree_id, this_tree_active_conns, sup->respawn_spawn_threshold);
 
-                /* Spawn replacement tree BEFORE destroying (to perturb node ID)
-                 * Only spawn if not shutting down - otherwise just destroy the old tree */
-                thread_tree_t *new_tree = NULL;
-                if (sup->monitor_running) {
-                    new_tree = spawn_tree(sup, i, tree);
-                }
+                    /* Accumulate statistics from dying tree */
+                    uint64_t tree_metadata = atomic_load(&tree->metadata_count);
+                    uint64_t tree_filtered = atomic_load(&tree->filtered_count);
+                    uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
+                    uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
 
-                /* Remove old tree from array FIRST */
-                sup->trees[i] = NULL;
-                sup->active_trees--;
+                    atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
+                    atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
+                    atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
+                    atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
 
-                /* Release lock during destruction (pthread_join can block) */
-                pthread_mutex_unlock(&sup->trees_lock);
+                    log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
+                            tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
+                            (unsigned long)tree_first_strike, (unsigned long)tree_second_strike);
 
-                thread_tree_destroy(tree);
+                    /* Spawn replacement tree (with node ID perturbation if keyspace partitioning enabled) */
+                    thread_tree_t *new_tree = spawn_tree(sup, i, tree);
 
-                /* Re-acquire lock to add new tree */
-                pthread_mutex_lock(&sup->trees_lock);
+                    if (!new_tree) {
+                        log_msg(LOG_ERROR, "[tree %u] Failed to spawn replacement tree", tree_id);
+                        continue;
+                    }
 
-                if (new_tree) {
+                    /* Move old tree to draining list */
+                    if (move_to_draining(sup, i) < 0) {
+                        log_msg(LOG_ERROR, "[tree %u] Failed to move to draining, destroying immediately", tree_id);
+                        /* Fallback: destroy immediately if can't move to draining */
+                        pthread_mutex_unlock(&sup->trees_lock);
+                        thread_tree_destroy(tree);
+                        pthread_mutex_lock(&sup->trees_lock);
+                        sup->trees[i] = NULL;
+                        sup->active_trees--;
+                    }
+
+                    /* Start replacement tree immediately */
                     sup->trees[i] = new_tree;
                     thread_tree_start(new_tree);
                     sup->active_trees++;
-                    log_msg(LOG_DEBUG, "[supervisor] Replacement tree %u started in slot %d",
-                            new_tree->tree_id, i);
+
+                    log_msg(LOG_INFO, "[tree %u] Replacement tree started (slot=%d, draining_count=%d)",
+                            new_tree->tree_id, i, sup->draining_count);
+                } else {
+                    /* Not ready yet - log periodically */
+                    static time_t last_log_time[256] = {0};  /* Assume max 256 trees */
+                    time_t now = time(NULL);
+                    if (i < 256 && difftime(now, last_log_time[i]) >= 10) {
+                        log_msg(LOG_DEBUG, "[tree %u] Waiting for respawn threshold (this_tree_active_connections=%d > %d)",
+                                tree_id, this_tree_active_conns, sup->respawn_spawn_threshold);
+                        last_log_time[i] = now;
+                    }
                 }
 
                 continue;  /* Skip normal processing for this slot */
@@ -909,6 +1088,9 @@ static void *monitor_thread_func(void *arg) {
         }
 
         pthread_mutex_unlock(&sup->trees_lock);
+
+        /* Monitor and destroy draining trees */
+        monitor_draining_trees(sup);
     }
 
     log_msg(LOG_DEBUG, "[supervisor] Monitor thread exiting");
@@ -969,6 +1151,8 @@ int supervisor_get_total_connections(supervisor_t *sup) {
     }
 
     int total = 0;
+
+    /* Count active tree connections */
     pthread_mutex_lock(&sup->trees_lock);
     for (int i = 0; i < sup->max_trees; i++) {
         if (sup->trees[i]) {
@@ -976,5 +1160,36 @@ int supervisor_get_total_connections(supervisor_t *sup) {
         }
     }
     pthread_mutex_unlock(&sup->trees_lock);
+
+    /* Count draining tree connections */
+    pthread_mutex_lock(&sup->draining_lock);
+    for (int i = 0; i < sup->draining_count; i++) {
+        if (sup->draining_trees[i].tree) {
+            total += atomic_load(&sup->draining_trees[i].tree->active_connections);
+        }
+    }
+    pthread_mutex_unlock(&sup->draining_lock);
+
     return total;
+}
+
+/**
+ * Get draining tree statistics (for debugging/monitoring)
+ */
+void supervisor_get_draining_stats(supervisor_t *sup, int *count, int *max_count, int *total_connections) {
+    if (!sup || !count || !max_count || !total_connections) {
+        return;
+    }
+
+    *max_count = sup->max_draining_trees;
+    *total_connections = 0;
+
+    pthread_mutex_lock(&sup->draining_lock);
+    *count = sup->draining_count;
+    for (int i = 0; i < sup->draining_count; i++) {
+        if (sup->draining_trees[i].tree) {
+            *total_connections += atomic_load(&sup->draining_trees[i].tree->active_connections);
+        }
+    }
+    pthread_mutex_unlock(&sup->draining_lock);
 }

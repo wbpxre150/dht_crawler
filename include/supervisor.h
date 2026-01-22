@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
+#include <time.h>
 #include "thread_tree.h"
 
 /* Forward declarations */
@@ -11,6 +12,13 @@ struct bloom_filter;
 struct shared_node_pool;
 struct tree_socket;
 struct tree_dispatcher;
+
+/* Draining tree tracking */
+typedef struct draining_tree {
+    thread_tree_t *tree;           /* Pointer to draining tree */
+    time_t drain_start_time;       /* When tree entered draining state */
+    int original_slot;             /* Original slot index in active trees array */
+} draining_tree_t;
 
 /**
  * Supervisor: Manages multiple thread trees for DHT crawling
@@ -71,6 +79,11 @@ typedef struct supervisor_config {
     int rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
     int min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
     int require_empty_queue;           /* Only respawn if queue empty (default: 1) */
+
+    /* Respawn overlapping configuration */
+    int respawn_spawn_threshold;       /* Spawn replacement when connections drop below this */
+    int respawn_drain_timeout_sec;     /* Force destroy draining tree after this timeout */
+    int max_draining_trees;            /* Maximum trees allowed in draining state */
 
     /* Porn filter settings */
     int porn_filter_enabled;           /* Enable porn filter (0=disabled, 1=enabled) */
@@ -170,6 +183,16 @@ typedef struct supervisor {
     atomic_uint_least64_t cumulative_first_strike_failures;
     atomic_uint_least64_t cumulative_second_strike_failures;
     atomic_uint_least64_t cumulative_filtered_count;
+
+    /* Draining trees management */
+    draining_tree_t *draining_trees;   /* Array of trees in draining state */
+    int draining_count;                 /* Current number of draining trees */
+    int max_draining_trees;             /* Maximum allowed draining trees (from config) */
+    pthread_mutex_t draining_lock;      /* Protects draining_trees array */
+
+    /* Respawn configuration */
+    int respawn_spawn_threshold;        /* Spawn replacement at this connection count */
+    int respawn_drain_timeout_sec;      /* Force destroy after this timeout */
 } supervisor_t;
 
 /**
@@ -220,5 +243,14 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
  * @return Total active connections
  */
 int supervisor_get_total_connections(supervisor_t *sup);
+
+/**
+ * Get draining tree statistics (for debugging/monitoring)
+ * @param sup Supervisor instance
+ * @param count Output: current number of draining trees
+ * @param max_count Output: maximum draining trees allowed
+ * @param total_connections Output: total connections across draining trees
+ */
+void supervisor_get_draining_stats(supervisor_t *sup, int *count, int *max_count, int *total_connections);
 
 #endif /* SUPERVISOR_H */
