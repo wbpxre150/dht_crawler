@@ -1373,5 +1373,16 @@ void thread_tree_request_shutdown(thread_tree_t *tree, shutdown_reason_t reason)
         if (tree->peers_queue) {
             tree_peers_queue_signal_shutdown(tree->peers_queue);
         }
+
+        /* Signal throttle condition variables to wake up paused workers.
+         * Workers check shutdown_requested in their while condition, but if
+         * they're already blocked in pthread_cond_wait(), they need a broadcast. */
+        pthread_mutex_lock(&tree->throttle_lock);
+        pthread_cond_broadcast(&tree->throttle_resume);
+        pthread_mutex_unlock(&tree->throttle_lock);
+
+        pthread_mutex_lock(&tree->get_peers_throttle_lock);
+        pthread_cond_broadcast(&tree->get_peers_throttle_resume);
+        pthread_mutex_unlock(&tree->get_peers_throttle_lock);
     }
 }

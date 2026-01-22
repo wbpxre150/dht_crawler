@@ -866,8 +866,12 @@ static void *monitor_thread_func(void *arg) {
                         tree_id, (unsigned long)tree_metadata, (unsigned long)tree_first_strike,
                         (unsigned long)tree_second_strike, (unsigned long)tree_filtered);
 
-                /* Spawn replacement tree BEFORE destroying (to perturb node ID) */
-                thread_tree_t *new_tree = spawn_tree(sup, i, tree);
+                /* Spawn replacement tree BEFORE destroying (to perturb node ID)
+                 * Only spawn if not shutting down - otherwise just destroy the old tree */
+                thread_tree_t *new_tree = NULL;
+                if (sup->monitor_running) {
+                    new_tree = spawn_tree(sup, i, tree);
+                }
 
                 /* Remove old tree from array FIRST */
                 sup->trees[i] = NULL;
