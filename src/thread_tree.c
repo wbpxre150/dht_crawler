@@ -923,23 +923,53 @@ static void *bootstrap_thread_func(void *arg) {
     }
 
     int got = 0;
+    bool used_cache_primary = false;
 
-    /* Try shared node pool first */
-    size_t pool_count = shared_node_pool_get_count(pool);
-    if (pool_count >= 100) {
-        got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
-        log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool (pool has %zu)",
-                tree->tree_id, got, pool_count);
+    /* NEW: Check if BEP51 cache is full - if so, use as PRIMARY source */
+    if (bep51_cache) {
+        size_t cache_count = bep51_cache_get_count(bep51_cache);
+        size_t cache_capacity = bep51_cache->capacity;
+
+        if (cache_count >= cache_capacity) {
+            /* Cache is full - use as PRIMARY source */
+            log_msg(LOG_DEBUG, "[tree %u] BEP51 cache is full (%zu/%zu), using as PRIMARY bootstrap source",
+                    tree->tree_id, cache_count, cache_capacity);
+            got = bep51_cache_get_random(bep51_cache, sampled_nodes, sample_size);
+            log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from BEP51 cache (primary)", tree->tree_id, got);
+            used_cache_primary = true;
+
+            /* Fallback to shared pool if cache insufficient */
+            if (got < 100) {
+                log_msg(LOG_DEBUG, "[tree %u] BEP51 cache returned insufficient nodes (%d), falling back to shared pool",
+                        tree->tree_id, got);
+                size_t pool_count = shared_node_pool_get_count(pool);
+                if (pool_count >= 100) {
+                    got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
+                    log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool (fallback)", tree->tree_id, got);
+                }
+            }
+        }
     }
 
-    /* Fall back to BEP51 cache if shared pool is depleted */
-    if (got < 100 && bep51_cache) {
-        size_t cache_count = bep51_cache_get_count(bep51_cache);
-        if (cache_count >= 100) {
-            log_msg(LOG_DEBUG, "[tree %u] Shared pool depleted (%d nodes), falling back to BEP51 cache (%zu nodes)",
-                    tree->tree_id, got, cache_count);
-            got = bep51_cache_get_random(bep51_cache, sampled_nodes, sample_size);
-            log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from BEP51 cache", tree->tree_id, got);
+    /* EXISTING LOGIC: If cache not full, use shared pool as primary (original behavior) */
+    if (!used_cache_primary) {
+        /* Try shared node pool first */
+        size_t pool_count = shared_node_pool_get_count(pool);
+        if (pool_count >= 100) {
+            got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
+            log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool (pool has %zu)",
+                    tree->tree_id, got, pool_count);
+        }
+
+        /* Fall back to BEP51 cache if shared pool is depleted */
+        if (got < 100 && bep51_cache) {
+            size_t cache_count = bep51_cache_get_count(bep51_cache);
+            if (cache_count >= 100) {
+                log_msg(LOG_DEBUG, "[tree %u] Shared pool depleted (%d nodes), falling back to BEP51 cache (%zu nodes)",
+                        tree->tree_id, got, cache_count);
+                got = bep51_cache_get_random(bep51_cache, sampled_nodes, sample_size);
+                log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from BEP51 cache (fallback)", tree->tree_id, got);
+            }
         }
     }
 

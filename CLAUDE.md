@@ -62,10 +62,15 @@ The crawler uses a **supervisor pattern** that manages multiple independent "thr
 
 Each thread tree implements a concurrent pipeline:
 
-1. **Bootstrap Stage** (`tree_socket.c`, `shared_node_pool.c`)
-   - Global bootstrap pool: Shared across all trees for fast startup
-   - Each tree samples 1000 nodes from shared pool
-   - BEP51 cache: Persists high-quality BEP51-capable nodes to disk for instant bootstrap
+1. **Bootstrap Stage** (`thread_tree.c:bootstrap_thread_func`)
+   - **Intelligent bootstrap prioritization**:
+     - When BEP51 cache is FULL (count >= capacity): Uses cache as PRIMARY source
+     - When BEP51 cache is NOT full: Uses shared pool as primary, cache as fallback
+   - Global bootstrap pool: Shared static pool populated once at startup (5000 nodes)
+   - BEP51 cache: Dynamic cache of verified BEP51-capable nodes (5000 capacity)
+     - Continuously updated by BEP51 workers during operation
+     - Persisted to disk for instant bootstrap across restarts
+     - Prioritized over static pool once full for better node quality
 
 2. **Find_Node Workers** (`thread_tree.c:find_node_worker_func`)
    - Continuously discover DHT nodes to populate routing table
