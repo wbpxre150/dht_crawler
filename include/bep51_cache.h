@@ -9,6 +9,7 @@
 
 /* Forward declarations */
 struct shared_node_pool;
+struct tree_node;
 
 /**
  * BEP51 Cache Node
@@ -84,6 +85,17 @@ int bep51_cache_populate_shared_pool(bep51_cache_t *cache,
  * @return Number of nodes currently cached
  */
 size_t bep51_cache_get_count(bep51_cache_t *cache);
+
+/**
+ * Get random nodes from the cache (thread-safe)
+ * @param cache The cache
+ * @param out Output array to store sampled nodes (caller allocates)
+ * @param count Number of nodes to sample
+ * @return Number of nodes actually sampled
+ */
+int bep51_cache_get_random(bep51_cache_t *cache,
+                           struct tree_node *out,
+                           int count);
 
 /**
  * Destroy the cache and free all resources

@@ -423,6 +423,51 @@ size_t bep51_cache_get_count(bep51_cache_t *cache) {
     return count;
 }
 
+int bep51_cache_get_random(bep51_cache_t *cache,
+                           tree_node_t *out,
+                           int count) {
+    if (!cache || !out || count <= 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&cache->lock);
+
+    size_t available = cache->count;
+    if (available == 0) {
+        pthread_mutex_unlock(&cache->lock);
+        return 0;
+    }
+
+    int to_sample = (count < (int)available) ? count : (int)available;
+    int sampled = 0;
+
+    /* Iterate through FIFO buffer from random start */
+    size_t start = rand() % cache->capacity;
+    for (size_t i = 0; i < cache->capacity && sampled < to_sample; i++) {
+        size_t idx = (start + i) % cache->capacity;
+        bep51_cache_node_t *node = cache->nodes_fifo[idx];
+
+        if (!node) {
+            continue;  /* Empty slot in circular buffer */
+        }
+
+        /* Convert bep51_cache_node_t to tree_node_t */
+        memcpy(out[sampled].node_id, node->node_id, 20);
+        memcpy(&out[sampled].addr, &node->addr, sizeof(struct sockaddr_storage));
+        out[sampled].last_seen = time(NULL);
+        out[sampled].last_queried = 0;
+        out[sampled].fail_count = 0;
+        out[sampled].bep51_status = BEP51_CAPABLE;  /* Known BEP51-capable */
+        out[sampled].next = NULL;
+        sampled++;
+    }
+
+    pthread_mutex_unlock(&cache->lock);
+
+    log_msg(LOG_DEBUG, "[bep51_cache] Sampled %d random nodes from cache", sampled);
+    return sampled;
+}
+
 void bep51_cache_destroy(bep51_cache_t *cache) {
     if (!cache) {
         return;

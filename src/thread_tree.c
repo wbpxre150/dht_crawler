@@ -892,6 +892,7 @@ static void *bootstrap_thread_func(void *arg) {
     }
 
     shared_node_pool_t *pool = tree->supervisor->shared_node_pool;
+    bep51_cache_t *bep51_cache = tree->supervisor->bep51_cache;
     int sample_size = tree->supervisor->per_tree_sample_size;
 
     /* Sample random nodes from the shared pool */
@@ -901,15 +902,37 @@ static void *bootstrap_thread_func(void *arg) {
         goto shutdown;
     }
 
-    int got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
+    int got = 0;
+
+    /* Try shared node pool first */
+    size_t pool_count = shared_node_pool_get_count(pool);
+    if (pool_count >= 100) {
+        got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
+        log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool (pool has %zu)",
+                tree->tree_id, got, pool_count);
+    }
+
+    /* Fall back to BEP51 cache if shared pool is depleted */
+    if (got < 100 && bep51_cache) {
+        size_t cache_count = bep51_cache_get_count(bep51_cache);
+        if (cache_count >= 100) {
+            log_msg(LOG_DEBUG, "[tree %u] Shared pool depleted (%d nodes), falling back to BEP51 cache (%zu nodes)",
+                    tree->tree_id, got, cache_count);
+            got = bep51_cache_get_random(bep51_cache, sampled_nodes, sample_size);
+            log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from BEP51 cache", tree->tree_id, got);
+        }
+    }
+
     if (got < 100) {
-        log_msg(LOG_ERROR, "[tree %u] Insufficient nodes in shared pool: got %d, need at least 100",
-                tree->tree_id, got);
+        log_msg(LOG_ERROR, "[tree %u] Insufficient nodes for bootstrap: got %d, need at least 100 (pool: %zu, cache: %zu)",
+                tree->tree_id, got,
+                shared_node_pool_get_count(pool),
+                bep51_cache ? bep51_cache_get_count(bep51_cache) : 0);
         free(sampled_nodes);
         goto shutdown;
     }
 
-    log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool", tree->tree_id, got);
+    log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes for bootstrap", tree->tree_id, got);
 
     /* Add sampled nodes to routing table */
     for (int i = 0; i < got; i++) {
