@@ -989,25 +989,23 @@ void *tree_rate_monitor_func(void *arg) {
         time_t now = time(NULL);
         double tree_age = difftime(now, tree->creation_time);
 
-        /* Check minimum lifetime immunity */
-        if (tree_age < ctx->min_lifetime_sec) {
-            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE to rate checks",
-                    tree->tree_id, tree_age, ctx->min_lifetime_sec);
-            /* Update baseline so first real check after immunity measures only the recent interval,
-             * not the entire time since monitor start */
-            last_metadata_count = atomic_load(&tree->metadata_count);
-            last_check_time = now;
-            continue;
-        }
-
         /* Get current metadata count */
         uint64_t current_metadata_count = atomic_load(&tree->metadata_count);
         double time_delta = difftime(now, last_check_time);
 
-        /* Calculate metadata rate */
+        /* Calculate metadata rate (always, so stats endpoint shows it) */
         uint64_t metadata_delta = current_metadata_count - last_metadata_count;
         double metadata_rate = (time_delta > 0) ? (double)metadata_delta / time_delta : 0.0;
         tree->metadata_rate = metadata_rate;
+
+        /* Check minimum lifetime immunity - still calculate rate but don't act on it */
+        if (tree_age < ctx->min_lifetime_sec) {
+            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE (rate: %.4f/sec)",
+                    tree->tree_id, tree_age, ctx->min_lifetime_sec, metadata_rate);
+            last_metadata_count = current_metadata_count;
+            last_check_time = now;
+            continue;
+        }
 
         log_msg(LOG_DEBUG, "[tree %u] Metadata rate: %.4f/sec (threshold: %.4f/sec, delta=%lu in %.0fs)",
                 tree->tree_id, metadata_rate, ctx->min_metadata_rate,
