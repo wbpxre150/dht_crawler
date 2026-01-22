@@ -15,11 +15,11 @@ static uint32_t g_tid_counter = 0;
 
 int tree_protocol_gen_tid(uint8_t *out) {
     uint32_t tid = __sync_fetch_and_add(&g_tid_counter, 1);
-    out[0] = 't';
-    out[1] = (tid >> 8) & 0xff;
-    out[2] = tid & 0xff;
-    out[3] = '\0';
-    return 3;
+    out[0] = (tid >> 24) & 0xff;
+    out[1] = (tid >> 16) & 0xff;
+    out[2] = (tid >> 8) & 0xff;
+    out[3] = tid & 0xff;
+    return 4;
 }
 
 /* Build a bencode message manually (simple approach) */
