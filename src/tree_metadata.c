@@ -990,6 +990,10 @@ void *tree_rate_monitor_func(void *arg) {
         if (tree_age < ctx->min_lifetime_sec) {
             log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE to rate checks",
                     tree->tree_id, tree_age, ctx->min_lifetime_sec);
+            /* Update baseline so first real check after immunity measures only the recent interval,
+             * not the entire time since monitor start */
+            last_metadata_count = atomic_load(&tree->metadata_count);
+            last_check_time = now;
             continue;
         }
 
