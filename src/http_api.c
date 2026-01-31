@@ -26,11 +26,13 @@ static int search_handler(struct mg_connection *conn, void *cbdata);
 static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int root_handler(struct mg_connection *conn, void *cbdata);
 static int refresh_handler(struct mg_connection *conn, void *cbdata);
+static int random_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
+static int get_random_video_torrents(database_t *db, search_result_t **results, int *count);
 
 /* Helper: Format info_hash as hex */
 static void format_hex(const uint8_t *data, size_t len, char *out) {
@@ -101,6 +103,7 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/search", search_handler, api);
     mg_set_request_handler(api->mg_ctx, "/stats", stats_handler, api);
     mg_set_request_handler(api->mg_ctx, "/refresh", refresh_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/random", random_handler, api);
 
     api->running = 1;
     log_msg(LOG_DEBUG, "HTTP API server started on port %d", api->port);
@@ -312,6 +315,11 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "        <input type='hidden' name='format' value='html'>\n"
         "        <button type='submit' class='btn'>Search</button>\n"
         "      </form>\n"
+        "      <div style='margin-top: 16px;'>\n"
+        "        <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>\n"
+        "          Random 100 Video Torrents\n"
+        "        </a>\n"
+        "      </div>\n"
         "    </div>\n"
         "    <div class='stats'>\n"
         "      <div>%s torrents indexed</div>\n"
@@ -752,7 +760,87 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     return 200;
 }
 
+/* Random video torrents handler */
+static int random_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
 
+    /* Get random video torrents */
+    search_result_t *results = NULL;
+    int count = 0;
+    int rc = get_random_video_torrents(api->database, &results, &count);
+
+    if (rc != 0) {
+        const char *error = "{\"error\":\"Database query failed\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 500;
+    }
+
+    if (count == 0) {
+        /* No results - show empty state */
+        const char *empty_html =
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>\n"
+            "  <meta charset='UTF-8'>\n"
+            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+            "  <title>No Video Torrents</title>\n"
+            "  <style>\n"
+            "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
+            "    .message { margin: 50px 0; color: #666; }\n"
+            "    a { color: #1a73e8; text-decoration: none; }\n"
+            "  </style>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <h1>No Video Torrents Found</h1>\n"
+            "  <p class='message'>No video torrents with 50 peers are currently available.</p>\n"
+            "  <a href='/'>Back to Search</a>\n"
+            "</body>\n"
+            "</html>";
+
+        mg_printf(conn,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(empty_html), empty_html);
+
+        return 200;
+    }
+
+    /* Generate HTML using the shared function with NULL query to indicate random mode */
+    char *html = generate_search_results_html(results, count, NULL, 1, count);
+    if (!html) {
+        const char *error = "{\"error\":\"Failed to generate HTML\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        free_search_results(results, count);
+        return 500;
+    }
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/html\r\n"
+              "Content-Length: %d\r\n"
+              "\r\n"
+              "%s",
+              (int)strlen(html), html);
+
+    free(html);
+    free_search_results(results, count);
+    return 200;
+}
 
 static int search_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
@@ -1123,6 +1211,111 @@ void free_search_results(search_result_t *results, int count) {
     free(results);
 }
 
+/* Get 100 random video torrents with exactly 50 peers */
+static int get_random_video_torrents(database_t *db, search_result_t **results, int *count) {
+    if (!db || !results || !count) {
+        return -1;
+    }
+
+    *results = NULL;
+    *count = 0;
+
+    /* Query for random video torrents with 50 peers (max tracked)
+     * Video is defined as majority of torrent size being video files */
+    const char *sql =
+        "WITH video_stats AS ("
+        "    SELECT tf.torrent_id,"
+        "           SUM(CASE "
+        "               WHEN LOWER(tf.filename) LIKE '%.mp4' "
+        "                 OR LOWER(tf.filename) LIKE '%.avi' "
+        "                 OR LOWER(tf.filename) LIKE '%.mkv' "
+        "                 OR LOWER(tf.filename) LIKE '%.wmv' "
+        "                 OR LOWER(tf.filename) LIKE '%.mov' "
+        "                 OR LOWER(tf.filename) LIKE '%.flv' "
+        "                 OR LOWER(tf.filename) LIKE '%.mpg' "
+        "                 OR LOWER(tf.filename) LIKE '%.mpeg' "
+        "                 OR LOWER(tf.filename) LIKE '%.m4v' "
+        "                 OR LOWER(tf.filename) LIKE '%.webm' "
+        "               THEN tf.size_bytes ELSE 0 END) as video_bytes,"
+        "           SUM(tf.size_bytes) as total_bytes "
+        "    FROM torrent_files tf "
+        "    GROUP BY tf.torrent_id "
+        "    HAVING video_bytes * 2 > total_bytes"
+        ") "
+        "SELECT t.info_hash, t.name, t.size_bytes, t.total_peers, "
+        "       t.added_timestamp, COUNT(f.id) as file_count "
+        "FROM torrents t "
+        "INNER JOIN video_stats vs ON t.id = vs.torrent_id "
+        "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
+        "WHERE t.total_peers = 50 "
+        "GROUP BY t.id "
+        "ORDER BY RANDOM() "
+        "LIMIT 100";
+
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare random video query: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    /* Allocate results array */
+    search_result_t *res = (search_result_t *)calloc(100, sizeof(search_result_t));
+    if (!res) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+
+    int i = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && i < 100) {
+        /* Extract torrent data */
+        memcpy(res[i].info_hash, sqlite3_column_blob(stmt, 0), 20);
+        res[i].name = strdup((const char *)sqlite3_column_text(stmt, 1));
+        res[i].size_bytes = sqlite3_column_int64(stmt, 2);
+        res[i].total_peers = sqlite3_column_int(stmt, 3);
+        res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
+        res[i].num_files = sqlite3_column_int(stmt, 5);
+
+        /* Get file listings for this torrent */
+        if (res[i].num_files > 0) {
+            const char *files_sql =
+                "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
+                "       tf.size_bytes "
+                "FROM torrent_files tf "
+                "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+                "WHERE tf.torrent_id = (SELECT id FROM torrents WHERE info_hash = ?) "
+                "ORDER BY tf.file_index LIMIT 10";
+
+            sqlite3_stmt *files_stmt;
+            if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_blob(files_stmt, 1, res[i].info_hash, 20, SQLITE_STATIC);
+
+                int file_count = 0;
+                res[i].file_paths = (char **)calloc(10, sizeof(char *));
+                res[i].file_sizes = (int64_t *)calloc(10, sizeof(int64_t));
+
+                while (sqlite3_step(files_stmt) == SQLITE_ROW && file_count < 10) {
+                    res[i].file_paths[file_count] = strdup((const char *)sqlite3_column_text(files_stmt, 0));
+                    res[i].file_sizes[file_count] = sqlite3_column_int64(files_stmt, 1);
+                    file_count++;
+                }
+
+                sqlite3_finalize(files_stmt);
+            }
+        }
+
+        i++;
+    }
+
+    sqlite3_finalize(stmt);
+
+    *results = res;
+    *count = i;
+
+    log_msg(LOG_DEBUG, "Random video query returned %d results", i);
+    return 0;
+}
+
 /* URL decode helper */
 static char* url_decode(const char *str) {
     if (!str) return NULL;
@@ -1179,13 +1372,16 @@ static char* url_encode(const char *str) {
     return encoded;
 }
 
-/* Generate HTML page for search results */
+/* Generate HTML page for search results (or random video torrents when query is NULL) */
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count) {
     if (!results || count <= 0) {
         return NULL;
     }
 
-    /* Calculate pagination info */
+    /* Determine if this is random mode (query is NULL) */
+    int is_random_mode = (query == NULL);
+
+    /* Calculate pagination info (not used in random mode) */
     int total_pages = (total_count + HTTP_API_MAX_RESULTS - 1) / HTTP_API_MAX_RESULTS;
     int has_prev = page > 1;
     int has_next = page < total_pages;
@@ -1217,7 +1413,10 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "<head>\n"
            "  <meta charset='UTF-8'>\n"
            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
-           "  <title>Search Results: %s</title>\n"
+           "  <title>%s</title>\n",
+           is_random_mode ? "Random 100 Video Torrents" : query);
+
+    APPEND(
            "  <style>\n"
            "    * { box-sizing: border-box; margin: 0; padding: 0; }\n"
            "    body {\n"
@@ -1437,25 +1636,41 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "</head>\n"
            "<body>\n"
            "  <div class='container'>\n"
-           "    <div class='header'>\n"
-           "      <h1>Search Results</h1>\n"
-           "      <form class='search-form' action='/search' method='get'>\n"
-           "        <input type='text' name='q' placeholder='Search torrents...' value='%s'>\n"
-           "        <input type='hidden' name='format' value='html'>\n"
-           "        <button type='submit' class='btn'>Search</button>\n"
-           "      </form>\n"
-           "    </div>\n",
-           query, query);
+           "    <div class='header'>\n");
+
+    /* Header content differs between search results and random mode */
+    if (is_random_mode) {
+        APPEND("      <h1>Random 100 Video Torrents</h1>\n"
+               "      <div style='display: flex; gap: 8px; flex-wrap: wrap;'>\n"
+               "        <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>Shuffle</a>\n"
+               "        <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
+               "      </div>\n"
+               "    </div>\n");
+    } else {
+        APPEND("      <h1>Search Results</h1>\n"
+               "      <form class='search-form' action='/search' method='get'>\n"
+               "        <input type='text' name='q' placeholder='Search torrents...' value='%s'>\n"
+               "        <input type='hidden' name='format' value='html'>\n"
+               "        <button type='submit' class='btn'>Search</button>\n"
+               "      </form>\n"
+               "    </div>\n",
+               query);
+    }
 
     /* Show results info with pagination context */
-    int start_result = (page - 1) * HTTP_API_MAX_RESULTS + 1;
-    int end_result = start_result + count - 1;
-    if (total_pages > 1) {
-        APPEND("    <div class='results-info'>Showing %d-%d of %d results (page %d of %d)</div>\n",
-               start_result, end_result, total_count, page, total_pages);
-    } else {
-        APPEND("    <div class='results-info'>Found %d result%s</div>\n",
+    if (is_random_mode) {
+        APPEND("    <div class='results-info'>Showing %d random video torrent%s with 50 peers</div>\n",
                count, count == 1 ? "" : "s");
+    } else {
+        int start_result = (page - 1) * HTTP_API_MAX_RESULTS + 1;
+        int end_result = start_result + count - 1;
+        if (total_pages > 1) {
+            APPEND("    <div class='results-info'>Showing %d-%d of %d results (page %d of %d)</div>\n",
+                   start_result, end_result, total_count, page, total_pages);
+        } else {
+            APPEND("    <div class='results-info'>Found %d result%s</div>\n",
+                   count, count == 1 ? "" : "s");
+        }
     }
 
     /* Generate torrent cards */
@@ -1704,8 +1919,8 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "    }\n"
            "  </script>\n");
 
-    /* Add pagination controls if needed */
-    if (total_pages > 1) {
+    /* Add pagination controls if needed (not for random mode) */
+    if (!is_random_mode && total_pages > 1) {
         char *encoded_query = url_encode(query);
         if (encoded_query) {
             APPEND("  <div class='pagination'>\n");
