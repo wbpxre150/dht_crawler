@@ -1725,10 +1725,6 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     /* Header content differs between search results and random mode */
     if (is_random_mode) {
         APPEND("      <h1>Random 100 Video Torrents</h1>\n"
-               "      <div style='display: flex; gap: 8px; flex-wrap: wrap;'>\n"
-               "        <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>Shuffle</a>\n"
-               "        <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
-               "      </div>\n"
                "    </div>\n");
     } else {
         APPEND("      <h1>Search Results</h1>\n"
@@ -2031,6 +2027,14 @@ static char* generate_search_results_html(search_result_t *results, int count, c
             APPEND("  </div>\n");
             free(encoded_query);
         }
+    }
+
+    /* Add shuffle/back buttons at bottom for random mode */
+    if (is_random_mode) {
+        APPEND("  <div style='display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 20px;'>\n"
+               "    <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>Shuffle</a>\n"
+               "    <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
+               "  </div>\n");
     }
 
     APPEND("</body>\n"
