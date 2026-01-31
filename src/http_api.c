@@ -1211,7 +1211,47 @@ void free_search_results(search_result_t *results, int count) {
     free(results);
 }
 
-/* Get 100 random video torrents with exactly 50 peers */
+/* Check if a torrent is primarily video content by examining its files */
+static int is_video_torrent(database_t *db, int64_t torrent_id) {
+    const char *sql =
+        "SELECT "
+        "    SUM(CASE "
+        "        WHEN LOWER(filename) LIKE '%.mp4' "
+        "          OR LOWER(filename) LIKE '%.avi' "
+        "          OR LOWER(filename) LIKE '%.mkv' "
+        "          OR LOWER(filename) LIKE '%.wmv' "
+        "          OR LOWER(filename) LIKE '%.mov' "
+        "          OR LOWER(filename) LIKE '%.flv' "
+        "          OR LOWER(filename) LIKE '%.mpg' "
+        "          OR LOWER(filename) LIKE '%.mpeg' "
+        "          OR LOWER(filename) LIKE '%.m4v' "
+        "          OR LOWER(filename) LIKE '%.webm' "
+        "        THEN size_bytes ELSE 0 END) as video_bytes, "
+        "    SUM(size_bytes) as total_bytes "
+        "FROM torrent_files WHERE torrent_id = ?";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+
+    sqlite3_bind_int64(stmt, 1, torrent_id);
+
+    int is_video = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t video_bytes = sqlite3_column_int64(stmt, 0);
+        int64_t total_bytes = sqlite3_column_int64(stmt, 1);
+        /* Video if majority of content is video files */
+        if (total_bytes > 0 && video_bytes * 2 > total_bytes) {
+            is_video = 1;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return is_video;
+}
+
+/* Get 100 random video torrents with exactly 50 peers using random ID sampling */
 static int get_random_video_torrents(database_t *db, search_result_t **results, int *count) {
     if (!db || !results || !count) {
         return -1;
@@ -1220,99 +1260,143 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
     *results = NULL;
     *count = 0;
 
-    /* Query for random video torrents with 50 peers (max tracked)
-     * Video is defined as majority of torrent size being video files */
-    const char *sql =
-        "WITH video_stats AS ("
-        "    SELECT tf.torrent_id,"
-        "           SUM(CASE "
-        "               WHEN LOWER(tf.filename) LIKE '%.mp4' "
-        "                 OR LOWER(tf.filename) LIKE '%.avi' "
-        "                 OR LOWER(tf.filename) LIKE '%.mkv' "
-        "                 OR LOWER(tf.filename) LIKE '%.wmv' "
-        "                 OR LOWER(tf.filename) LIKE '%.mov' "
-        "                 OR LOWER(tf.filename) LIKE '%.flv' "
-        "                 OR LOWER(tf.filename) LIKE '%.mpg' "
-        "                 OR LOWER(tf.filename) LIKE '%.mpeg' "
-        "                 OR LOWER(tf.filename) LIKE '%.m4v' "
-        "                 OR LOWER(tf.filename) LIKE '%.webm' "
-        "               THEN tf.size_bytes ELSE 0 END) as video_bytes,"
-        "           SUM(tf.size_bytes) as total_bytes "
-        "    FROM torrent_files tf "
-        "    GROUP BY tf.torrent_id "
-        "    HAVING video_bytes * 2 > total_bytes"
-        ") "
-        "SELECT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-        "       t.added_timestamp, COUNT(f.id) as file_count "
-        "FROM torrents t "
-        "INNER JOIN video_stats vs ON t.id = vs.torrent_id "
-        "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
-        "WHERE t.total_peers = 50 "
-        "GROUP BY t.id "
-        "ORDER BY RANDOM() "
-        "LIMIT 100";
+    /* Get max ID for random sampling range */
+    int64_t max_id = 0;
+    sqlite3_stmt *max_stmt;
+    if (sqlite3_prepare_v2(db->db, "SELECT MAX(id) FROM torrents", -1, &max_stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(max_stmt) == SQLITE_ROW) {
+            max_id = sqlite3_column_int64(max_stmt, 0);
+        }
+        sqlite3_finalize(max_stmt);
+    }
 
-    sqlite3_stmt *stmt;
-    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare random video query: %s", sqlite3_errmsg(db->db));
+    if (max_id == 0) {
+        log_msg(LOG_DEBUG, "Random video query: no torrents in database");
+        return 0;
+    }
+
+    /* Seed random number generator */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (uintptr_t)&seed);
+    srand(seed);
+
+    /* Prepare statement to fetch torrent by ID with 50 peers */
+    const char *torrent_sql =
+        "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp "
+        "FROM torrents WHERE id = ? AND total_peers = 50";
+
+    sqlite3_stmt *torrent_stmt;
+    if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    /* Prepare statement for file count */
+    const char *file_count_sql = "SELECT COUNT(*) FROM torrent_files WHERE torrent_id = ?";
+    sqlite3_stmt *file_count_stmt;
+    if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(torrent_stmt);
         return -1;
     }
 
     /* Allocate results array */
     search_result_t *res = (search_result_t *)calloc(100, sizeof(search_result_t));
     if (!res) {
-        sqlite3_finalize(stmt);
+        sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(file_count_stmt);
         return -1;
     }
 
-    int i = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && i < 100) {
-        /* Extract torrent data */
-        memcpy(res[i].info_hash, sqlite3_column_blob(stmt, 0), 20);
-        res[i].name = strdup((const char *)sqlite3_column_text(stmt, 1));
-        res[i].size_bytes = sqlite3_column_int64(stmt, 2);
-        res[i].total_peers = sqlite3_column_int(stmt, 3);
-        res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
-        res[i].num_files = sqlite3_column_int(stmt, 5);
+    /* Track found info_hashes to avoid duplicates */
+    uint8_t found_hashes[100][20];
+    int found = 0;
+    int attempts = 0;
+    int max_attempts = 50000;  /* Safety limit to prevent infinite loop */
 
-        /* Get file listings for this torrent */
-        if (res[i].num_files > 0) {
-            const char *files_sql =
-                "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
-                "       tf.size_bytes "
-                "FROM torrent_files tf "
-                "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
-                "WHERE tf.torrent_id = (SELECT id FROM torrents WHERE info_hash = ?) "
-                "ORDER BY tf.file_index LIMIT 10";
+    while (found < 100 && attempts < max_attempts) {
+        attempts++;
 
-            sqlite3_stmt *files_stmt;
-            if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) == SQLITE_OK) {
-                sqlite3_bind_blob(files_stmt, 1, res[i].info_hash, 20, SQLITE_STATIC);
+        /* Generate random ID in range [1, max_id] */
+        int64_t random_id = ((int64_t)rand() * rand()) % max_id + 1;
 
-                int file_count = 0;
-                res[i].file_paths = (char **)calloc(10, sizeof(char *));
-                res[i].file_sizes = (int64_t *)calloc(10, sizeof(int64_t));
+        /* Query for torrent with this ID and 50 peers */
+        sqlite3_bind_int64(torrent_stmt, 1, random_id);
 
-                while (sqlite3_step(files_stmt) == SQLITE_ROW && file_count < 10) {
-                    res[i].file_paths[file_count] = strdup((const char *)sqlite3_column_text(files_stmt, 0));
-                    res[i].file_sizes[file_count] = sqlite3_column_int64(files_stmt, 1);
-                    file_count++;
+        if (sqlite3_step(torrent_stmt) == SQLITE_ROW) {
+            int64_t torrent_id = sqlite3_column_int64(torrent_stmt, 0);
+            const void *info_hash_blob = sqlite3_column_blob(torrent_stmt, 1);
+
+            /* Check for duplicate */
+            int is_duplicate = 0;
+            for (int j = 0; j < found; j++) {
+                if (memcmp(found_hashes[j], info_hash_blob, 20) == 0) {
+                    is_duplicate = 1;
+                    break;
+                }
+            }
+
+            if (!is_duplicate && is_video_torrent(db, torrent_id)) {
+                /* Found a valid video torrent */
+                memcpy(res[found].info_hash, info_hash_blob, 20);
+                memcpy(found_hashes[found], info_hash_blob, 20);
+
+                const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
+                res[found].name = name ? strdup(name) : strdup("Unknown");
+                res[found].size_bytes = sqlite3_column_int64(torrent_stmt, 3);
+                res[found].total_peers = sqlite3_column_int(torrent_stmt, 4);
+                res[found].added_timestamp = sqlite3_column_int64(torrent_stmt, 5);
+
+                /* Get file count */
+                sqlite3_bind_int64(file_count_stmt, 1, torrent_id);
+                if (sqlite3_step(file_count_stmt) == SQLITE_ROW) {
+                    res[found].num_files = sqlite3_column_int(file_count_stmt, 0);
+                }
+                sqlite3_reset(file_count_stmt);
+
+                /* Get file listings for this torrent */
+                if (res[found].num_files > 0) {
+                    const char *files_sql =
+                        "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
+                        "       tf.size_bytes "
+                        "FROM torrent_files tf "
+                        "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+                        "WHERE tf.torrent_id = ? "
+                        "ORDER BY tf.file_index LIMIT 10";
+
+                    sqlite3_stmt *files_stmt;
+                    if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) == SQLITE_OK) {
+                        sqlite3_bind_int64(files_stmt, 1, torrent_id);
+
+                        int file_count = 0;
+                        res[found].file_paths = (char **)calloc(10, sizeof(char *));
+                        res[found].file_sizes = (int64_t *)calloc(10, sizeof(int64_t));
+
+                        while (sqlite3_step(files_stmt) == SQLITE_ROW && file_count < 10) {
+                            const char *path = (const char *)sqlite3_column_text(files_stmt, 0);
+                            res[found].file_paths[file_count] = path ? strdup(path) : strdup("");
+                            res[found].file_sizes[file_count] = sqlite3_column_int64(files_stmt, 1);
+                            file_count++;
+                        }
+
+                        sqlite3_finalize(files_stmt);
+                    }
                 }
 
-                sqlite3_finalize(files_stmt);
+                found++;
             }
         }
 
-        i++;
+        sqlite3_reset(torrent_stmt);
     }
 
-    sqlite3_finalize(stmt);
+    sqlite3_finalize(torrent_stmt);
+    sqlite3_finalize(file_count_stmt);
 
     *results = res;
-    *count = i;
+    *count = found;
 
-    log_msg(LOG_DEBUG, "Random video query returned %d results", i);
+    log_msg(LOG_DEBUG, "Random video query returned %d results after %d attempts", found, attempts);
     return 0;
 }
 
