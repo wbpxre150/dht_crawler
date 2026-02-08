@@ -1036,6 +1036,11 @@ void *tree_metadata_worker_func(void *arg) {
                     /* Update filtered count statistics */
                     atomic_fetch_add(&tree->filtered_count, 1);
 
+                    /* Add to bloom filter to prevent re-processing */
+                    if (tree->shared_bloom) {
+                        bloom_filter_add(tree->shared_bloom, metadata->infohash);
+                    }
+
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent: %s", tree->tree_id, metadata->name);
 
                     /* Free the metadata and skip database insertion */
