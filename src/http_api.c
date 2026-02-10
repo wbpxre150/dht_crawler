@@ -573,7 +573,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
 
         /* Calculate metadata fetch success rate */
-        uint64_t total_attempts = 0;
+        uint64_t total_attempts = atomic_load(&api->supervisor->cumulative_metadata_attempts);
         pthread_mutex_lock(&api->supervisor->trees_lock);
         for (int i = 0; i < api->supervisor->max_trees; i++) {
             if (api->supervisor->trees[i]) {

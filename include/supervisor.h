@@ -194,6 +194,7 @@ typedef struct supervisor {
     atomic_uint_least64_t cumulative_first_strike_failures;
     atomic_uint_least64_t cumulative_second_strike_failures;
     atomic_uint_least64_t cumulative_filtered_count;
+    atomic_uint_least64_t cumulative_metadata_attempts;
 
     /* Draining trees management */
     draining_tree_t *draining_trees;   /* Array of trees in draining state */

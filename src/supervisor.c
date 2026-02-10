@@ -120,6 +120,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_first_strike_failures, 0);
     atomic_init(&sup->cumulative_second_strike_failures, 0);
     atomic_init(&sup->cumulative_filtered_count, 0);
+    atomic_init(&sup->cumulative_metadata_attempts, 0);
 
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
@@ -1130,11 +1131,13 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_filtered = atomic_load(&tree->filtered_count);
                     uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
                     uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
+                    uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
 
                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
                     atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
                     atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
+                    atomic_fetch_add(&sup->cumulative_metadata_attempts, tree_attempts);
 
                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
