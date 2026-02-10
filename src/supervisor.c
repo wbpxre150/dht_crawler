@@ -286,11 +286,22 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
     uint32_t old_partition = tree->partition_index;
     uint64_t tree_metadata = atomic_load(&tree->metadata_count);
 
-    /* Update partition stats */
+    /* Update partition stats with lifetime metadata */
     sup->partition_stats[old_partition].total_metadata += tree_metadata;
 
-    if (tree_metadata == 0) {
+    /* Check if this tree's metadata rate was effectively zero at shutdown.
+     * We use metadata_rate (computed by the rate monitor each check interval)
+     * rather than lifetime metadata_count, because a tree that fetched 50 metadata
+     * early on but then dropped to 0 rate should count as a "zero rate" respawn
+     * for partition death detection. The rate monitor already confirmed the rate
+     * was below min_metadata_rate before triggering the shutdown. */
+    bool was_zero_rate = (tree->metadata_rate < sup->min_metadata_rate);
+
+    if (was_zero_rate) {
         sup->partition_stats[old_partition].consecutive_zero_respawns++;
+        log_msg(LOG_DEBUG, "[supervisor] Partition %u: zero-rate respawn #%d (tree had rate=%.4f, lifetime_metadata=%lu)",
+                old_partition, sup->partition_stats[old_partition].consecutive_zero_respawns,
+                tree->metadata_rate, (unsigned long)tree_metadata);
     } else {
         sup->partition_stats[old_partition].consecutive_zero_respawns = 0;
     }
@@ -301,7 +312,7 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
         return old_partition;
     }
 
-    log_msg(LOG_INFO, "[supervisor] Partition %u is dead (%d consecutive zero-metadata respawns)",
+    log_msg(LOG_INFO, "[supervisor] Partition %u is dead (%d consecutive low-rate respawns)",
             old_partition, sup->partition_stats[old_partition].consecutive_zero_respawns);
 
     /* Find the best alternative partition */
