@@ -29,7 +29,8 @@ static const char *BOOTSTRAP_NODES[] = {
 static const int BOOTSTRAP_PORT = 6881;
 
 /* Forward declaration of internal helpers */
-static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree);
+static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree, uint32_t partition_index);
+static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *tree);
 static void *monitor_thread_func(void *arg);
 static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec, int num_workers);
 
@@ -136,6 +137,18 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
+    /* Adaptive keyspace partitioning */
+    sup->dead_partition_threshold = config->dead_partition_threshold > 0 ? config->dead_partition_threshold : 3;
+    sup->max_trees_per_partition = config->max_trees_per_partition > 0 ? config->max_trees_per_partition : 4;
+    sup->partition_stats = calloc(sup->max_trees, sizeof(partition_stats_t));
+    if (!sup->partition_stats) {
+        log_msg(LOG_ERROR, "[supervisor] Failed to allocate partition_stats array");
+        free(sup->trees);
+        pthread_mutex_destroy(&sup->trees_lock);
+        free(sup);
+        return NULL;
+    }
+
     /* Store respawn overlapping configuration */
     sup->respawn_spawn_threshold = config->respawn_spawn_threshold >= 0 ? config->respawn_spawn_threshold : 50;
     sup->respawn_drain_timeout_sec = config->respawn_drain_timeout_sec > 0 ? config->respawn_drain_timeout_sec : 120;
@@ -145,6 +158,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->draining_trees = calloc(sup->max_draining_trees, sizeof(draining_tree_t));
     if (!sup->draining_trees) {
         log_msg(LOG_ERROR, "[supervisor] Failed to allocate draining trees array");
+        free(sup->partition_stats);
         free(sup->trees);
         pthread_mutex_destroy(&sup->trees_lock);
         free(sup);
@@ -154,6 +168,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     if (pthread_mutex_init(&sup->draining_lock, NULL) != 0) {
         log_msg(LOG_ERROR, "[supervisor] Failed to init draining_lock mutex");
         free(sup->draining_trees);
+        free(sup->partition_stats);
         free(sup->trees);
         pthread_mutex_destroy(&sup->trees_lock);
         free(sup);
@@ -170,15 +185,16 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 /**
  * Spawn a new tree for the given slot
  * @param sup Supervisor instance
- * @param slot_index Slot index (0 to max_trees-1), used as partition index
- * @param old_tree Previous tree in this slot (NULL for first spawn, non-NULL for respawn)
+ * @param slot_index Slot index (0 to max_trees-1)
+ * @param old_tree Previous tree in this slot (NULL for first spawn, non-NULL for respawn with perturbation)
+ * @param partition_index Keyspace partition to assign this tree to
  * @return Pointer to new tree, or NULL on error
  */
-static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree) {
+static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree, uint32_t partition_index) {
     tree_config_t config = {
         /* Keyspace partitioning */
         .use_keyspace_partitioning = sup->use_keyspace_partitioning,
-        .partition_index = (uint32_t)slot_index,
+        .partition_index = partition_index,
         .num_partitions = (uint32_t)sup->max_trees,
         .dht_port = sup->dht_port,
 
@@ -252,6 +268,82 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
     }
 
     return tree;
+}
+
+/**
+ * Choose which partition to use when respawning a tree.
+ * Updates partition_stats based on the dying tree's performance.
+ * If the old partition is "dead" (N consecutive zero-metadata respawns),
+ * migrates to the most productive partition that isn't at capacity.
+ *
+ * Caller must hold trees_lock.
+ *
+ * @param sup Supervisor instance
+ * @param tree The dying tree being respawned
+ * @return Partition index to use for the new tree
+ */
+static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *tree) {
+    uint32_t old_partition = tree->partition_index;
+    uint64_t tree_metadata = atomic_load(&tree->metadata_count);
+
+    /* Update partition stats */
+    sup->partition_stats[old_partition].total_metadata += tree_metadata;
+
+    if (tree_metadata == 0) {
+        sup->partition_stats[old_partition].consecutive_zero_respawns++;
+    } else {
+        sup->partition_stats[old_partition].consecutive_zero_respawns = 0;
+    }
+
+    /* Check if partition is dead */
+    if (sup->partition_stats[old_partition].consecutive_zero_respawns < sup->dead_partition_threshold) {
+        /* Partition is still viable, stay */
+        return old_partition;
+    }
+
+    log_msg(LOG_INFO, "[supervisor] Partition %u is dead (%d consecutive zero-metadata respawns)",
+            old_partition, sup->partition_stats[old_partition].consecutive_zero_respawns);
+
+    /* Find the best alternative partition */
+    uint32_t best_partition = old_partition;
+    uint64_t best_metadata = 0;
+    bool found_alternative = false;
+
+    for (int p = 0; p < sup->max_trees; p++) {
+        if ((uint32_t)p == old_partition) {
+            continue;
+        }
+
+        /* Skip dead partitions */
+        if (sup->partition_stats[p].consecutive_zero_respawns >= sup->dead_partition_threshold) {
+            continue;
+        }
+
+        /* Skip partitions at capacity */
+        if (sup->partition_stats[p].current_tree_count >= sup->max_trees_per_partition) {
+            continue;
+        }
+
+        /* Pick partition with highest total_metadata */
+        if (!found_alternative || sup->partition_stats[p].total_metadata > best_metadata) {
+            best_partition = (uint32_t)p;
+            best_metadata = sup->partition_stats[p].total_metadata;
+            found_alternative = true;
+        }
+    }
+
+    if (found_alternative && best_partition != old_partition) {
+        log_msg(LOG_INFO, "[supervisor] Migrating slot from partition %u to partition %u "
+                "(target has %lu cumulative metadata, %d trees)",
+                old_partition, best_partition,
+                (unsigned long)best_metadata,
+                sup->partition_stats[best_partition].current_tree_count);
+    } else {
+        log_msg(LOG_WARN, "[supervisor] No better partition found for migration from partition %u, staying",
+                old_partition);
+    }
+
+    return best_partition;
 }
 
 /**
@@ -769,10 +861,11 @@ void supervisor_start(supervisor_t *sup) {
 
     /* Spawn all trees (they will sample from the shared pool) */
     for (int i = 0; i < sup->max_trees; i++) {
-        sup->trees[i] = spawn_tree(sup, i, NULL);  /* NULL = first spawn, not a respawn */
+        sup->trees[i] = spawn_tree(sup, i, NULL, (uint32_t)i);  /* NULL = first spawn, partition = slot */
         if (sup->trees[i]) {
             thread_tree_start(sup->trees[i]);
             sup->active_trees++;
+            sup->partition_stats[i].current_tree_count++;
         }
     }
 
@@ -939,6 +1032,7 @@ void supervisor_destroy(supervisor_t *sup) {
     }
 
     pthread_mutex_destroy(&sup->trees_lock);
+    free(sup->partition_stats);
     free(sup->trees);
     free(sup);
 
@@ -1035,13 +1129,22 @@ static void *monitor_thread_func(void *arg) {
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
                             (unsigned long)tree_first_strike, (unsigned long)tree_second_strike);
 
-                    /* Spawn replacement tree (with node ID perturbation if keyspace partitioning enabled) */
-                    thread_tree_t *new_tree = spawn_tree(sup, i, tree);
+                    /* Choose partition for respawn (may migrate away from dead partitions) */
+                    uint32_t new_partition = choose_partition_for_respawn(sup, tree);
+                    uint32_t old_partition = tree->partition_index;
+                    sup->partition_stats[old_partition].current_tree_count--;
+
+                    /* If migrating to a new partition, don't perturb from old tree (generate fresh ID) */
+                    thread_tree_t *perturb_from = (new_partition == old_partition) ? tree : NULL;
+                    thread_tree_t *new_tree = spawn_tree(sup, i, perturb_from, new_partition);
 
                     if (!new_tree) {
                         log_msg(LOG_ERROR, "[tree %u] Failed to spawn replacement tree", tree_id);
+                        sup->partition_stats[old_partition].current_tree_count++;  /* Restore count */
                         continue;
                     }
+
+                    sup->partition_stats[new_partition].current_tree_count++;
 
                     /* Move old tree to draining list */
                     if (move_to_draining(sup, i) < 0) {

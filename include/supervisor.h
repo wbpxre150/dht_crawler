@@ -13,6 +13,13 @@ struct shared_node_pool;
 struct tree_socket;
 struct tree_dispatcher;
 
+/* Per-partition performance tracking for adaptive keyspace */
+typedef struct partition_stats {
+    uint64_t total_metadata;           /* Cumulative metadata from trees in this partition */
+    int consecutive_zero_respawns;     /* Consecutive respawns with zero metadata */
+    int current_tree_count;            /* Active trees currently in this partition */
+} partition_stats_t;
+
 /* Draining tree tracking */
 typedef struct draining_tree {
     thread_tree_t *tree;           /* Pointer to draining tree */
@@ -87,6 +94,10 @@ typedef struct supervisor_config {
 
     /* Porn filter settings */
     int porn_filter_enabled;           /* Enable porn filter (0=disabled, 1=enabled) */
+
+    /* Adaptive keyspace partitioning settings */
+    int dead_partition_threshold;       /* Consecutive zero-metadata respawns before migration (default: 3) */
+    int max_trees_per_partition;        /* Max trees allowed in one partition (default: 4) */
 
     /* Shared resources */
     struct batch_writer *batch_writer;
@@ -193,6 +204,11 @@ typedef struct supervisor {
     /* Respawn configuration */
     int respawn_spawn_threshold;        /* Spawn replacement at this connection count */
     int respawn_drain_timeout_sec;      /* Force destroy after this timeout */
+
+    /* Adaptive keyspace partitioning */
+    partition_stats_t *partition_stats;  /* Array of size max_trees (one per partition) */
+    int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration */
+    int max_trees_per_partition;         /* Max trees allowed in one partition */
 } supervisor_t;
 
 /**

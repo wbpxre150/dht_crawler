@@ -375,7 +375,10 @@ int main(int argc, char *argv[]) {
             .respawn_drain_timeout_sec = config.respawn_drain_timeout_sec,
             .max_draining_trees = config.max_draining_trees,
             /* Porn filter settings */
-            .porn_filter_enabled = config.porn_filter_enabled
+            .porn_filter_enabled = config.porn_filter_enabled,
+            /* Adaptive keyspace partitioning */
+            .dead_partition_threshold = config.dead_partition_threshold,
+            .max_trees_per_partition = config.max_trees_per_partition
         };
         /* Copy BEP51 cache path (can't use string literal in struct initializer) */
         strncpy(sup_config.bep51_cache_path, config.bep51_cache_path, sizeof(sup_config.bep51_cache_path) - 1);

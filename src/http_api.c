@@ -495,6 +495,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
             if (tree) {
                 cJSON *tree_json = cJSON_CreateObject();
                 cJSON_AddNumberToObject(tree_json, "tree_id", tree->tree_id);
+                cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
                 cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
@@ -543,6 +544,25 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         }
         pthread_mutex_unlock(&api->supervisor->trees_lock);
         cJSON_AddItemToObject(root, "trees", trees_array);
+
+        /* Add partition stats */
+        if (api->supervisor->partition_stats) {
+            cJSON *partitions_array = cJSON_CreateArray();
+            pthread_mutex_lock(&api->supervisor->trees_lock);
+            for (int i = 0; i < api->supervisor->max_trees; i++) {
+                cJSON *part = cJSON_CreateObject();
+                cJSON_AddNumberToObject(part, "partition", i);
+                cJSON_AddNumberToObject(part, "total_metadata",
+                    (double)api->supervisor->partition_stats[i].total_metadata);
+                cJSON_AddNumberToObject(part, "consecutive_zero_respawns",
+                    api->supervisor->partition_stats[i].consecutive_zero_respawns);
+                cJSON_AddNumberToObject(part, "current_tree_count",
+                    api->supervisor->partition_stats[i].current_tree_count);
+                cJSON_AddItemToArray(partitions_array, part);
+            }
+            pthread_mutex_unlock(&api->supervisor->trees_lock);
+            cJSON_AddItemToObject(root, "partitions", partitions_array);
+        }
 
         /* Add aggregate stats */
         cJSON *aggregate = cJSON_CreateObject();

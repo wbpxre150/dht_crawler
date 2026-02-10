@@ -124,6 +124,8 @@ typedef struct {
 
     /* Keyspace partitioning settings */
     int use_keyspace_partitioning;       /* Enable keyspace partitioning (0=random node IDs, 1=partitioned, default: 1) */
+    int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration (default: 3) */
+    int max_trees_per_partition;         /* Max trees allowed in one partition (default: 4) */
 
     /* Refresh thread settings (for /refresh HTTP endpoint) */
     int refresh_bootstrap_sample_size;   /* Nodes to sample from shared pool (default: 1000) */

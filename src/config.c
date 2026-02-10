@@ -132,6 +132,8 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Keyspace partitioning - enabled by default */
     config->use_keyspace_partitioning = 1;          /* 1=enabled (evenly distributed node IDs) */
+    config->dead_partition_threshold = 3;            /* 3 consecutive zero-metadata respawns before migration */
+    config->max_trees_per_partition = 4;             /* Max 4 trees in one partition */
 
     /* Refresh thread defaults (for /refresh HTTP endpoint) */
     config->refresh_bootstrap_sample_size = 1000;   /* Sample 1000 nodes from shared pool */
@@ -439,6 +441,14 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Keyspace partitioning toggle */
         else if (strcmp(key, "use_keyspace_partitioning") == 0) {
             config->use_keyspace_partitioning = atoi(value);
+        } else if (strcmp(key, "dead_partition_threshold") == 0) {
+            config->dead_partition_threshold = atoi(value);
+            if (config->dead_partition_threshold < 1) config->dead_partition_threshold = 1;
+            if (config->dead_partition_threshold > 20) config->dead_partition_threshold = 20;
+        } else if (strcmp(key, "max_trees_per_partition") == 0) {
+            config->max_trees_per_partition = atoi(value);
+            if (config->max_trees_per_partition < 1) config->max_trees_per_partition = 1;
+            if (config->max_trees_per_partition > 64) config->max_trees_per_partition = 64;
         }
         /* Refresh thread settings */
         else if (strcmp(key, "refresh_bootstrap_sample_size") == 0) {
