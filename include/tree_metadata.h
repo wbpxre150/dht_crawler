@@ -123,6 +123,7 @@ typedef struct rate_monitor_ctx {
     int grace_period_sec;
     int min_lifetime_sec;
     bool require_empty_queue;
+    double ema_alpha;
 } rate_monitor_ctx_t;
 
 /**

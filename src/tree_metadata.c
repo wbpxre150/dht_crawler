@@ -1082,11 +1082,13 @@ void *tree_rate_monitor_func(void *arg) {
     rate_monitor_ctx_t *ctx = (rate_monitor_ctx_t *)arg;
     thread_tree_t *tree = ctx->tree;
 
-    log_msg(LOG_DEBUG, "[tree %u] Rate monitor started (min_rate=%.4f, check_interval=%ds)",
-            tree->tree_id, ctx->min_metadata_rate, ctx->check_interval_sec);
+    double alpha = ctx->ema_alpha;
+    log_msg(LOG_DEBUG, "[tree %u] Rate monitor started (min_rate=%.4f, check_interval=%ds, ema_alpha=%.2f)",
+            tree->tree_id, ctx->min_metadata_rate, ctx->check_interval_sec, alpha);
 
     uint64_t last_metadata_count = 0;
     time_t last_check_time = time(NULL);
+    double ema_rate = -1.0;  /* Sentinel: -1 means first check (no prior EMA) */
 
     while (!atomic_load(&tree->shutdown_requested)) {
         /* Sleep in 1-second chunks for responsiveness */
@@ -1103,40 +1105,49 @@ void *tree_rate_monitor_func(void *arg) {
         uint64_t current_metadata_count = atomic_load(&tree->metadata_count);
         double time_delta = difftime(now, last_check_time);
 
-        /* Calculate metadata rate (always, so stats endpoint shows it) */
+        /* Calculate instantaneous metadata rate */
         uint64_t metadata_delta = current_metadata_count - last_metadata_count;
-        double metadata_rate = (time_delta > 0) ? (double)metadata_delta / time_delta : 0.0;
-        tree->metadata_rate = metadata_rate;
+        double instantaneous_rate = (time_delta > 0) ? (double)metadata_delta / time_delta : 0.0;
+
+        /* Update EMA */
+        if (ema_rate < 0.0) {
+            ema_rate = instantaneous_rate;  /* First check: seed EMA */
+        } else {
+            ema_rate = alpha * instantaneous_rate + (1.0 - alpha) * ema_rate;
+        }
+
+        /* Publish EMA rate for stats endpoint */
+        tree->metadata_rate = ema_rate;
 
         /* Check minimum lifetime immunity - still calculate rate but don't act on it */
         if (tree_age < ctx->min_lifetime_sec) {
-            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE (rate: %.4f/sec)",
-                    tree->tree_id, tree_age, ctx->min_lifetime_sec, metadata_rate);
+            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE (instant: %.4f/sec, ema: %.4f/sec)",
+                    tree->tree_id, tree_age, ctx->min_lifetime_sec, instantaneous_rate, ema_rate);
             last_metadata_count = current_metadata_count;
             last_check_time = now;
             continue;
         }
 
-        log_msg(LOG_DEBUG, "[tree %u] Metadata rate: %.4f/sec (threshold: %.4f/sec, delta=%lu in %.0fs)",
-                tree->tree_id, metadata_rate, ctx->min_metadata_rate,
+        log_msg(LOG_DEBUG, "[tree %u] Metadata rate: instant=%.4f/sec, ema=%.4f/sec (threshold: %.4f/sec, delta=%lu in %.0fs)",
+                tree->tree_id, instantaneous_rate, ema_rate, ctx->min_metadata_rate,
                 (unsigned long)metadata_delta, time_delta);
 
-        /* Check if rate is below threshold */
-        if (metadata_rate < ctx->min_metadata_rate) {
+        /* Check if EMA rate is below threshold */
+        if (ema_rate < ctx->min_metadata_rate) {
             /* Check queue requirement */
             if (ctx->require_empty_queue) {
                 int queue_size = tree_infohash_queue_count(tree->infohash_queue);
                 if (queue_size > 0) {
-                    log_msg(LOG_DEBUG, "[tree %u] Metadata rate %.4f < %.4f, but queue not empty (%d) - CONTINUING",
-                            tree->tree_id, metadata_rate, ctx->min_metadata_rate, queue_size);
+                    log_msg(LOG_DEBUG, "[tree %u] EMA rate %.4f < %.4f, but queue not empty (%d) - CONTINUING",
+                            tree->tree_id, ema_rate, ctx->min_metadata_rate, queue_size);
                     last_metadata_count = current_metadata_count;
                     last_check_time = now;
                     continue;
                 }
             }
 
-            log_msg(LOG_WARN, "[tree %u] Metadata rate %.4f < threshold %.4f, entering grace period (%ds)",
-                    tree->tree_id, metadata_rate, ctx->min_metadata_rate, ctx->grace_period_sec);
+            log_msg(LOG_WARN, "[tree %u] EMA rate %.4f < threshold %.4f, entering grace period (%ds)",
+                    tree->tree_id, ema_rate, ctx->min_metadata_rate, ctx->grace_period_sec);
 
             /* Grace period - sleep in 1s chunks */
             for (int i = 0; i < ctx->grace_period_sec && !atomic_load(&tree->shutdown_requested); i++) {
@@ -1145,33 +1156,40 @@ void *tree_rate_monitor_func(void *arg) {
 
             if (atomic_load(&tree->shutdown_requested)) break;
 
-            /* Re-check after grace period */
+            /* Re-check after grace period: compute new instantaneous rate and update EMA */
             time_t now2 = time(NULL);
             uint64_t current_metadata_count2 = atomic_load(&tree->metadata_count);
             double time_delta2 = difftime(now2, last_check_time);
             uint64_t metadata_delta2 = current_metadata_count2 - last_metadata_count;
-            double metadata_rate2 = (time_delta2 > 0) ? (double)metadata_delta2 / time_delta2 : 0.0;
+            double instantaneous_rate2 = (time_delta2 > 0) ? (double)metadata_delta2 / time_delta2 : 0.0;
 
-            if (metadata_rate2 < ctx->min_metadata_rate) {
+            /* Update EMA with grace period observation */
+            ema_rate = alpha * instantaneous_rate2 + (1.0 - alpha) * ema_rate;
+            tree->metadata_rate = ema_rate;
+
+            if (ema_rate < ctx->min_metadata_rate) {
                 /* Check queue requirement again */
                 if (ctx->require_empty_queue) {
                     int queue_size = tree_infohash_queue_count(tree->infohash_queue);
                     if (queue_size > 0) {
-                        log_msg(LOG_DEBUG, "[tree %u] Metadata rate STILL %.4f < %.4f after grace period, but queue not empty (%d) - CONTINUING",
-                                tree->tree_id, metadata_rate2, ctx->min_metadata_rate, queue_size);
+                        log_msg(LOG_DEBUG, "[tree %u] EMA rate STILL %.4f < %.4f after grace period, but queue not empty (%d) - CONTINUING",
+                                tree->tree_id, ema_rate, ctx->min_metadata_rate, queue_size);
                         last_metadata_count = current_metadata_count2;
                         last_check_time = now2;
                         continue;
                     }
                 }
 
-                log_msg(LOG_INFO, "[tree %u] Metadata rate SUSTAINED at %.4f < %.4f after grace period - REQUESTING SHUTDOWN",
-                        tree->tree_id, metadata_rate2, ctx->min_metadata_rate);
+                log_msg(LOG_INFO, "[tree %u] EMA rate SUSTAINED at %.4f < %.4f after grace period (instant: %.4f) - REQUESTING SHUTDOWN",
+                        tree->tree_id, ema_rate, ctx->min_metadata_rate, instantaneous_rate2);
                 thread_tree_request_shutdown(tree, SHUTDOWN_REASON_RATE_BASED);
                 break;
             } else {
-                log_msg(LOG_DEBUG, "[tree %u] Metadata rate improved to %.4f - CONTINUING",
-                        tree->tree_id, metadata_rate2);
+                log_msg(LOG_DEBUG, "[tree %u] EMA rate improved to %.4f after grace period (instant: %.4f) - CONTINUING",
+                        tree->tree_id, ema_rate, instantaneous_rate2);
+                last_metadata_count = current_metadata_count2;
+                last_check_time = now2;
+                continue;
             }
         }
 

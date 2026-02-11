@@ -829,6 +829,7 @@ static void tree_start_rate_monitor(thread_tree_t *tree) {
     ctx->grace_period_sec = tree->rate_grace_period_sec;
     ctx->min_lifetime_sec = tree->min_lifetime_sec;
     ctx->require_empty_queue = tree->require_empty_queue;
+    ctx->ema_alpha = tree->ema_alpha;
 
     int rc = pthread_create(&tree->rate_monitor_thread, NULL, tree_rate_monitor_func, ctx);
     if (rc != 0) {
@@ -1138,6 +1139,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
             tree->min_lifetime_sec, base_lifetime_sec);
 
     tree->require_empty_queue = config->require_empty_queue;
+    tree->ema_alpha = (config->ema_alpha > 0.0 && config->ema_alpha <= 1.0) ? config->ema_alpha : 0.3;
 
     /* Porn filter configuration */
     tree->porn_filter_enabled = config->porn_filter_enabled;

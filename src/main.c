@@ -370,6 +370,7 @@ int main(int argc, char *argv[]) {
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,
             .min_lifetime_minutes = config.tree_min_lifetime_minutes,
             .require_empty_queue = config.tree_require_empty_queue,
+            .rate_ema_alpha = config.tree_rate_ema_alpha,
             /* Respawn overlapping configuration */
             .respawn_spawn_threshold = config.respawn_spawn_threshold,
             .respawn_drain_timeout_sec = config.respawn_drain_timeout_sec,

@@ -96,6 +96,7 @@ typedef struct tree_config {
     int rate_grace_period_sec;          /* Grace period before respawn (default: 30) */
     int min_lifetime_minutes;           /* Min lifetime before rate checks (default: 10) */
     bool require_empty_queue;           /* Only respawn if queue empty (default: true) */
+    double ema_alpha;                   /* EMA smoothing alpha for metadata rate (default: 0.3) */
 
     /* Porn filter settings */
     int porn_filter_enabled;            /* Enable porn filter (0=disabled, 1=enabled) */
@@ -206,6 +207,7 @@ typedef struct thread_tree {
     int rate_grace_period_sec;              /* Grace period before respawn (default: 30s) */
     int min_lifetime_sec;                   /* Minimum lifetime before rate checks (default: 600s = 10min) */
     bool require_empty_queue;               /* Only respawn if infohash queue empty */
+    double ema_alpha;                       /* EMA smoothing alpha for metadata rate */
 
     /* Porn filter settings */
     int porn_filter_enabled;                /* Enable porn filter (0=disabled, 1=enabled) */

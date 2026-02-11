@@ -121,6 +121,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_rate_grace_period_sec = 30;           /* 30 second grace period */
     config->tree_min_lifetime_minutes = 10;            /* 10 minute minimum lifetime */
     config->tree_require_empty_queue = 1;              /* Require empty queue before respawn */
+    config->tree_rate_ema_alpha = 0.3;                 /* EMA smoothing alpha (default: 0.3) */
 
     /* Tree respawn overlapping defaults */
     config->respawn_spawn_threshold = 50;              /* Spawn replacement at 50 connections */
@@ -421,6 +422,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (config->tree_min_lifetime_minutes < 0) config->tree_min_lifetime_minutes = 0;
         } else if (strcmp(key, "tree_require_empty_queue") == 0) {
             config->tree_require_empty_queue = atoi(value);
+        } else if (strcmp(key, "tree_rate_ema_alpha") == 0) {
+            config->tree_rate_ema_alpha = atof(value);
+            if (config->tree_rate_ema_alpha <= 0.0) config->tree_rate_ema_alpha = 0.01;
+            if (config->tree_rate_ema_alpha > 1.0) config->tree_rate_ema_alpha = 1.0;
         }
         /* Tree respawn overlapping configuration */
         else if (strcmp(key, "respawn_spawn_threshold") == 0) {

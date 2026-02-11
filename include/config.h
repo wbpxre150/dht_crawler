@@ -113,6 +113,7 @@ typedef struct {
     int tree_rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
     int tree_min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
     int tree_require_empty_queue;           /* Only respawn if queue empty (default: 1) */
+    double tree_rate_ema_alpha;             /* EMA smoothing alpha for metadata rate (default: 0.3) */
 
     /* Tree respawn overlapping configuration */
     int respawn_spawn_threshold;            /* Spawn replacement when connections drop below this (default: 50) */

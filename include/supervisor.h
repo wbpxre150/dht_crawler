@@ -85,6 +85,7 @@ typedef struct supervisor_config {
     int rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
     int min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
     int require_empty_queue;           /* Only respawn if queue empty (default: 1) */
+    double rate_ema_alpha;             /* EMA smoothing alpha for metadata rate (default: 0.3) */
 
     /* Respawn overlapping configuration */
     int respawn_spawn_threshold;       /* Spawn replacement when connections drop below this */
@@ -177,6 +178,7 @@ typedef struct supervisor {
     int rate_grace_period_sec;
     int min_lifetime_minutes;
     int require_empty_queue;
+    double rate_ema_alpha;             /* EMA smoothing alpha for metadata rate */
 
     /* Porn filter settings */
     int porn_filter_enabled;           /* Enable porn filter */

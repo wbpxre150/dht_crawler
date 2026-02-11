@@ -106,6 +106,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
     sup->min_lifetime_minutes = config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10;
     sup->require_empty_queue = config->require_empty_queue;
+    sup->rate_ema_alpha = (config->rate_ema_alpha > 0.0 && config->rate_ema_alpha <= 1.0) ? config->rate_ema_alpha : 0.3;
 
     /* Porn filter settings */
     sup->porn_filter_enabled = config->porn_filter_enabled;
@@ -240,6 +241,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .rate_grace_period_sec = sup->rate_grace_period_sec,
         .min_lifetime_minutes = sup->min_lifetime_minutes,
         .require_empty_queue = sup->require_empty_queue,
+        .ema_alpha = sup->rate_ema_alpha,
         /* Porn filter settings */
         .porn_filter_enabled = sup->porn_filter_enabled,
         /* Shared resources */
