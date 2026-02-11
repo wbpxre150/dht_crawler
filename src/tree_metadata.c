@@ -506,12 +506,11 @@ static tree_torrent_metadata_t *parse_info_dict(const uint8_t *data, size_t len,
     return meta;
 }
 
-/* Main fetch function */
+/* Main fetch function (single peer) */
 tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     const uint8_t *infohash,
     const struct sockaddr_storage *peer,
-    tree_metadata_config_t *config,
-    tree_metadata_state_t *shared_state
+    tree_metadata_config_t *config
 ) {
     if (!infohash || !peer) return NULL;
 
@@ -663,59 +662,21 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
                             break;
                         }
 
-                        /* Allocate or reuse buffers */
                         total_pieces = (metadata_size + BT_METADATA_PIECE_SIZE - 1) / BT_METADATA_PIECE_SIZE;
+                        metadata_buffer = calloc(1, metadata_size);
+                        pieces_bitmap = calloc(1, (total_pieces + 7) / 8);
+                        pieces_received = 0;
 
-                        if (shared_state && shared_state->metadata_buffer) {
-                            /* Reusing existing buffers - validate size consistency */
-                            if (shared_state->metadata_size != metadata_size) {
-                                log_msg(LOG_DEBUG, "Metadata size mismatch (expected %d, got %d)",
-                                        shared_state->metadata_size, metadata_size);
-                                state = CONN_STATE_ERROR;
-                                break;
-                            }
-                            /* Use existing buffers */
-                            metadata_buffer = shared_state->metadata_buffer;
-                            pieces_bitmap = shared_state->pieces_bitmap;
-                            pieces_received = shared_state->pieces_received;
-
-                            log_msg(LOG_DEBUG, "Resuming from %d/%d pieces (%.1f%%)",
-                                    pieces_received, total_pieces,
-                                    (double)pieces_received / total_pieces * 100);
-                        } else {
-                            /* First peer - allocate new */
-                            metadata_buffer = calloc(1, metadata_size);
-                            pieces_bitmap = calloc(1, (total_pieces + 7) / 8);
-                            pieces_received = 0;
-
-                            if (!metadata_buffer || !pieces_bitmap) {
-                                state = CONN_STATE_ERROR;
-                                break;
-                            }
-
-                            /* Store in shared state */
-                            if (shared_state) {
-                                shared_state->metadata_buffer = metadata_buffer;
-                                shared_state->pieces_bitmap = pieces_bitmap;
-                                shared_state->metadata_size = metadata_size;
-                                shared_state->total_pieces = total_pieces;
-                                shared_state->pieces_received = 0;
-                            }
+                        if (!metadata_buffer || !pieces_bitmap) {
+                            state = CONN_STATE_ERROR;
+                            break;
                         }
 
-                        /* Request missing pieces only */
-                        int pieces_to_request = 0;
+                        /* Request all pieces */
                         for (int i = 0; i < total_pieces; i++) {
-                            int byte_idx = i / 8;
-                            int bit_idx = i % 8;
-
-                            if (!(pieces_bitmap[byte_idx] & (1 << bit_idx))) {
-                                send_metadata_request(fd, ut_metadata_id, i);
-                                pieces_to_request++;
-                            }
+                            send_metadata_request(fd, ut_metadata_id, i);
                         }
 
-                        log_msg(LOG_DEBUG, "Requested %d missing pieces", pieces_to_request);
                         state = CONN_STATE_REQUESTING_METADATA;
 
                     } else if (ext_id == OUR_UT_METADATA_ID && state == CONN_STATE_REQUESTING_METADATA) {
@@ -752,18 +713,12 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
                                     pieces_bitmap[byte_idx] |= (1 << bit_idx);
                                     pieces_received++;
 
-                                    /* Sync progress to shared state */
-                                    if (shared_state) {
-                                        shared_state->pieces_received = pieces_received;
-                                    }
-
                                     if (pieces_received >= total_pieces) {
                                         /* Verify hash */
                                         uint8_t computed_hash[20];
                                         SHA1(metadata_buffer, metadata_size, computed_hash);
 
                                         if (memcmp(computed_hash, infohash, 20) == 0) {
-                                            /* Parse and build result */
                                             result = parse_info_dict(metadata_buffer, metadata_size, infohash);
                                             state = CONN_STATE_COMPLETE;
                                         } else {
@@ -786,11 +741,400 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
     /* Cleanup */
     if (tree) atomic_fetch_sub(&tree->active_connections, 1);
     close(fd);
+    free(metadata_buffer);
+    free(pieces_bitmap);
 
-    /* Only free buffers if NOT using shared state */
-    if (!shared_state || !shared_state->metadata_buffer) {
-        if (metadata_buffer) free(metadata_buffer);
-        if (pieces_bitmap) free(pieces_bitmap);
+    return result;
+}
+
+/* ---- Parallel peer connections ---- */
+
+#define MAX_PARALLEL_PEERS 4
+
+/* Per-connection state for parallel fetching */
+typedef struct {
+    int fd;
+    conn_state_t state;
+    uint8_t recv_buf[65536];
+    size_t recv_offset;
+    uint8_t ut_metadata_id;
+    int metadata_size;
+    int total_pieces;
+    uint8_t *metadata_buffer;
+    uint8_t *pieces_bitmap;
+    int pieces_received;
+    time_t connect_start;
+} parallel_conn_t;
+
+/* Initialize a connection slot with a new peer */
+static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
+                                const struct sockaddr_storage *peer,
+                                thread_tree_t *tree) {
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    conn->state = CONN_STATE_ERROR;
+
+    int family = peer->ss_family;
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    if (tree) atomic_fetch_add(&tree->active_connections, 1);
+
+    if (set_nonblocking(fd) < 0) {
+        if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+        close(fd);
+        return -1;
+    }
+
+    int flag = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    /* Start non-blocking connect */
+    socklen_t addrlen = (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+    int ret = connect(fd, (const struct sockaddr *)peer, addrlen);
+    if (ret == 0) {
+        /* Connected immediately - send handshake */
+        uint8_t peer_id[20];
+        generate_peer_id(peer_id);
+        if (send_handshake(fd, infohash, peer_id) < 0) {
+            if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+            close(fd);
+            return -1;
+        }
+        conn->state = CONN_STATE_HANDSHAKING;
+    } else if (errno == EINPROGRESS) {
+        conn->state = CONN_STATE_CONNECTING;
+    } else {
+        if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+        close(fd);
+        return -1;
+    }
+
+    conn->fd = fd;
+    conn->connect_start = time(NULL);
+    return 0;
+}
+
+/* Close and cleanup a connection slot */
+static void parallel_conn_close(parallel_conn_t *conn, thread_tree_t *tree) {
+    if (conn->fd >= 0) {
+        if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+        close(conn->fd);
+        conn->fd = -1;
+    }
+    free(conn->metadata_buffer);
+    free(conn->pieces_bitmap);
+    conn->metadata_buffer = NULL;
+    conn->pieces_bitmap = NULL;
+    conn->state = CONN_STATE_ERROR;
+}
+
+/* Process data for a single parallel connection. Returns metadata on success, NULL otherwise. */
+static tree_torrent_metadata_t *parallel_conn_process(parallel_conn_t *conn,
+                                                       const uint8_t *infohash,
+                                                       int max_metadata) {
+    if (conn->state == CONN_STATE_HANDSHAKING) {
+        if (conn->recv_offset >= BT_HANDSHAKE_SIZE) {
+            if (conn->recv_buf[0] != BT_PROTOCOL_LEN ||
+                memcmp(conn->recv_buf + 1, BT_PROTOCOL_STRING, BT_PROTOCOL_LEN) != 0 ||
+                (conn->recv_buf[25] & 0x10) == 0 ||
+                memcmp(conn->recv_buf + 28, infohash, 20) != 0) {
+                conn->state = CONN_STATE_ERROR;
+                return NULL;
+            }
+
+            if (send_extended_handshake(conn->fd) < 0) {
+                conn->state = CONN_STATE_ERROR;
+                return NULL;
+            }
+
+            memmove(conn->recv_buf, conn->recv_buf + BT_HANDSHAKE_SIZE,
+                    conn->recv_offset - BT_HANDSHAKE_SIZE);
+            conn->recv_offset -= BT_HANDSHAKE_SIZE;
+            conn->state = CONN_STATE_EXTENDED_HANDSHAKE;
+        }
+    }
+
+    /* Process BT messages */
+    while (conn->recv_offset >= 4 &&
+           conn->state != CONN_STATE_ERROR &&
+           conn->state != CONN_STATE_COMPLETE &&
+           conn->state != CONN_STATE_HANDSHAKING &&
+           conn->state != CONN_STATE_CONNECTING) {
+
+        uint32_t msg_len;
+        memcpy(&msg_len, conn->recv_buf, 4);
+        msg_len = ntohl(msg_len);
+
+        if (msg_len > 1024 * 1024) {
+            conn->state = CONN_STATE_ERROR;
+            return NULL;
+        }
+
+        if (conn->recv_offset < msg_len + 4) break;
+
+        if (msg_len == 0) {
+            memmove(conn->recv_buf, conn->recv_buf + 4, conn->recv_offset - 4);
+            conn->recv_offset -= 4;
+            continue;
+        }
+
+        uint8_t msg_type = conn->recv_buf[4];
+
+        if (msg_type == BT_MSG_EXTENDED && msg_len > 1) {
+            uint8_t ext_id = conn->recv_buf[5];
+
+            if (ext_id == BT_EXT_HANDSHAKE && conn->state == CONN_STATE_EXTENDED_HANDSHAKE) {
+                if (parse_extended_handshake(conn->recv_buf + 6, msg_len - 2,
+                                             &conn->ut_metadata_id, &conn->metadata_size) < 0) {
+                    conn->state = CONN_STATE_ERROR;
+                    goto shift;
+                }
+
+                if (conn->metadata_size > max_metadata) {
+                    conn->state = CONN_STATE_ERROR;
+                    goto shift;
+                }
+
+                conn->total_pieces = (conn->metadata_size + BT_METADATA_PIECE_SIZE - 1) / BT_METADATA_PIECE_SIZE;
+                conn->metadata_buffer = calloc(1, conn->metadata_size);
+                conn->pieces_bitmap = calloc(1, (conn->total_pieces + 7) / 8);
+
+                if (!conn->metadata_buffer || !conn->pieces_bitmap) {
+                    conn->state = CONN_STATE_ERROR;
+                    goto shift;
+                }
+
+                for (int i = 0; i < conn->total_pieces; i++) {
+                    send_metadata_request(conn->fd, conn->ut_metadata_id, i);
+                }
+
+                conn->state = CONN_STATE_REQUESTING_METADATA;
+
+            } else if (ext_id == OUR_UT_METADATA_ID && conn->state == CONN_STATE_REQUESTING_METADATA) {
+                int piece_msg_type, piece_index;
+                const uint8_t *piece_data;
+                size_t piece_len;
+
+                parse_metadata_piece(conn->recv_buf + 6, msg_len - 2,
+                                    &piece_msg_type, &piece_index,
+                                    &piece_data, &piece_len);
+
+                if (piece_msg_type == UT_METADATA_REJECT) {
+                    conn->state = CONN_STATE_ERROR;
+                    goto shift;
+                }
+
+                if (piece_msg_type == UT_METADATA_DATA &&
+                    piece_index >= 0 && piece_index < conn->total_pieces) {
+
+                    size_t offset = piece_index * BT_METADATA_PIECE_SIZE;
+                    size_t expected = BT_METADATA_PIECE_SIZE;
+                    if (offset + expected > (size_t)conn->metadata_size) {
+                        expected = conn->metadata_size - offset;
+                    }
+
+                    if (piece_len == expected) {
+                        int byte_idx = piece_index / 8;
+                        int bit_idx = piece_index % 8;
+
+                        if (!(conn->pieces_bitmap[byte_idx] & (1 << bit_idx))) {
+                            memcpy(conn->metadata_buffer + offset, piece_data, piece_len);
+                            conn->pieces_bitmap[byte_idx] |= (1 << bit_idx);
+                            conn->pieces_received++;
+
+                            if (conn->pieces_received >= conn->total_pieces) {
+                                uint8_t computed_hash[20];
+                                SHA1(conn->metadata_buffer, conn->metadata_size, computed_hash);
+
+                                if (memcmp(computed_hash, infohash, 20) == 0) {
+                                    tree_torrent_metadata_t *result = parse_info_dict(
+                                        conn->metadata_buffer, conn->metadata_size, infohash);
+                                    conn->state = CONN_STATE_COMPLETE;
+                                    return result;
+                                } else {
+                                    conn->state = CONN_STATE_ERROR;
+                                    goto shift;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+shift:
+        memmove(conn->recv_buf, conn->recv_buf + msg_len + 4, conn->recv_offset - msg_len - 4);
+        conn->recv_offset -= (msg_len + 4);
+
+        if (conn->state == CONN_STATE_ERROR) return NULL;
+    }
+
+    return NULL;
+}
+
+/* Fetch metadata using parallel peer connections with sliding window */
+tree_torrent_metadata_t *tree_fetch_metadata_parallel(
+    const uint8_t *infohash,
+    const struct sockaddr_storage *peers,
+    int peer_count,
+    tree_metadata_config_t *config
+) {
+    if (!infohash || !peers || peer_count <= 0) return NULL;
+
+    int tcp_timeout = config ? config->tcp_connect_timeout_ms : DEFAULT_TCP_TIMEOUT_MS;
+    int metadata_timeout = config ? config->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS;
+    int max_metadata = config ? config->max_metadata_size : MAX_METADATA_SIZE_DEFAULT;
+    int window_size = config ? config->parallel_peers : 2;
+    thread_tree_t *tree = config ? config->tree : NULL;
+
+    if (window_size < 1) window_size = 1;
+    if (window_size > MAX_PARALLEL_PEERS) window_size = MAX_PARALLEL_PEERS;
+    if (window_size > peer_count) window_size = peer_count;
+
+    parallel_conn_t conns[MAX_PARALLEL_PEERS];
+    for (int i = 0; i < MAX_PARALLEL_PEERS; i++) {
+        conns[i].fd = -1;
+        conns[i].state = CONN_STATE_ERROR;
+        conns[i].metadata_buffer = NULL;
+        conns[i].pieces_bitmap = NULL;
+    }
+
+    int next_peer = 0;  /* Next untried peer index */
+    tree_torrent_metadata_t *result = NULL;
+    time_t global_start = time(NULL);
+
+    /* Fill initial window */
+    int active_count = 0;
+    for (int i = 0; i < window_size && next_peer < peer_count; i++) {
+        if (parallel_conn_start(&conns[i], infohash, &peers[next_peer], tree) == 0) {
+            active_count++;
+        }
+        next_peer++;
+    }
+
+    /* Main poll loop */
+    while (active_count > 0 && !result) {
+        /* Check global timeout */
+        if (difftime(time(NULL), global_start) > metadata_timeout / 1000) {
+            break;
+        }
+
+        /* Build poll array */
+        struct pollfd pfds[MAX_PARALLEL_PEERS];
+        int pfd_to_conn[MAX_PARALLEL_PEERS];  /* Map pollfd index -> conn index */
+        int nfds = 0;
+
+        for (int i = 0; i < window_size; i++) {
+            if (conns[i].fd < 0 || conns[i].state == CONN_STATE_ERROR ||
+                conns[i].state == CONN_STATE_COMPLETE) continue;
+
+            pfds[nfds].fd = conns[i].fd;
+            pfds[nfds].revents = 0;
+
+            if (conns[i].state == CONN_STATE_CONNECTING) {
+                pfds[nfds].events = POLLOUT;
+            } else {
+                pfds[nfds].events = POLLIN;
+            }
+
+            pfd_to_conn[nfds] = i;
+            nfds++;
+        }
+
+        if (nfds == 0) break;
+
+        int ret = poll(pfds, nfds, 500);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* Process each ready connection */
+        for (int p = 0; p < nfds && !result; p++) {
+            int ci = pfd_to_conn[p];
+            parallel_conn_t *conn = &conns[ci];
+
+            if (pfds[p].revents == 0) {
+                /* Check per-connection timeout for connecting state */
+                if (conn->state == CONN_STATE_CONNECTING &&
+                    difftime(time(NULL), conn->connect_start) > tcp_timeout / 1000) {
+                    parallel_conn_close(conn, tree);
+                    active_count--;
+                }
+                continue;
+            }
+
+            if (pfds[p].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                parallel_conn_close(conn, tree);
+                active_count--;
+                continue;
+            }
+
+            if (conn->state == CONN_STATE_CONNECTING && (pfds[p].revents & POLLOUT)) {
+                /* Check connect result */
+                int error;
+                socklen_t len = sizeof(error);
+                if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+                    parallel_conn_close(conn, tree);
+                    active_count--;
+                    continue;
+                }
+
+                /* Connected - send handshake */
+                uint8_t peer_id[20];
+                generate_peer_id(peer_id);
+                if (send_handshake(conn->fd, infohash, peer_id) < 0) {
+                    parallel_conn_close(conn, tree);
+                    active_count--;
+                    continue;
+                }
+                conn->state = CONN_STATE_HANDSHAKING;
+                continue;
+            }
+
+            if (pfds[p].revents & POLLIN) {
+                ssize_t nread = read(conn->fd, conn->recv_buf + conn->recv_offset,
+                                     sizeof(conn->recv_buf) - conn->recv_offset);
+                if (nread <= 0) {
+                    parallel_conn_close(conn, tree);
+                    active_count--;
+                    continue;
+                }
+
+                conn->recv_offset += nread;
+                result = parallel_conn_process(conn, infohash, max_metadata);
+
+                if (conn->state == CONN_STATE_ERROR) {
+                    parallel_conn_close(conn, tree);
+                    active_count--;
+                }
+            }
+        }
+
+        /* Fill empty slots from remaining peers */
+        if (!result) {
+            for (int i = 0; i < window_size && next_peer < peer_count; i++) {
+                if (conns[i].fd >= 0) continue;  /* Slot still active */
+                if (conns[i].state != CONN_STATE_ERROR) continue;
+
+                if (parallel_conn_start(&conns[i], infohash, &peers[next_peer], tree) == 0) {
+                    active_count++;
+                }
+                next_peer++;
+            }
+        }
+    }
+
+    /* Cleanup all connections */
+    for (int i = 0; i < window_size; i++) {
+        if (conns[i].fd >= 0) {
+            parallel_conn_close(&conns[i], tree);
+        } else {
+            /* fd already closed but buffers may need freeing */
+            free(conns[i].metadata_buffer);
+            free(conns[i].pieces_bitmap);
+        }
     }
 
     return result;
@@ -906,6 +1250,7 @@ void *tree_metadata_worker_func(void *arg) {
         .tcp_connect_timeout_ms = 5000,
         .metadata_timeout_ms = 30000,
         .max_metadata_size = 10 * 1024 * 1024,
+        .parallel_peers = 2,
         .tree = tree
     };
 
@@ -919,72 +1264,18 @@ void *tree_metadata_worker_func(void *arg) {
         /* Track that we're attempting to fetch this infohash */
         atomic_fetch_add(&tree->metadata_attempts, 1);
 
-        /* Initialize shared state for incremental piece collection */
-        tree_metadata_state_t shared_state = {0};
-        shared_state.peer_attempts = calloc(entry.peer_count, sizeof(int));
-        if (!shared_state.peer_attempts) {
-            log_msg(LOG_ERROR, "[tree %u] Failed to allocate peer_attempts array", tree->tree_id);
-            continue;
-        }
-        shared_state.max_rounds = 2;
-        shared_state.round = 1;
-
-        /* Multi-round peer attempt loop
-         * For RATE-BASED shutdowns (respawn): try ALL peers before giving up,
-         * so the infohash isn't lost when the tree respawns.
-         * For SUPERVISOR shutdowns (program exit): break immediately for fast exit. */
-        tree_torrent_metadata_t *metadata = NULL;
-
-        while (!metadata && shared_state.round <= shared_state.max_rounds) {
-            for (int i = 0; i < entry.peer_count && !metadata; i++) {
-                /* Allow immediate exit during program shutdown (Ctrl+C) */
-                if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
-                    break;
-                }
-
-                /* Skip peers already tried this round */
-                if (shared_state.peer_attempts[i] >= shared_state.round) {
-                    continue;
-                }
-
-                shared_state.peer_attempts[i] = shared_state.round;
-                metadata = tree_fetch_metadata_from_peer(entry.infohash, &entry.peers[i], &config, &shared_state);
-
-                if (metadata) {
-                    log_msg(LOG_DEBUG, "[tree %u] Fetched metadata on round %d",
-                            tree->tree_id, shared_state.round);
-                    break;
-                }
-            }
-
-            if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
-                break;
-            }
-
-            /* Check retry condition after round 1 */
-            if (!metadata && shared_state.round == 1 && shared_state.pieces_received > 0) {
-                double completion = (double)shared_state.pieces_received / shared_state.total_pieces;
-
-                if (completion >= 0.80) {
-                    log_msg(LOG_DEBUG, "[tree %u] %.1f%% complete, retrying peers (infohash: %02x%02x...)",
-                            tree->tree_id, completion * 100, entry.infohash[0], entry.infohash[1]);
-                    /* Reset peer attempts for round 2 */
-                    memset(shared_state.peer_attempts, 0, entry.peer_count * sizeof(int));
-                    shared_state.round = 2;
-                    continue;
-                }
-            }
-
+        /* Allow immediate exit during program shutdown (Ctrl+C) */
+        if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
             break;
         }
 
-        /* Cleanup shared state */
-        if (shared_state.metadata_buffer) free(shared_state.metadata_buffer);
-        if (shared_state.pieces_bitmap) free(shared_state.pieces_bitmap);
-        if (shared_state.peer_attempts) free(shared_state.peer_attempts);
+        /* Fetch metadata using parallel peer connections */
+        tree_torrent_metadata_t *metadata = tree_fetch_metadata_parallel(
+            entry.infohash, entry.peers, entry.peer_count, &config);
 
         /* Exit worker loop immediately on supervisor shutdown */
         if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
+            if (metadata) tree_free_metadata(metadata);
             break;
         }
 
