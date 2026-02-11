@@ -746,6 +746,14 @@ static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec
 
             /* Add each node to the shared pool */
             for (int i = 0; i < count; i++) {
+                /* Validate port is not 0 */
+                if (nodes[i]->addr.port == 0) {
+                    log_msg(LOG_DEBUG, "[global_bootstrap] Skipping node with invalid port 0: %s",
+                            nodes[i]->addr.ip);
+                    free(nodes[i]);
+                    continue;
+                }
+
                 struct sockaddr_storage addr;
                 memset(&addr, 0, sizeof(addr));
                 struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
