@@ -115,6 +115,7 @@ typedef struct thread_tree {
     uint32_t tree_id;
     uint8_t node_id[20];           /* Private node_id for this tree */
     uint32_t partition_index;      /* Keyspace partition this tree belongs to */
+    uint32_t home_partition;       /* Original partition assigned at startup */
     uint32_t num_partitions;       /* Total number of partitions in the system */
 
     /* Private data structures (no sharing between trees) */

@@ -549,17 +549,34 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         if (api->supervisor->partition_stats) {
             cJSON *partitions_array = cJSON_CreateArray();
             pthread_mutex_lock(&api->supervisor->trees_lock);
+            /* Compute average metadata rate per partition from active trees */
+            double *partition_rates = calloc(api->supervisor->max_trees, sizeof(double));
+            if (partition_rates) {
+                for (int s = 0; s < api->supervisor->max_trees; s++) {
+                    if (api->supervisor->trees[s]) {
+                        uint32_t p = api->supervisor->trees[s]->partition_index;
+                        partition_rates[p] += api->supervisor->trees[s]->metadata_rate;
+                    }
+                }
+                for (int i = 0; i < api->supervisor->max_trees; i++) {
+                    int count = api->supervisor->partition_stats[i].current_tree_count;
+                    if (count > 0) {
+                        partition_rates[i] /= count;
+                    }
+                }
+            }
             for (int i = 0; i < api->supervisor->max_trees; i++) {
                 cJSON *part = cJSON_CreateObject();
                 cJSON_AddNumberToObject(part, "partition", i);
-                cJSON_AddNumberToObject(part, "total_metadata",
-                    (double)api->supervisor->partition_stats[i].total_metadata);
+                cJSON_AddNumberToObject(part, "avg_metadata_rate",
+                    partition_rates ? partition_rates[i] : 0.0);
                 cJSON_AddNumberToObject(part, "consecutive_zero_respawns",
                     api->supervisor->partition_stats[i].consecutive_zero_respawns);
                 cJSON_AddNumberToObject(part, "current_tree_count",
                     api->supervisor->partition_stats[i].current_tree_count);
                 cJSON_AddItemToArray(partitions_array, part);
             }
+            free(partition_rates);
             pthread_mutex_unlock(&api->supervisor->trees_lock);
             cJSON_AddItemToObject(root, "partitions", partitions_array);
         }

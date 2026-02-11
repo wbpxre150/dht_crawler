@@ -15,7 +15,6 @@ struct tree_dispatcher;
 
 /* Per-partition performance tracking for adaptive keyspace */
 typedef struct partition_stats {
-    uint64_t total_metadata;           /* Cumulative metadata from trees in this partition */
     int consecutive_zero_respawns;     /* Consecutive respawns with zero metadata */
     int current_tree_count;            /* Active trees currently in this partition */
 } partition_stats_t;
@@ -208,6 +207,7 @@ typedef struct supervisor {
 
     /* Adaptive keyspace partitioning */
     partition_stats_t *partition_stats;  /* Array of size max_trees (one per partition) */
+    uint32_t *home_partitions;           /* Array[max_trees]: home partition per slot */
     int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration */
     int max_trees_per_partition;         /* Max trees allowed in one partition */
 } supervisor_t;
