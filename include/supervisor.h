@@ -78,9 +78,11 @@ typedef struct supervisor_config {
 
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
 
     /* Metadata rate-based respawn settings */
-    double min_metadata_rate;          /* Min metadata rate before respawn (default: 0.01) */
+    double min_metadata_rate;          /* Floor for dynamic threshold (default: 0.01) */
+    double dynamic_rate_margin;        /* Margin subtracted from per-tree average (default: 0.02) */
     int rate_check_interval_sec;       /* Rate check interval (default: 60) */
     int rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
     int min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
@@ -171,14 +173,19 @@ typedef struct supervisor {
 
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
+    int parallel_peers;
 
     /* Metadata rate-based respawn settings */
-    double min_metadata_rate;
+    double min_metadata_rate;          /* Floor for dynamic threshold */
+    double dynamic_rate_margin;        /* Margin subtracted from per-tree average */
     int rate_check_interval_sec;
     int rate_grace_period_sec;
     int min_lifetime_minutes;
     int require_empty_queue;
     double rate_ema_alpha;             /* EMA smoothing alpha for metadata rate */
+
+    /* Per-slot grace period tracking for dynamic rate respawn */
+    time_t *rate_below_since;          /* Array[max_trees]: when each tree first went below threshold (0=not below) */
 
     /* Porn filter settings */
     int porn_filter_enabled;           /* Enable porn filter */

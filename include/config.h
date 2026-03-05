@@ -106,9 +106,11 @@ typedef struct {
     /* Thread tree Stage 5 settings (metadata) */
     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
 
     /* Thread tree metadata rate-based respawn settings */
-    double min_metadata_rate;               /* Min metadata rate before respawn (default: 0.01) */
+    double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */
+    double dynamic_rate_margin;             /* Margin subtracted from per-tree average (default: 0.02) */
     int tree_rate_check_interval_sec;       /* Rate check interval (default: 60) */
     int tree_rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
     int tree_min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */

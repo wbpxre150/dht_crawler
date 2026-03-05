@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <time.h>
 
 struct batch_writer {
     database_t *db;
@@ -16,7 +18,11 @@ struct batch_writer {
     size_t batch_size;
     size_t batch_capacity;
 
-    uv_timer_t flush_timer;
+    /* Periodic flush thread (replaces uv_timer which requires uv_run()) */
+    pthread_t flush_thread;
+    pthread_mutex_t flush_thread_mutex;
+    pthread_cond_t flush_thread_cond;
+    bool flush_thread_running;
     int flush_interval_sec;
 
     uv_mutex_t mutex;
@@ -34,21 +40,40 @@ struct batch_writer {
     minute_stat_t hourly_stats[60];
 };
 
-/* Timer callback for periodic flush */
-static void flush_timer_cb(uv_timer_t *timer) {
-    batch_writer_t *writer = (batch_writer_t*)timer->data;
-    
-    uv_mutex_lock(&writer->mutex);
-    
-    if (writer->batch_size > 0) {
-        log_msg(LOG_DEBUG, "Auto-flushing batch writer (%zu items)", writer->batch_size);
-        
-        /* Unlock during flush to allow other operations */
-        uv_mutex_unlock(&writer->mutex);
-        batch_writer_flush(writer);
-    } else {
-        uv_mutex_unlock(&writer->mutex);
+/* Background thread for periodic flush.
+ * Uses pthread so it works regardless of whether uv_run() is active. */
+static void* flush_thread_func(void *arg) {
+    batch_writer_t *writer = (batch_writer_t*)arg;
+
+    while (true) {
+        /* Sleep for flush_interval_sec, waking early if signaled to stop */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += writer->flush_interval_sec;
+
+        pthread_mutex_lock(&writer->flush_thread_mutex);
+        pthread_cond_timedwait(&writer->flush_thread_cond,
+                               &writer->flush_thread_mutex, &ts);
+        bool should_stop = !writer->flush_thread_running;
+        pthread_mutex_unlock(&writer->flush_thread_mutex);
+
+        if (should_stop) break;
+
+        uv_mutex_lock(&writer->mutex);
+        if (writer->batch_size > 0) {
+            log_msg(LOG_DEBUG, "Auto-flushing batch writer (%zu items)", writer->batch_size);
+            uv_mutex_unlock(&writer->mutex);
+            batch_writer_flush(writer);
+        } else {
+            uv_mutex_unlock(&writer->mutex);
+            /* Checkpoint even with no pending writes - WAL can grow from
+             * rolled-back transactions or FTS5 segment merges without any
+             * completed batch flushes. */
+            database_wal_checkpoint(writer->db);
+        }
     }
+
+    return NULL;
 }
 
 batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
@@ -57,13 +82,13 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
         log_msg(LOG_ERROR, "Invalid batch writer parameters");
         return NULL;
     }
-    
+
     batch_writer_t *writer = calloc(1, sizeof(batch_writer_t));
     if (!writer) {
         log_msg(LOG_ERROR, "Failed to allocate batch writer");
         return NULL;
     }
-    
+
     writer->db = db;
     writer->bloom = NULL;
     writer->bloom_path = NULL;
@@ -74,9 +99,10 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->flush_interval_sec = flush_interval_sec;
     writer->running = true;
     writer->flush_in_progress = false;
+    writer->flush_thread_running = false;
     writer->total_written = 0;
     writer->total_flushes = 0;
-    
+
     /* Allocate batch array */
     writer->batch = calloc(batch_capacity, sizeof(torrent_metadata_t*));
     if (!writer->batch) {
@@ -84,7 +110,7 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
         free(writer);
         return NULL;
     }
-    
+
     /* Initialize mutex */
     if (uv_mutex_init(&writer->mutex) != 0) {
         log_msg(LOG_ERROR, "Failed to initialize batch writer mutex");
@@ -92,17 +118,23 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
         free(writer);
         return NULL;
     }
-    
-    /* Initialize flush timer */
-    if (uv_timer_init(loop, &writer->flush_timer) != 0) {
-        log_msg(LOG_ERROR, "Failed to initialize flush timer");
+
+    /* Initialize flush thread synchronization primitives */
+    if (pthread_mutex_init(&writer->flush_thread_mutex, NULL) != 0) {
+        log_msg(LOG_ERROR, "Failed to initialize flush thread mutex");
         uv_mutex_destroy(&writer->mutex);
         free(writer->batch);
         free(writer);
         return NULL;
     }
-    
-    writer->flush_timer.data = writer;
+    if (pthread_cond_init(&writer->flush_thread_cond, NULL) != 0) {
+        log_msg(LOG_ERROR, "Failed to initialize flush thread cond");
+        pthread_mutex_destroy(&writer->flush_thread_mutex);
+        uv_mutex_destroy(&writer->mutex);
+        free(writer->batch);
+        free(writer);
+        return NULL;
+    }
 
     /* Initialize hourly stats array (zero out) */
     memset(writer->hourly_stats, 0, sizeof(writer->hourly_stats));
@@ -127,10 +159,19 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
             (unsigned long long)writer->cached_torrent_count,
             (unsigned long long)writer->cached_file_count);
 
-    /* Start periodic flush timer */
+    /* Start periodic flush thread */
     if (flush_interval_sec > 0) {
-        uint64_t interval_ms = flush_interval_sec * 1000;
-        uv_timer_start(&writer->flush_timer, flush_timer_cb, interval_ms, interval_ms);
+        writer->flush_thread_running = true;
+        if (pthread_create(&writer->flush_thread, NULL, flush_thread_func, writer) != 0) {
+            log_msg(LOG_ERROR, "Failed to start flush thread");
+            writer->flush_thread_running = false;
+            pthread_cond_destroy(&writer->flush_thread_cond);
+            pthread_mutex_destroy(&writer->flush_thread_mutex);
+            uv_mutex_destroy(&writer->mutex);
+            free(writer->batch);
+            free(writer);
+            return NULL;
+        }
     }
 
     log_msg(LOG_DEBUG, "Batch writer initialized: capacity=%zu, flush_interval=%ds",
@@ -309,6 +350,11 @@ int batch_writer_flush(batch_writer_t *writer) {
     /* Use optimized batch insert (single transaction, single mutex lock) */
     int ret = database_insert_batch(writer->db, batch_copy, count);
 
+    /* Checkpoint WAL after every flush attempt, regardless of whether inserts
+     * succeeded.  Rolled-back transactions still write frames to the WAL, so
+     * we must checkpoint unconditionally to prevent unbounded growth. */
+    database_wal_checkpoint(writer->db);
+
     /* Count successes (database_insert_batch handles logging) */
     size_t written = (ret == 0) ? count : 0;
 
@@ -481,16 +527,22 @@ void batch_writer_shutdown(batch_writer_t *writer) {
     if (!writer) {
         return;
     }
-    
+
     log_msg(LOG_DEBUG, "Batch writer shutting down...");
-    
+
+    /* Stop the periodic flush thread first */
+    if (writer->flush_thread_running) {
+        pthread_mutex_lock(&writer->flush_thread_mutex);
+        writer->flush_thread_running = false;
+        pthread_cond_signal(&writer->flush_thread_cond);
+        pthread_mutex_unlock(&writer->flush_thread_mutex);
+        pthread_join(writer->flush_thread, NULL);
+    }
+
     uv_mutex_lock(&writer->mutex);
     writer->running = false;
     uv_mutex_unlock(&writer->mutex);
-    
-    /* Stop flush timer */
-    uv_timer_stop(&writer->flush_timer);
-    
+
     /* Flush any pending writes */
     batch_writer_flush(writer);
 }
@@ -499,17 +551,12 @@ void batch_writer_cleanup(batch_writer_t *writer) {
     if (!writer) {
         return;
     }
-    
+
     /* Shutdown if not already done */
     if (writer->running) {
         batch_writer_shutdown(writer);
     }
-    
-    /* Close timer handle if not already closing */
-    if (!uv_is_closing((uv_handle_t*)&writer->flush_timer)) {
-        uv_close((uv_handle_t*)&writer->flush_timer, NULL);
-    }
-    
+
     /* Free any remaining batch items */
     uv_mutex_lock(&writer->mutex);
     for (size_t i = 0; i < writer->batch_size; i++) {
@@ -529,11 +576,13 @@ void batch_writer_cleanup(batch_writer_t *writer) {
         }
     }
     uv_mutex_unlock(&writer->mutex);
-    
+
     log_msg(LOG_DEBUG, "Batch writer cleaned up (%lu total written, %lu flushes)",
             writer->total_written, writer->total_flushes);
-    
+
     /* Cleanup */
+    pthread_cond_destroy(&writer->flush_thread_cond);
+    pthread_mutex_destroy(&writer->flush_thread_mutex);
     uv_mutex_destroy(&writer->mutex);
     free(writer->batch);
     free(writer);

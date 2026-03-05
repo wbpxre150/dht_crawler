@@ -1,7 +1,7 @@
 # DHT Crawler Makefile
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -D__BSD_VISIBLE=1
+CFLAGS = -Wall -Wextra -O2 -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -D__BSD_VISIBLE=1 $(EXTRA_CFLAGS)
 INCLUDES = -Iinclude -Ilib/wbpxre-dht -Ilib/bencode-c -Ilib/cJSON -Ilib/civetweb/include -Ilib/libbloom -Ilib/uthash/src
 LDFLAGS = -luv -lsqlite3 -lpthread -lssl -lcrypto -ldl -lm -lurcu lib/libbloom/build/libbloom.a
 
@@ -47,31 +47,34 @@ dirs:
 	@mkdir -p $(BUILD_DIR)
 	@mkdir -p $(DATA_DIR)
 
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
+
 $(TARGET): $(OBJS) $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/wbpxre_dht.o: $(LIB_DIR)/wbpxre-dht/wbpxre_dht.c
+$(BUILD_DIR)/wbpxre_dht.o: $(LIB_DIR)/wbpxre-dht/wbpxre_dht.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/wbpxre_routing.o: $(LIB_DIR)/wbpxre-dht/wbpxre_routing.c
+$(BUILD_DIR)/wbpxre_routing.o: $(LIB_DIR)/wbpxre-dht/wbpxre_routing.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/wbpxre_protocol.o: $(LIB_DIR)/wbpxre-dht/wbpxre_protocol.c
+$(BUILD_DIR)/wbpxre_protocol.o: $(LIB_DIR)/wbpxre-dht/wbpxre_protocol.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/wbpxre_worker.o: $(LIB_DIR)/wbpxre-dht/wbpxre_worker.c
+$(BUILD_DIR)/wbpxre_worker.o: $(LIB_DIR)/wbpxre-dht/wbpxre_worker.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/bencode.o: $(LIB_DIR)/bencode-c/bencode.c
+$(BUILD_DIR)/bencode.o: $(LIB_DIR)/bencode-c/bencode.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/cJSON.o: $(LIB_DIR)/cJSON/cJSON.c
+$(BUILD_DIR)/cJSON.o: $(LIB_DIR)/cJSON/cJSON.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILD_DIR)/civetweb.o: $(LIB_DIR)/civetweb/src/civetweb.c
+$(BUILD_DIR)/civetweb.o: $(LIB_DIR)/civetweb/src/civetweb.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -DNO_SSL -c $< -o $@
 
 libbloom:
@@ -96,16 +99,17 @@ install-deps:
 run: $(TARGET)
 	./$(TARGET)
 
-debug: CFLAGS += -g -DDEBUG
-debug: clean all
+debug:
+	$(MAKE) clean
+	$(MAKE) all EXTRA_CFLAGS="-g -DDEBUG"
 
-asan: CFLAGS += -g -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
-asan: LDFLAGS += -fsanitize=address -fsanitize=undefined
-asan: clean all
+asan:
+	$(MAKE) clean
+	$(MAKE) all EXTRA_CFLAGS="-g -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="$(LDFLAGS) -fsanitize=address -fsanitize=undefined"
 
-tsan: CFLAGS += -g -fsanitize=thread -fno-omit-frame-pointer
-tsan: LDFLAGS += -fsanitize=thread
-tsan: clean all
+tsan:
+	$(MAKE) clean
+	$(MAKE) all EXTRA_CFLAGS="-g -fsanitize=thread -fno-omit-frame-pointer" LDFLAGS="$(LDFLAGS) -fsanitize=thread"
 
 valgrind: debug
 	valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)

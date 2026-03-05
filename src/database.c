@@ -90,7 +90,15 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
 
     /* Enable WAL mode for better concurrency */
     sqlite3_exec(db->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    /* NORMAL sync: WAL survives process crashes intact (no fsync on commit).
+     * Durability is provided by wal_checkpoint(RESTART) called after every
+     * batch flush, which checkpoints all frames and resets the WAL write
+     * position so the file does not grow unboundedly. */
     sqlite3_exec(db->db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+    /* Disable automatic PASSIVE checkpoints - they never complete when there
+     * are concurrent readers (which is always the case here with many threads).
+     * Our manual RESTART checkpoint after each batch flush handles this. */
+    sqlite3_exec(db->db, "PRAGMA wal_autocheckpoint=0;", NULL, NULL, NULL);
     sqlite3_exec(db->db, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
     /* Larger page size for better compression (32KB) */
     sqlite3_exec(db->db, "PRAGMA page_size=32768;", NULL, NULL, NULL);
@@ -552,6 +560,26 @@ int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t cou
     return (written > 0) ? 0 : -1;
 }
 
+/* Checkpoint WAL into the main database file (RESTART mode).
+ * Called after each successful batch flush to keep the WAL from growing
+ * unboundedly and to ensure the main DB file stays up-to-date.
+ *
+ * RESTART waits for any active readers to finish (unlike PASSIVE which skips
+ * them), checkpoints all WAL frames, then resets the WAL write position to
+ * the beginning so the file is overwritten rather than appended to.  With
+ * wal_autocheckpoint=0 this is the sole checkpoint mechanism.
+ *
+ * Returns 0 on success, -1 on error. */
+int database_wal_checkpoint(database_t *db) {
+    if (!db || !db->db) {
+        return -1;
+    }
+    uv_mutex_lock(&db->mutex);
+    int rc = sqlite3_exec(db->db, "PRAGMA wal_checkpoint(RESTART);", NULL, NULL, NULL);
+    uv_mutex_unlock(&db->mutex);
+    return (rc == SQLITE_OK) ? 0 : -1;
+}
+
 /* Vacuum database */
 int database_vacuum(database_t *db) {
     if (!db || !db->db) {
@@ -603,6 +631,58 @@ int database_optimize(database_t *db) {
     return 0;
 }
 
+/* Rebuild bloom filter from all infohashes in the database.
+ * Opens the database read-only, iterates every info_hash in torrents,
+ * and adds each to the provided bloom filter.
+ * Returns the number of hashes added, or -1 on error. */
+int database_rebuild_bloom(const char *db_path, bloom_filter_t *bloom) {
+    if (!db_path || !bloom) {
+        return -1;
+    }
+
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild_bloom: failed to open database %s: %s",
+                db_path, sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT info_hash FROM torrents", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild_bloom: failed to prepare query: %s",
+                sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    int count = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const void *blob = sqlite3_column_blob(stmt, 0);
+        int blob_len = sqlite3_column_bytes(stmt, 0);
+        if (blob && blob_len == SHA1_DIGEST_LENGTH) {
+            bloom_filter_add(bloom, (const unsigned char *)blob);
+            count++;
+            if (count % 100000 == 0) {
+                log_msg(LOG_INFO, "rebuild_bloom: %d infohashes processed...", count);
+            }
+        }
+    }
+
+    if (rc != SQLITE_DONE) {
+        log_msg(LOG_ERROR, "rebuild_bloom: query error: %s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return count;
+}
+
 /* Cleanup database */
 void database_cleanup(database_t *db) {
     if (!db) {
@@ -635,6 +715,9 @@ void database_cleanup(database_t *db) {
     }
 
     if (db->db) {
+        /* Checkpoint WAL into main DB file before closing so all committed
+         * data is in the main file and the WAL is cleared cleanly. */
+        sqlite3_exec(db->db, "PRAGMA wal_checkpoint(FULL);", NULL, NULL, NULL);
         sqlite3_close(db->db);
         db->db = NULL;
     }

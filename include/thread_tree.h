@@ -89,6 +89,7 @@ typedef struct tree_config {
 
     /* Stage 5: Metadata fetcher settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
@@ -147,6 +148,7 @@ typedef struct thread_tree {
 
     /* Stage 5 config */
     int tcp_connect_timeout_ms;
+    int parallel_peers;
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;

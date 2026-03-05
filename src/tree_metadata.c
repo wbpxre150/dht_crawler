@@ -1247,10 +1247,10 @@ void *tree_metadata_worker_func(void *arg) {
 
     tree_peers_queue_t *peers_queue = (tree_peers_queue_t *)tree->peers_queue;
     tree_metadata_config_t config = {
-        .tcp_connect_timeout_ms = 5000,
+        .tcp_connect_timeout_ms = tree->tcp_connect_timeout_ms,
         .metadata_timeout_ms = 30000,
         .max_metadata_size = 10 * 1024 * 1024,
-        .parallel_peers = 2,
+        .parallel_peers = tree->parallel_peers,
         .tree = tree
     };
 
@@ -1368,14 +1368,16 @@ void *tree_metadata_worker_func(void *arg) {
     return NULL;
 }
 
-/* Rate monitor thread function */
+/* Rate monitor thread function
+ * Computes and publishes the per-tree EMA metadata rate.
+ * Respawn decisions are made by the supervisor monitor thread using the dynamic threshold. */
 void *tree_rate_monitor_func(void *arg) {
     rate_monitor_ctx_t *ctx = (rate_monitor_ctx_t *)arg;
     thread_tree_t *tree = ctx->tree;
 
     double alpha = ctx->ema_alpha;
-    log_msg(LOG_DEBUG, "[tree %u] Rate monitor started (min_rate=%.4f, check_interval=%ds, ema_alpha=%.2f)",
-            tree->tree_id, ctx->min_metadata_rate, ctx->check_interval_sec, alpha);
+    log_msg(LOG_DEBUG, "[tree %u] Rate monitor started (check_interval=%ds, ema_alpha=%.2f)",
+            tree->tree_id, ctx->check_interval_sec, alpha);
 
     uint64_t last_metadata_count = 0;
     time_t last_check_time = time(NULL);
@@ -1390,7 +1392,6 @@ void *tree_rate_monitor_func(void *arg) {
         if (atomic_load(&tree->shutdown_requested)) break;
 
         time_t now = time(NULL);
-        double tree_age = difftime(now, tree->creation_time);
 
         /* Get current metadata count */
         uint64_t current_metadata_count = atomic_load(&tree->metadata_count);
@@ -1407,82 +1408,12 @@ void *tree_rate_monitor_func(void *arg) {
             ema_rate = alpha * instantaneous_rate + (1.0 - alpha) * ema_rate;
         }
 
-        /* Publish EMA rate for stats endpoint */
+        /* Publish EMA rate for supervisor and stats endpoint */
         tree->metadata_rate = ema_rate;
 
-        /* Check minimum lifetime immunity - still calculate rate but don't act on it */
-        if (tree_age < ctx->min_lifetime_sec) {
-            log_msg(LOG_DEBUG, "[tree %u] Age %.0fs < min %ds - IMMUNE (instant: %.4f/sec, ema: %.4f/sec)",
-                    tree->tree_id, tree_age, ctx->min_lifetime_sec, instantaneous_rate, ema_rate);
-            last_metadata_count = current_metadata_count;
-            last_check_time = now;
-            continue;
-        }
-
-        log_msg(LOG_DEBUG, "[tree %u] Metadata rate: instant=%.4f/sec, ema=%.4f/sec (threshold: %.4f/sec, delta=%lu in %.0fs)",
-                tree->tree_id, instantaneous_rate, ema_rate, ctx->min_metadata_rate,
+        log_msg(LOG_DEBUG, "[tree %u] Metadata rate: instant=%.4f/sec, ema=%.4f/sec (delta=%lu in %.0fs)",
+                tree->tree_id, instantaneous_rate, ema_rate,
                 (unsigned long)metadata_delta, time_delta);
-
-        /* Check if EMA rate is below threshold */
-        if (ema_rate < ctx->min_metadata_rate) {
-            /* Check queue requirement */
-            if (ctx->require_empty_queue) {
-                int queue_size = tree_infohash_queue_count(tree->infohash_queue);
-                if (queue_size > 0) {
-                    log_msg(LOG_DEBUG, "[tree %u] EMA rate %.4f < %.4f, but queue not empty (%d) - CONTINUING",
-                            tree->tree_id, ema_rate, ctx->min_metadata_rate, queue_size);
-                    last_metadata_count = current_metadata_count;
-                    last_check_time = now;
-                    continue;
-                }
-            }
-
-            log_msg(LOG_WARN, "[tree %u] EMA rate %.4f < threshold %.4f, entering grace period (%ds)",
-                    tree->tree_id, ema_rate, ctx->min_metadata_rate, ctx->grace_period_sec);
-
-            /* Grace period - sleep in 1s chunks */
-            for (int i = 0; i < ctx->grace_period_sec && !atomic_load(&tree->shutdown_requested); i++) {
-                sleep(1);
-            }
-
-            if (atomic_load(&tree->shutdown_requested)) break;
-
-            /* Re-check after grace period: compute new instantaneous rate and update EMA */
-            time_t now2 = time(NULL);
-            uint64_t current_metadata_count2 = atomic_load(&tree->metadata_count);
-            double time_delta2 = difftime(now2, last_check_time);
-            uint64_t metadata_delta2 = current_metadata_count2 - last_metadata_count;
-            double instantaneous_rate2 = (time_delta2 > 0) ? (double)metadata_delta2 / time_delta2 : 0.0;
-
-            /* Update EMA with grace period observation */
-            ema_rate = alpha * instantaneous_rate2 + (1.0 - alpha) * ema_rate;
-            tree->metadata_rate = ema_rate;
-
-            if (ema_rate < ctx->min_metadata_rate) {
-                /* Check queue requirement again */
-                if (ctx->require_empty_queue) {
-                    int queue_size = tree_infohash_queue_count(tree->infohash_queue);
-                    if (queue_size > 0) {
-                        log_msg(LOG_DEBUG, "[tree %u] EMA rate STILL %.4f < %.4f after grace period, but queue not empty (%d) - CONTINUING",
-                                tree->tree_id, ema_rate, ctx->min_metadata_rate, queue_size);
-                        last_metadata_count = current_metadata_count2;
-                        last_check_time = now2;
-                        continue;
-                    }
-                }
-
-                log_msg(LOG_INFO, "[tree %u] EMA rate SUSTAINED at %.4f < %.4f after grace period (instant: %.4f) - REQUESTING SHUTDOWN",
-                        tree->tree_id, ema_rate, ctx->min_metadata_rate, instantaneous_rate2);
-                thread_tree_request_shutdown(tree, SHUTDOWN_REASON_RATE_BASED);
-                break;
-            } else {
-                log_msg(LOG_DEBUG, "[tree %u] EMA rate improved to %.4f after grace period (instant: %.4f) - CONTINUING",
-                        tree->tree_id, ema_rate, instantaneous_rate2);
-                last_metadata_count = current_metadata_count2;
-                last_check_time = now2;
-                continue;
-            }
-        }
 
         last_metadata_count = current_metadata_count;
         last_check_time = now;

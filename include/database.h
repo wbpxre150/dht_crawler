@@ -55,7 +55,12 @@ int database_commit_transaction(database_t *db);
 int database_rollback_transaction(database_t *db);
 void database_cleanup(database_t *db);
 
+/* Rebuild bloom filter by scanning all infohashes in the database.
+ * Returns the number of hashes added, or -1 on error. */
+int database_rebuild_bloom(const char *db_path, struct bloom_filter *bloom);
+
 /* Maintenance functions */
+int database_wal_checkpoint(database_t *db);
 int database_vacuum(database_t *db);
 int database_analyze(database_t *db);
 int database_optimize(database_t *db);

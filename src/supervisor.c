@@ -12,6 +12,7 @@
 #include "tree_routing.h"
 #include "wbpxre_dht.h"
 #include "keyspace.h"
+#include "tree_infohash_queue.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -99,9 +100,11 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
+    sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
 
     /* Metadata rate-based respawn settings */
     sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
+    sup->dynamic_rate_margin = config->dynamic_rate_margin >= 0 ? config->dynamic_rate_margin : 0.02;
     sup->rate_check_interval_sec = config->rate_check_interval_sec > 0 ? config->rate_check_interval_sec : 60;
     sup->rate_grace_period_sec = config->rate_grace_period_sec > 0 ? config->rate_grace_period_sec : 30;
     sup->min_lifetime_minutes = config->min_lifetime_minutes > 0 ? config->min_lifetime_minutes : 10;
@@ -188,6 +191,20 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
+    /* Allocate per-slot grace period tracking for dynamic rate respawn */
+    sup->rate_below_since = calloc(sup->max_trees, sizeof(time_t));
+    if (!sup->rate_below_since) {
+        log_msg(LOG_ERROR, "[supervisor] Failed to allocate rate_below_since array");
+        pthread_mutex_destroy(&sup->draining_lock);
+        free(sup->draining_trees);
+        free(sup->home_partitions);
+        free(sup->partition_stats);
+        free(sup->trees);
+        pthread_mutex_destroy(&sup->trees_lock);
+        free(sup);
+        return NULL;
+    }
+
     log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_target=%d, draining_slots=%d, spawn_threshold=%d, drain_timeout=%ds",
             sup->max_trees, sup->global_bootstrap_target, sup->max_draining_trees,
             sup->respawn_spawn_threshold, sup->respawn_drain_timeout_sec);
@@ -235,6 +252,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .peers_resume_threshold = sup->peers_resume_threshold,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
+        .parallel_peers = sup->parallel_peers,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,
@@ -1096,6 +1114,7 @@ void supervisor_destroy(supervisor_t *sup) {
     pthread_mutex_destroy(&sup->trees_lock);
     free(sup->home_partitions);
     free(sup->partition_stats);
+    free(sup->rate_below_since);
     free(sup->trees);
     free(sup);
 
@@ -1130,6 +1149,34 @@ static void *monitor_thread_func(void *arg) {
 
         /* Check tree performance */
         pthread_mutex_lock(&sup->trees_lock);
+
+        /* Compute dynamic respawn threshold for this cycle:
+         *   dynamic_threshold = max(min_metadata_rate, (total_rate / N) - dynamic_rate_margin)
+         * where N = active non-draining trees past their immunity period. */
+        double total_rate = 0.0;
+        int active_rate_count = 0;
+        time_t now_thresh = time(NULL);
+        for (int j = 0; j < sup->max_trees; j++) {
+            thread_tree_t *t = sup->trees[j];
+            if (!t || (uintptr_t)t < 0x1000) continue;
+            if (atomic_load(&t->needs_respawn)) continue;
+            double age = difftime(now_thresh, t->creation_time);
+            if (age < (double)t->min_lifetime_sec) continue;
+            total_rate += t->metadata_rate;
+            active_rate_count++;
+        }
+        double dynamic_threshold = sup->min_metadata_rate;
+        if (active_rate_count > 0) {
+            double avg = total_rate / active_rate_count;
+            double computed = avg - sup->dynamic_rate_margin;
+            if (computed > sup->min_metadata_rate) {
+                dynamic_threshold = computed;
+            }
+        }
+        log_msg(LOG_DEBUG, "[supervisor] Dynamic threshold: %.4f/s (avg=%.4f, N=%d, margin=%.4f, floor=%.4f)",
+                dynamic_threshold,
+                active_rate_count > 0 ? total_rate / active_rate_count : 0.0,
+                active_rate_count, sup->dynamic_rate_margin, sup->min_metadata_rate);
 
         for (int i = 0; i < sup->max_trees; i++) {
             thread_tree_t *tree = sup->trees[i];
@@ -1224,6 +1271,7 @@ static void *monitor_thread_func(void *arg) {
 
                     /* Start replacement tree immediately */
                     sup->trees[i] = new_tree;
+                    sup->rate_below_since[i] = 0;  /* Reset grace period for new tree */
                     thread_tree_start(new_tree);
                     sup->active_trees++;
 
@@ -1247,12 +1295,63 @@ static void *monitor_thread_func(void *arg) {
             tree_phase_t phase = atomic_load(&tree->current_phase);
             uint64_t metadata_count = atomic_load(&tree->metadata_count);
 
-            /* TODO: Implement rate calculation in Stage 2 */
-            /* For now, just log status */
-            log_msg(LOG_DEBUG, "[supervisor] Tree %u phase=%s metadata=%lu",
+            log_msg(LOG_DEBUG, "[supervisor] Tree %u phase=%s metadata=%lu ema=%.4f/s",
                     tree_id,
                     thread_tree_phase_name(phase),
-                    (unsigned long)metadata_count);
+                    (unsigned long)metadata_count,
+                    tree->metadata_rate);
+
+            /* Skip rate check if tree is still in immunity period */
+            time_t now_check = time(NULL);
+            double tree_age = difftime(now_check, tree->creation_time);
+            if (tree_age < (double)tree->min_lifetime_sec) {
+                sup->rate_below_since[i] = 0;
+                continue;
+            }
+
+            /* Skip rate check if tree has not yet computed its first EMA (rate == 0.0 at init) */
+            if (tree->metadata_rate == 0.0 && metadata_count == 0) {
+                continue;
+            }
+
+            /* Check rate against dynamic threshold */
+            double ema_rate = tree->metadata_rate;
+            if (ema_rate < dynamic_threshold) {
+                /* Optionally wait for empty infohash queue before respawning */
+                if (sup->require_empty_queue) {
+                    int queue_size = tree_infohash_queue_count(tree->infohash_queue);
+                    if (queue_size > 0) {
+                        log_msg(LOG_DEBUG, "[tree %u] EMA %.4f < threshold %.4f but queue not empty (%d) - waiting",
+                                tree_id, ema_rate, dynamic_threshold, queue_size);
+                        sup->rate_below_since[i] = 0;
+                        continue;
+                    }
+                }
+
+                if (sup->rate_below_since[i] == 0) {
+                    sup->rate_below_since[i] = now_check;
+                    log_msg(LOG_WARN, "[tree %u] EMA rate %.4f/s < dynamic threshold %.4f/s - grace period starts (%ds)",
+                            tree_id, ema_rate, dynamic_threshold, sup->rate_grace_period_sec);
+                } else {
+                    double below_duration = difftime(now_check, sup->rate_below_since[i]);
+                    if (below_duration >= (double)sup->rate_grace_period_sec) {
+                        log_msg(LOG_INFO, "[tree %u] EMA rate %.4f/s < threshold %.4f/s for %.0fs - requesting respawn",
+                                tree_id, ema_rate, dynamic_threshold, below_duration);
+                        if (!atomic_load(&tree->shutdown_requested)) {
+                            thread_tree_request_shutdown(tree, SHUTDOWN_REASON_RATE_BASED);
+                        }
+                    } else {
+                        log_msg(LOG_DEBUG, "[tree %u] EMA rate %.4f/s < threshold %.4f/s for %.0fs / %ds",
+                                tree_id, ema_rate, dynamic_threshold, below_duration, sup->rate_grace_period_sec);
+                    }
+                }
+            } else {
+                if (sup->rate_below_since[i] != 0) {
+                    log_msg(LOG_DEBUG, "[tree %u] EMA rate %.4f/s recovered above threshold %.4f/s",
+                            tree_id, ema_rate, dynamic_threshold);
+                }
+                sup->rate_below_since[i] = 0;
+            }
         }
 
         pthread_mutex_unlock(&sup->trees_lock);

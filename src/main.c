@@ -146,9 +146,13 @@ void cleanup_app_context(app_context_t *ctx) {
 }
 
 int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
     int rc;
+    bool rebuild_bloom = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
+            rebuild_bloom = true;
+        }
+    }
 
     /* Increase file descriptor limit to support max_concurrent_connections
      * The default soft limit is often 1024, which is too low for high-concurrency crawling.
@@ -184,6 +188,48 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_WARN, "Could not load config.ini, using defaults");
     }
 
+    /* Rebuild bloom filter from database if requested */
+    if (rebuild_bloom) {
+        if (!config.bloom_enabled) {
+            log_msg(LOG_ERROR, "--rebuild-bloom-filter: bloom filter is disabled in config.ini");
+            return 1;
+        }
+        if (!config.bloom_persist) {
+            log_msg(LOG_ERROR, "--rebuild-bloom-filter: bloom filter persistence is disabled in config.ini (bloom_persist=0)");
+            return 1;
+        }
+        if (ensure_parent_directory_exists(config.bloom_path) != 0) {
+            log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to create bloom filter directory");
+            return 1;
+        }
+
+        log_msg(LOG_INFO, "Rebuilding bloom filter from database %s ...", g_app_ctx.db_path);
+        bloom_filter_t *bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
+        if (!bloom) {
+            log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to allocate bloom filter");
+            return 1;
+        }
+
+        int added = database_rebuild_bloom(g_app_ctx.db_path, bloom);
+        if (added < 0) {
+            log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to read database");
+            bloom_filter_cleanup(bloom);
+            return 1;
+        }
+
+        log_msg(LOG_INFO, "Added %d infohashes to bloom filter", added);
+
+        if (bloom_filter_save(bloom, config.bloom_path) != 0) {
+            log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to save bloom filter to %s", config.bloom_path);
+            bloom_filter_cleanup(bloom);
+            return 1;
+        }
+
+        /* Keep the rebuilt bloom as g_bloom directly - no need for a save/load roundtrip */
+        g_bloom = bloom;
+        log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s. Continuing startup...", config.bloom_path);
+    }
+
     /* Set up signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -214,35 +260,40 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        log_msg(LOG_DEBUG, "Initializing bloom filter (capacity: %lu, error rate: %.3f%%)...",
-                config.bloom_capacity, config.bloom_error_rate * 100.0);
-        g_bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
-        if (!g_bloom) {
-            log_msg(LOG_ERROR, "Failed to initialize bloom filter");
-            infohash_queue_cleanup(&g_queue);
-            return 1;
-        }
+        if (g_bloom) {
+            /* Already set by --rebuild-bloom-filter above; use it directly */
+            log_msg(LOG_DEBUG, "Using rebuilt bloom filter directly (skipping load)");
+        } else {
+            log_msg(LOG_DEBUG, "Initializing bloom filter (capacity: %lu, error rate: %.3f%%)...",
+                    config.bloom_capacity, config.bloom_error_rate * 100.0);
+            g_bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
+            if (!g_bloom) {
+                log_msg(LOG_ERROR, "Failed to initialize bloom filter");
+                infohash_queue_cleanup(&g_queue);
+                return 1;
+            }
 
-        /* Try to load existing bloom filter if persistence is enabled */
-        if (config.bloom_persist) {
-            bloom_filter_t *loaded_bloom = bloom_filter_load(config.bloom_path);
-            if (loaded_bloom) {
-                /* Check if loaded filter has same capacity as configured */
-                uint64_t loaded_capacity = 0;
-                double loaded_error_rate = 0.0;
-                bloom_filter_stats(loaded_bloom, &loaded_capacity, &loaded_error_rate, NULL);
+            /* Try to load existing bloom filter if persistence is enabled */
+            if (config.bloom_persist) {
+                bloom_filter_t *loaded_bloom = bloom_filter_load(config.bloom_path);
+                if (loaded_bloom) {
+                    /* Check if loaded filter has same capacity as configured */
+                    uint64_t loaded_capacity = 0;
+                    double loaded_error_rate = 0.0;
+                    bloom_filter_stats(loaded_bloom, &loaded_capacity, &loaded_error_rate, NULL);
 
-                if (loaded_capacity == config.bloom_capacity &&
-                    loaded_error_rate == config.bloom_error_rate) {
-                    bloom_filter_cleanup(g_bloom);
-                    g_bloom = loaded_bloom;
-                } else {
-                    log_msg(LOG_WARN, "Bloom filter config mismatch - loaded: capacity=%lu error=%.3f%%, "
-                            "config: capacity=%lu error=%.3f%%. Starting fresh.",
-                            loaded_capacity, loaded_error_rate * 100.0,
-                            config.bloom_capacity, config.bloom_error_rate * 100.0);
-                    bloom_filter_cleanup(loaded_bloom);
-                    /* Keep the newly initialized filter with correct config */
+                    if (loaded_capacity == config.bloom_capacity &&
+                        loaded_error_rate == config.bloom_error_rate) {
+                        bloom_filter_cleanup(g_bloom);
+                        g_bloom = loaded_bloom;
+                    } else {
+                        log_msg(LOG_WARN, "Bloom filter config mismatch - loaded: capacity=%lu error=%.3f%%, "
+                                "config: capacity=%lu error=%.3f%%. Starting fresh.",
+                                loaded_capacity, loaded_error_rate * 100.0,
+                                config.bloom_capacity, config.bloom_error_rate * 100.0);
+                        bloom_filter_cleanup(loaded_bloom);
+                        /* Keep the newly initialized filter with correct config */
+                    }
                 }
             }
         }
@@ -364,8 +415,10 @@ int main(int argc, char *argv[]) {
             .peers_resume_threshold = config.tree_peers_resume_threshold,
             /* Stage 5 settings */
             .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
+            .parallel_peers = config.tree_parallel_peers,
             /* Metadata rate-based respawn settings */
             .min_metadata_rate = config.min_metadata_rate,
+            .dynamic_rate_margin = config.dynamic_rate_margin,
             .rate_check_interval_sec = config.tree_rate_check_interval_sec,
             .rate_grace_period_sec = config.tree_rate_grace_period_sec,
             .min_lifetime_minutes = config.tree_min_lifetime_minutes,

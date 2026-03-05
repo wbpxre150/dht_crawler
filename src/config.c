@@ -114,9 +114,11 @@ void config_init_defaults(crawler_config_t *config) {
     /* Thread tree Stage 5 defaults (metadata) */
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
+    config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash */
 
     /* Thread tree metadata rate-based respawn defaults */
-    config->min_metadata_rate = 0.01;                  /* 0.01 metadata/sec threshold */
+    config->min_metadata_rate = 0.01;                  /* Floor for dynamic threshold */
+    config->dynamic_rate_margin = 0.02;                /* Margin from per-tree average */
     config->tree_rate_check_interval_sec = 60;         /* Check every 60 seconds */
     config->tree_rate_grace_period_sec = 30;           /* 30 second grace period */
     config->tree_min_lifetime_minutes = 10;            /* 10 minute minimum lifetime */
@@ -406,11 +408,18 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "tree_tcp_connect_timeout_ms") == 0) {
             config->tree_tcp_connect_timeout_ms = atoi(value);
             if (config->tree_tcp_connect_timeout_ms < 1000) config->tree_tcp_connect_timeout_ms = 1000;
+        } else if (strcmp(key, "tree_parallel_peers") == 0) {
+            config->tree_parallel_peers = atoi(value);
+            if (config->tree_parallel_peers < 1) config->tree_parallel_peers = 1;
+            if (config->tree_parallel_peers > 10) config->tree_parallel_peers = 10;
         }
         /* Thread tree metadata rate-based respawn settings */
         else if (strcmp(key, "min_metadata_rate") == 0) {
             config->min_metadata_rate = atof(value);
             if (config->min_metadata_rate < 0.0) config->min_metadata_rate = 0.0;
+        } else if (strcmp(key, "dynamic_rate_margin") == 0) {
+            config->dynamic_rate_margin = atof(value);
+            if (config->dynamic_rate_margin < 0.0) config->dynamic_rate_margin = 0.0;
         } else if (strcmp(key, "tree_rate_check_interval_sec") == 0) {
             config->tree_rate_check_interval_sec = atoi(value);
             if (config->tree_rate_check_interval_sec < 10) config->tree_rate_check_interval_sec = 10;
