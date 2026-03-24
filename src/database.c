@@ -113,7 +113,24 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
         return -1;
     }
 
+    /* Initialize checkpoint rwlock */
+    if (pthread_rwlock_init(&db->checkpoint_rwlock, NULL) != 0) {
+        uv_mutex_destroy(&db->mutex);
+        sqlite3_close(db->db);
+        return -1;
+    }
+
     return 0;
+}
+
+/* Acquire read lock - prevents WAL checkpoint while held */
+void database_read_lock(database_t *db) {
+    if (db) pthread_rwlock_rdlock(&db->checkpoint_rwlock);
+}
+
+/* Release read lock */
+void database_read_unlock(database_t *db) {
+    if (db) pthread_rwlock_unlock(&db->checkpoint_rwlock);
 }
 
 /* Set bloom filter for tracking successful writes */
@@ -214,6 +231,7 @@ int database_check_exists(database_t *db, const uint8_t *info_hash) {
         return 0;
     }
 
+    pthread_rwlock_rdlock(&db->checkpoint_rwlock);
     uv_mutex_lock(&db->mutex);
 
     sqlite3_reset(db->check_exists_stmt);
@@ -221,7 +239,12 @@ int database_check_exists(database_t *db, const uint8_t *info_hash) {
 
     int exists = (sqlite3_step(db->check_exists_stmt) == SQLITE_ROW);
 
+    /* CRITICAL: Reset after stepping to release the implicit read transaction.
+     * An unreset statement holds a read lock on the WAL, blocking checkpoints. */
+    sqlite3_reset(db->check_exists_stmt);
+
     uv_mutex_unlock(&db->mutex);
+    pthread_rwlock_unlock(&db->checkpoint_rwlock);
     return exists;
 }
 
@@ -560,23 +583,58 @@ int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t cou
     return (written > 0) ? 0 : -1;
 }
 
-/* Checkpoint WAL into the main database file (RESTART mode).
- * Called after each successful batch flush to keep the WAL from growing
- * unboundedly and to ensure the main DB file stays up-to-date.
+/* Checkpoint WAL into the main database file (TRUNCATE mode).
  *
- * RESTART waits for any active readers to finish (unlike PASSIVE which skips
- * them), checkpoints all WAL frames, then resets the WAL write position to
- * the beginning so the file is overwritten rather than appended to.  With
- * wal_autocheckpoint=0 this is the sole checkpoint mechanism.
+ * Acquires the checkpoint_rwlock write lock to block ALL readers (HTTP API,
+ * check_exists) until the checkpoint completes.  This guarantees the WAL is
+ * fully transferred to the main DB and the WAL file is truncated to zero.
  *
  * Returns 0 on success, -1 on error. */
 int database_wal_checkpoint(database_t *db) {
     if (!db || !db->db) {
         return -1;
     }
+
+    /* Write lock: blocks until all readers release their read locks,
+     * and prevents new readers from starting. */
+    pthread_rwlock_wrlock(&db->checkpoint_rwlock);
     uv_mutex_lock(&db->mutex);
-    int rc = sqlite3_exec(db->db, "PRAGMA wal_checkpoint(RESTART);", NULL, NULL, NULL);
+
+    /* Reset ALL prepared statements to release any implicit read transactions
+     * held by this connection.  An unreset statement prevents the checkpoint
+     * from completing even on the same connection. */
+    if (db->check_exists_stmt)   sqlite3_reset(db->check_exists_stmt);
+    if (db->insert_torrent_stmt) sqlite3_reset(db->insert_torrent_stmt);
+    if (db->insert_file_stmt)    sqlite3_reset(db->insert_file_stmt);
+    if (db->insert_prefix_stmt)  sqlite3_reset(db->insert_prefix_stmt);
+    if (db->lookup_prefix_stmt)  sqlite3_reset(db->lookup_prefix_stmt);
+
+    /* Set busy timeout so TRUNCATE waits for any stragglers the rwlock
+     * didn't cover (e.g. database_rebuild_bloom's separate connection). */
+    sqlite3_busy_timeout(db->db, 30000);
+
+    int nLog = 0, nCkpt = 0;
+    int rc = sqlite3_wal_checkpoint_v2(db->db, NULL,
+                SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
+
+    /* Restore no-timeout for normal operations */
+    sqlite3_busy_timeout(db->db, 0);
+
+    if (rc == SQLITE_BUSY) {
+        log_msg(LOG_WARN, "WAL checkpoint BUSY: %d/%d frames checkpointed (readers still active)",
+                nCkpt, nLog);
+    } else if (rc == SQLITE_OK) {
+        if (nLog > 0) {
+            log_msg(LOG_DEBUG, "WAL checkpoint OK: %d/%d frames checkpointed, WAL truncated",
+                    nCkpt, nLog);
+        }
+    } else {
+        log_msg(LOG_ERROR, "WAL checkpoint failed (rc=%d): %s", rc, sqlite3_errstr(rc));
+    }
+
     uv_mutex_unlock(&db->mutex);
+    pthread_rwlock_unlock(&db->checkpoint_rwlock);
+
     return (rc == SQLITE_OK) ? 0 : -1;
 }
 
@@ -715,12 +773,27 @@ void database_cleanup(database_t *db) {
     }
 
     if (db->db) {
-        /* Checkpoint WAL into main DB file before closing so all committed
-         * data is in the main file and the WAL is cleared cleanly. */
-        sqlite3_exec(db->db, "PRAGMA wal_checkpoint(FULL);", NULL, NULL, NULL);
+        /* Final checkpoint: reset all statements, then truncate WAL.
+         * No need for rwlock here since we're shutting down. */
+        if (db->check_exists_stmt)   sqlite3_reset(db->check_exists_stmt);
+        if (db->insert_torrent_stmt) sqlite3_reset(db->insert_torrent_stmt);
+        if (db->insert_file_stmt)    sqlite3_reset(db->insert_file_stmt);
+        if (db->insert_prefix_stmt)  sqlite3_reset(db->insert_prefix_stmt);
+        if (db->lookup_prefix_stmt)  sqlite3_reset(db->lookup_prefix_stmt);
+
+        sqlite3_busy_timeout(db->db, 30000);
+        int nLog = 0, nCkpt = 0;
+        int rc = sqlite3_wal_checkpoint_v2(db->db, NULL,
+                    SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
+        if (rc != SQLITE_OK) {
+            log_msg(LOG_WARN, "Final WAL checkpoint returned %d: %s (%d/%d frames)",
+                    rc, sqlite3_errstr(rc), nCkpt, nLog);
+        }
+
         sqlite3_close(db->db);
         db->db = NULL;
     }
 
+    pthread_rwlock_destroy(&db->checkpoint_rwlock);
     uv_mutex_destroy(&db->mutex);
 }

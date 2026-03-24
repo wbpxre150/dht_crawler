@@ -4,6 +4,7 @@
 #include "dht_crawler.h"
 #include <sqlite3.h>
 #include <stdint.h>
+#include <pthread.h>
 
 /* File info structure */
 typedef struct {
@@ -38,8 +39,14 @@ typedef struct {
     app_context_t *app_ctx;
     int batch_count;
     uv_mutex_t mutex;
+    pthread_rwlock_t checkpoint_rwlock;  /* Coordinates readers vs WAL checkpoint */
     struct bloom_filter *bloom;  /* Bloom filter for marking successful writes */
 } database_t;
+
+/* Acquire/release read lock for database queries (used by HTTP API etc.)
+ * Prevents WAL checkpoint from running while readers are active. */
+void database_read_lock(database_t *db);
+void database_read_unlock(database_t *db);
 
 /* Function declarations */
 int database_init(database_t *db, const char *db_path, app_context_t *app_ctx);

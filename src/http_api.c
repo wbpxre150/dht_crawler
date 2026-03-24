@@ -27,12 +27,17 @@ static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int root_handler(struct mg_connection *conn, void *cbdata);
 static int refresh_handler(struct mg_connection *conn, void *cbdata);
 static int random_handler(struct mg_connection *conn, void *cbdata);
+static int random_music_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
 static int get_random_video_torrents(database_t *db, search_result_t **results, int *count);
+static int get_random_music_torrents(database_t *db, search_result_t **results, int *count);
+
+/* Sentinel value to indicate music random mode in generate_search_results_html */
+#define RANDOM_MUSIC_MODE_SENTINEL "\x01MUSIC"
 
 /* Helper: Format info_hash as hex */
 static void format_hex(const uint8_t *data, size_t len, char *out) {
@@ -104,6 +109,7 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/stats", stats_handler, api);
     mg_set_request_handler(api->mg_ctx, "/refresh", refresh_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random", random_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/random-music", random_music_handler, api);
 
     api->running = 1;
     log_msg(LOG_DEBUG, "HTTP API server started on port %d", api->port);
@@ -315,9 +321,12 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "        <input type='hidden' name='format' value='html'>\n"
         "        <button type='submit' class='btn'>Search</button>\n"
         "      </form>\n"
-        "      <div style='margin-top: 16px;'>\n"
+        "      <div style='margin-top: 16px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;'>\n"
         "        <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>\n"
         "          Random 100 Video Torrents\n"
+        "        </a>\n"
+        "        <a href='/random-music' class='btn' style='background: #e91e63; text-decoration: none;'>\n"
+        "          Random 100 Music Torrents\n"
         "        </a>\n"
         "      </div>\n"
         "    </div>\n"
@@ -656,6 +665,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     const char *check_sql = "SELECT 1 FROM torrents WHERE info_hash = ? LIMIT 1";
     sqlite3_stmt *check_stmt;
     int exists = 0;
+    database_read_lock(api->database);
     if (sqlite3_prepare_v2(api->database->db, check_sql, -1, &check_stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_blob(check_stmt, 1, info_hash, 20, SQLITE_STATIC);
         if (sqlite3_step(check_stmt) == SQLITE_ROW) {
@@ -663,6 +673,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
         }
         sqlite3_finalize(check_stmt);
     }
+    database_read_unlock(api->database);
 
     if (!exists) {
         const char *error = "{\"error\":\"Torrent not found in database\"}";
@@ -853,6 +864,85 @@ static int random_handler(struct mg_connection *conn, void *cbdata) {
 
     /* Generate HTML using the shared function with NULL query to indicate random mode */
     char *html = generate_search_results_html(results, count, NULL, 1, count);
+    if (!html) {
+        const char *error = "{\"error\":\"Failed to generate HTML\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        free_search_results(results, count);
+        return 500;
+    }
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/html\r\n"
+              "Content-Length: %d\r\n"
+              "\r\n"
+              "%s",
+              (int)strlen(html), html);
+
+    free(html);
+    free_search_results(results, count);
+    return 200;
+}
+
+/* Random music torrents handler */
+static int random_music_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
+
+    search_result_t *results = NULL;
+    int count = 0;
+    int rc = get_random_music_torrents(api->database, &results, &count);
+
+    if (rc != 0) {
+        const char *error = "{\"error\":\"Database query failed\"}";
+        mg_printf(conn,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(error), error);
+        return 500;
+    }
+
+    if (count == 0) {
+        const char *empty_html =
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>\n"
+            "  <meta charset='UTF-8'>\n"
+            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+            "  <title>No Music Torrents</title>\n"
+            "  <style>\n"
+            "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
+            "    .message { margin: 50px 0; color: #666; }\n"
+            "    a { color: #1a73e8; text-decoration: none; }\n"
+            "  </style>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <h1>No Music Torrents Found</h1>\n"
+            "  <p class='message'>No music torrents with 50 peers are currently available.</p>\n"
+            "  <a href='/'>Back to Search</a>\n"
+            "</body>\n"
+            "</html>";
+
+        mg_printf(conn,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(empty_html), empty_html);
+
+        return 200;
+    }
+
+    char *html = generate_search_results_html(results, count, RANDOM_MUSIC_MODE_SENTINEL, 1, count);
     if (!html) {
         const char *error = "{\"error\":\"Failed to generate HTML\"}";
         mg_printf(conn,
@@ -1107,6 +1197,8 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     *count = 0;
     *total_count = 0;
 
+    database_read_lock(db);
+
     /* First, get total count of matching results */
     const char *count_sql =
         "SELECT COUNT(DISTINCT t.id) "
@@ -1122,6 +1214,7 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     int rc = sqlite3_prepare_v2(db->db, count_sql, -1, &count_stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
         return -1;
     }
 
@@ -1154,6 +1247,7 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
         return -1;
     }
 
@@ -1167,6 +1261,7 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
     if (!res) {
         sqlite3_finalize(stmt);
+        database_read_unlock(db);
         return -1;
     }
 
@@ -1213,6 +1308,8 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
 
     sqlite3_finalize(stmt);
 
+    database_read_unlock(db);
+
     *results = res;
     *count = i;
 
@@ -1248,7 +1345,8 @@ void free_search_results(search_result_t *results, int count) {
     free(results);
 }
 
-/* Check if a torrent is primarily video content by examining its files */
+/* Check if a torrent is primarily video content by examining its files.
+ * CALLER must hold database_read_lock. */
 static int is_video_torrent(database_t *db, int64_t torrent_id) {
     const char *sql =
         "SELECT "
@@ -1288,6 +1386,46 @@ static int is_video_torrent(database_t *db, int64_t torrent_id) {
     return is_video;
 }
 
+/* Check if a torrent is primarily music based on file extensions */
+static int is_music_torrent(database_t *db, int64_t torrent_id) {
+    const char *sql =
+        "SELECT "
+        "    SUM(CASE "
+        "        WHEN LOWER(filename) LIKE '%.mp3' "
+        "          OR LOWER(filename) LIKE '%.flac' "
+        "          OR LOWER(filename) LIKE '%.ogg' "
+        "          OR LOWER(filename) LIKE '%.opus' "
+        "          OR LOWER(filename) LIKE '%.m4a' "
+        "          OR LOWER(filename) LIKE '%.aac' "
+        "          OR LOWER(filename) LIKE '%.wav' "
+        "          OR LOWER(filename) LIKE '%.wma' "
+        "          OR LOWER(filename) LIKE '%.ape' "
+        "          OR LOWER(filename) LIKE '%.alac' "
+        "        THEN size_bytes ELSE 0 END) as music_bytes, "
+        "    SUM(size_bytes) as total_bytes "
+        "FROM torrent_files WHERE torrent_id = ?";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+
+    sqlite3_bind_int64(stmt, 1, torrent_id);
+
+    int is_music = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t music_bytes = sqlite3_column_int64(stmt, 0);
+        int64_t total_bytes = sqlite3_column_int64(stmt, 1);
+        /* Music if majority of content is music files */
+        if (total_bytes > 0 && music_bytes * 2 > total_bytes) {
+            is_music = 1;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return is_music;
+}
+
 /* Get 100 random video torrents with exactly 50 peers using random ID sampling */
 static int get_random_video_torrents(database_t *db, search_result_t **results, int *count) {
     if (!db || !results || !count) {
@@ -1296,6 +1434,8 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
 
     *results = NULL;
     *count = 0;
+
+    database_read_lock(db);
 
     /* Get max ID for random sampling range */
     int64_t max_id = 0;
@@ -1309,6 +1449,7 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
 
     if (max_id == 0) {
         log_msg(LOG_DEBUG, "Random video query: no torrents in database");
+        database_read_unlock(db);
         return 0;
     }
 
@@ -1326,6 +1467,7 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
     sqlite3_stmt *torrent_stmt;
     if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
         return -1;
     }
 
@@ -1334,6 +1476,7 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
     sqlite3_stmt *file_count_stmt;
     if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
         sqlite3_finalize(torrent_stmt);
+        database_read_unlock(db);
         return -1;
     }
 
@@ -1342,6 +1485,7 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
     if (!res) {
         sqlite3_finalize(torrent_stmt);
         sqlite3_finalize(file_count_stmt);
+        database_read_unlock(db);
         return -1;
     }
 
@@ -1430,10 +1574,166 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
     sqlite3_finalize(torrent_stmt);
     sqlite3_finalize(file_count_stmt);
 
+    database_read_unlock(db);
+
     *results = res;
     *count = found;
 
     log_msg(LOG_DEBUG, "Random video query returned %d results after %d attempts", found, attempts);
+    return 0;
+}
+
+/* Get 100 random music torrents with exactly 50 peers using random ID sampling */
+static int get_random_music_torrents(database_t *db, search_result_t **results, int *count) {
+    if (!db || !results || !count) {
+        return -1;
+    }
+
+    *results = NULL;
+    *count = 0;
+
+    database_read_lock(db);
+
+    /* Get max ID for random sampling range */
+    int64_t max_id = 0;
+    sqlite3_stmt *max_stmt;
+    if (sqlite3_prepare_v2(db->db, "SELECT MAX(id) FROM torrents", -1, &max_stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(max_stmt) == SQLITE_ROW) {
+            max_id = sqlite3_column_int64(max_stmt, 0);
+        }
+        sqlite3_finalize(max_stmt);
+    }
+
+    if (max_id == 0) {
+        log_msg(LOG_DEBUG, "Random music query: no torrents in database");
+        database_read_unlock(db);
+        return 0;
+    }
+
+    /* Seed random number generator */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (uintptr_t)&seed);
+    srand(seed);
+
+    /* Prepare statement to fetch torrent by ID with 50 peers */
+    const char *torrent_sql =
+        "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp "
+        "FROM torrents WHERE id = ? AND total_peers = 50";
+
+    sqlite3_stmt *torrent_stmt;
+    if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
+        return -1;
+    }
+
+    /* Prepare statement for file count */
+    const char *file_count_sql = "SELECT COUNT(*) FROM torrent_files WHERE torrent_id = ?";
+    sqlite3_stmt *file_count_stmt;
+    if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(torrent_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    /* Allocate results array */
+    search_result_t *res = (search_result_t *)calloc(100, sizeof(search_result_t));
+    if (!res) {
+        sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(file_count_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    /* Track found info_hashes to avoid duplicates */
+    uint8_t found_hashes[100][20];
+    int found = 0;
+    int attempts = 0;
+    int max_attempts = 50000;
+
+    while (found < 100 && attempts < max_attempts) {
+        attempts++;
+
+        int64_t random_id = ((int64_t)rand() * rand()) % max_id + 1;
+
+        sqlite3_bind_int64(torrent_stmt, 1, random_id);
+
+        if (sqlite3_step(torrent_stmt) == SQLITE_ROW) {
+            int64_t torrent_id = sqlite3_column_int64(torrent_stmt, 0);
+            const void *info_hash_blob = sqlite3_column_blob(torrent_stmt, 1);
+
+            /* Check for duplicate */
+            int is_duplicate = 0;
+            for (int j = 0; j < found; j++) {
+                if (memcmp(found_hashes[j], info_hash_blob, 20) == 0) {
+                    is_duplicate = 1;
+                    break;
+                }
+            }
+
+            if (!is_duplicate && is_music_torrent(db, torrent_id)) {
+                memcpy(res[found].info_hash, info_hash_blob, 20);
+                memcpy(found_hashes[found], info_hash_blob, 20);
+
+                const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
+                res[found].name = name ? strdup(name) : strdup("Unknown");
+                res[found].size_bytes = sqlite3_column_int64(torrent_stmt, 3);
+                res[found].total_peers = sqlite3_column_int(torrent_stmt, 4);
+                res[found].added_timestamp = sqlite3_column_int64(torrent_stmt, 5);
+
+                /* Get file count */
+                sqlite3_bind_int64(file_count_stmt, 1, torrent_id);
+                if (sqlite3_step(file_count_stmt) == SQLITE_ROW) {
+                    res[found].num_files = sqlite3_column_int(file_count_stmt, 0);
+                }
+                sqlite3_reset(file_count_stmt);
+
+                /* Get file listings for this torrent */
+                if (res[found].num_files > 0) {
+                    const char *files_sql =
+                        "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
+                        "       tf.size_bytes "
+                        "FROM torrent_files tf "
+                        "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+                        "WHERE tf.torrent_id = ? "
+                        "ORDER BY tf.file_index LIMIT 10";
+
+                    sqlite3_stmt *files_stmt;
+                    if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) == SQLITE_OK) {
+                        sqlite3_bind_int64(files_stmt, 1, torrent_id);
+
+                        int file_count = 0;
+                        res[found].file_paths = (char **)calloc(10, sizeof(char *));
+                        res[found].file_sizes = (int64_t *)calloc(10, sizeof(int64_t));
+
+                        while (sqlite3_step(files_stmt) == SQLITE_ROW && file_count < 10) {
+                            const char *path = (const char *)sqlite3_column_text(files_stmt, 0);
+                            res[found].file_paths[file_count] = path ? strdup(path) : strdup("");
+                            res[found].file_sizes[file_count] = sqlite3_column_int64(files_stmt, 1);
+                            file_count++;
+                        }
+
+                        sqlite3_finalize(files_stmt);
+                    }
+                }
+
+                found++;
+            }
+        }
+
+        sqlite3_reset(torrent_stmt);
+    }
+
+    sqlite3_finalize(torrent_stmt);
+    sqlite3_finalize(file_count_stmt);
+
+    database_read_unlock(db);
+
+    *results = res;
+    *count = found;
+
+    log_msg(LOG_DEBUG, "Random music query returned %d results after %d attempts", found, attempts);
     return 0;
 }
 
@@ -1499,8 +1799,10 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         return NULL;
     }
 
-    /* Determine if this is random mode (query is NULL) */
+    /* Determine if this is random mode (query is NULL or music sentinel) */
     int is_random_mode = (query == NULL);
+    int is_music_mode = (query != NULL && strcmp(query, RANDOM_MUSIC_MODE_SENTINEL) == 0);
+    if (is_music_mode) is_random_mode = 1;
 
     /* Calculate pagination info (not used in random mode) */
     int total_pages = (total_count + HTTP_API_MAX_RESULTS - 1) / HTTP_API_MAX_RESULTS;
@@ -1535,7 +1837,7 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "  <meta charset='UTF-8'>\n"
            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
            "  <title>%s</title>\n",
-           is_random_mode ? "Random 100 Video Torrents" : query);
+           is_music_mode ? "Random 100 Music Torrents" : (is_random_mode ? "Random 100 Video Torrents" : query));
 
     APPEND(
            "  <style>\n"
@@ -1760,7 +2062,10 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "    <div class='header'>\n");
 
     /* Header content differs between search results and random mode */
-    if (is_random_mode) {
+    if (is_music_mode) {
+        APPEND("      <h1>Random 100 Music Torrents</h1>\n"
+               "    </div>\n");
+    } else if (is_random_mode) {
         APPEND("      <h1>Random 100 Video Torrents</h1>\n"
                "    </div>\n");
     } else {
@@ -1775,7 +2080,10 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     }
 
     /* Show results info with pagination context */
-    if (is_random_mode) {
+    if (is_music_mode) {
+        APPEND("    <div class='results-info'>Showing %d random music torrent%s with 50 peers</div>\n",
+               count, count == 1 ? "" : "s");
+    } else if (is_random_mode) {
         APPEND("    <div class='results-info'>Showing %d random video torrent%s with 50 peers</div>\n",
                count, count == 1 ? "" : "s");
     } else {
@@ -2067,7 +2375,12 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     }
 
     /* Add shuffle/back buttons at bottom for random mode */
-    if (is_random_mode) {
+    if (is_music_mode) {
+        APPEND("  <div style='display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 20px;'>\n"
+               "    <a href='/random-music' class='btn' style='background: #e91e63; text-decoration: none;'>Shuffle</a>\n"
+               "    <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
+               "  </div>\n");
+    } else if (is_random_mode) {
         APPEND("  <div style='display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 20px;'>\n"
                "    <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>Shuffle</a>\n"
                "    <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
