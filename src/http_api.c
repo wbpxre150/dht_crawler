@@ -317,7 +317,7 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "    <div class='logo'>DHT Crawler</div>\n"
         "    <div class='search-box'>\n"
         "      <form class='search-form' action='/search' method='get'>\n"
-        "        <input type='text' name='q' placeholder='Search torrents...' autofocus required>\n"
+        "        <input type='text' name='q' placeholder='Search torrents... (use &quot;quotes&quot; for exact words)' autofocus required>\n"
         "        <input type='hidden' name='format' value='html'>\n"
         "        <button type='submit' class='btn'>Search</button>\n"
         "      </form>\n"
@@ -1187,7 +1187,124 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     return 200;
 }
 
-/* Search torrents using FTS5 */
+/* --- Quoted search query parsing --- */
+
+#define MAX_QUERY_PARTS 16
+
+typedef struct {
+    char *quoted[MAX_QUERY_PARTS];
+    int num_quoted;
+    char *unquoted[MAX_QUERY_PARTS];
+    int num_unquoted;
+    char *torrent_fts_query;  /* full query with quotes (porter handles natively) */
+    char *file_fts_query;     /* unquoted terms only (for trigram MATCH) */
+} parsed_query_t;
+
+static void free_parsed_query(parsed_query_t *pq) {
+    for (int i = 0; i < pq->num_quoted; i++) free(pq->quoted[i]);
+    for (int i = 0; i < pq->num_unquoted; i++) free(pq->unquoted[i]);
+    free(pq->torrent_fts_query);
+    free(pq->file_fts_query);
+    memset(pq, 0, sizeof(*pq));
+}
+
+static int parse_search_query(const char *raw, parsed_query_t *pq) {
+    memset(pq, 0, sizeof(*pq));
+
+    /* Build torrent FTS query: preserve quotes as-is for porter tokenizer */
+    pq->torrent_fts_query = strdup(raw);
+    if (!pq->torrent_fts_query) return -1;
+
+    /* Parse quoted and unquoted segments */
+    const char *p = raw;
+    char file_fts_buf[512] = {0};
+    int file_fts_len = 0;
+
+    while (*p) {
+        /* Skip whitespace */
+        while (*p && *p == ' ') p++;
+        if (!*p) break;
+
+        if (*p == '"') {
+            /* Quoted term */
+            p++; /* skip opening quote */
+            const char *start = p;
+            while (*p && *p != '"') p++;
+            int len = (int)(p - start);
+            if (*p == '"') p++; /* skip closing quote */
+
+            /* Skip empty quoted terms */
+            if (len == 0) continue;
+            if (pq->num_quoted >= MAX_QUERY_PARTS) continue;
+
+            pq->quoted[pq->num_quoted] = strndup(start, len);
+            pq->num_quoted++;
+        } else {
+            /* Unquoted term */
+            const char *start = p;
+            while (*p && *p != ' ' && *p != '"') p++;
+            int len = (int)(p - start);
+            if (len == 0) continue;
+            if (pq->num_unquoted >= MAX_QUERY_PARTS) continue;
+
+            pq->unquoted[pq->num_unquoted] = strndup(start, len);
+            pq->num_unquoted++;
+
+        }
+    }
+
+    /* Build file FTS query: ALL terms (quoted + unquoted) without quotes.
+     * Trigram tokenizer does substring matching, so including quoted terms here
+     * lets the FTS index pre-filter candidates before GLOB refines to word boundaries.
+     * This avoids a catastrophic full table scan when only quoted terms exist. */
+    for (int qi = 0; qi < pq->num_unquoted; qi++) {
+        if (file_fts_len > 0 && file_fts_len < (int)sizeof(file_fts_buf) - 1)
+            file_fts_buf[file_fts_len++] = ' ';
+        int len = (int)strlen(pq->unquoted[qi]);
+        int space = (int)sizeof(file_fts_buf) - file_fts_len - 1;
+        if (len < space) {
+            memcpy(file_fts_buf + file_fts_len, pq->unquoted[qi], len);
+            file_fts_len += len;
+        }
+    }
+    for (int qi = 0; qi < pq->num_quoted; qi++) {
+        if (file_fts_len > 0 && file_fts_len < (int)sizeof(file_fts_buf) - 1)
+            file_fts_buf[file_fts_len++] = ' ';
+        int len = (int)strlen(pq->quoted[qi]);
+        int space = (int)sizeof(file_fts_buf) - file_fts_len - 1;
+        if (len < space) {
+            memcpy(file_fts_buf + file_fts_len, pq->quoted[qi], len);
+            file_fts_len += len;
+        }
+    }
+    file_fts_buf[file_fts_len] = '\0';
+    pq->file_fts_query = strdup(file_fts_buf);
+
+    return 0;
+}
+
+/*
+ * Build a word-boundary SQL condition for a quoted term against a column.
+ * Appends to buf. Uses GLOB patterns with [^a-zA-Z0-9] for boundaries.
+ * bind_idx is the 1-based sqlite3_bind parameter index for the lowercase term.
+ * Returns the number of bind parameters consumed (always 4).
+ */
+static int append_word_boundary_condition(char *buf, size_t bufsize, int *pos,
+                                           const char *column, int bind_idx) {
+    int written = snprintf(buf + *pos, bufsize - *pos,
+        "(LOWER(%s) GLOB '*[^a-zA-Z0-9]' || ?%d || '[^a-zA-Z0-9]*'"
+        " OR LOWER(%s) GLOB ?%d || '[^a-zA-Z0-9]*'"
+        " OR LOWER(%s) GLOB '*[^a-zA-Z0-9]' || ?%d"
+        " OR LOWER(%s) = ?%d)",
+        column, bind_idx,
+        column, bind_idx + 1,
+        column, bind_idx + 2,
+        column, bind_idx + 3);
+    if (written > 0) *pos += written;
+    return 4; /* number of bind params consumed */
+}
+
+/* Search torrents using FTS5, with support for quoted exact-word matching */
 int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {
     if (!db || !query || !results || !count || !total_count) {
         return -1;
@@ -1197,71 +1314,184 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     *count = 0;
     *total_count = 0;
 
+    /* Parse query for quoted terms */
+    parsed_query_t pq;
+    if (parse_search_query(query, &pq) != 0) {
+        return -1;
+    }
+
+    /* Fast path: no quoted terms — use original simple queries */
+    int has_quoted = (pq.num_quoted > 0);
+
     database_read_lock(db);
 
-    /* First, get total count of matching results */
-    const char *count_sql =
-        "SELECT COUNT(DISTINCT t.id) "
-        "FROM torrents t "
-        "WHERE t.id IN ("
-        "    SELECT rowid FROM torrent_search WHERE name MATCH ?"
-        "    UNION"
-        "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-        "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?)"
-        ")";
+    /*
+     * Build dynamic SQL for file_search subquery.
+     * - No quoted terms: use trigram FTS MATCH as before.
+     * - Has quoted terms + unquoted terms: FTS MATCH on unquoted, plus GLOB word-boundary checks.
+     * - Only quoted terms: skip FTS, use GLOB word-boundary checks on torrent_files directly.
+     */
+    char count_sql[4096];
+    char main_sql[4096];
 
+    /* Lowercase versions of quoted terms for binding */
+    char *quoted_lower[MAX_QUERY_PARTS];
+    for (int qi = 0; qi < pq.num_quoted; qi++) {
+        quoted_lower[qi] = strdup(pq.quoted[qi]);
+        for (char *c = quoted_lower[qi]; *c; c++) {
+            if (*c >= 'A' && *c <= 'Z') *c += 32;
+        }
+    }
+
+    if (!has_quoted) {
+        /* No quoted terms — original queries */
+        (void)snprintf(count_sql, sizeof(count_sql),
+            "SELECT COUNT(DISTINCT t.id) "
+            "FROM torrents t "
+            "WHERE t.id IN ("
+            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
+            "    UNION"
+            "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+            "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
+            ")");
+
+        (void)snprintf(main_sql, sizeof(main_sql),
+            "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
+            "       t.added_timestamp, COUNT(f.id) as file_count "
+            "FROM torrents t "
+            "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
+            "WHERE t.id IN ("
+            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
+            "    UNION"
+            "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+            "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
+            ") "
+            "GROUP BY t.id "
+            "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
+            "LIMIT ?3 OFFSET ?4");
+    } else {
+        /* Has quoted terms — build dynamic file_search subquery with word-boundary checks */
+
+        /* Torrent search part: porter tokenizer handles quotes natively */
+        /* File search part: word-boundary GLOB conditions for quoted terms */
+
+        /* Build file subquery portion */
+        char file_subquery[2048];
+        int fpos = 0;
+
+        /* Bind indices: ?1 = torrent FTS query, ?2 = file FTS query (all terms for trigram pre-filter)
+         * ?3... = quoted term GLOB binds (4 per quoted term)
+         * Then LIMIT and OFFSET at the end */
+        int bind_idx = 3; /* next available bind index */
+
+        /* Always use trigram FTS MATCH as pre-filter, then GLOB for word boundaries.
+         * file_fts_query contains ALL terms (quoted + unquoted) so trigram narrows
+         * candidates via its index before the GLOB conditions refine to exact words. */
+        fpos += snprintf(file_subquery + fpos, sizeof(file_subquery) - fpos,
+            "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+            "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)");
+
+        for (int qi = 0; qi < pq.num_quoted; qi++) {
+            fpos += snprintf(file_subquery + fpos, sizeof(file_subquery) - fpos, " AND ");
+            (void)append_word_boundary_condition(file_subquery, sizeof(file_subquery), &fpos,
+                "tf.filename", bind_idx);
+            bind_idx += 4;
+        }
+
+        int limit_idx = bind_idx;
+        int offset_idx = bind_idx + 1;
+
+        (void)snprintf(count_sql, sizeof(count_sql),
+            "SELECT COUNT(DISTINCT t.id) "
+            "FROM torrents t "
+            "WHERE t.id IN ("
+            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
+            "    UNION "
+            "    %s"
+            ")", file_subquery);
+
+        (void)snprintf(main_sql, sizeof(main_sql),
+            "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
+            "       t.added_timestamp, COUNT(f.id) as file_count "
+            "FROM torrents t "
+            "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
+            "WHERE t.id IN ("
+            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
+            "    UNION "
+            "    %s"
+            ") "
+            "GROUP BY t.id "
+            "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
+            "LIMIT ?%d OFFSET ?%d", file_subquery, limit_idx, offset_idx);
+    }
+
+    /* Helper macro: bind quoted term GLOB params starting at bind_idx */
+    #define BIND_QUOTED_GLOB_PARAMS(stmt, start_idx, pq, quoted_lower) do { \
+        int _bi = (start_idx); \
+        for (int _qi = 0; _qi < (pq).num_quoted; _qi++) { \
+            sqlite3_bind_text((stmt), _bi,     quoted_lower[_qi], -1, SQLITE_STATIC); \
+            sqlite3_bind_text((stmt), _bi + 1, quoted_lower[_qi], -1, SQLITE_STATIC); \
+            sqlite3_bind_text((stmt), _bi + 2, quoted_lower[_qi], -1, SQLITE_STATIC); \
+            sqlite3_bind_text((stmt), _bi + 3, quoted_lower[_qi], -1, SQLITE_STATIC); \
+            _bi += 4; \
+        } \
+    } while(0)
+
+    /* --- Execute count query --- */
     sqlite3_stmt *count_stmt;
     int rc = sqlite3_prepare_v2(db->db, count_sql, -1, &count_stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(db->db));
         database_read_unlock(db);
+        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+        free_parsed_query(&pq);
         return -1;
     }
 
-    sqlite3_bind_text(count_stmt, 1, query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(count_stmt, 2, query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(count_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(count_stmt, 2, has_quoted ? pq.file_fts_query : query, -1, SQLITE_STATIC);
+    if (has_quoted) {
+        BIND_QUOTED_GLOB_PARAMS(count_stmt, 3, pq, quoted_lower);
+    }
 
     if (sqlite3_step(count_stmt) == SQLITE_ROW) {
         *total_count = sqlite3_column_int(count_stmt, 0);
     }
     sqlite3_finalize(count_stmt);
 
-    /* Build FTS5 search query - searches both torrent names and file names
-     * Uses subqueries to properly utilize FTS5 MATCH function, then UNION to combine results */
-    const char *sql =
-        "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-        "       t.added_timestamp, COUNT(f.id) as file_count "
-        "FROM torrents t "
-        "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
-        "WHERE t.id IN ("
-        "    SELECT rowid FROM torrent_search WHERE name MATCH ?"
-        "    UNION"
-        "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-        "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?)"
-        ") "
-        "GROUP BY t.id "
-        "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
-        "LIMIT ? OFFSET ?";
-
+    /* --- Execute main query --- */
     sqlite3_stmt *stmt;
-    rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    rc = sqlite3_prepare_v2(db->db, main_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(db->db));
         database_read_unlock(db);
+        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+        free_parsed_query(&pq);
         return -1;
     }
 
-    /* Bind query parameter twice (once for torrent names, once for file paths) */
-    sqlite3_bind_text(stmt, 1, query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, query, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
-    sqlite3_bind_int(stmt, 4, offset);
+    sqlite3_bind_text(stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, has_quoted ? pq.file_fts_query : query, -1, SQLITE_STATIC);
+    if (!has_quoted) {
+        sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
+        sqlite3_bind_int(stmt, 4, offset);
+    } else {
+        BIND_QUOTED_GLOB_PARAMS(stmt, 3, pq, quoted_lower);
+        int limit_idx = 3 + pq.num_quoted * 4;
+        int offset_idx = limit_idx + 1;
+        sqlite3_bind_int(stmt, limit_idx, HTTP_API_MAX_RESULTS);
+        sqlite3_bind_int(stmt, offset_idx, offset);
+    }
+
+    #undef BIND_QUOTED_GLOB_PARAMS
 
     /* Allocate results array */
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
     if (!res) {
         sqlite3_finalize(stmt);
         database_read_unlock(db);
+        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+        free_parsed_query(&pq);
         return -1;
     }
 
@@ -1312,6 +1542,9 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
 
     *results = res;
     *count = i;
+
+    for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+    free_parsed_query(&pq);
 
     log_msg(LOG_DEBUG, "Search found %d results (offset %d, total %d) for query: %s", i, offset, *total_count, query);
     return 0;
@@ -2071,7 +2304,7 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     } else {
         APPEND("      <h1>Search Results</h1>\n"
                "      <form class='search-form' action='/search' method='get'>\n"
-               "        <input type='text' name='q' placeholder='Search torrents...' value='%s'>\n"
+               "        <input type='text' name='q' placeholder='Search torrents... (use &quot;quotes&quot; for exact words)' value='%s'>\n"
                "        <input type='hidden' name='format' value='html'>\n"
                "        <button type='submit' class='btn'>Search</button>\n"
                "      </form>\n"
