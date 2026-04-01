@@ -366,14 +366,18 @@ static int64_t get_or_create_prefix(database_t *db, const char *prefix) {
     int rc = sqlite3_step(db->lookup_prefix_stmt);
     if (rc == SQLITE_ROW) {
         /* Found existing prefix */
-        return sqlite3_column_int64(db->lookup_prefix_stmt, 0);
+        int64_t result = sqlite3_column_int64(db->lookup_prefix_stmt, 0);
+        sqlite3_reset(db->lookup_prefix_stmt);
+        return result;
     }
+    sqlite3_reset(db->lookup_prefix_stmt);
 
     /* Insert new prefix */
     sqlite3_reset(db->insert_prefix_stmt);
     sqlite3_bind_text(db->insert_prefix_stmt, 1, prefix, -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(db->insert_prefix_stmt);
+    sqlite3_reset(db->insert_prefix_stmt);
     if (rc != SQLITE_DONE) {
         log_msg(LOG_ERROR, "Failed to insert path prefix '%s': %s",
                 prefix, sqlite3_errmsg(db->db));
@@ -392,6 +396,7 @@ static int64_t get_or_create_prefix(database_t *db, const char *prefix) {
         if (sqlite3_step(db->lookup_prefix_stmt) == SQLITE_ROW) {
             prefix_id = sqlite3_column_int64(db->lookup_prefix_stmt, 0);
         }
+        sqlite3_reset(db->lookup_prefix_stmt);
     }
 
     return prefix_id;
@@ -414,6 +419,7 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
     sqlite3_bind_int64(db->insert_torrent_stmt, 5, torrent->added_timestamp);
 
     int rc = sqlite3_step(db->insert_torrent_stmt);
+    sqlite3_reset(db->insert_torrent_stmt);
     if (rc != SQLITE_DONE) {
         /* Enhanced error logging with info_hash */
         char hash_hex[41];
@@ -466,6 +472,7 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
         sqlite3_bind_int(db->insert_file_stmt, 5, files[i].file_index);
 
         rc = sqlite3_step(db->insert_file_stmt);
+        sqlite3_reset(db->insert_file_stmt);
         if (rc != SQLITE_DONE) {
             log_msg(LOG_ERROR, "Failed to insert file '%s' (prefix: '%s', filename: '%s') for torrent_id %lld: %s",
                    files[i].path ? files[i].path : "(null)",
