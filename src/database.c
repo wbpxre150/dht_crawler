@@ -99,6 +99,12 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
      * are concurrent readers (which is always the case here with many threads).
      * Our manual RESTART checkpoint after each batch flush handles this. */
     sqlite3_exec(db->db, "PRAGMA wal_autocheckpoint=0;", NULL, NULL, NULL);
+    /* Cap the WAL file at 500 MB. After each RESTART checkpoint, SQLite will
+     * truncate the WAL back down to this limit if it has grown larger. Only
+     * the overflow above 500 MB is truncated (not the whole file), so the
+     * I/O burst is far smaller than CHECKPOINT_TRUNCATE which always shrinks
+     * to zero. */
+    sqlite3_exec(db->db, "PRAGMA journal_size_limit=524288000;", NULL, NULL, NULL);
     sqlite3_exec(db->db, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
     /* Larger page size for better compression (32KB) */
     sqlite3_exec(db->db, "PRAGMA page_size=32768;", NULL, NULL, NULL);
@@ -622,7 +628,7 @@ int database_wal_checkpoint(database_t *db) {
 
     int nLog = 0, nCkpt = 0;
     int rc = sqlite3_wal_checkpoint_v2(db->db, NULL,
-                SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
+                SQLITE_CHECKPOINT_RESTART, &nLog, &nCkpt);
 
     /* Restore no-timeout for normal operations */
     sqlite3_busy_timeout(db->db, 0);
@@ -632,7 +638,7 @@ int database_wal_checkpoint(database_t *db) {
                 nCkpt, nLog);
     } else if (rc == SQLITE_OK) {
         if (nLog > 0) {
-            log_msg(LOG_DEBUG, "WAL checkpoint OK: %d/%d frames checkpointed, WAL truncated",
+            log_msg(LOG_DEBUG, "WAL checkpoint OK: %d/%d frames checkpointed, WAL write pointer reset",
                     nCkpt, nLog);
         }
     } else {
