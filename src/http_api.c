@@ -26,17 +26,29 @@ static int search_handler(struct mg_connection *conn, void *cbdata);
 static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int root_handler(struct mg_connection *conn, void *cbdata);
 static int refresh_handler(struct mg_connection *conn, void *cbdata);
-static int random_handler(struct mg_connection *conn, void *cbdata);
+static int random_tv_handler(struct mg_connection *conn, void *cbdata);
+static int random_movie_handler(struct mg_connection *conn, void *cbdata);
 static int random_music_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
-static int get_random_video_torrents(database_t *db, search_result_t **results, int *count);
+
+typedef enum {
+    VIDEO_FILTER_TV,      /* video torrent AND title has SxxExx */
+    VIDEO_FILTER_MOVIE    /* video torrent AND title has NO SxxExx */
+} video_filter_t;
+
+static int get_random_video_torrents_filtered(database_t *db, search_result_t **results, int *count, video_filter_t filter);
+static int get_random_tv_torrents(database_t *db, search_result_t **results, int *count);
+static int get_random_movie_torrents(database_t *db, search_result_t **results, int *count);
 static int get_random_music_torrents(database_t *db, search_result_t **results, int *count);
 
-/* Sentinel value to indicate music random mode in generate_search_results_html */
+/* Sentinel values to indicate random-mode categories in generate_search_results_html.
+ * Compared by pointer identity, so real query strings cannot collide. */
+#define RANDOM_TV_MODE_SENTINEL    "\x01TV"
+#define RANDOM_MOVIE_MODE_SENTINEL "\x01MOVIE"
 #define RANDOM_MUSIC_MODE_SENTINEL "\x01MUSIC"
 
 /* Helper: Format info_hash as hex */
@@ -108,7 +120,8 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/search", search_handler, api);
     mg_set_request_handler(api->mg_ctx, "/stats", stats_handler, api);
     mg_set_request_handler(api->mg_ctx, "/refresh", refresh_handler, api);
-    mg_set_request_handler(api->mg_ctx, "/random", random_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/random-tv", random_tv_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/random-movies", random_movie_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random-music", random_music_handler, api);
 
     api->running = 1;
@@ -322,8 +335,11 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "        <button type='submit' class='btn'>Search</button>\n"
         "      </form>\n"
         "      <div style='margin-top: 16px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;'>\n"
-        "        <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>\n"
-        "          Random 100 Video Torrents\n"
+        "        <a href='/random-tv' class='btn' style='background: #34a853; text-decoration: none;'>\n"
+        "          Random 100 TV Series\n"
+        "        </a>\n"
+        "        <a href='/random-movies' class='btn' style='background: #1a73e8; text-decoration: none;'>\n"
+        "          Random 100 Movies\n"
         "        </a>\n"
         "        <a href='/random-music' class='btn' style='background: #e91e63; text-decoration: none;'>\n"
         "          Random 100 Music Torrents\n"
@@ -809,13 +825,17 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
 }
 
 /* Random video torrents handler */
-static int random_handler(struct mg_connection *conn, void *cbdata) {
-    http_api_t *api = (http_api_t *)cbdata;
+/* Shared implementation for /random-tv and /random-movies. */
+static int random_video_handler_impl(struct mg_connection *conn,
+                                     http_api_t *api,
+                                     video_filter_t filter) {
+    const char *category_label = (filter == VIDEO_FILTER_TV) ? "TV Series" : "Movies";
 
-    /* Get random video torrents */
     search_result_t *results = NULL;
     int count = 0;
-    int rc = get_random_video_torrents(api->database, &results, &count);
+    int rc = (filter == VIDEO_FILTER_TV)
+                 ? get_random_tv_torrents(api->database, &results, &count)
+                 : get_random_movie_torrents(api->database, &results, &count);
 
     if (rc != 0) {
         const char *error = "{\"error\":\"Database query failed\"}";
@@ -830,14 +850,14 @@ static int random_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     if (count == 0) {
-        /* No results - show empty state */
-        const char *empty_html =
+        char empty_html[1024];
+        snprintf(empty_html, sizeof(empty_html),
             "<!DOCTYPE html>\n"
             "<html>\n"
             "<head>\n"
             "  <meta charset='UTF-8'>\n"
             "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
-            "  <title>No Video Torrents</title>\n"
+            "  <title>No %s Found</title>\n"
             "  <style>\n"
             "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
             "    .message { margin: 50px 0; color: #666; }\n"
@@ -845,11 +865,12 @@ static int random_handler(struct mg_connection *conn, void *cbdata) {
             "  </style>\n"
             "</head>\n"
             "<body>\n"
-            "  <h1>No Video Torrents Found</h1>\n"
-            "  <p class='message'>No video torrents with 50 peers are currently available.</p>\n"
+            "  <h1>No %s Found</h1>\n"
+            "  <p class='message'>No %s torrents with 50 peers are currently available.</p>\n"
             "  <a href='/'>Back to Search</a>\n"
             "</body>\n"
-            "</html>";
+            "</html>",
+            category_label, category_label, category_label);
 
         mg_printf(conn,
                   "HTTP/1.1 200 OK\r\n"
@@ -862,8 +883,10 @@ static int random_handler(struct mg_connection *conn, void *cbdata) {
         return 200;
     }
 
-    /* Generate HTML using the shared function with NULL query to indicate random mode */
-    char *html = generate_search_results_html(results, count, NULL, 1, count);
+    const char *sentinel = (filter == VIDEO_FILTER_TV)
+                               ? RANDOM_TV_MODE_SENTINEL
+                               : RANDOM_MOVIE_MODE_SENTINEL;
+    char *html = generate_search_results_html(results, count, sentinel, 1, count);
     if (!html) {
         const char *error = "{\"error\":\"Failed to generate HTML\"}";
         mg_printf(conn,
@@ -888,6 +911,14 @@ static int random_handler(struct mg_connection *conn, void *cbdata) {
     free(html);
     free_search_results(results, count);
     return 200;
+}
+
+static int random_tv_handler(struct mg_connection *conn, void *cbdata) {
+    return random_video_handler_impl(conn, (http_api_t *)cbdata, VIDEO_FILTER_TV);
+}
+
+static int random_movie_handler(struct mg_connection *conn, void *cbdata) {
+    return random_video_handler_impl(conn, (http_api_t *)cbdata, VIDEO_FILTER_MOVIE);
 }
 
 /* Random music torrents handler */
@@ -1659,8 +1690,41 @@ static int is_music_torrent(database_t *db, int64_t torrent_id) {
     return is_music;
 }
 
-/* Get 100 random video torrents with exactly 50 peers using random ID sampling */
-static int get_random_video_torrents(database_t *db, search_result_t **results, int *count) {
+/* Returns 1 if name contains an SxxExx pattern (case-insensitive), where each
+ * xx is 1-3 decimal digits and the leading S is at a word boundary (start of
+ * string or preceded by a non-alphabetic char). Used to classify TV series
+ * from the torrent title alone. */
+static int has_tv_episode_pattern(const char *name) {
+    if (!name) return 0;
+    for (const char *p = name; *p; p++) {
+        if (*p != 'S' && *p != 's') continue;
+        if (p != name) {
+            unsigned char prev = (unsigned char)p[-1];
+            if ((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z')) {
+                continue;
+            }
+        }
+        const char *q = p + 1;
+        int digits1 = 0;
+        while (*q >= '0' && *q <= '9' && digits1 < 3) { q++; digits1++; }
+        if (digits1 == 0) continue;
+        if (*q != 'E' && *q != 'e') continue;
+        q++;
+        int digits2 = 0;
+        while (*q >= '0' && *q <= '9' && digits2 < 3) { q++; digits2++; }
+        if (digits2 == 0) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* Get 100 random video torrents with exactly 50 peers, filtered to either TV
+ * series (title has SxxExx) or movies (title does not). Uses random ID
+ * sampling. */
+static int get_random_video_torrents_filtered(database_t *db,
+                                              search_result_t **results,
+                                              int *count,
+                                              video_filter_t filter) {
     if (!db || !results || !count) {
         return -1;
     }
@@ -1740,6 +1804,7 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
         if (sqlite3_step(torrent_stmt) == SQLITE_ROW) {
             int64_t torrent_id = sqlite3_column_int64(torrent_stmt, 0);
             const void *info_hash_blob = sqlite3_column_blob(torrent_stmt, 1);
+            const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
 
             /* Check for duplicate */
             int is_duplicate = 0;
@@ -1750,12 +1815,21 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
                 }
             }
 
+            int passes_filter = 0;
             if (!is_duplicate && is_video_torrent(db, torrent_id)) {
-                /* Found a valid video torrent */
+                int is_tv = has_tv_episode_pattern(name);
+                if (filter == VIDEO_FILTER_TV) {
+                    passes_filter = is_tv;
+                } else {
+                    passes_filter = !is_tv;
+                }
+            }
+
+            if (passes_filter) {
+                /* Found a valid torrent matching the filter */
                 memcpy(res[found].info_hash, info_hash_blob, 20);
                 memcpy(found_hashes[found], info_hash_blob, 20);
 
-                const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
                 res[found].name = name ? strdup(name) : strdup("Unknown");
                 res[found].size_bytes = sqlite3_column_int64(torrent_stmt, 3);
                 res[found].total_peers = sqlite3_column_int(torrent_stmt, 4);
@@ -1812,8 +1886,17 @@ static int get_random_video_torrents(database_t *db, search_result_t **results, 
     *results = res;
     *count = found;
 
-    log_msg(LOG_DEBUG, "Random video query returned %d results after %d attempts", found, attempts);
+    log_msg(LOG_DEBUG, "Random %s query returned %d results after %d attempts",
+            filter == VIDEO_FILTER_TV ? "TV" : "movie", found, attempts);
     return 0;
+}
+
+static int get_random_tv_torrents(database_t *db, search_result_t **results, int *count) {
+    return get_random_video_torrents_filtered(db, results, count, VIDEO_FILTER_TV);
+}
+
+static int get_random_movie_torrents(database_t *db, search_result_t **results, int *count) {
+    return get_random_video_torrents_filtered(db, results, count, VIDEO_FILTER_MOVIE);
 }
 
 /* Get 100 random music torrents with exactly 50 peers using random ID sampling */
@@ -2032,10 +2115,11 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         return NULL;
     }
 
-    /* Determine if this is random mode (query is NULL or music sentinel) */
-    int is_random_mode = (query == NULL);
+    /* Determine random-mode category from sentinel query string */
+    int is_tv_mode    = (query != NULL && strcmp(query, RANDOM_TV_MODE_SENTINEL)    == 0);
+    int is_movie_mode = (query != NULL && strcmp(query, RANDOM_MOVIE_MODE_SENTINEL) == 0);
     int is_music_mode = (query != NULL && strcmp(query, RANDOM_MUSIC_MODE_SENTINEL) == 0);
-    if (is_music_mode) is_random_mode = 1;
+    int is_random_mode = is_tv_mode || is_movie_mode || is_music_mode;
 
     /* Calculate pagination info (not used in random mode) */
     int total_pages = (total_count + HTTP_API_MAX_RESULTS - 1) / HTTP_API_MAX_RESULTS;
@@ -2070,7 +2154,10 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "  <meta charset='UTF-8'>\n"
            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
            "  <title>%s</title>\n",
-           is_music_mode ? "Random 100 Music Torrents" : (is_random_mode ? "Random 100 Video Torrents" : query));
+           is_tv_mode    ? "Random 100 TV Series" :
+           is_movie_mode ? "Random 100 Movies" :
+           is_music_mode ? "Random 100 Music Torrents" :
+                           (query ? query : ""));
 
     APPEND(
            "  <style>\n"
@@ -2295,11 +2382,14 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "    <div class='header'>\n");
 
     /* Header content differs between search results and random mode */
-    if (is_music_mode) {
-        APPEND("      <h1>Random 100 Music Torrents</h1>\n"
+    if (is_tv_mode) {
+        APPEND("      <h1>Random 100 TV Series</h1>\n"
                "    </div>\n");
-    } else if (is_random_mode) {
-        APPEND("      <h1>Random 100 Video Torrents</h1>\n"
+    } else if (is_movie_mode) {
+        APPEND("      <h1>Random 100 Movies</h1>\n"
+               "    </div>\n");
+    } else if (is_music_mode) {
+        APPEND("      <h1>Random 100 Music Torrents</h1>\n"
                "    </div>\n");
     } else {
         APPEND("      <h1>Search Results</h1>\n"
@@ -2309,15 +2399,18 @@ static char* generate_search_results_html(search_result_t *results, int count, c
                "        <button type='submit' class='btn'>Search</button>\n"
                "      </form>\n"
                "    </div>\n",
-               query);
+               query ? query : "");
     }
 
     /* Show results info with pagination context */
-    if (is_music_mode) {
-        APPEND("    <div class='results-info'>Showing %d random music torrent%s with 50 peers</div>\n",
+    if (is_tv_mode) {
+        APPEND("    <div class='results-info'>Showing %d random TV series torrent%s with 50 peers</div>\n",
                count, count == 1 ? "" : "s");
-    } else if (is_random_mode) {
-        APPEND("    <div class='results-info'>Showing %d random video torrent%s with 50 peers</div>\n",
+    } else if (is_movie_mode) {
+        APPEND("    <div class='results-info'>Showing %d random movie torrent%s with 50 peers</div>\n",
+               count, count == 1 ? "" : "s");
+    } else if (is_music_mode) {
+        APPEND("    <div class='results-info'>Showing %d random music torrent%s with 50 peers</div>\n",
                count, count == 1 ? "" : "s");
     } else {
         int start_result = (page - 1) * HTTP_API_MAX_RESULTS + 1;
@@ -2608,14 +2701,19 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     }
 
     /* Add shuffle/back buttons at bottom for random mode */
-    if (is_music_mode) {
+    if (is_tv_mode) {
         APPEND("  <div style='display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 20px;'>\n"
-               "    <a href='/random-music' class='btn' style='background: #e91e63; text-decoration: none;'>Shuffle</a>\n"
+               "    <a href='/random-tv' class='btn' style='background: #34a853; text-decoration: none;'>Shuffle</a>\n"
                "    <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
                "  </div>\n");
-    } else if (is_random_mode) {
+    } else if (is_movie_mode) {
         APPEND("  <div style='display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 20px;'>\n"
-               "    <a href='/random' class='btn' style='background: #34a853; text-decoration: none;'>Shuffle</a>\n"
+               "    <a href='/random-movies' class='btn' style='background: #1a73e8; text-decoration: none;'>Shuffle</a>\n"
+               "    <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
+               "  </div>\n");
+    } else if (is_music_mode) {
+        APPEND("  <div style='display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 20px;'>\n"
+               "    <a href='/random-music' class='btn' style='background: #e91e63; text-decoration: none;'>Shuffle</a>\n"
                "    <a href='/' class='btn' style='text-decoration: none;'>Back to Search</a>\n"
                "  </div>\n");
     }
