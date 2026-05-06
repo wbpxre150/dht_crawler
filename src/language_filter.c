@@ -86,6 +86,13 @@ void language_filter_cleanup(void) {
     lf_state.threshold = 0;
 }
 
+static int exceeds_threshold(const char *str, int threshold) {
+    int l, nl;
+    count_script_chars(str, &l, &nl);
+    int total = l + nl;
+    return total > 0 && (nl * 100 / total) >= threshold;
+}
+
 int language_filter_check(const torrent_metadata_t *metadata) {
     if (!lf_state.initialized || lf_state.threshold <= 0 || !metadata) return 0;
 
@@ -93,40 +100,27 @@ int language_filter_check(const torrent_metadata_t *metadata) {
     lf_state.stats.total_checked++;
     pthread_mutex_unlock(&lf_state.stats_mutex);
 
-    int total_latin = 0, total_non_latin = 0;
-
-    if (metadata->name) {
-        int l, nl;
-        count_script_chars(metadata->name, &l, &nl);
-        total_latin += l;
-        total_non_latin += nl;
-    }
+    if (metadata->name && exceeds_threshold(metadata->name, lf_state.threshold))
+        goto filtered;
 
     if (metadata->files) {
         for (int i = 0; i < metadata->num_files; i++) {
-            if (metadata->files[i].path) {
-                int l, nl;
-                count_script_chars(metadata->files[i].path, &l, &nl);
-                total_latin += l;
-                total_non_latin += nl;
-            }
+            if (metadata->files[i].path && exceeds_threshold(metadata->files[i].path, lf_state.threshold))
+                goto filtered;
         }
     }
 
-    int total = total_latin + total_non_latin;
-    if (total == 0) return 0;
-
-    if ((total_non_latin * 100 / total) >= lf_state.threshold) {
-        pthread_mutex_lock(&lf_state.stats_mutex);
-        lf_state.stats.filtered_by_non_latin++;
-        lf_state.stats.total_filtered++;
-        pthread_mutex_unlock(&lf_state.stats_mutex);
-
-        log_msg(LOG_DEBUG, "Language filter: filtered non-Latin (>%d%%): %s",
-                lf_state.threshold, metadata->name ? metadata->name : "(no name)");
-        return 1;
-    }
     return 0;
+
+filtered:
+    pthread_mutex_lock(&lf_state.stats_mutex);
+    lf_state.stats.filtered_by_non_latin++;
+    lf_state.stats.total_filtered++;
+    pthread_mutex_unlock(&lf_state.stats_mutex);
+
+    log_msg(LOG_DEBUG, "Language filter: filtered non-Latin (>%d%%): %s",
+            lf_state.threshold, metadata->name ? metadata->name : "(no name)");
+    return 1;
 }
 
 void language_filter_get_stats(language_filter_stats_t *stats) {

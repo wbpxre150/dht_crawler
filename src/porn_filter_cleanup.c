@@ -195,12 +195,47 @@ static int load_metadata_for_id(sqlite3 *db, int64_t id, torrent_metadata_t *out
     const unsigned char *nm = sqlite3_column_text(st, 1);
     out->name = nm ? strdup((const char *)nm) : NULL;
     sqlite3_finalize(st);
+
+    /* Load file paths from torrent_files for filename-based language checks */
+    sqlite3_stmt *fst = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename)"
+            " FROM torrent_files tf"
+            " LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id"
+            " WHERE tf.torrent_id = ?",
+            -1, &fst, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(fst, 1, id);
+
+        int capacity = 0;
+        while (sqlite3_step(fst) == SQLITE_ROW) {
+            const unsigned char *path = sqlite3_column_text(fst, 0);
+            if (!path) continue;
+            if (out->num_files >= capacity) {
+                int new_cap = capacity == 0 ? 16 : capacity * 2;
+                file_info_t *tmp = realloc(out->files, new_cap * sizeof(file_info_t));
+                if (!tmp) break;
+                out->files = tmp;
+                capacity = new_cap;
+            }
+            out->files[out->num_files].path = strdup((const char *)path);
+            out->files[out->num_files].size_bytes = 0;
+            out->files[out->num_files].file_index = out->num_files;
+            out->num_files++;
+        }
+        sqlite3_finalize(fst);
+    }
+
     return 0;
 }
 
 static void free_metadata(torrent_metadata_t *m) {
     if (!m) return;
     free(m->name);
+    if (m->files) {
+        for (int i = 0; i < m->num_files; i++)
+            free(m->files[i].path);
+        free(m->files);
+    }
     memset(m, 0, sizeof(*m));
 }
 
