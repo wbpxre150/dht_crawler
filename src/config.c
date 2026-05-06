@@ -77,7 +77,6 @@ void config_init_defaults(crawler_config_t *config) {
     /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
     strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
-    config->porn_filter_keyword_threshold = 8;      /* Min weight for keyword match */
     config->porn_filter_non_latin_threshold = 33;   /* Filter if >33% non-Latin characters */
 
     /* Thread tree defaults (Stage 1) */
@@ -317,10 +316,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->porn_filter_enabled = atoi(value);
         } else if (strcmp(key, "porn_filter_keyword_file") == 0) {
             strncpy(config->porn_filter_keyword_file, value, sizeof(config->porn_filter_keyword_file) - 1);
-        } else if (strcmp(key, "porn_filter_keyword_threshold") == 0) {
-            config->porn_filter_keyword_threshold = atoi(value);
-            if (config->porn_filter_keyword_threshold < 1) config->porn_filter_keyword_threshold = 1;
-            if (config->porn_filter_keyword_threshold > 10) config->porn_filter_keyword_threshold = 10;
         } else if (strcmp(key, "porn_filter_non_latin_threshold") == 0) {
             config->porn_filter_non_latin_threshold = atoi(value);
             if (config->porn_filter_non_latin_threshold < 0) config->porn_filter_non_latin_threshold = 0;

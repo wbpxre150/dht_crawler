@@ -17,7 +17,6 @@
  */
 typedef struct keyword_entry {
     char *keyword;              // Normalized keyword (lowercase)
-    int weight;                 // Severity weight (1-10)
     UT_hash_handle hh;
 } keyword_entry_t;
 
@@ -31,8 +30,6 @@ static struct {
     porn_filter_stats_t stats;
     int initialized;
 
-    // Configurable thresholds
-    int keyword_threshold;
     int non_latin_threshold; // 0 = disabled, 1-100 = max % non-Latin chars allowed
 } filter_state = {
     .keyword_hash = NULL,
@@ -40,7 +37,6 @@ static struct {
     .stats_mutex = PTHREAD_MUTEX_INITIALIZER,
     .stats = {0},
     .initialized = 0,
-    .keyword_threshold = 8,
     .non_latin_threshold = 33,
 };
 
@@ -118,33 +114,29 @@ static void trim_whitespace(char *str) {
 /**
  * Generic helper: add keyword to any hash table
  */
-static int add_keyword_to_table(keyword_entry_t **table, const char *keyword, int weight) {
+static int add_keyword_to_table(keyword_entry_t **table, const char *keyword) {
     if (!keyword || strlen(keyword) == 0) return -1;
 
     keyword_entry_t *entry;
     HASH_FIND_STR(*table, keyword, entry);
-    if (entry) {
-        if (weight > entry->weight) entry->weight = weight;
-        return 0;
-    }
+    if (entry) return 0;
 
     entry = malloc(sizeof(keyword_entry_t));
     if (!entry) return -1;
 
     entry->keyword = strdup(keyword);
     if (!entry->keyword) { free(entry); return -1; }
-    entry->weight = weight;
 
     HASH_ADD_KEYPTR(hh, *table, entry->keyword, strlen(entry->keyword), entry);
     return 0;
 }
 
-static int add_keyword(const char *keyword, int weight) {
-    return add_keyword_to_table(&filter_state.keyword_hash, keyword, weight);
+static int add_keyword(const char *keyword) {
+    return add_keyword_to_table(&filter_state.keyword_hash, keyword);
 }
 
-static int add_xxx_keyword(const char *keyword, int weight) {
-    return add_keyword_to_table(&filter_state.xxx_cooccurrence_hash, keyword, weight);
+static int add_xxx_keyword(const char *keyword) {
+    return add_keyword_to_table(&filter_state.xxx_cooccurrence_hash, keyword);
 }
 
 /**
@@ -162,7 +154,7 @@ static void free_keyword_table(keyword_entry_t **table) {
 
 /**
  * Load keywords from file.
- * Format: keyword[:weight]
+ * Format: keyword (one per line)
  * Section headers: [standalone] or [xxx_cooccurrence]
  * Lines starting with # are comments.
  *
@@ -197,24 +189,14 @@ static int load_keywords(const char *file_path) {
             continue;
         }
 
-        // Parse keyword:weight
-        char *colon = strchr(line, ':');
-        int weight = 5;
-        if (colon) {
-            *colon = '\0';
-            weight = atoi(colon + 1);
-            if (weight < 1) weight = 1;
-            if (weight > 10) weight = 10;
-        }
-
         normalize_string(line);
         trim_whitespace(line);
 
         if (strlen(line) > 0) {
             if (in_xxx_section) {
-                if (add_xxx_keyword(line, weight) == 0) loaded_cooccurrence++;
+                if (add_xxx_keyword(line) == 0) loaded_cooccurrence++;
             } else {
-                if (add_keyword(line, weight) == 0) loaded_standalone++;
+                if (add_keyword(line) == 0) loaded_standalone++;
             }
         }
     }
@@ -226,39 +208,26 @@ static int load_keywords(const char *file_path) {
 }
 
 /**
- * Check if text contains keywords from hash table
- * Returns highest weight found, or 0 if no match
+ * Check if text contains any keyword from the standalone hash table.
+ * Returns 1 on match, 0 otherwise.
  */
-static int check_keywords_in_text(const char *text, int *out_weight) {
-    if (!text || !filter_state.keyword_hash) {
-        *out_weight = 0;
-        return 0;
-    }
+static int check_keywords_in_text(const char *text) {
+    if (!text || !filter_state.keyword_hash) return 0;
 
-    // Normalize text for comparison
     char *normalized = strdup(text);
-    if (!normalized) {
-        *out_weight = 0;
-        return 0;
-    }
+    if (!normalized) return 0;
     normalize_string(normalized);
 
-    int max_weight = 0;
     int found = 0;
-
-    // Check each keyword against the normalized text
     keyword_entry_t *entry, *tmp;
     HASH_ITER(hh, filter_state.keyword_hash, entry, tmp) {
         if (strstr(normalized, entry->keyword)) {
             found = 1;
-            if (entry->weight > max_weight) {
-                max_weight = entry->weight;
-            }
+            break;
         }
     }
 
     free(normalized);
-    *out_weight = max_weight;
     return found;
 }
 
@@ -268,7 +237,8 @@ static int check_keywords_in_text(const char *text, int *out_weight) {
 
 /**
  * Returns 1 if the text contains "xxx" as a whole word AND at least one
- * keyword from the [xxx_cooccurrence] section also appears as a whole word.
+ * keyword from the [xxx_cooccurrence] section appears anywhere as a substring
+ * (catches compound words like "sexmex", "analwetpissy").
  */
 static int check_xxx_cooccurrence(const char *text) {
     if (!text || !filter_state.xxx_cooccurrence_hash) return 0;
@@ -289,18 +259,12 @@ static int check_xxx_cooccurrence(const char *text) {
 
     if (!has_xxx) { free(lower); return 0; }
 
-    /* Whole-word scan for each co-occurrence keyword */
+    /* Substring scan for each co-occurrence keyword — no word-boundary checks
+     * so compound words like "sexmex" or "analwetpissy" are caught. The
+     * presence of "xxx" already provides strong signal. */
     keyword_entry_t *entry, *tmp;
     HASH_ITER(hh, filter_state.xxx_cooccurrence_hash, entry, tmp) {
-        const char *t = entry->keyword;
-        size_t tlen = strlen(t);
-        const char *q = lower;
-        while ((q = strstr(q, t)) != NULL) {
-            int b = (q == lower) || !isalnum((unsigned char)*(q - 1));
-            int a = !isalnum((unsigned char)*(q + tlen));
-            if (b && a) { free(lower); return 1; }
-            q += tlen;
-        }
+        if (strstr(lower, entry->keyword)) { free(lower); return 1; }
     }
 
     free(lower);
@@ -453,20 +417,15 @@ int porn_filter_check(const torrent_metadata_t *metadata) {
     filter_state.stats.total_checked++;
     pthread_mutex_unlock(&filter_state.stats_mutex);
 
-    int weight = 0;
-
     // Layer 1: Keyword matching in torrent name
-    if (metadata->name && check_keywords_in_text(metadata->name, &weight)) {
-        if (weight >= filter_state.keyword_threshold) {
-            pthread_mutex_lock(&filter_state.stats_mutex);
-            filter_state.stats.filtered_by_keyword++;
-            filter_state.stats.total_filtered++;
-            pthread_mutex_unlock(&filter_state.stats_mutex);
+    if (metadata->name && check_keywords_in_text(metadata->name)) {
+        pthread_mutex_lock(&filter_state.stats_mutex);
+        filter_state.stats.filtered_by_keyword++;
+        filter_state.stats.total_filtered++;
+        pthread_mutex_unlock(&filter_state.stats_mutex);
 
-            log_msg(LOG_DEBUG, "Filtered by keyword (name): %s (weight=%d)",
-                    metadata->name, weight);
-            return 1;
-        }
+        log_msg(LOG_DEBUG, "Filtered by keyword (name): %s", metadata->name);
+        return 1;
     }
 
     // Layer 1.5: xxx co-occurrence check (torrent name only)
@@ -502,12 +461,6 @@ void porn_filter_get_stats(porn_filter_stats_t *stats) {
     pthread_mutex_lock(&filter_state.stats_mutex);
     *stats = filter_state.stats;
     pthread_mutex_unlock(&filter_state.stats_mutex);
-}
-
-void porn_filter_set_thresholds(int keyword_threshold) {
-    filter_state.keyword_threshold = keyword_threshold;
-
-    log_msg(LOG_DEBUG, "Porn filter thresholds updated: keyword=%d", keyword_threshold);
 }
 
 void porn_filter_set_non_latin_threshold(int threshold) {

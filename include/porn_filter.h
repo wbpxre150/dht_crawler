@@ -56,13 +56,6 @@ int porn_filter_check(const torrent_metadata_t *metadata);
 void porn_filter_get_stats(porn_filter_stats_t *stats);
 
 /**
- * Set filter thresholds (for runtime configuration)
- *
- * @param keyword_threshold Minimum weight for keyword match (default: 8)
- */
-void porn_filter_set_thresholds(int keyword_threshold);
-
-/**
  * Set the non-Latin character threshold.
  *
  * @param threshold Percentage (0-100). 0 disables the check.

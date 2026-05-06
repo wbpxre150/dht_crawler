@@ -1,6 +1,5 @@
 # Pornography Content Filter Keywords
-# Format: keyword[:weight]
-# Weight: 1-10 (higher = more severe, default=5)
+# Format: keyword
 # Lines starting with # are comments
 #
 # SECTIONS
@@ -17,35 +16,35 @@
 # ============================================================================
 # Adult Industry Terms (Studios, Sites) - the only reliable standalone signals
 # ============================================================================
-pornhub:10
-xvideos:10
-xhamster:10
-xnxx:10
-redtube:10
-youporn:10
-brazzers:10
-bangbros:10
-realitykings:10
-naughtyamerica:10
-mofos:9
-digitalplayground:9
-evilangel:9
-wickedpictures:9
-onlyfans:9
-manyvids:9
-chaturbate:9
-stripchat:9
-cam4:9
-livejasmin:9
-myfreecams:9
-lolihouse:9
-sxyprn:9
-tushyraw:9
-elegantangel:9
-wowgirls:9
-ultrafilms:9
-ftvgirls:9
-blackedraw:9
+pornhub
+xvideos
+xhamster
+xnxx
+redtube
+youporn
+brazzers
+bangbros
+realitykings
+naughtyamerica
+mofos
+digitalplayground
+evilangel
+wickedpictures
+onlyfans
+manyvids
+chaturbate
+stripchat
+cam4
+livejasmin
+myfreecams
+lolihouse
+sxyprn
+tushyraw
+elegantangel
+wowgirls
+ultrafilms
+ftvgirls
+blackedraw
 
 [xxx_cooccurrence]
 # Everything else – reliable only when "xxx" is also present in the title.
@@ -55,158 +54,158 @@ blackedraw:9
 # ============================================================================
 # High-confidence explicit terms
 # ============================================================================
-porn:10
-porno:10
-pornography:10
-xxxx:10
-hentai:10
-blowjob:10
-handjob:9
-cumshot:10
-orgasm:9
-masturbation:9
-masturbate:9
-erotic:9
-softcore:9
-fetish:9
-bdsm:9
-lesbian porn:10
-gay porn:10
-nsfw:9
+porn
+porno
+pornography
+xxxx
+hentai
+blowjob
+handjob
+cumshot
+orgasm
+masturbation
+masturbate
+erotic
+softcore
+fetish
+bdsm
+lesbian porn
+gay porn
+nsfw
 
 # ============================================================================
 # Body part terms
 # ============================================================================
-boobs:9
-tits:10
-pussy:10
-penis:9
-vagina:9
-cock:8
-dick:7
-ass:7
-breasts:5
-naked:8
+boobs
+tits
+pussy
+penis
+vagina
+cock
+dick
+ass
+breasts
+naked
 
 # ============================================================================
 # Category / act terms
 # ============================================================================
-milf:9
-threesome:10
-foursome:10
-orgy:10
-gangbang:10
-creampie:10
-anal:8
-sex:8
-sexy:7
-hardcore:9
-pov:6
-cum:7
-piss:7
-squirt:8
-fisting:9
-penetration:8
-dp:8
-facial:7
-fuck:10
-fucking:10
-slut:9
-whore:9
-bitch:7
-kinky:7
-horny:8
-naughty:7
-strip:6
-girl on girl:9
-guy on guy:8
-nude model:8
-hot girl:7
+milf
+threesome
+foursome
+orgy
+gangbang
+creampie
+anal
+sex
+sexy
+hardcore
+pov
+cum
+piss
+squirt
+fisting
+penetration
+dp
+facial
+fuck
+fucking
+slut
+whore
+bitch
+kinky
+horny
+naughty
+strip
+girl on girl
+guy on guy
+nude model
+hot girl
 
 # ============================================================================
 # Explicit toys / services
 # ============================================================================
-dildo:10
-vibrator:9
-sex toy:10
-striptease:10
-stripper:9
-escort:9
-prostitute:10
-hooker:10
-camgirl:10
-camboy:10
-adult entertainment:10
-x-rated:10
-rated x:10
+dildo
+vibrator
+sex toy
+striptease
+stripper
+escort
+prostitute
+hooker
+camgirl
+camboy
+adult entertainment
+x-rated
+rated x
 
 # ============================================================================
 # Content descriptors – too generic alone
 # ============================================================================
-nude:9
-nudes:9
-adult:8
-adult video:10
-adult film:10
-sex scene:10
-sex tape:10
-nude scene:10
-porn star:10
-porn video:10
-erotic film:10
-sex worker:10
-18+:9
-21+:9
-adults only:9
-explicit content:9
-not safe for work:9
-siterip:10
-onlyfans leak:10
-patreon leak:10
-premium leak:9
-amateur:6
-homemade:6
-compilation:6
-collection:5
-scene:5
-leaked:6
-private:5
-mature content:6
-uncensored:6
-uncut:6
-for adults:6
-webcam:5
-photoset:6
-video set:6
-pack:5
-megapack:6
-behind the scenes:5
-bonus scenes:5
+nude
+nudes
+adult
+adult video
+adult film
+sex scene
+sex tape
+nude scene
+porn star
+porn video
+erotic film
+sex worker
+18+
+21+
+adults only
+explicit content
+not safe for work
+siterip
+onlyfans leak
+patreon leak
+premium leak
+amateur
+homemade
+compilation
+collection
+scene
+leaked
+private
+mature content
+uncensored
+uncut
+for adults
+webcam
+photoset
+video set
+pack
+megapack
+behind the scenes
+bonus scenes
 
 # ============================================================================
 # Appearance / ethnicity descriptors
 # ============================================================================
-teen:6
-ebony:5
-latina:5
-blonde:5
-brunette:5
-redhead:5
+teen
+ebony
+latina
+blonde
+brunette
+redhead
 
 # ============================================================================
 # Fashion terms
 # ============================================================================
-lingerie:5
-bikini:4
-swimsuit:4
+lingerie
+bikini
+swimsuit
 
 # ============================================================================
 # International terms
 # ============================================================================
-jav:9
-av idol:10
-gravure:6
-ero:7
+jav
+av idol
+gravure
+ero
 
 # ============================================================================
 # Custom user added terms
@@ -239,4 +238,3 @@ voyeur
 exposed
 bang
 pie
-
