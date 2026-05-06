@@ -266,7 +266,7 @@ int http_torrent_page_handler(struct mg_connection *conn, void *cbdata) {
         "</style></head><body>",
         name_esc);
 
-    sb_append(&s, "<p><a href='/'>&larr; Back</a></p>");
+    sb_append(&s, "<p><a href='/' onclick='if(history.length>1){event.preventDefault();history.back();}'>&larr; Back</a></p>");
     sb_append(&s, "<h1>%s</h1>", name_esc);
     sb_append(&s,
         "<div class='meta'>%s &middot; %d peer%s &middot; %d file%s &middot; <code>%s</code></div>",
@@ -289,8 +289,8 @@ int http_torrent_page_handler(struct mg_connection *conn, void *cbdata) {
     sb_append(&s, "<div class='query-preview' id='queryPreview'></div>");
     sb_append(&s,
         "<div class='btnrow'>"
-        "<a class='btn' id='imdbBtn' href='#' onclick='return openImdb(event)'>Search IMDb</a>"
-        "<a class='btn alt' id='dhtBtn' href='#' onclick='return openDht(event)'>Search DHT crawler</a>"
+        "<button class='btn' id='imdbBtn' onclick='openImdb()'>Search IMDb</button>"
+        "<button class='btn alt' id='dhtBtn' onclick='openDht()'>Search DHT crawler</button>"
         "<button class='btn alt' onclick='refreshPeers()' id='refreshBtn'>\xE2\x86\xBB Refresh peers</button>"
         "<button class='btn alt' onclick='copyMagnet()'>\xF0\x9F\xA7\xB2 Copy magnet</button>"
         "<span id='peerInfo' style='align-self:center;color:#555'>%d peer%s</span>"
@@ -322,15 +322,15 @@ int http_torrent_page_handler(struct mg_connection *conn, void *cbdata) {
         "  p.addEventListener('click',function(){p.classList.toggle('on');updatePreview();});"
         "});"
         "updatePreview();"
-        "function openImdb(e){e.preventDefault();var q=encodeURIComponent(buildQuery());"
-        "  var url='https://www.imdb.com/find/?q='+q;"
-        "  var w=window.open(url,'_blank_'+Date.now());"
-        "  if(!w||w.closed){window.location.href=url;}"
-        "  return false;"
+        "function openImdb(){"
+        "  var q=encodeURIComponent(buildQuery());"
+        "  var a=document.createElement('a');"
+        "  a.href='https://www.imdb.com/find/?q='+q;"
+        "  a.target='_blank';a.rel='noopener noreferrer';"
+        "  document.body.appendChild(a);a.click();document.body.removeChild(a);"
         "}"
-        "function openDht(e){e.preventDefault();"
+        "function openDht(){"
         "  window.location.href='/search?q='+encodeURIComponent(buildQuery())+'&format=html';"
-        "  return false;"
         "}"
         "function refreshPeers(){"
         "  var btn=document.getElementById('refreshBtn');"
