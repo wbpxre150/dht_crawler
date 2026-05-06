@@ -104,4 +104,11 @@ int database_vacuum_into(database_t *db, const char *dest_path);
 int database_analyze(database_t *db);
 int database_optimize(database_t *db);
 
+/* Run PRAGMA integrity_check. Returns 0 if clean, >0 error count, -1 on failure. */
+int database_integrity_check(const char *db_path);
+
+/* Copy all readable rows from src_path into a fresh dst_path database.
+ * Returns number of torrent rows recovered, or -1 on fatal error. */
+int database_recover(const char *src_path, const char *dst_path);
+
 #endif /* DATABASE_H */

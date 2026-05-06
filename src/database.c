@@ -778,6 +778,222 @@ int database_rebuild_bloom(const char *db_path, bloom_filter_t *bloom) {
     return count;
 }
 
+/* Run integrity_check PRAGMA on the database.
+ * Returns 0 if the database is clean, >0 for the number of errors found,
+ * or -1 on a fatal open/query failure. */
+int database_integrity_check(const char *db_path) {
+    if (!db_path) return -1;
+
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "integrity_check: failed to open %s: %s",
+                db_path, sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "integrity_check: failed to prepare query: %s",
+                sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    int errors = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *msg = (const char *)sqlite3_column_text(stmt, 0);
+        if (!msg) continue;
+        if (strcmp(msg, "ok") == 0) {
+            log_msg(LOG_INFO, "integrity_check: ok");
+        } else {
+            log_msg(LOG_ERROR, "integrity_check: %s", msg);
+            errors++;
+        }
+    }
+
+    if (rc != SQLITE_DONE) {
+        log_msg(LOG_ERROR, "integrity_check: query error: %s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return errors;
+}
+
+/* Recover a corrupt database by copying all readable rows into a fresh database.
+ * Opens src_path read-only, creates dst_path with the full schema, then copies
+ * path_prefixes → torrents → torrent_files in order (preserving original IDs so
+ * foreign-key relationships survive). FK checks are disabled during the copy.
+ * Returns the number of torrent rows recovered, or -1 on a fatal error. */
+int database_recover(const char *src_path, const char *dst_path) {
+    if (!src_path || !dst_path) return -1;
+
+    sqlite3 *src = NULL, *dst = NULL;
+    int rc;
+
+    rc = sqlite3_open_v2(src_path, &src, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "recover: failed to open source %s: %s",
+                src_path, sqlite3_errmsg(src));
+        sqlite3_close(src);
+        return -1;
+    }
+
+    rc = sqlite3_open(dst_path, &dst);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "recover: failed to open destination %s: %s",
+                dst_path, sqlite3_errmsg(dst));
+        sqlite3_close(src);
+        sqlite3_close(dst);
+        return -1;
+    }
+
+    sqlite3_exec(dst, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(dst, "PRAGMA foreign_keys=OFF;", NULL, NULL, NULL);
+
+    char *err = NULL;
+    rc = sqlite3_exec(dst, CREATE_TABLES_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "recover: failed to create tables: %s", err);
+        sqlite3_free(err);
+        sqlite3_close(src); sqlite3_close(dst);
+        return -1;
+    }
+    rc = sqlite3_exec(dst, CREATE_FTS_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "recover: failed to create FTS tables: %s", err);
+        sqlite3_free(err);
+        sqlite3_close(src); sqlite3_close(dst);
+        return -1;
+    }
+    rc = sqlite3_exec(dst, CREATE_TRIGGERS_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "recover: failed to create triggers: %s", err);
+        sqlite3_free(err);
+        sqlite3_close(src); sqlite3_close(dst);
+        return -1;
+    }
+
+    sqlite3_exec(dst, "BEGIN;", NULL, NULL, NULL);
+
+    sqlite3_stmt *sel = NULL, *ins = NULL;
+    int skipped = 0;
+
+    /* --- path_prefixes --- */
+    int prefix_count = 0;
+    rc = sqlite3_prepare_v2(src, "SELECT id, prefix FROM path_prefixes", -1, &sel, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_prepare_v2(dst,
+            "INSERT OR IGNORE INTO path_prefixes(id, prefix) VALUES(?,?)",
+            -1, &ins, NULL);
+        while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+            const char *prefix = (const char *)sqlite3_column_text(sel, 1);
+            if (!prefix) { skipped++; continue; }
+            sqlite3_bind_int64(ins, 1, sqlite3_column_int64(sel, 0));
+            sqlite3_bind_text(ins, 2, prefix, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins) == SQLITE_DONE) prefix_count++;
+            else skipped++;
+            sqlite3_reset(ins);
+        }
+        if (rc != SQLITE_DONE)
+            log_msg(LOG_WARN, "recover: path_prefixes scan ended early: %s", sqlite3_errmsg(src));
+        sqlite3_finalize(ins); ins = NULL;
+    }
+    sqlite3_finalize(sel); sel = NULL;
+    log_msg(LOG_INFO, "recover: copied %d path prefixes", prefix_count);
+
+    /* --- torrents --- */
+    int torrent_count = 0;
+    rc = sqlite3_prepare_v2(src,
+        "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp FROM torrents",
+        -1, &sel, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_prepare_v2(dst,
+            "INSERT OR IGNORE INTO torrents"
+            "(id, info_hash, name, size_bytes, total_peers, added_timestamp)"
+            " VALUES(?,?,?,?,?,?)",
+            -1, &ins, NULL);
+        while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+            const void *hash = sqlite3_column_blob(sel, 1);
+            int hash_len = sqlite3_column_bytes(sel, 1);
+            const char *name = (const char *)sqlite3_column_text(sel, 2);
+            if (!hash || hash_len != SHA1_DIGEST_LENGTH || !name) { skipped++; continue; }
+
+            sqlite3_bind_int64(ins, 1, sqlite3_column_int64(sel, 0));
+            sqlite3_bind_blob(ins, 2, hash, hash_len, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 3, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins, 4, sqlite3_column_int64(sel, 3));
+            sqlite3_bind_int(ins, 5, sqlite3_column_int(sel, 4));
+            sqlite3_bind_int64(ins, 6, sqlite3_column_int64(sel, 5));
+
+            if (sqlite3_step(ins) == SQLITE_DONE) torrent_count++;
+            else skipped++;
+            sqlite3_reset(ins);
+
+            if (torrent_count % 100000 == 0 && torrent_count > 0)
+                log_msg(LOG_INFO, "recover: %d torrents copied...", torrent_count);
+        }
+        if (rc != SQLITE_DONE)
+            log_msg(LOG_WARN, "recover: torrents scan ended early: %s", sqlite3_errmsg(src));
+        sqlite3_finalize(ins); ins = NULL;
+    }
+    sqlite3_finalize(sel); sel = NULL;
+
+    /* --- torrent_files --- */
+    int file_count = 0;
+    rc = sqlite3_prepare_v2(src,
+        "SELECT id, torrent_id, prefix_id, filename, size_bytes, file_index FROM torrent_files",
+        -1, &sel, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_prepare_v2(dst,
+            "INSERT OR IGNORE INTO torrent_files"
+            "(id, torrent_id, prefix_id, filename, size_bytes, file_index)"
+            " VALUES(?,?,?,?,?,?)",
+            -1, &ins, NULL);
+        while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+            const char *filename = (const char *)sqlite3_column_text(sel, 3);
+            if (!filename) { skipped++; continue; }
+
+            sqlite3_bind_int64(ins, 1, sqlite3_column_int64(sel, 0));
+            sqlite3_bind_int64(ins, 2, sqlite3_column_int64(sel, 1));
+            if (sqlite3_column_type(sel, 2) == SQLITE_NULL)
+                sqlite3_bind_null(ins, 3);
+            else
+                sqlite3_bind_int64(ins, 3, sqlite3_column_int64(sel, 2));
+            sqlite3_bind_text(ins, 4, filename, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins, 5, sqlite3_column_int64(sel, 4));
+            sqlite3_bind_int(ins, 6, sqlite3_column_int(sel, 5));
+
+            if (sqlite3_step(ins) == SQLITE_DONE) file_count++;
+            else skipped++;
+            sqlite3_reset(ins);
+        }
+        if (rc != SQLITE_DONE)
+            log_msg(LOG_WARN, "recover: torrent_files scan ended early: %s", sqlite3_errmsg(src));
+        sqlite3_finalize(ins); ins = NULL;
+    }
+    sqlite3_finalize(sel); sel = NULL;
+    log_msg(LOG_INFO, "recover: copied %d torrent files", file_count);
+
+    sqlite3_exec(dst, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_exec(dst, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+    sqlite3_exec(dst, "VACUUM;", NULL, NULL, NULL);
+
+    sqlite3_close(src);
+    sqlite3_close(dst);
+
+    if (skipped > 0)
+        log_msg(LOG_WARN, "recover: %d rows skipped (corrupt or invalid data)", skipped);
+    log_msg(LOG_INFO, "recover: total %d torrents recovered", torrent_count);
+    return torrent_count;
+}
+
 /* Cleanup database */
 void database_cleanup(database_t *db) {
     if (!db) {

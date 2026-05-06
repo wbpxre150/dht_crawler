@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/resource.h>
 #include <errno.h>
 #include <limits.h>
@@ -120,6 +121,47 @@ static int ensure_parent_directory_exists(const char *filepath) {
     return ret;
 }
 
+/* Check that the filesystem containing tmp_path has enough free space to hold
+ * a copy of db_path (plus its WAL file if present).
+ * Returns 0 if space is sufficient, -1 if not. On statvfs failure the check
+ * is skipped with a warning and 0 is returned so the operation can proceed. */
+static int check_disk_space(const char *db_path, const char *tmp_path) {
+    struct stat st;
+    off_t required = 0;
+
+    if (stat(db_path, &st) == 0)
+        required += st.st_size;
+
+    char wal_path[PATH_MAX];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    if (stat(wal_path, &st) == 0)
+        required += st.st_size;
+
+    char *tmp_copy = strdup(tmp_path);
+    if (!tmp_copy) return 0;
+    char *dir = dirname(tmp_copy);
+
+    struct statvfs vfs;
+    int rc = statvfs(dir, &vfs);
+    free(tmp_copy);
+
+    if (rc != 0) {
+        log_msg(LOG_WARN, "Could not check available disk space: %s", strerror(errno));
+        return 0;
+    }
+
+    uint64_t available = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_bsize;
+    log_msg(LOG_INFO, "Disk space: need %lld bytes, have %llu bytes available",
+            (long long)required, (unsigned long long)available);
+
+    if (available < (uint64_t)required) {
+        log_msg(LOG_ERROR, "Insufficient disk space for operation: need %lld bytes, only %llu available",
+                (long long)required, (unsigned long long)available);
+        return -1;
+    }
+    return 0;
+}
+
 /* Initialize application context */
 void init_app_context(app_context_t *ctx) {
     memset(ctx, 0, sizeof(app_context_t));
@@ -153,6 +195,8 @@ int main(int argc, char *argv[]) {
     bool rebuild_bloom = false;
     bool porn_filter_update = false;
     bool compact_db = false;
+    bool check_db = false;
+    bool recover_db = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
@@ -161,6 +205,9 @@ int main(int argc, char *argv[]) {
             printf("  --porn-filter-update     Re-scan the database and remove entries matching the porn filter\n");
             printf("  --compact                Compact the database by writing a fresh copy and replacing the original\n");
             printf("                           Can be used alone or combined with --porn-filter-update\n");
+            printf("  --check-database         Run an integrity check on the database and report any errors\n");
+            printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
+            printf("                           database, then replacing the original\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -169,6 +216,10 @@ int main(int argc, char *argv[]) {
             porn_filter_update = true;
         } else if (strcmp(argv[i], "--compact") == 0) {
             compact_db = true;
+        } else if (strcmp(argv[i], "--check-database") == 0) {
+            check_db = true;
+        } else if (strcmp(argv[i], "--recover-database") == 0) {
+            recover_db = true;
         }
     }
 
@@ -245,6 +296,61 @@ int main(int argc, char *argv[]) {
 
         bloom_filter_cleanup(bloom);
         log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s.", config.bloom_path);
+        return 0;
+    }
+
+    /*******************************************************************
+     * --check-database: run integrity_check PRAGMA and report results.
+     *******************************************************************/
+    if (check_db) {
+        log_msg(LOG_INFO, "Checking database integrity: %s", g_app_ctx.db_path);
+        int nerrors = database_integrity_check(g_app_ctx.db_path);
+        cleanup_app_context(&g_app_ctx);
+        if (nerrors < 0) {
+            log_msg(LOG_ERROR, "--check-database: failed to open or query database.");
+            return 1;
+        }
+        if (nerrors == 0) {
+            log_msg(LOG_INFO, "--check-database: database is clean.");
+            return 0;
+        }
+        log_msg(LOG_ERROR, "--check-database: %d integrity error(s) found.", nerrors);
+        return 1;
+    }
+
+    /*******************************************************************
+     * --recover-database: copy all readable rows into a fresh database,
+     * then replace the original.
+     *******************************************************************/
+    if (recover_db) {
+        char tmp_path[PATH_MAX];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.recover.tmp", g_app_ctx.db_path);
+
+        if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        unlink(tmp_path);
+
+        log_msg(LOG_INFO, "Recovering database %s into %s ...", g_app_ctx.db_path, tmp_path);
+        int nrows = database_recover(g_app_ctx.db_path, tmp_path);
+
+        cleanup_app_context(&g_app_ctx);
+
+        if (nrows < 0) {
+            log_msg(LOG_ERROR, "--recover-database: recovery failed; original database unchanged.");
+            unlink(tmp_path);
+            return 1;
+        }
+
+        if (rename(tmp_path, g_app_ctx.db_path) != 0) {
+            log_msg(LOG_ERROR, "--recover-database: failed to replace database: %s", strerror(errno));
+            log_msg(LOG_ERROR, "Recovered copy left at %s", tmp_path);
+            return 1;
+        }
+
+        log_msg(LOG_INFO, "--recover-database: complete. %d torrents recovered.", nrows);
         return 0;
     }
 
@@ -406,6 +512,17 @@ int main(int argc, char *argv[]) {
     if (compact_db) {
         char tmp_path[PATH_MAX];
         snprintf(tmp_path, sizeof(tmp_path), "%s.compact.tmp", g_app_ctx.db_path);
+
+        if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
+            database_cleanup(&g_database);
+            torrent_search_cleanup();
+            porn_filter_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            infohash_queue_cleanup(&g_queue);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
 
         /* Remove any leftover temp file from a previous failed run */
         unlink(tmp_path);
