@@ -3,45 +3,19 @@
 # Weight: 1-10 (higher = more severe, default=5)
 # Lines starting with # are comments
 #
-# This file allows customization of the pornography content filter.
-# Add or remove keywords as needed for your use case.
+# SECTIONS
+# --------
+# [standalone]       – keywords that trigger the filter on their own
+# [xxx_cooccurrence] – keywords that only trigger when "xxx" also appears
+#                      as a whole word in the torrent title
 #
-# Note: Keywords are case-insensitive and matched as substrings
+# All matching is case-insensitive. Standalone uses substring matching.
+# Co-occurrence uses whole-word matching for both "xxx" and the trigger word.
+
+[standalone]
 
 # ============================================================================
-# Explicit Terms (High Confidence) - Weight 8-10
-# ============================================================================
-porn:10
-porno:10
-pornography:10
-# xxx:9  # REMOVED: Too many false positives with video quality markers (XXX.1080p)
-xxxx:10
-# adult:8  # REMOVED: Too generic, matches "adult education", "adult animation", etc.
-nsfw:9
-nude:9
-nudes:9
-# naked:8  # REDUCED WEIGHT: "Naked Gun" movie causes false positives
-naked gun:1
-# sex:8  # REMOVED: Too generic, causes many false positives in compound words
-# sexy:8  # REMOVED: Too generic
-erotic:9
-hentai:10
-# hardcore:9  # REMOVED: Matches music genres "hardcore techno", "hardcore punk"
-softcore:9
-fetish:9
-bdsm:9
-lesbian porn:10
-gay porn:10
-# anal:8  # REMOVED: Too generic, substring matches "analysis", "analog", "canal"
-blowjob:10
-handjob:9
-cumshot:10
-orgasm:9
-masturbation:9
-masturbate:9
-
-# ============================================================================
-# Adult Industry Terms (Studios, Sites) - Weight 7-10
+# Adult Industry Terms (Studios, Sites) - the only reliable standalone signals
 # ============================================================================
 pornhub:10
 xvideos:10
@@ -56,7 +30,6 @@ naughtyamerica:10
 mofos:9
 digitalplayground:9
 evilangel:9
-vivid:9
 wickedpictures:9
 onlyfans:9
 manyvids:9
@@ -65,142 +38,172 @@ stripchat:9
 cam4:9
 livejasmin:9
 myfreecams:9
+lolihouse:9
+sxyprn:9
+tushyraw:9
+elegantangel:9
+wowgirls:9
+ultrafilms:9
+ftvgirls:9
+
+
+[xxx_cooccurrence]
+# Everything else – reliable only when "xxx" is also present in the title.
+# Whole-word matching prevents substring false positives
+# (e.g. "anal" won't match "analysis", "cock" won't match "peacock").
 
 # ============================================================================
-# Common Euphemisms and Code Words - Weight 5-7
+# High-confidence explicit terms
 # ============================================================================
-18+:9
-21+:9
-adults only:9
-# mature content:6  # REMOVED: Too generic, matches movie descriptions
-explicit content:9
-# uncensored:6  # REMOVED: Common in anime releases (uncensored version)
-# uncut:6  # REMOVED: Common in director's cuts, extended editions
-# r-rated:5  # REMOVED: Standard movie rating
-x-rated:10
-rated x:10
-not safe for work:9
-# for adults:6  # REMOVED: Too generic
-adult entertainment:10
+porn:10
+porno:10
+pornography:10
+xxxx:10
+hentai:10
+blowjob:10
+handjob:9
+cumshot:10
+orgasm:9
+masturbation:9
+masturbate:9
+erotic:9
+softcore:9
+fetish:9
+bdsm:9
+lesbian porn:10
+gay porn:10
+nsfw:9
 
 # ============================================================================
-# Content Type Indicators - Weight 6-8
-# ============================================================================
-# amateur:6  # REMOVED: Too generic, used for amateur photography, sports, etc.
-# homemade:6  # REMOVED: Too generic
-# compilation:6  # REMOVED: Common in music/video compilations
-# collection:6  # REMOVED: Too generic
-# full length:5  # REMOVED: Standard movie descriptor
-# unrated:6  # REMOVED: Standard movie version descriptor
-# behind the scenes:5  # REMOVED: Standard DVD extra content
-# bonus scenes:5  # REMOVED: Standard DVD extra content
-
-# ============================================================================
-# Video/Image Collection Indicators - Weight 5-7
-# ============================================================================
-# pack:5  # REMOVED: Too generic, used for software packs, game packs, etc.
-# megapack:6  # REMOVED: Too generic
-siterip:10
-# photoset:6  # REMOVED: Too generic, used for photography
-# video set:6  # REMOVED: Too generic
-# scene:5  # REMOVED: Too generic, common in release names
-
-# ============================================================================
-# Platform/Network Identifiers - Weight 7-9
-# ============================================================================
-onlyfans leak:10
-patreon leak:10
-premium leak:9
-# leaked:6  # REMOVED: Too generic, used for game leaks, movie leaks, etc.
-# private:5  # REMOVED: Too generic
-
-# ============================================================================
-# Body Part Terms (Context Dependent) - Weight 5-7
+# Body part terms
 # ============================================================================
 boobs:9
 tits:10
-# ass:6  # REMOVED: Too generic, substring matches "class", "pass", "bass", "dass"
 pussy:10
-# dick:7  # REMOVED: Common name, too generic
-# cock:8  # REMOVED: Substring matches "peacock", "gamecock", etc.
 penis:9
 vagina:9
-# breasts:5  # REMOVED: Too generic, can appear in medical contexts
+cock:8
+dick:7
+ass:7
+breasts:5
+naked:8
 
 # ============================================================================
-# Category/Genre Terms - Weight 6-9
+# Category / act terms
 # ============================================================================
 milf:9
-# teen:6  # REMOVED: Too generic, matches "teen movies", "teen drama", etc.
-# ebony:5  # REMOVED: Too generic, can refer to wood, color, etc.
-# asian:5  # REMOVED: Too generic, geographic/ethnic descriptor
-# latina:5  # REMOVED: Too generic, geographic/ethnic descriptor
-# blonde:5  # REMOVED: Too generic, common appearance descriptor
-# brunette:5  # REMOVED: Too generic, common appearance descriptor
-# redhead:5  # REMOVED: Too generic, common appearance descriptor
 threesome:10
 foursome:10
 orgy:10
 gangbang:10
 creampie:10
-# facial:7  # REMOVED: Too generic, matches "facial recognition", "facial features"
-# pov:6  # REMOVED: Too generic, common cinematography term
+anal:8
+sex:8
+sexy:7
+hardcore:9
+pov:6
+cum:7
+piss:7
+squirt:8
+fisting:9
+penetration:8
+dp:8
+facial:7
+fuck:10
+fucking:10
+slut:9
+whore:9
+bitch:7
+kinky:7
+horny:8
+naughty:7
+strip:6
+girl on girl:9
+guy on guy:8
+nude model:8
+hot girl:7
 
 # ============================================================================
-# Additional Explicit Terms - Weight 7-10
+# Explicit toys / services
 # ============================================================================
 dildo:10
 vibrator:9
 sex toy:10
-# lingerie:5  # REMOVED: Too generic, fashion/clothing term
-# bikini:4  # REMOVED: Too generic, common clothing item
-# swimsuit:4  # REMOVED: Too generic, common clothing item
 striptease:10
 stripper:9
 escort:9
 prostitute:10
 hooker:10
-# webcam:5  # REMOVED: Too generic, common technology term
 camgirl:10
 camboy:10
+adult entertainment:10
+x-rated:10
+rated x:10
 
 # ============================================================================
-# International Terms (Common) - Weight 7-9
+# Content descriptors – too generic alone
 # ============================================================================
-jav:9
-av idol:10
-# gravure:6  # REMOVED: Too generic, can refer to art/printing technique
-# ero:7  # REMOVED: Too short, high risk of substring false positives
-
-# ============================================================================
-# Multi-word Phrases (High Specificity) - Weight 10
-# ============================================================================
-# These are highly specific phrases that are very unlikely to appear in legitimate content
+nude:9
+nudes:9
+adult:8
+adult video:10
+adult film:10
 sex scene:10
 sex tape:10
 nude scene:10
-adult video:10
-adult film:10
 porn star:10
 porn video:10
 erotic film:10
 sex worker:10
+18+:9
+21+:9
+adults only:9
+explicit content:9
+not safe for work:9
+siterip:10
+onlyfans leak:10
+patreon leak:10
+premium leak:9
+amateur:6
+homemade:6
+compilation:6
+collection:5
+scene:5
+leaked:6
+private:5
+mature content:6
+uncensored:6
+uncut:6
+for adults:6
+webcam:5
+photoset:6
+video set:6
+pack:5
+megapack:6
+behind the scenes:5
+bonus scenes:5
 
 # ============================================================================
-# False Positive Mitigation
+# Appearance / ethnicity descriptors
 # ============================================================================
-# Note: To prevent false positives, multi-word phrases are preferred
-# The filter uses three layers:
-# 1. Keyword matching (most conservative)
-# 2. Regex pattern matching (evasion detection)
-# 3. Heuristic scoring (multiple signals)
-#
-# Keywords removed to reduce false positives:
-# - Generic terms: adult, sex, xxx, hardcore, amateur, pack, scene
-# - Common substrings: ass, cock, anal, facial, pov
-# - Descriptors: teen, blonde, asian, leaked
-# - Technical: webcam, uncensored, uncut
-#
-# These removals significantly reduce false positives while maintaining
-# high accuracy through the combination of specific keywords, regex patterns,
-# and heuristic scoring.
+teen:6
+ebony:5
+latina:5
+blonde:5
+brunette:5
+redhead:5
+
+# ============================================================================
+# Fashion terms
+# ============================================================================
+lingerie:5
+bikini:4
+swimsuit:4
+
+# ============================================================================
+# International terms
+# ============================================================================
+jav:9
+av idol:10
+gravure:6
+ero:7

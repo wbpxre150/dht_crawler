@@ -466,8 +466,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(porn_filter, "total_checked", (double)pf_stats.total_checked);
         cJSON_AddNumberToObject(porn_filter, "total_filtered", (double)pf_stats.total_filtered);
         cJSON_AddNumberToObject(porn_filter, "filtered_by_keyword", (double)pf_stats.filtered_by_keyword);
-        cJSON_AddNumberToObject(porn_filter, "filtered_by_regex", (double)pf_stats.filtered_by_regex);
-        cJSON_AddNumberToObject(porn_filter, "filtered_by_heuristic", (double)pf_stats.filtered_by_heuristic);
 
         /* Calculate filter rate */
         double filter_rate = 0.0;

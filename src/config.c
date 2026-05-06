@@ -78,8 +78,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->porn_filter_enabled = 0;                /* Disabled by default */
     strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
     config->porn_filter_keyword_threshold = 8;      /* Min weight for keyword match */
-    config->porn_filter_regex_threshold = 9;        /* Min weight for regex match */
-    config->porn_filter_heuristic_threshold = 5;    /* Min score for heuristic match */
 
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
@@ -322,14 +320,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->porn_filter_keyword_threshold = atoi(value);
             if (config->porn_filter_keyword_threshold < 1) config->porn_filter_keyword_threshold = 1;
             if (config->porn_filter_keyword_threshold > 10) config->porn_filter_keyword_threshold = 10;
-        } else if (strcmp(key, "porn_filter_regex_threshold") == 0) {
-            config->porn_filter_regex_threshold = atoi(value);
-            if (config->porn_filter_regex_threshold < 1) config->porn_filter_regex_threshold = 1;
-            if (config->porn_filter_regex_threshold > 10) config->porn_filter_regex_threshold = 10;
-        } else if (strcmp(key, "porn_filter_heuristic_threshold") == 0) {
-            config->porn_filter_heuristic_threshold = atoi(value);
-            if (config->porn_filter_heuristic_threshold < 0) config->porn_filter_heuristic_threshold = 0;
-            if (config->porn_filter_heuristic_threshold > 20) config->porn_filter_heuristic_threshold = 20;
         }
         /* Thread tree settings (Stage 1) */
         else if (strcmp(key, "num_trees") == 0) {

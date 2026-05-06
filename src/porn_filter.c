@@ -4,7 +4,6 @@
 #include <string.h>
 #include <strings.h>  /* For strcasecmp */
 #include <ctype.h>
-#include <regex.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -23,40 +22,24 @@ typedef struct keyword_entry {
 } keyword_entry_t;
 
 /**
- * Regex pattern for evasion detection
- */
-typedef struct {
-    regex_t regex;
-    char *pattern_desc;
-    int weight;
-    int compiled;               // 1 if regex compiled successfully
-} regex_pattern_t;
-
-/**
  * Global filter state
  */
 static struct {
-    keyword_entry_t *keyword_hash;     // Hash table of keywords
-    regex_pattern_t *regex_patterns;   // Array of compiled regex
-    size_t num_regex;
-    pthread_mutex_t stats_mutex;       // Protect stats
+    keyword_entry_t *keyword_hash;            // Standalone filter keywords
+    keyword_entry_t *xxx_cooccurrence_hash;   // Keywords active only when "xxx" is also present
+    pthread_mutex_t stats_mutex;              // Protect stats
     porn_filter_stats_t stats;
     int initialized;
 
     // Configurable thresholds
     int keyword_threshold;
-    int regex_threshold;
-    int heuristic_threshold;
 } filter_state = {
     .keyword_hash = NULL,
-    .regex_patterns = NULL,
-    .num_regex = 0,
+    .xxx_cooccurrence_hash = NULL,
     .stats_mutex = PTHREAD_MUTEX_INITIALIZER,
     .stats = {0},
     .initialized = 0,
     .keyword_threshold = 8,
-    .regex_threshold = 9,
-    .heuristic_threshold = 5
 };
 
 /* Snapshot of keyword pointers (built lazily on first enumeration call) */
@@ -121,65 +104,63 @@ static void trim_whitespace(char *str) {
     }
 }
 
-/**
- * Count special characters in string
- */
-static float calculate_special_char_ratio(const char *str) {
-    if (!str || strlen(str) == 0) return 0.0f;
-
-    int total = 0;
-    int special = 0;
-
-    for (const char *p = str; *p; p++) {
-        total++;
-        if (!isalnum((unsigned char)*p) && !isspace((unsigned char)*p)) {
-            special++;
-        }
-    }
-
-    return total > 0 ? (float)special / total : 0.0f;
-}
-
 /* ============================================================================
  * Layer 1: Hash Set Keyword Matching
  * ============================================================================ */
 
 /**
- * Add keyword to hash table
+ * Generic helper: add keyword to any hash table
  */
-static int add_keyword(const char *keyword, int weight) {
+static int add_keyword_to_table(keyword_entry_t **table, const char *keyword, int weight) {
     if (!keyword || strlen(keyword) == 0) return -1;
 
-    // Check if already exists
     keyword_entry_t *entry;
-    HASH_FIND_STR(filter_state.keyword_hash, keyword, entry);
+    HASH_FIND_STR(*table, keyword, entry);
     if (entry) {
-        // Update weight if higher
-        if (weight > entry->weight) {
-            entry->weight = weight;
-        }
+        if (weight > entry->weight) entry->weight = weight;
         return 0;
     }
 
-    // Create new entry
     entry = malloc(sizeof(keyword_entry_t));
     if (!entry) return -1;
 
     entry->keyword = strdup(keyword);
-    if (!entry->keyword) {
-        free(entry);
-        return -1;
-    }
+    if (!entry->keyword) { free(entry); return -1; }
     entry->weight = weight;
 
-    HASH_ADD_KEYPTR(hh, filter_state.keyword_hash, entry->keyword, strlen(entry->keyword), entry);
+    HASH_ADD_KEYPTR(hh, *table, entry->keyword, strlen(entry->keyword), entry);
     return 0;
 }
 
+static int add_keyword(const char *keyword, int weight) {
+    return add_keyword_to_table(&filter_state.keyword_hash, keyword, weight);
+}
+
+static int add_xxx_keyword(const char *keyword, int weight) {
+    return add_keyword_to_table(&filter_state.xxx_cooccurrence_hash, keyword, weight);
+}
+
 /**
- * Load keywords from file
+ * Free all entries in a keyword hash table
+ */
+static void free_keyword_table(keyword_entry_t **table) {
+    keyword_entry_t *entry, *tmp;
+    HASH_ITER(hh, *table, entry, tmp) {
+        HASH_DEL(*table, entry);
+        free(entry->keyword);
+        free(entry);
+    }
+    *table = NULL;
+}
+
+/**
+ * Load keywords from file.
  * Format: keyword[:weight]
- * Lines starting with # are comments
+ * Section headers: [standalone] or [xxx_cooccurrence]
+ * Lines starting with # are comments.
+ *
+ * [standalone]      – keywords that trigger the filter on their own (default)
+ * [xxx_cooccurrence] – keywords that only trigger when "xxx" is also in the title
  */
 static int load_keywords(const char *file_path) {
     FILE *fp = fopen(file_path, "r");
@@ -189,27 +170,29 @@ static int load_keywords(const char *file_path) {
     }
 
     char line[256];
-    int line_num = 0;
-    int loaded = 0;
+    int loaded_standalone = 0;
+    int loaded_cooccurrence = 0;
+    int in_xxx_section = 0;  // 0 = standalone (default), 1 = xxx_cooccurrence
 
     while (fgets(line, sizeof(line), fp)) {
-        line_num++;
-
-        // Remove newline
         line[strcspn(line, "\r\n")] = '\0';
-
-        // Trim whitespace
         trim_whitespace(line);
 
-        // Skip empty lines and comments
-        if (strlen(line) == 0 || line[0] == '#') {
+        if (strlen(line) == 0 || line[0] == '#') continue;
+
+        // Section header detection
+        if (line[0] == '[') {
+            if (strcasecmp(line, "[xxx_cooccurrence]") == 0) {
+                in_xxx_section = 1;
+            } else if (strcasecmp(line, "[standalone]") == 0) {
+                in_xxx_section = 0;
+            }
             continue;
         }
 
         // Parse keyword:weight
         char *colon = strchr(line, ':');
-        int weight = 5;  // Default weight
-
+        int weight = 5;
         if (colon) {
             *colon = '\0';
             weight = atoi(colon + 1);
@@ -217,19 +200,21 @@ static int load_keywords(const char *file_path) {
             if (weight > 10) weight = 10;
         }
 
-        // Normalize keyword
         normalize_string(line);
         trim_whitespace(line);
 
         if (strlen(line) > 0) {
-            if (add_keyword(line, weight) == 0) {
-                loaded++;
+            if (in_xxx_section) {
+                if (add_xxx_keyword(line, weight) == 0) loaded_cooccurrence++;
+            } else {
+                if (add_keyword(line, weight) == 0) loaded_standalone++;
             }
         }
     }
 
     fclose(fp);
-    log_msg(LOG_DEBUG, "Loaded %d keywords from %s", loaded, file_path);
+    log_msg(LOG_DEBUG, "Loaded %d standalone + %d xxx co-occurrence keywords from %s",
+            loaded_standalone, loaded_cooccurrence, file_path);
     return 0;
 }
 
@@ -271,241 +256,48 @@ static int check_keywords_in_text(const char *text, int *out_weight) {
 }
 
 /* ============================================================================
- * Layer 2: Regex Pattern Matching
+ * Layer 1.5: xxx Co-occurrence Check
  * ============================================================================ */
 
 /**
- * Initialize regex patterns for evasion detection
+ * Returns 1 if the text contains "xxx" as a whole word AND at least one
+ * keyword from the [xxx_cooccurrence] section also appears as a whole word.
  */
-static int init_regex_patterns(void) {
-    // Define patterns (limited to 5 for performance)
-    const char *patterns[] = {
-        "p[o0][r|2]n",                           // L33tspeak: porn, p0rn, po2n, pr0n
-        "x+[._-]*x+[._-]*x+",                    // XXX with separators
-        "adult[^a-z]{0,5}(video|movie|film)",    // Adult + video combo
-        "(pornhub|xvideos|xhamster|xnxx)",       // Common sites
-        "[0-9]{2,}\\+",                          // Age indicators: 18+, 21+, etc.
-    };
+static int check_xxx_cooccurrence(const char *text) {
+    if (!text || !filter_state.xxx_cooccurrence_hash) return 0;
 
-    const char *descriptions[] = {
-        "L33tspeak porn",
-        "XXX pattern",
-        "Adult video combo",
-        "Adult site names",
-        "Age indicator"
-    };
+    char *lower = strdup(text);
+    if (!lower) return 0;
+    normalize_string(lower);
 
-    const int weights[] = {9, 8, 7, 10, 6};
-
-    filter_state.num_regex = sizeof(patterns) / sizeof(patterns[0]);
-    filter_state.regex_patterns = calloc(filter_state.num_regex, sizeof(regex_pattern_t));
-    if (!filter_state.regex_patterns) {
-        log_msg(LOG_ERROR, "Failed to allocate regex patterns");
-        return -1;
+    /* Whole-word scan for "xxx" */
+    int has_xxx = 0;
+    const char *p = lower;
+    while ((p = strstr(p, "xxx")) != NULL) {
+        int before_ok = (p == lower) || !isalnum((unsigned char)*(p - 1));
+        int after_ok  = !isalnum((unsigned char)*(p + 3));
+        if (before_ok && after_ok) { has_xxx = 1; break; }
+        p += 3;
     }
 
-    int compiled_count = 0;
-    for (size_t i = 0; i < filter_state.num_regex; i++) {
-        filter_state.regex_patterns[i].pattern_desc = strdup(descriptions[i]);
-        filter_state.regex_patterns[i].weight = weights[i];
+    if (!has_xxx) { free(lower); return 0; }
 
-        int ret = regcomp(&filter_state.regex_patterns[i].regex, patterns[i],
-                         REG_EXTENDED | REG_ICASE | REG_NOSUB);
-        if (ret == 0) {
-            filter_state.regex_patterns[i].compiled = 1;
-            compiled_count++;
-        } else {
-            char errbuf[256];
-            regerror(ret, &filter_state.regex_patterns[i].regex, errbuf, sizeof(errbuf));
-            log_msg(LOG_WARN, "Failed to compile regex pattern '%s': %s", patterns[i], errbuf);
-            filter_state.regex_patterns[i].compiled = 0;
+    /* Whole-word scan for each co-occurrence keyword */
+    keyword_entry_t *entry, *tmp;
+    HASH_ITER(hh, filter_state.xxx_cooccurrence_hash, entry, tmp) {
+        const char *t = entry->keyword;
+        size_t tlen = strlen(t);
+        const char *q = lower;
+        while ((q = strstr(q, t)) != NULL) {
+            int b = (q == lower) || !isalnum((unsigned char)*(q - 1));
+            int a = !isalnum((unsigned char)*(q + tlen));
+            if (b && a) { free(lower); return 1; }
+            q += tlen;
         }
     }
 
-    log_msg(LOG_DEBUG, "Compiled %d/%zu regex patterns", compiled_count, filter_state.num_regex);
+    free(lower);
     return 0;
-}
-
-/**
- * Cleanup regex patterns
- */
-static void cleanup_regex_patterns(void) {
-    if (!filter_state.regex_patterns) return;
-
-    for (size_t i = 0; i < filter_state.num_regex; i++) {
-        if (filter_state.regex_patterns[i].compiled) {
-            regfree(&filter_state.regex_patterns[i].regex);
-        }
-        free(filter_state.regex_patterns[i].pattern_desc);
-    }
-
-    free(filter_state.regex_patterns);
-    filter_state.regex_patterns = NULL;
-    filter_state.num_regex = 0;
-}
-
-/**
- * Check text against regex patterns
- * Returns highest weight found, or 0 if no match
- */
-static int check_regex_patterns(const char *text, int *out_weight) {
-    if (!text || !filter_state.regex_patterns) {
-        *out_weight = 0;
-        return 0;
-    }
-
-    int max_weight = 0;
-    int found = 0;
-
-    for (size_t i = 0; i < filter_state.num_regex; i++) {
-        if (!filter_state.regex_patterns[i].compiled) continue;
-
-        if (regexec(&filter_state.regex_patterns[i].regex, text, 0, NULL, 0) == 0) {
-            found = 1;
-            if (filter_state.regex_patterns[i].weight > max_weight) {
-                max_weight = filter_state.regex_patterns[i].weight;
-            }
-        }
-    }
-
-    *out_weight = max_weight;
-    return found;
-}
-
-/* ============================================================================
- * Layer 3: Heuristic Scoring
- * ============================================================================ */
-
-/**
- * Check if file has video extension
- */
-static int is_video_file(const char *path) {
-    if (!path) return 0;
-
-    const char *ext = strrchr(path, '.');
-    if (!ext) return 0;
-    ext++; // Skip the dot
-
-    const char *video_exts[] = {"mp4", "avi", "mkv", "wmv", "mov", "flv", "mpg", "mpeg", "m4v", "webm"};
-    for (size_t i = 0; i < sizeof(video_exts) / sizeof(video_exts[0]); i++) {
-        if (strcasecmp(ext, video_exts[i]) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/**
- * Check if file has image extension
- */
-static int is_image_file(const char *path) {
-    if (!path) return 0;
-
-    const char *ext = strrchr(path, '.');
-    if (!ext) return 0;
-    ext++;
-
-    const char *image_exts[] = {"jpg", "jpeg", "png", "gif", "bmp", "webp"};
-    for (size_t i = 0; i < sizeof(image_exts) / sizeof(image_exts[0]); i++) {
-        if (strcasecmp(ext, image_exts[i]) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/**
- * Check if files have sequential numbering pattern
- */
-static int has_sequential_files(const torrent_metadata_t *metadata) {
-    if (!metadata || metadata->num_files < 10) return 0;
-
-    int sequential_count = 0;
-
-    for (int i = 0; i < metadata->num_files; i++) {
-        const char *path = metadata->files[i].path;
-        if (!path) continue;
-
-        // Look for patterns like: 01, 02, 03 or file01, file02, etc.
-        const char *p = path;
-        while (*p) {
-            if (isdigit((unsigned char)*p) && isdigit((unsigned char)*(p+1))) {
-                sequential_count++;
-                break;
-            }
-            p++;
-        }
-    }
-
-    // If more than 50% of files have sequential numbering
-    return (sequential_count * 2 > metadata->num_files);
-}
-
-/**
- * Calculate heuristic score
- */
-static int calculate_heuristic_score(const torrent_metadata_t *metadata) {
-    if (!metadata) return 0;
-
-    int score = 0;
-    int video_count = 0;
-    int image_count = 0;
-    uint64_t total_size = 0;
-
-    // Analyze files
-    for (int i = 0; i < metadata->num_files; i++) {
-        const char *path = metadata->files[i].path;
-        if (!path) continue;
-
-        if (is_video_file(path)) {
-            video_count++;
-        }
-        if (is_image_file(path)) {
-            image_count++;
-        }
-        total_size += metadata->files[i].size_bytes;
-
-        // Check for suspicious keywords in file paths (lower weight than direct name match)
-        int weight;
-        if (check_keywords_in_text(path, &weight)) {
-            score += (weight >= 5) ? 2 : 1;
-        }
-    }
-
-    // Heuristic 1: Video file extensions (+2 points)
-    if (video_count >= 1) {
-        score += 2;
-    }
-
-    // Heuristic 2: Many sequential files (+1 point)
-    if (has_sequential_files(metadata)) {
-        score += 1;
-    }
-
-    // Heuristic 3: Long torrent name (+1 point)
-    if (metadata->name && strlen(metadata->name) > 100) {
-        score += 1;
-    }
-
-    // Heuristic 4: High special character density (+1 point)
-    if (metadata->name) {
-        float ratio = calculate_special_char_ratio(metadata->name);
-        if (ratio > 0.20f) {  // More than 20% special characters
-            score += 1;
-        }
-    }
-
-    // Heuristic 5: Large video files (+1 point)
-    if (video_count > 0 && total_size > 1073741824ULL) {  // > 1GB
-        score += 1;
-    }
-
-    // Heuristic 6: Many small images (+2 points)
-    if (image_count > 50) {
-        score += 2;
-    }
-
-    return score;
 }
 
 /* ============================================================================
@@ -529,14 +321,6 @@ int porn_filter_init(const char *keyword_file_path) {
         // Continue anyway - regex and heuristics still work
     }
 
-    // Initialize regex patterns
-    if (init_regex_patterns() < 0) {
-        log_msg(LOG_ERROR, "Failed to initialize regex patterns");
-        // Cleanup and return error
-        porn_filter_cleanup();
-        return -1;
-    }
-
     filter_state.initialized = 1;
     log_msg(LOG_DEBUG, "Porn filter initialized successfully");
     return 0;
@@ -545,19 +329,9 @@ int porn_filter_init(const char *keyword_file_path) {
 void porn_filter_cleanup(void) {
     if (!filter_state.initialized) return;
 
-    // Free keyword hash table
-    keyword_entry_t *entry, *tmp;
-    HASH_ITER(hh, filter_state.keyword_hash, entry, tmp) {
-        HASH_DEL(filter_state.keyword_hash, entry);
-        free(entry->keyword);
-        free(entry);
-    }
-    filter_state.keyword_hash = NULL;
-
+    free_keyword_table(&filter_state.keyword_hash);
+    free_keyword_table(&filter_state.xxx_cooccurrence_hash);
     invalidate_keyword_snapshot();
-
-    // Cleanup regex patterns
-    cleanup_regex_patterns();
 
     filter_state.initialized = 0;
     log_msg(LOG_DEBUG, "Porn filter cleaned up");
@@ -605,46 +379,14 @@ int porn_filter_check(const torrent_metadata_t *metadata) {
         }
     }
 
-    // Layer 2: Regex pattern matching in torrent name
-    if (metadata->name && check_regex_patterns(metadata->name, &weight)) {
-        if (weight >= filter_state.regex_threshold) {
-            pthread_mutex_lock(&filter_state.stats_mutex);
-            filter_state.stats.filtered_by_regex++;
-            filter_state.stats.total_filtered++;
-            pthread_mutex_unlock(&filter_state.stats_mutex);
-
-            log_msg(LOG_DEBUG, "Filtered by regex (name): %s (weight=%d)",
-                    metadata->name, weight);
-            return 1;
-        }
-    }
-
-    // Layer 2: Regex pattern matching in file paths
-    for (int i = 0; i < metadata->num_files; i++) {
-        if (metadata->files[i].path && check_regex_patterns(metadata->files[i].path, &weight)) {
-            if (weight >= filter_state.regex_threshold) {
-                pthread_mutex_lock(&filter_state.stats_mutex);
-                filter_state.stats.filtered_by_regex++;
-                filter_state.stats.total_filtered++;
-                pthread_mutex_unlock(&filter_state.stats_mutex);
-
-                log_msg(LOG_DEBUG, "Filtered by regex (file): %s (weight=%d)",
-                        metadata->name, weight);
-                return 1;
-            }
-        }
-    }
-
-    // Layer 3: Heuristic scoring
-    int heuristic_score = calculate_heuristic_score(metadata);
-    if (heuristic_score >= filter_state.heuristic_threshold) {
+    // Layer 1.5: xxx co-occurrence check (torrent name only)
+    if (metadata->name && check_xxx_cooccurrence(metadata->name)) {
         pthread_mutex_lock(&filter_state.stats_mutex);
-        filter_state.stats.filtered_by_heuristic++;
+        filter_state.stats.filtered_by_keyword++;
         filter_state.stats.total_filtered++;
         pthread_mutex_unlock(&filter_state.stats_mutex);
 
-        log_msg(LOG_DEBUG, "Filtered by heuristic: %s (score=%d)",
-                metadata->name ? metadata->name : "(unnamed)", heuristic_score);
+        log_msg(LOG_DEBUG, "Filtered by xxx co-occurrence: %s", metadata->name);
         return 1;
     }
 
@@ -660,13 +402,10 @@ void porn_filter_get_stats(porn_filter_stats_t *stats) {
     pthread_mutex_unlock(&filter_state.stats_mutex);
 }
 
-void porn_filter_set_thresholds(int keyword_threshold, int regex_threshold, int heuristic_threshold) {
+void porn_filter_set_thresholds(int keyword_threshold) {
     filter_state.keyword_threshold = keyword_threshold;
-    filter_state.regex_threshold = regex_threshold;
-    filter_state.heuristic_threshold = heuristic_threshold;
 
-    log_msg(LOG_DEBUG, "Porn filter thresholds updated: keyword=%d, regex=%d, heuristic=%d",
-            keyword_threshold, regex_threshold, heuristic_threshold);
+    log_msg(LOG_DEBUG, "Porn filter thresholds updated: keyword=%d", keyword_threshold);
 }
 
 int porn_filter_get_keyword_count(void) {

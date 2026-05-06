@@ -311,13 +311,9 @@ int main(int argc, char *argv[]) {
             log_msg(LOG_WARN, "Failed to initialize porn filter, continuing without filtering");
         } else {
             /* Set thresholds from config */
-            porn_filter_set_thresholds(config.porn_filter_keyword_threshold,
-                                      config.porn_filter_regex_threshold,
-                                      config.porn_filter_heuristic_threshold);
-            log_msg(LOG_DEBUG, "Porn filter enabled (thresholds: keyword=%d, regex=%d, heuristic=%d)",
-                    config.porn_filter_keyword_threshold,
-                    config.porn_filter_regex_threshold,
-                    config.porn_filter_heuristic_threshold);
+            porn_filter_set_thresholds(config.porn_filter_keyword_threshold);
+            log_msg(LOG_DEBUG, "Porn filter enabled (keyword threshold=%d)",
+                    config.porn_filter_keyword_threshold);
         }
     } else {
         log_msg(LOG_DEBUG, "Porn filter disabled");

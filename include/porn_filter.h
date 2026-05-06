@@ -20,11 +20,9 @@
  * Filter statistics
  */
 typedef struct {
-    uint64_t total_checked;          // Total torrents checked
-    uint64_t filtered_by_keyword;    // Filtered by Layer 1 (keywords)
-    uint64_t filtered_by_regex;      // Filtered by Layer 2 (regex)
-    uint64_t filtered_by_heuristic;  // Filtered by Layer 3 (heuristics)
-    uint64_t total_filtered;         // Total filtered (all layers)
+    uint64_t total_checked;       // Total torrents checked
+    uint64_t filtered_by_keyword; // Filtered by keyword or xxx co-occurrence
+    uint64_t total_filtered;      // Total filtered
 } porn_filter_stats_t;
 
 /**
@@ -60,10 +58,8 @@ void porn_filter_get_stats(porn_filter_stats_t *stats);
  * Set filter thresholds (for runtime configuration)
  *
  * @param keyword_threshold Minimum weight for keyword match (default: 8)
- * @param regex_threshold Minimum weight for regex match (default: 9)
- * @param heuristic_threshold Minimum score for heuristic match (default: 5)
  */
-void porn_filter_set_thresholds(int keyword_threshold, int regex_threshold, int heuristic_threshold);
+void porn_filter_set_thresholds(int keyword_threshold);
 
 /**
  * Enumerate currently-loaded keywords (lowercase form).
