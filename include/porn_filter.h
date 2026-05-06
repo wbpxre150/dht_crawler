@@ -22,7 +22,6 @@
 typedef struct {
     uint64_t total_checked;         // Total torrents checked
     uint64_t filtered_by_keyword;   // Filtered by keyword or xxx co-occurrence
-    uint64_t filtered_by_non_latin; // Filtered by non-Latin script threshold
     uint64_t total_filtered;        // Total filtered
 } porn_filter_stats_t;
 
@@ -54,13 +53,6 @@ int porn_filter_check(const torrent_metadata_t *metadata);
  * @param stats Pointer to stats structure to fill
  */
 void porn_filter_get_stats(porn_filter_stats_t *stats);
-
-/**
- * Set the non-Latin character threshold.
- *
- * @param threshold Percentage (0-100). 0 disables the check.
- */
-void porn_filter_set_non_latin_threshold(int threshold);
 
 /**
  * Enumerate currently-loaded keywords (lowercase form).

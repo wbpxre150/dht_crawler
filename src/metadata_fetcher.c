@@ -7,6 +7,7 @@
 #include "batch_writer.h"
 #include "connection_request_queue.h"
 #include "porn_filter.h"
+#include "language_filter.h"
 #include <openssl/sha.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1597,13 +1598,20 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
     log_msg(LOG_DEBUG, "Parsed torrent: %s (%lld bytes, %d files)",
            name, (long long)torrent.size_bytes, torrent.num_files);
 
-    /* Check porn filter if enabled */
-    if (fetcher->config->porn_filter_enabled) {
-        if (porn_filter_check(&torrent)) {
-            /* Update filtered count statistics */
+    /* Check porn filter and language filter */
+    {
+        int filtered = 0;
+        const char *filter_reason = NULL;
+        if (fetcher->config->porn_filter_enabled && porn_filter_check(&torrent)) {
+            filtered = 1;
+            filter_reason = "filtered_porn";
+        } else if (language_filter_check(&torrent)) {
+            filtered = 1;
+            filter_reason = "filtered_language";
+        }
+        if (filtered) {
             __atomic_fetch_add(&fetcher->filtered_count, 1, __ATOMIC_RELAXED);
 
-            /* Cleanup - free the torrent structure fields */
             free(name);
             if (torrent.files) {
                 for (int32_t i = 0; i < torrent.num_files; i++) {
@@ -1614,9 +1622,8 @@ static int verify_and_parse_metadata(peer_connection_t *peer) {
                 free(torrent.files);
             }
 
-            /* Close connection - content filtered */
-            close_peer_connection(peer, "filtered_porn");
-            return 0;  /* Success but filtered */
+            close_peer_connection(peer, filter_reason);
+            return 0;
         }
     }
 

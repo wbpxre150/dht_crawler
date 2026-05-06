@@ -77,7 +77,9 @@ void config_init_defaults(crawler_config_t *config) {
     /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
     strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
-    config->porn_filter_non_latin_threshold = 33;   /* Filter if >33% non-Latin characters */
+
+    /* Language filter defaults */
+    config->language_filter_non_latin_threshold = 33; /* Filter if >33% non-Latin characters */
 
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
@@ -316,10 +318,13 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->porn_filter_enabled = atoi(value);
         } else if (strcmp(key, "porn_filter_keyword_file") == 0) {
             strncpy(config->porn_filter_keyword_file, value, sizeof(config->porn_filter_keyword_file) - 1);
-        } else if (strcmp(key, "porn_filter_non_latin_threshold") == 0) {
-            config->porn_filter_non_latin_threshold = atoi(value);
-            if (config->porn_filter_non_latin_threshold < 0) config->porn_filter_non_latin_threshold = 0;
-            if (config->porn_filter_non_latin_threshold > 100) config->porn_filter_non_latin_threshold = 100;
+        }
+        /* Language filter settings */
+        else if (strcmp(key, "language_filter_non_latin_threshold") == 0 ||
+                 strcmp(key, "porn_filter_non_latin_threshold") == 0) {
+            config->language_filter_non_latin_threshold = atoi(value);
+            if (config->language_filter_non_latin_threshold < 0) config->language_filter_non_latin_threshold = 0;
+            if (config->language_filter_non_latin_threshold > 100) config->language_filter_non_latin_threshold = 100;
         }
         /* Thread tree settings (Stage 1) */
         else if (strcmp(key, "num_trees") == 0) {

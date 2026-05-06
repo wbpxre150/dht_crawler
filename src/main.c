@@ -7,6 +7,7 @@
 #include "bloom_filter.h"
 #include "porn_filter.h"
 #include "porn_filter_cleanup.h"
+#include "language_filter.h"
 #include "torrent_search.h"
 #include "config.h"
 #include "supervisor.h"
@@ -314,13 +315,14 @@ int main(int argc, char *argv[]) {
         if (rc != 0) {
             log_msg(LOG_WARN, "Failed to initialize porn filter, continuing without filtering");
         } else {
-            porn_filter_set_non_latin_threshold(config.porn_filter_non_latin_threshold);
-            log_msg(LOG_DEBUG, "Porn filter enabled (non-Latin threshold=%d%%)",
-                    config.porn_filter_non_latin_threshold);
+            log_msg(LOG_DEBUG, "Porn filter enabled");
         }
     } else {
         log_msg(LOG_DEBUG, "Porn filter disabled");
     }
+
+    /* Initialize language filter (independent of porn filter) */
+    language_filter_init(config.language_filter_non_latin_threshold);
 
     /* Initialize torrent search module for title extraction */
     log_msg(LOG_DEBUG, "Initializing torrent search module...");
@@ -335,6 +337,7 @@ int main(int argc, char *argv[]) {
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize database: %d", rc);
         porn_filter_cleanup();
+        language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
         infohash_queue_cleanup(&g_queue);
         return 1;
@@ -382,6 +385,7 @@ int main(int argc, char *argv[]) {
         database_cleanup(&g_database);
         torrent_search_cleanup();
         porn_filter_cleanup();
+        language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
         infohash_queue_cleanup(&g_queue);
         cleanup_app_context(&g_app_ctx);
@@ -630,6 +634,7 @@ int main(int argc, char *argv[]) {
         database_cleanup(&g_database);
         torrent_search_cleanup();
         porn_filter_cleanup();
+        language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
 
         log_msg(LOG_DEBUG, "DHT Crawler (thread tree mode) stopped.");
@@ -788,6 +793,7 @@ int main(int argc, char *argv[]) {
     database_cleanup(&g_database);
     torrent_search_cleanup();
     porn_filter_cleanup();
+    language_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
     infohash_queue_cleanup(&g_queue);
     cleanup_app_context(&g_app_ctx);

@@ -1,5 +1,6 @@
 #include "porn_filter_cleanup.h"
 #include "porn_filter.h"
+#include "language_filter.h"
 #include "dht_crawler.h"
 #include "database.h"
 #include <ctype.h>
@@ -356,7 +357,7 @@ int porn_filter_cleanup_run(database_t *db_handle, const char *db_path) {
         }
     }
 
-    /* Flush remaining */
+    /* Flush remaining porn-filter batch */
     if (batch_n > 0) {
         if (flush_delete_batch(db) == 0) {
             deleted += batch_n;
@@ -372,6 +373,77 @@ int porn_filter_cleanup_run(database_t *db_handle, const char *db_path) {
         return 1;
     }
 
+    /* ---------------------------------------------------------------
+     * Language filter pass: scan ALL rows independently.
+     * This is separate from the keyword candidate pre-filter above so
+     * non-English torrents without porn keywords are also caught.
+     * --------------------------------------------------------------- */
+    int64_t lang_deleted = 0;
+    {
+        sqlite3_stmt *lang_iter = NULL;
+        sqlite3_stmt *lang_del_ins = NULL;
+
+        if (exec_sql(db, "CREATE TEMP TABLE lang_del(id INTEGER PRIMARY KEY);") == 0 &&
+            sqlite3_prepare_v2(db, "SELECT id FROM torrents", -1, &lang_iter, NULL) == SQLITE_OK &&
+            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO lang_del(id) VALUES (?)",
+                               -1, &lang_del_ins, NULL) == SQLITE_OK) {
+
+            log_msg(LOG_INFO, "cleanup: starting language filter pass over all %lld rows...", (long long)total);
+
+            if (exec_sql(db, "BEGIN;") == 0) {
+                int64_t lang_scanned = 0;
+                int lang_batch = 0;
+
+                while (!cleanup_interrupted && sqlite3_step(lang_iter) == SQLITE_ROW) {
+                    int64_t id = sqlite3_column_int64(lang_iter, 0);
+                    torrent_metadata_t meta;
+                    if (load_metadata_for_id(db, id, &meta) != 0) {
+                        lang_scanned++;
+                        continue;
+                    }
+
+                    if (language_filter_check(&meta)) {
+                        printf("  [lang] removing: %s\n", meta.name ? meta.name : "(no name)");
+                        fflush(stdout);
+                        sqlite3_reset(lang_del_ins);
+                        sqlite3_bind_int64(lang_del_ins, 1, id);
+                        if (sqlite3_step(lang_del_ins) == SQLITE_DONE) {
+                            lang_batch++;
+                        }
+                    }
+                    free_metadata(&meta);
+                    lang_scanned++;
+
+                    if (lang_batch >= DELETE_BATCH_SIZE) {
+                        exec_sql(db, "DELETE FROM torrents WHERE id IN (SELECT id FROM lang_del);");
+                        exec_sql(db, "DELETE FROM lang_del;");
+                        lang_deleted += lang_batch;
+                        lang_batch = 0;
+                        log_msg(LOG_INFO, "cleanup: [lang] scanned=%lld deleted=%lld",
+                                (long long)lang_scanned, (long long)lang_deleted);
+                    } else if (lang_scanned % 10000 == 0) {
+                        log_msg(LOG_INFO, "cleanup: [lang] scanned=%lld deleted=%lld (pending=%d)",
+                                (long long)lang_scanned, (long long)lang_deleted, lang_batch);
+                    }
+                }
+
+                if (lang_batch > 0) {
+                    exec_sql(db, "DELETE FROM torrents WHERE id IN (SELECT id FROM lang_del);");
+                    exec_sql(db, "DELETE FROM lang_del;");
+                    lang_deleted += lang_batch;
+                }
+
+                exec_sql(db, "COMMIT;");
+                log_msg(LOG_INFO, "cleanup: [lang] DONE scanned=%lld deleted=%lld",
+                        (long long)lang_scanned, (long long)lang_deleted);
+            }
+        }
+
+        if (lang_iter) sqlite3_finalize(lang_iter);
+        if (lang_del_ins) sqlite3_finalize(lang_del_ins);
+        sqlite3_exec(db, "DROP TABLE IF EXISTS temp.lang_del;", NULL, NULL, NULL);
+    }
+
     /* Truncate WAL */
     sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
 
@@ -380,10 +452,10 @@ int porn_filter_cleanup_run(database_t *db_handle, const char *db_path) {
     sqlite3_exec(db, "DROP TABLE IF EXISTS temp.pf_del;", NULL, NULL, NULL);
 
     long elapsed = (long)(time(NULL) - t_start);
-    log_msg(LOG_INFO, "cleanup: DONE total=%lld candidates=%lld deleted=%lld elapsed=%lds",
-            (long long)total, (long long)cand_count, (long long)deleted, elapsed);
-    printf("\nSummary: scanned=%lld candidates=%lld deleted=%lld elapsed=%lds\n",
-           (long long)scanned, (long long)cand_count, (long long)deleted, elapsed);
+    log_msg(LOG_INFO, "cleanup: DONE total=%lld candidates=%lld porn_deleted=%lld lang_deleted=%lld elapsed=%lds",
+            (long long)total, (long long)cand_count, (long long)deleted, (long long)lang_deleted, elapsed);
+    printf("\nSummary: candidates=%lld porn_deleted=%lld lang_deleted=%lld elapsed=%lds\n",
+           (long long)cand_count, (long long)deleted, (long long)lang_deleted, elapsed);
 
     sigaction(SIGINT, &sa_old, NULL);
     return cleanup_interrupted ? 0 : 0;

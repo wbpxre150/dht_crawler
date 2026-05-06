@@ -9,6 +9,7 @@
 #include "dht_crawler.h"
 #include "database.h"
 #include "porn_filter.h"
+#include "language_filter.h"
 #include "../lib/bencode-c/bencode.h"
 
 #include <openssl/sha.h>
@@ -1322,8 +1323,17 @@ void *tree_metadata_worker_func(void *arg) {
             int rc = tree_metadata_to_database_format(metadata, &db_meta, entry.peer_count);
 
             if (rc == 0) {
-                /* Check porn filter if enabled */
+                /* Check porn filter and language filter */
+                int filtered = 0;
                 if (tree->porn_filter_enabled && porn_filter_check(&db_meta)) {
+                    filtered = 1;
+                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (porn): %s", tree->tree_id, metadata->name);
+                } else if (language_filter_check(&db_meta)) {
+                    filtered = 1;
+                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (language): %s", tree->tree_id, metadata->name);
+                }
+
+                if (filtered) {
                     /* Update filtered count statistics */
                     atomic_fetch_add(&tree->filtered_count, 1);
 
@@ -1331,8 +1341,6 @@ void *tree_metadata_worker_func(void *arg) {
                     if (tree->shared_bloom) {
                         bloom_filter_add(tree->shared_bloom, metadata->infohash);
                     }
-
-                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent: %s", tree->tree_id, metadata->name);
 
                     /* Free the metadata and skip database insertion */
                     free_database_metadata(&db_meta);

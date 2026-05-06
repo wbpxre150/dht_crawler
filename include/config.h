@@ -69,7 +69,9 @@ typedef struct {
     /* Pornography content filter settings */
     int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */
     char porn_filter_keyword_file[512];  /* Path to keyword file */
-    int porn_filter_non_latin_threshold; /* Filter if non-Latin chars exceed this % (0=disabled, default: 33) */
+
+    /* Language filter settings (independent of porn filter) */
+    int language_filter_non_latin_threshold; /* Filter torrents where non-Latin chars exceed this % (0=disabled, default: 33) */
 
     /* Thread tree settings (Stage 1) */
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */

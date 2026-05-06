@@ -14,7 +14,7 @@
 [standalone]
 
 # ============================================================================
-# Adult Industry Terms (Studios, Sites) - the only reliable standalone signals
+# Adult Industry Terms (Studios, Sites, Tags)
 # ============================================================================
 pornhub
 xvideos
@@ -46,10 +46,16 @@ ultrafilms
 ftvgirls
 blackedraw
 
+# ============================================================================
+# Child porn
+# ============================================================================
+phtc
+pedo
+pedophile
+preteen
+
 [xxx_cooccurrence]
 # Everything else – reliable only when "xxx" is also present in the title.
-# Whole-word matching prevents substring false positives
-# (e.g. "anal" won't match "analysis", "cock" won't match "peacock").
 
 # ============================================================================
 # High-confidence explicit terms
@@ -211,19 +217,17 @@ ero
 # Custom user added terms
 # ============================================================================
 taboo
-babes
+babe
 nubile
 milfy
 blacked
 sensual
-sweethearts
+sweetheart
 hole
 playboy
-girls
-sister
-brother
-stepmum
-stepdad
+girl
+boy
+step
 hunter
 lustery
 wet
