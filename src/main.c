@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <errno.h>
+#include <limits.h>
 #include <libgen.h>
 
 /* Global application context */
@@ -158,7 +159,8 @@ int main(int argc, char *argv[]) {
             printf("Options:\n");
             printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
             printf("  --porn-filter-update     Re-scan the database and remove entries matching the porn filter\n");
-            printf("  --compact                Run VACUUM after --porn-filter-update to reclaim disk space\n");
+            printf("  --compact                Compact the database by writing a fresh copy and replacing the original\n");
+            printf("                           Can be used alone or combined with --porn-filter-update\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -364,10 +366,6 @@ int main(int argc, char *argv[]) {
         database_set_bloom(&g_database, g_bloom);
     }
 
-    if (compact_db && !porn_filter_update) {
-        log_msg(LOG_WARN, "--compact has no effect without --porn-filter-update. Ignoring.");
-    }
-
     /*******************************************************************
      * --porn-filter-update maintenance mode: scan DB and remove rows
      * the current filter would have rejected, then exit.
@@ -390,15 +388,30 @@ int main(int argc, char *argv[]) {
 
         int rrc = porn_filter_cleanup_run(&g_database, g_app_ctx.db_path);
 
-        if (rrc == 0 && compact_db) {
-            log_msg(LOG_INFO, "Running VACUUM to reclaim disk space...");
-            if (database_vacuum(&g_database) == 0) {
-                log_msg(LOG_INFO, "VACUUM complete.");
-            } else {
-                log_msg(LOG_ERROR, "VACUUM failed.");
-                rrc = 1;
-            }
+        if (rrc != 0 || !compact_db) {
+            database_cleanup(&g_database);
+            torrent_search_cleanup();
+            porn_filter_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            infohash_queue_cleanup(&g_queue);
+            cleanup_app_context(&g_app_ctx);
+            return rrc;
         }
+    }
+
+    /*******************************************************************
+     * --compact: write a fresh compacted copy, replace original, exit.
+     *******************************************************************/
+    if (compact_db) {
+        char tmp_path[PATH_MAX];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.compact.tmp", g_app_ctx.db_path);
+
+        /* Remove any leftover temp file from a previous failed run */
+        unlink(tmp_path);
+
+        log_msg(LOG_INFO, "Compacting database into %s ...", tmp_path);
+        int crc = database_vacuum_into(&g_database, tmp_path);
 
         database_cleanup(&g_database);
         torrent_search_cleanup();
@@ -406,8 +419,24 @@ int main(int argc, char *argv[]) {
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
         infohash_queue_cleanup(&g_queue);
+
+        if (crc != 0) {
+            log_msg(LOG_ERROR, "Compaction failed; original database unchanged.");
+            unlink(tmp_path);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        if (rename(tmp_path, g_app_ctx.db_path) != 0) {
+            log_msg(LOG_ERROR, "Failed to replace database with compacted copy: %s", strerror(errno));
+            log_msg(LOG_ERROR, "Compacted copy left at %s", tmp_path);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        log_msg(LOG_INFO, "Database compaction complete.");
         cleanup_app_context(&g_app_ctx);
-        return rrc;
+        return 0;
     }
 
     /*******************************************************************

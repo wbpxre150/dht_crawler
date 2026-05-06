@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <limits.h>
 
 /* SQL schema creation statements */
 static const char *CREATE_TABLES_SQL =
@@ -664,6 +665,26 @@ int database_vacuum(database_t *db) {
     int rc = sqlite3_exec(db->db, "VACUUM;", NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "VACUUM failed: %s", err_msg);
+        sqlite3_free(err_msg);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Vacuum database into a new file (VACUUM INTO) */
+int database_vacuum_into(database_t *db, const char *dest_path) {
+    if (!db || !db->db || !dest_path) {
+        return -1;
+    }
+
+    char sql[PATH_MAX + 32];
+    snprintf(sql, sizeof(sql), "VACUUM INTO '%s';", dest_path);
+
+    char *err_msg = NULL;
+    int rc = sqlite3_exec(db->db, sql, NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "VACUUM INTO failed: %s", err_msg);
         sqlite3_free(err_msg);
         return -1;
     }

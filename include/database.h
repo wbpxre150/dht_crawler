@@ -100,6 +100,7 @@ int database_rebuild_bloom(const char *db_path, struct bloom_filter *bloom);
 /* Maintenance functions */
 int database_wal_checkpoint(database_t *db);
 int database_vacuum(database_t *db);
+int database_vacuum_into(database_t *db, const char *dest_path);
 int database_analyze(database_t *db);
 int database_optimize(database_t *db);
 
