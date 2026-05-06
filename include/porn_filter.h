@@ -22,6 +22,7 @@
 typedef struct {
     uint64_t total_checked;         // Total torrents checked
     uint64_t filtered_by_keyword;   // Filtered by keyword or xxx co-occurrence
+    uint64_t filtered_by_file;      // Filtered by known spam filename in file list
     uint64_t total_filtered;        // Total filtered
 } porn_filter_stats_t;
 

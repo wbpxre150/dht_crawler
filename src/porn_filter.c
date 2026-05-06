@@ -337,6 +337,21 @@ int porn_filter_check(const torrent_metadata_t *metadata) {
         return 1;
     }
 
+    // Layer 2: Known spam filename in file list
+    if (metadata->files) {
+        for (int32_t i = 0; i < metadata->num_files; i++) {
+            const char *path = metadata->files[i].path;
+            if (path && strstr(path, "manko.fun.url")) {
+                pthread_mutex_lock(&filter_state.stats_mutex);
+                filter_state.stats.filtered_by_file++;
+                filter_state.stats.total_filtered++;
+                pthread_mutex_unlock(&filter_state.stats_mutex);
+                log_msg(LOG_DEBUG, "Filtered by spam file marker: %s", metadata->name);
+                return 1;
+            }
+        }
+    }
+
     // All checks passed - allow torrent
     return 0;
 }
