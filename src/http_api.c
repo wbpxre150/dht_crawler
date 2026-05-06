@@ -6,6 +6,7 @@
 #include "batch_writer.h"
 #include "metadata_fetcher.h"
 #include "porn_filter.h"
+#include "language_filter.h"
 #include "torrent_search.h"
 #include "supervisor.h"
 #include "thread_tree.h"
@@ -475,6 +476,21 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(porn_filter, "filter_rate_percent", filter_rate);
 
         cJSON_AddItemToObject(root, "porn_filter", porn_filter);
+    }
+
+    /* Add language filter statistics */
+    language_filter_stats_t lf_stats;
+    language_filter_get_stats(&lf_stats);
+    if (lf_stats.total_checked > 0) {
+        cJSON *language_filter = cJSON_CreateObject();
+        cJSON_AddNumberToObject(language_filter, "total_checked", (double)lf_stats.total_checked);
+        cJSON_AddNumberToObject(language_filter, "total_filtered", (double)lf_stats.total_filtered);
+        cJSON_AddNumberToObject(language_filter, "filtered_by_non_latin", (double)lf_stats.filtered_by_non_latin);
+
+        double filter_rate = (lf_stats.total_filtered * 100.0) / lf_stats.total_checked;
+        cJSON_AddNumberToObject(language_filter, "filter_rate_percent", filter_rate);
+
+        cJSON_AddItemToObject(root, "language_filter", language_filter);
     }
 
     /* Stage 6: Add supervisor/thread tree statistics */
