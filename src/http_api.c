@@ -10,6 +10,7 @@
 #include "supervisor.h"
 #include "thread_tree.h"
 #include "bep51_cache.h"
+#include "http_torrent_page.h"
 #include <civetweb.h>
 
 /* Forward declarations for tree queue functions to avoid type conflicts */
@@ -123,6 +124,8 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/random-tv", random_tv_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random-movies", random_movie_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random-music", random_music_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/torrent/files", http_torrent_files_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/torrent", http_torrent_page_handler, api);
 
     api->running = 1;
     log_msg(LOG_DEBUG, "HTTP API server started on port %d", api->port);
@@ -2443,25 +2446,14 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         if (results[i].total_peers > 100) peer_class = "";
         else if (results[i].total_peers > 10) peer_class = "medium";
 
-        /* Extract media title for IMDB search */
-        char *media_title = extract_media_title(results[i].name);
-        char *encoded_imdb_query = media_title ? url_encode(media_title) : NULL;
-        free(media_title);
-
         APPEND("    <div class='torrent-card'>\n"
                "      <div class='torrent-header' onclick='toggleFiles(\"%s\")'>\n"
                "        <div class='torrent-name'>",
                hex);
 
-        /* Add IMDB link if we have a valid encoded query */
-        /* Use onclick handler to open in external browser on Android WebView */
-        if (encoded_imdb_query) {
-            APPEND("<a href='https://www.imdb.com/find/?q=%s' onclick='return openExternal(event, this.href)'>%s</a>",
-                   encoded_imdb_query, results[i].name);
-            free(encoded_imdb_query);
-        } else {
-            APPEND("%s", results[i].name);
-        }
+        /* Link to per-torrent detail page (in-app navigation) */
+        APPEND("<a href='/torrent?hash=%s' onclick='event.stopPropagation()'>%s</a>",
+               hex, results[i].name);
 
         APPEND("</div>\n"
                "        <div class='torrent-meta'>\n"

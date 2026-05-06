@@ -810,3 +810,150 @@ void database_cleanup(database_t *db) {
     pthread_rwlock_destroy(&db->checkpoint_rwlock);
     uv_mutex_destroy(&db->mutex);
 }
+
+static int hex_to_bin20(const char *hex, uint8_t *out) {
+    if (!hex || strlen(hex) != 40) return -1;
+    for (int i = 0; i < 20; i++) {
+        unsigned int v;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) return -1;
+        out[i] = (uint8_t)v;
+    }
+    return 0;
+}
+
+int db_get_torrent_by_hash(database_t *db, const char *hex_hash, torrent_summary_t *out) {
+    if (!db || !hex_hash || !out) return -1;
+    uint8_t bin[20];
+    if (hex_to_bin20(hex_hash, bin) != 0) return -1;
+
+    memset(out, 0, sizeof(*out));
+    memcpy(out->info_hash, hex_hash, 40);
+    out->info_hash[40] = '\0';
+
+    const char *sql =
+        "SELECT t.name, t.size_bytes, t.total_peers, t.added_timestamp, "
+        "  (SELECT COUNT(*) FROM torrent_files tf WHERE tf.torrent_id = t.id) "
+        "FROM torrents t WHERE t.info_hash = ? LIMIT 1";
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    database_read_lock(db);
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(stmt, 1, bin, 20, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *name = sqlite3_column_text(stmt, 0);
+            out->name = name ? strdup((const char *)name) : strdup("");
+            out->size_bytes = sqlite3_column_int64(stmt, 1);
+            out->total_peers = sqlite3_column_int(stmt, 2);
+            out->added_timestamp = sqlite3_column_int64(stmt, 3);
+            out->file_count = sqlite3_column_int(stmt, 4);
+            rc = 0;
+        }
+        sqlite3_finalize(stmt);
+    }
+    database_read_unlock(db);
+    return rc;
+}
+
+int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
+                                   int offset, int limit, const char *filter,
+                                   torrent_file_row_t **out_files, int *out_count,
+                                   int *out_total) {
+    if (!db || !hex_hash || !out_files || !out_count) return -1;
+    uint8_t bin[20];
+    if (hex_to_bin20(hex_hash, bin) != 0) return -1;
+    if (limit <= 0 || limit > 500) limit = 50;
+    if (offset < 0) offset = 0;
+
+    int has_filter = (filter && filter[0] != '\0');
+
+    *out_files = NULL;
+    *out_count = 0;
+    if (out_total) *out_total = 0;
+
+    /* Resolve torrent_id once. */
+    int64_t torrent_id = -1;
+    {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT id FROM torrents WHERE info_hash = ? LIMIT 1";
+        database_read_lock(db);
+        if (sqlite3_prepare_v2(db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_blob(st, 1, bin, 20, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                torrent_id = sqlite3_column_int64(st, 0);
+            }
+            sqlite3_finalize(st);
+        }
+        database_read_unlock(db);
+    }
+    if (torrent_id < 0) return -1;
+
+    /* Total count */
+    {
+        sqlite3_stmt *st = NULL;
+        const char *count_sql = has_filter
+            ? "SELECT COUNT(*) FROM torrent_files tf "
+              "JOIN file_search fs ON fs.rowid = tf.id "
+              "WHERE tf.torrent_id = ? AND file_search MATCH ?"
+            : "SELECT COUNT(*) FROM torrent_files WHERE torrent_id = ?";
+        database_read_lock(db);
+        if (sqlite3_prepare_v2(db->db, count_sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, torrent_id);
+            if (has_filter) sqlite3_bind_text(st, 2, filter, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW && out_total) {
+                *out_total = sqlite3_column_int(st, 0);
+            }
+            sqlite3_finalize(st);
+        }
+        database_read_unlock(db);
+    }
+
+    /* Page query */
+    const char *page_sql = has_filter
+        ? "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) AS path, "
+          "       tf.size_bytes "
+          "FROM torrent_files tf "
+          "JOIN file_search fs ON fs.rowid = tf.id "
+          "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+          "WHERE tf.torrent_id = ? AND file_search MATCH ? "
+          "ORDER BY tf.file_index LIMIT ? OFFSET ?"
+        : "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) AS path, "
+          "       tf.size_bytes "
+          "FROM torrent_files tf "
+          "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+          "WHERE tf.torrent_id = ? "
+          "ORDER BY tf.file_index LIMIT ? OFFSET ?";
+
+    torrent_file_row_t *rows = (torrent_file_row_t *)calloc(limit, sizeof(*rows));
+    if (!rows) return -1;
+    int n = 0;
+
+    sqlite3_stmt *st = NULL;
+    database_read_lock(db);
+    if (sqlite3_prepare_v2(db->db, page_sql, -1, &st, NULL) == SQLITE_OK) {
+        int idx = 1;
+        sqlite3_bind_int64(st, idx++, torrent_id);
+        if (has_filter) sqlite3_bind_text(st, idx++, filter, -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, idx++, limit);
+        sqlite3_bind_int(st, idx++, offset);
+
+        while (sqlite3_step(st) == SQLITE_ROW && n < limit) {
+            const unsigned char *p = sqlite3_column_text(st, 0);
+            rows[n].path = p ? strdup((const char *)p) : strdup("");
+            rows[n].size_bytes = sqlite3_column_int64(st, 1);
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
+    database_read_unlock(db);
+
+    *out_files = rows;
+    *out_count = n;
+    return 0;
+}
+
+void db_free_torrent_file_rows(torrent_file_row_t *rows, int count) {
+    if (!rows) return;
+    for (int i = 0; i < count; i++) free(rows[i].path);
+    free(rows);
+}

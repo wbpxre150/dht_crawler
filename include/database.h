@@ -62,6 +62,37 @@ int database_commit_transaction(database_t *db);
 int database_rollback_transaction(database_t *db);
 void database_cleanup(database_t *db);
 
+/* Torrent summary (for detail page) */
+typedef struct {
+    char info_hash[41];   /* 40 hex chars + NUL */
+    char *name;           /* allocated */
+    int64_t size_bytes;
+    int total_peers;
+    int64_t added_timestamp;
+    int file_count;
+} torrent_summary_t;
+
+typedef struct {
+    char *path;           /* allocated: prefix + '/' + filename, or filename */
+    int64_t size_bytes;
+} torrent_file_row_t;
+
+/* Look up a torrent summary by hex info_hash.
+ * Returns 0 on success (caller frees out->name), -1 if not found / error. */
+int db_get_torrent_by_hash(database_t *db, const char *hex_hash, torrent_summary_t *out);
+
+/* Get a paginated, optionally substring-filtered, list of files for a torrent.
+ * `filter` may be NULL or empty for no filter; otherwise files whose filename
+ * matches the trigram FTS query are returned.
+ * On success returns 0; caller must free each row's `path` and the array via
+ * db_free_torrent_file_rows(). */
+int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
+                                   int offset, int limit, const char *filter,
+                                   torrent_file_row_t **out_files, int *out_count,
+                                   int *out_total);
+
+void db_free_torrent_file_rows(torrent_file_row_t *rows, int count);
+
 /* Rebuild bloom filter by scanning all infohashes in the database.
  * Returns the number of hashes added, or -1 on error. */
 int database_rebuild_bloom(const char *db_path, struct bloom_filter *bloom);
