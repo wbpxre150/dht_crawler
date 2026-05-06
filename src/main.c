@@ -316,8 +316,9 @@ int main(int argc, char *argv[]) {
         } else {
             /* Set thresholds from config */
             porn_filter_set_thresholds(config.porn_filter_keyword_threshold);
-            log_msg(LOG_DEBUG, "Porn filter enabled (keyword threshold=%d)",
-                    config.porn_filter_keyword_threshold);
+            porn_filter_set_non_latin_threshold(config.porn_filter_non_latin_threshold);
+            log_msg(LOG_DEBUG, "Porn filter enabled (keyword threshold=%d, non-Latin threshold=%d%%)",
+                    config.porn_filter_keyword_threshold, config.porn_filter_non_latin_threshold);
         }
     } else {
         log_msg(LOG_DEBUG, "Porn filter disabled");

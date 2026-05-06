@@ -70,6 +70,7 @@ typedef struct {
     int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */
     char porn_filter_keyword_file[512];  /* Path to keyword file */
     int porn_filter_keyword_threshold;   /* Min weight for keyword match (1-10, default: 8) */
+    int porn_filter_non_latin_threshold; /* Filter if non-Latin chars exceed this % (0=disabled, default: 33) */
 
     /* Thread tree settings (Stage 1) */
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */

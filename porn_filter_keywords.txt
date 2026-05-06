@@ -45,7 +45,7 @@ elegantangel:9
 wowgirls:9
 ultrafilms:9
 ftvgirls:9
-
+blackedraw:9
 
 [xxx_cooccurrence]
 # Everything else – reliable only when "xxx" is also present in the title.
@@ -207,3 +207,36 @@ jav:9
 av idol:10
 gravure:6
 ero:7
+
+# ============================================================================
+# Custom user added terms
+# ============================================================================
+taboo
+babes
+nubile
+milfy
+blacked
+sensual
+sweethearts
+hole
+playboy
+girls
+sister
+brother
+stepmum
+stepdad
+hunter
+lustery
+wet
+tart
+sin
+daddy
+mummy
+exotic
+sis
+bro
+voyeur
+exposed
+bang
+pie
+

@@ -33,6 +33,7 @@ static struct {
 
     // Configurable thresholds
     int keyword_threshold;
+    int non_latin_threshold; // 0 = disabled, 1-100 = max % non-Latin chars allowed
 } filter_state = {
     .keyword_hash = NULL,
     .xxx_cooccurrence_hash = NULL,
@@ -40,6 +41,7 @@ static struct {
     .stats = {0},
     .initialized = 0,
     .keyword_threshold = 8,
+    .non_latin_threshold = 33,
 };
 
 /* Snapshot of keyword pointers (built lazily on first enumeration call) */
@@ -306,6 +308,105 @@ static int check_xxx_cooccurrence(const char *text) {
 }
 
 /* ============================================================================
+ * Non-Latin Script Detection
+ * ============================================================================ */
+
+/**
+ * Decode one UTF-8 sequence from *p, advance *p past it, return the code point.
+ * Returns 0xFFFD on invalid sequences and still advances by 1 byte.
+ */
+static uint32_t utf8_next(const unsigned char **p) {
+    unsigned char c = **p;
+    if (c < 0x80) { (*p)++; return c; }
+    if (c < 0xC2) { (*p)++; return 0xFFFD; }
+    if (c < 0xE0) {
+        if (((*p)[1] & 0xC0) != 0x80) { (*p)++; return 0xFFFD; }
+        uint32_t cp = ((uint32_t)(c & 0x1F) << 6) | ((*p)[1] & 0x3F);
+        *p += 2; return cp;
+    }
+    if (c < 0xF0) {
+        if (((*p)[1] & 0xC0) != 0x80 || ((*p)[2] & 0xC0) != 0x80) { (*p)++; return 0xFFFD; }
+        uint32_t cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)((*p)[1] & 0x3F) << 6) | ((*p)[2] & 0x3F);
+        *p += 3; return cp;
+    }
+    if (c < 0xF8) {
+        if (((*p)[1] & 0xC0) != 0x80 || ((*p)[2] & 0xC0) != 0x80 || ((*p)[3] & 0xC0) != 0x80) { (*p)++; return 0xFFFD; }
+        uint32_t cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)((*p)[1] & 0x3F) << 12) |
+                      ((uint32_t)((*p)[2] & 0x3F) << 6) | ((*p)[3] & 0x3F);
+        *p += 4; return cp;
+    }
+    (*p)++; return 0xFFFD;
+}
+
+static int is_non_latin(uint32_t cp) {
+    /* Latin Basic + Extended A/B + IPA + Spacing Modifiers + Combining Diacritics ≤ U+036F */
+    if (cp <= 0x036F) return 0;
+    /* Latin Extended Additional U+1E00–U+1EFF */
+    if (cp >= 0x1E00 && cp <= 0x1EFF) return 0;
+    /* Remaining Latin forms U+A720–U+A7FF */
+    if (cp >= 0xA720 && cp <= 0xA7FF) return 0;
+    /* Punctuation, digits, symbols, whitespace — neutral, don't count either way */
+    if (cp <= 0x0040) return 0;          /* ASCII control + punctuation */
+    if (cp >= 0x2000 && cp <= 0x206F) return 0; /* General punctuation */
+    if (cp >= 0x2100 && cp <= 0x214F) return 0; /* Letterlike symbols */
+    /* Everything else above U+036F that isn't Latin is considered non-Latin */
+    return 1;
+}
+
+/**
+ * Counts characters in str, splitting into latin_count and non_latin_count.
+ * Neutral characters (punctuation, digits, spaces) are not counted in either bucket.
+ */
+static void count_script_chars(const char *str, int *latin_out, int *non_latin_out) {
+    const unsigned char *p = (const unsigned char *)str;
+    int latin = 0, non_latin = 0;
+    while (*p) {
+        uint32_t cp = utf8_next(&p);
+        if (cp == 0xFFFD) continue;
+        if (cp <= 0x0040) continue;           /* punctuation/digits/space — neutral */
+        if (cp >= 0x2000 && cp <= 0x214F) continue;
+        if (is_non_latin(cp)) non_latin++;
+        else latin++;
+    }
+    *latin_out = latin;
+    *non_latin_out = non_latin;
+}
+
+/**
+ * Returns 1 if the torrent name + file names exceed the non-Latin threshold.
+ * Files may be NULL.
+ */
+static int check_non_latin(const torrent_metadata_t *metadata) {
+    int threshold = filter_state.non_latin_threshold;
+    if (threshold <= 0) return 0;
+
+    int total_latin = 0, total_non_latin = 0;
+
+    if (metadata->name) {
+        int l, nl;
+        count_script_chars(metadata->name, &l, &nl);
+        total_latin += l;
+        total_non_latin += nl;
+    }
+
+    if (metadata->files) {
+        for (int i = 0; i < metadata->num_files; i++) {
+            if (metadata->files[i].path) {
+                int l, nl;
+                count_script_chars(metadata->files[i].path, &l, &nl);
+                total_latin += l;
+                total_non_latin += nl;
+            }
+        }
+    }
+
+    int total = total_latin + total_non_latin;
+    if (total == 0) return 0;
+
+    return (total_non_latin * 100 / total) >= threshold;
+}
+
+/* ============================================================================
  * Public API
  * ============================================================================ */
 
@@ -379,6 +480,18 @@ int porn_filter_check(const torrent_metadata_t *metadata) {
         return 1;
     }
 
+    // Layer 2: Non-Latin script threshold check
+    if (check_non_latin(metadata)) {
+        pthread_mutex_lock(&filter_state.stats_mutex);
+        filter_state.stats.filtered_by_non_latin++;
+        filter_state.stats.total_filtered++;
+        pthread_mutex_unlock(&filter_state.stats_mutex);
+
+        log_msg(LOG_DEBUG, "Filtered by non-Latin script (>%d%%): %s",
+                filter_state.non_latin_threshold, metadata->name ? metadata->name : "(no name)");
+        return 1;
+    }
+
     // All checks passed - allow torrent
     return 0;
 }
@@ -395,6 +508,17 @@ void porn_filter_set_thresholds(int keyword_threshold) {
     filter_state.keyword_threshold = keyword_threshold;
 
     log_msg(LOG_DEBUG, "Porn filter thresholds updated: keyword=%d", keyword_threshold);
+}
+
+void porn_filter_set_non_latin_threshold(int threshold) {
+    if (threshold < 0) threshold = 0;
+    if (threshold > 100) threshold = 100;
+    filter_state.non_latin_threshold = threshold;
+
+    if (threshold == 0)
+        log_msg(LOG_DEBUG, "Porn filter non-Latin check disabled");
+    else
+        log_msg(LOG_DEBUG, "Porn filter non-Latin threshold set to %d%%", threshold);
 }
 
 int porn_filter_get_keyword_count(void) {
