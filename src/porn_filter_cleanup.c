@@ -142,10 +142,8 @@ static int apply_session_pragmas(sqlite3 *db) {
 
 /* Build keyword temp table populated as '%' || lower(?) || '%' patterns. */
 static int build_keyword_table(sqlite3 *db) {
-    if (exec_sql(db, "CREATE TEMP TABLE pf_kw(pat TEXT) WITHOUT ROWID;") != 0) {
-        /* WITHOUT ROWID requires PRIMARY KEY; fall back to plain temp */
-        sqlite3_exec(db, "DROP TABLE IF EXISTS temp.pf_kw;", NULL, NULL, NULL);
-        if (exec_sql(db, "CREATE TEMP TABLE pf_kw(pat TEXT);") != 0) return -1;
+    if (exec_sql(db, "CREATE TEMP TABLE pf_kw(pat TEXT PRIMARY KEY) WITHOUT ROWID;") != 0) {
+        return -1;
     }
 
     sqlite3_stmt *st = NULL;
