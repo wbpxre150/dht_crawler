@@ -236,9 +236,9 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* Keep the rebuilt bloom as g_bloom directly - no need for a save/load roundtrip */
-        g_bloom = bloom;
-        log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s. Continuing startup...", config.bloom_path);
+        bloom_filter_cleanup(bloom);
+        log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s.", config.bloom_path);
+        return 0;
     }
 
     /* Set up signal handlers */
@@ -271,10 +271,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (g_bloom) {
-            /* Already set by --rebuild-bloom-filter above; use it directly */
-            log_msg(LOG_DEBUG, "Using rebuilt bloom filter directly (skipping load)");
-        } else {
+        {
             log_msg(LOG_DEBUG, "Initializing bloom filter (capacity: %lu, error rate: %.3f%%)...",
                     config.bloom_capacity, config.bloom_error_rate * 100.0);
             g_bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
