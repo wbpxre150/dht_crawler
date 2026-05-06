@@ -59,6 +59,33 @@ static struct {
     .heuristic_threshold = 5
 };
 
+/* Snapshot of keyword pointers (built lazily on first enumeration call) */
+static const char **filter_kw_snapshot = NULL;
+static int filter_kw_snapshot_count = 0;
+
+static void invalidate_keyword_snapshot(void) {
+    free(filter_kw_snapshot);
+    filter_kw_snapshot = NULL;
+    filter_kw_snapshot_count = 0;
+}
+
+static void build_keyword_snapshot(void) {
+    if (filter_kw_snapshot) return;
+    int n = HASH_COUNT(filter_state.keyword_hash);
+    if (n <= 0) {
+        filter_kw_snapshot_count = 0;
+        return;
+    }
+    filter_kw_snapshot = malloc((size_t)n * sizeof(*filter_kw_snapshot));
+    if (!filter_kw_snapshot) { filter_kw_snapshot_count = 0; return; }
+    int i = 0;
+    keyword_entry_t *e, *t;
+    HASH_ITER(hh, filter_state.keyword_hash, e, t) {
+        filter_kw_snapshot[i++] = e->keyword;
+    }
+    filter_kw_snapshot_count = i;
+}
+
 /* ============================================================================
  * Utility Functions
  * ============================================================================ */
@@ -527,6 +554,8 @@ void porn_filter_cleanup(void) {
     }
     filter_state.keyword_hash = NULL;
 
+    invalidate_keyword_snapshot();
+
     // Cleanup regex patterns
     cleanup_regex_patterns();
 
@@ -638,4 +667,17 @@ void porn_filter_set_thresholds(int keyword_threshold, int regex_threshold, int 
 
     log_msg(LOG_DEBUG, "Porn filter thresholds updated: keyword=%d, regex=%d, heuristic=%d",
             keyword_threshold, regex_threshold, heuristic_threshold);
+}
+
+int porn_filter_get_keyword_count(void) {
+    if (!filter_state.initialized) return 0;
+    build_keyword_snapshot();
+    return filter_kw_snapshot_count;
+}
+
+const char *porn_filter_get_keyword(int index) {
+    if (!filter_state.initialized) return NULL;
+    build_keyword_snapshot();
+    if (index < 0 || index >= filter_kw_snapshot_count) return NULL;
+    return filter_kw_snapshot[index];
 }

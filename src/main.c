@@ -6,6 +6,7 @@
 #include "http_api.h"
 #include "bloom_filter.h"
 #include "porn_filter.h"
+#include "porn_filter_cleanup.h"
 #include "torrent_search.h"
 #include "config.h"
 #include "supervisor.h"
@@ -148,9 +149,12 @@ void cleanup_app_context(app_context_t *ctx) {
 int main(int argc, char *argv[]) {
     int rc;
     bool rebuild_bloom = false;
+    bool porn_filter_update = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
             rebuild_bloom = true;
+        } else if (strcmp(argv[i], "--porn-filter-update") == 0) {
+            porn_filter_update = true;
         }
     }
 
@@ -352,6 +356,37 @@ int main(int argc, char *argv[]) {
      * This prevents data loss from failed metadata fetches by allowing retries. */
     if (g_bloom) {
         database_set_bloom(&g_database, g_bloom);
+    }
+
+    /*******************************************************************
+     * --porn-filter-update maintenance mode: scan DB and remove rows
+     * the current filter would have rejected, then exit.
+     *******************************************************************/
+    if (porn_filter_update) {
+        if (!config.porn_filter_enabled) {
+            log_msg(LOG_ERROR, "--porn-filter-update requires porn_filter_enabled=1 in config.ini. Aborting.");
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            infohash_queue_cleanup(&g_queue);
+            return 1;
+        }
+        if (porn_filter_get_keyword_count() < 0) {
+            log_msg(LOG_ERROR, "--porn-filter-update: porn filter failed to initialize earlier. Aborting.");
+            database_cleanup(&g_database);
+            bloom_filter_cleanup(g_bloom);
+            infohash_queue_cleanup(&g_queue);
+            return 1;
+        }
+
+        int rrc = porn_filter_cleanup_run(&g_database, g_app_ctx.db_path);
+
+        database_cleanup(&g_database);
+        torrent_search_cleanup();
+        porn_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        infohash_queue_cleanup(&g_queue);
+        cleanup_app_context(&g_app_ctx);
+        return rrc;
     }
 
     /*******************************************************************

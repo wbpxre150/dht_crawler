@@ -65,4 +65,11 @@ void porn_filter_get_stats(porn_filter_stats_t *stats);
  */
 void porn_filter_set_thresholds(int keyword_threshold, int regex_threshold, int heuristic_threshold);
 
+/**
+ * Enumerate currently-loaded keywords (lowercase form).
+ * Returns 0 if filter not initialized.
+ */
+int porn_filter_get_keyword_count(void);
+const char *porn_filter_get_keyword(int index);
+
 #endif /* PORN_FILTER_H */
