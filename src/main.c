@@ -151,18 +151,22 @@ int main(int argc, char *argv[]) {
     int rc;
     bool rebuild_bloom = false;
     bool porn_filter_update = false;
+    bool compact_db = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
             printf("Options:\n");
             printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
             printf("  --porn-filter-update     Re-scan the database and remove entries matching the porn filter\n");
+            printf("  --compact                Run VACUUM after --porn-filter-update to reclaim disk space\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
             rebuild_bloom = true;
         } else if (strcmp(argv[i], "--porn-filter-update") == 0) {
             porn_filter_update = true;
+        } else if (strcmp(argv[i], "--compact") == 0) {
+            compact_db = true;
         }
     }
 
@@ -360,6 +364,10 @@ int main(int argc, char *argv[]) {
         database_set_bloom(&g_database, g_bloom);
     }
 
+    if (compact_db && !porn_filter_update) {
+        log_msg(LOG_WARN, "--compact has no effect without --porn-filter-update. Ignoring.");
+    }
+
     /*******************************************************************
      * --porn-filter-update maintenance mode: scan DB and remove rows
      * the current filter would have rejected, then exit.
@@ -381,6 +389,16 @@ int main(int argc, char *argv[]) {
         }
 
         int rrc = porn_filter_cleanup_run(&g_database, g_app_ctx.db_path);
+
+        if (rrc == 0 && compact_db) {
+            log_msg(LOG_INFO, "Running VACUUM to reclaim disk space...");
+            if (database_vacuum(&g_database) == 0) {
+                log_msg(LOG_INFO, "VACUUM complete.");
+            } else {
+                log_msg(LOG_ERROR, "VACUUM failed.");
+                rrc = 1;
+            }
+        }
 
         database_cleanup(&g_database);
         torrent_search_cleanup();
