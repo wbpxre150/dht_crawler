@@ -128,7 +128,22 @@ static char **tp_tokenize_name(const char *name, int *out_n) {
             if (!nw) break;
             words = nw;
         }
-        words[n++] = strdup(tok);
+        /* Strip special characters that break search queries */
+        char *w = strdup(tok);
+        if (w) {
+            char *dst = w;
+            for (char *src = w; *src; src++) {
+                char c = *src;
+                if (c != '(' && c != ')' && c != '[' && c != ']' &&
+                    c != '{' && c != '}')
+                    *dst++ = c;
+            }
+            *dst = '\0';
+        }
+        if (w && *w)
+            words[n++] = w;
+        else
+            free(w);
         tok = strtok_r(NULL, " \t\r\n", &saveptr);
     }
     free(copy);
