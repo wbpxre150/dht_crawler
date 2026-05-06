@@ -55,15 +55,20 @@ static void invalidate_keyword_snapshot(void) {
 static void build_keyword_snapshot(void) {
     if (filter_kw_snapshot) return;
     int n = HASH_COUNT(filter_state.keyword_hash);
-    if (n <= 0) {
+    int n_cooc = HASH_COUNT(filter_state.xxx_cooccurrence_hash);
+    int total = n + n_cooc;
+    if (total <= 0) {
         filter_kw_snapshot_count = 0;
         return;
     }
-    filter_kw_snapshot = malloc((size_t)n * sizeof(*filter_kw_snapshot));
+    filter_kw_snapshot = malloc((size_t)total * sizeof(*filter_kw_snapshot));
     if (!filter_kw_snapshot) { filter_kw_snapshot_count = 0; return; }
     int i = 0;
     keyword_entry_t *e, *t;
     HASH_ITER(hh, filter_state.keyword_hash, e, t) {
+        filter_kw_snapshot[i++] = e->keyword;
+    }
+    HASH_ITER(hh, filter_state.xxx_cooccurrence_hash, e, t) {
         filter_kw_snapshot[i++] = e->keyword;
     }
     filter_kw_snapshot_count = i;
