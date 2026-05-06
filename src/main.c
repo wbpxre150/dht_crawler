@@ -151,7 +151,14 @@ int main(int argc, char *argv[]) {
     bool rebuild_bloom = false;
     bool porn_filter_update = false;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [OPTIONS]\n\n", argv[0]);
+            printf("Options:\n");
+            printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
+            printf("  --porn-filter-update     Re-scan the database and remove entries matching the porn filter\n");
+            printf("  --help, -h               Show this help message and exit\n");
+            return 0;
+        } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
             rebuild_bloom = true;
         } else if (strcmp(argv[i], "--porn-filter-update") == 0) {
             porn_filter_update = true;
