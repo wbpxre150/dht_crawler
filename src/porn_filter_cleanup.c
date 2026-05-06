@@ -330,6 +330,8 @@ int porn_filter_cleanup_run(database_t *db_handle, const char *db_path) {
         }
 
         if (porn_filter_check(&meta)) {
+            printf("  removing: %s\n", meta.name ? meta.name : "(no name)");
+            fflush(stdout);
             sqlite3_reset(del_ins);
             sqlite3_bind_int64(del_ins, 1, id);
             if (sqlite3_step(del_ins) != SQLITE_DONE) {
