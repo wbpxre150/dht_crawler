@@ -54,7 +54,7 @@ int database_create_schema(database_t *db);
 void database_set_bloom(database_t *db, struct bloom_filter *bloom);
 int database_insert_torrent(database_t *db, const torrent_metadata_t *torrent,
                            const file_info_t *files, int num_files);
-int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t count);
+int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t count, size_t *out_written);
 int database_check_exists(database_t *db, const uint8_t *info_hash);
 int database_has_infohash(database_t *db, const unsigned char *hash);
 int database_begin_transaction(database_t *db);

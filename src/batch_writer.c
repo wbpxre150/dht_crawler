@@ -348,15 +348,16 @@ int batch_writer_flush(batch_writer_t *writer) {
     uv_mutex_unlock(&writer->mutex);
 
     /* Use optimized batch insert (single transaction, single mutex lock) */
-    int ret = database_insert_batch(writer->db, batch_copy, count);
+    size_t actual_written = 0;
+    int ret = database_insert_batch(writer->db, batch_copy, count, &actual_written);
 
     /* Checkpoint WAL after every flush attempt, regardless of whether inserts
      * succeeded.  Rolled-back transactions still write frames to the WAL, so
      * we must checkpoint unconditionally to prevent unbounded growth. */
     database_wal_checkpoint(writer->db);
 
-    /* Count successes (database_insert_batch handles logging) */
-    size_t written = (ret == 0) ? count : 0;
+    /* Use actual DB-reported count, not the batch size assumption */
+    size_t written = (ret == 0) ? actual_written : 0;
 
     /* CRITICAL: Update bloom filter in memory and save to disk after successful batch write
      * This ensures the bloom filter stays synchronized with the database.

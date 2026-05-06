@@ -509,10 +509,11 @@ int database_insert_torrent(database_t *db, const torrent_metadata_t *torrent,
 }
 
 /* Batch insert multiple torrents in a single transaction (optimized for batch_writer) */
-int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t count) {
+int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t count, size_t *out_written) {
     if (!db || !batch || count == 0) {
         return -1;
     }
+    if (out_written) *out_written = 0;
 
     /* Allocate array to track which inserts succeeded (for bloom filter updates) */
     bool *success_flags = (bool *)calloc(count, sizeof(bool));
@@ -585,6 +586,8 @@ int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t cou
 
     uv_mutex_unlock(&db->mutex);
     free(success_flags);
+
+    if (out_written) *out_written = written;
 
     if (failed > 0) {
         log_msg(LOG_WARN, "Batch insert: %zu/%zu items written, %zu failed",
