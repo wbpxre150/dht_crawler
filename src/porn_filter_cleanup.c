@@ -194,47 +194,12 @@ static int load_metadata_for_id(sqlite3 *db, int64_t id, torrent_metadata_t *out
     const unsigned char *nm = sqlite3_column_text(st, 1);
     out->name = nm ? strdup((const char *)nm) : NULL;
     sqlite3_finalize(st);
-
-    /* Files */
-    if (sqlite3_prepare_v2(db,
-            "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename), tf.size_bytes, tf.file_index "
-            "FROM torrent_files tf LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
-            "WHERE tf.torrent_id = ?",
-            -1, &st, NULL) != SQLITE_OK) {
-        return 0;  /* No files; metadata still usable */
-    }
-    sqlite3_bind_int64(st, 1, id);
-
-    int cap = 0;
-    file_info_t *files = NULL;
-    int n = 0;
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (n == cap) {
-            int new_cap = cap ? cap * 2 : 16;
-            file_info_t *nf = realloc(files, (size_t)new_cap * sizeof(*files));
-            if (!nf) break;
-            files = nf;
-            cap = new_cap;
-        }
-        const unsigned char *p = sqlite3_column_text(st, 0);
-        files[n].path = p ? strdup((const char *)p) : strdup("");
-        files[n].size_bytes = sqlite3_column_int64(st, 1);
-        files[n].file_index = (int16_t)sqlite3_column_int(st, 2);
-        n++;
-    }
-    sqlite3_finalize(st);
-    out->files = files;
-    out->num_files = n;
     return 0;
 }
 
 static void free_metadata(torrent_metadata_t *m) {
     if (!m) return;
     free(m->name);
-    if (m->files) {
-        for (int i = 0; i < m->num_files; i++) free(m->files[i].path);
-        free(m->files);
-    }
     memset(m, 0, sizeof(*m));
 }
 
@@ -315,23 +280,6 @@ int porn_filter_cleanup_run(database_t *db_handle, const char *db_path) {
                 "SELECT t.id FROM torrents t, pf_kw "
                 "WHERE lower(t.name) LIKE pf_kw.pat;") != 0) return 1;
         log_msg(LOG_INFO, "cleanup: name pass done in %lds", (long)(time(NULL) - t0));
-
-        log_msg(LOG_INFO, "cleanup: scanning torrent_files.filename for keyword hits...");
-        t0 = time(NULL);
-        if (exec_sql(db,
-                "INSERT OR IGNORE INTO pf_cand(id) "
-                "SELECT DISTINCT tf.torrent_id FROM torrent_files tf, pf_kw "
-                "WHERE lower(tf.filename) LIKE pf_kw.pat;") != 0) return 1;
-        log_msg(LOG_INFO, "cleanup: filename pass done in %lds", (long)(time(NULL) - t0));
-
-        log_msg(LOG_INFO, "cleanup: scanning path_prefixes.prefix for keyword hits...");
-        t0 = time(NULL);
-        if (exec_sql(db,
-                "INSERT OR IGNORE INTO pf_cand(id) "
-                "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-                "JOIN path_prefixes pp ON pp.id = tf.prefix_id, pf_kw "
-                "WHERE lower(pp.prefix) LIKE pf_kw.pat;") != 0) return 1;
-        log_msg(LOG_INFO, "cleanup: prefix pass done in %lds", (long)(time(NULL) - t0));
     }
 
     int64_t cand_count = 0;

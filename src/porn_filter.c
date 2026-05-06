@@ -363,22 +363,6 @@ int porn_filter_check(const torrent_metadata_t *metadata) {
         }
     }
 
-    // Layer 1: Keyword matching in file paths
-    for (int i = 0; i < metadata->num_files; i++) {
-        if (metadata->files[i].path && check_keywords_in_text(metadata->files[i].path, &weight)) {
-            if (weight >= filter_state.keyword_threshold) {
-                pthread_mutex_lock(&filter_state.stats_mutex);
-                filter_state.stats.filtered_by_keyword++;
-                filter_state.stats.total_filtered++;
-                pthread_mutex_unlock(&filter_state.stats_mutex);
-
-                log_msg(LOG_DEBUG, "Filtered by keyword (file): %s (weight=%d)",
-                        metadata->name, weight);
-                return 1;
-            }
-        }
-    }
-
     // Layer 1.5: xxx co-occurrence check (torrent name only)
     if (metadata->name && check_xxx_cooccurrence(metadata->name)) {
         pthread_mutex_lock(&filter_state.stats_mutex);
