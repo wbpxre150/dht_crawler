@@ -155,7 +155,7 @@ typedef struct thread_tree {
 
     /* Phase management */
     atomic_int current_phase;  /* Use atomic_int to store tree_phase_t enum values */
-    shutdown_reason_t shutdown_reason;  /* Reason for shutdown */
+    _Atomic shutdown_reason_t shutdown_reason;  /* Reason for shutdown */
     atomic_bool shutdown_requested;
     atomic_bool needs_respawn;          /* Signals supervisor to respawn this tree */
 

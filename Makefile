@@ -28,9 +28,9 @@ LIB_OBJS = $(BUILD_DIR)/wbpxre_dht.o \
 # Target executable
 TARGET = dht_crawler
 
-.PHONY: all clean dirs install-deps libbloom patch-bencode
+.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb
 
-all: dirs patch-bencode libbloom $(TARGET)
+all: dirs patch-bencode patch-civetweb libbloom $(TARGET)
 
 # Apply patches to submodules
 patch-bencode:
@@ -41,6 +41,12 @@ patch-bencode:
 	@if ! grep -q "Zero initialize the newly allocated portion" $(LIB_DIR)/bencode-c/bencode.c 2>/dev/null; then \
 		echo "Applying bencode-c initialization fix patch..."; \
 		patch -p1 -d . < patches/bencode-init-fix.patch || true; \
+	fi
+
+patch-civetweb:
+	@if ! grep -q "atomic_load_explicit" $(LIB_DIR)/civetweb/src/civetweb.c 2>/dev/null; then \
+		echo "Applying civetweb stop_flag atomic fix patch..."; \
+		patch -p1 -d . < patches/civetweb-stop-flag-atomic.patch || true; \
 	fi
 
 dirs:

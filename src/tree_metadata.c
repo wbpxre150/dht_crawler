@@ -1266,7 +1266,7 @@ void *tree_metadata_worker_func(void *arg) {
         atomic_fetch_add(&tree->metadata_attempts, 1);
 
         /* Allow immediate exit during program shutdown (Ctrl+C) */
-        if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
+        if (atomic_load(&tree->shutdown_reason) == SHUTDOWN_REASON_SUPERVISOR) {
             break;
         }
 
@@ -1275,7 +1275,7 @@ void *tree_metadata_worker_func(void *arg) {
             entry.infohash, entry.peers, entry.peer_count, &config);
 
         /* Exit worker loop immediately on supervisor shutdown */
-        if (tree->shutdown_reason == SHUTDOWN_REASON_SUPERVISOR) {
+        if (atomic_load(&tree->shutdown_reason) == SHUTDOWN_REASON_SUPERVISOR) {
             if (metadata) tree_free_metadata(metadata);
             break;
         }

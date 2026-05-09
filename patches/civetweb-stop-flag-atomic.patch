@@ -1,0 +1,17 @@
+--- a/lib/civetweb/src/civetweb.c
++++ b/lib/civetweb/src/civetweb.c
+@@ -2379,8 +2379,9 @@ STOP_FLAG_ASSIGN(stop_flag_t *f, stop_flag_t v)
+
+ #else /* STOP_FLAG_NEEDS_LOCK */
+
+-typedef int volatile stop_flag_t;
+-#define STOP_FLAG_IS_ZERO(f) ((*(f)) == 0)
+-#define STOP_FLAG_IS_TWO(f) ((*(f)) == 2)
+-#define STOP_FLAG_ASSIGN(f, v) ((*(f)) = (v))
++#include <stdatomic.h>
++typedef _Atomic int stop_flag_t;
++#define STOP_FLAG_IS_ZERO(f)   (atomic_load_explicit((f), memory_order_acquire) == 0)
++#define STOP_FLAG_IS_TWO(f)    (atomic_load_explicit((f), memory_order_acquire) == 2)
++#define STOP_FLAG_ASSIGN(f, v) atomic_store_explicit((f), (v), memory_order_release)
+
+ #endif /* STOP_FLAG_NEEDS_LOCK */

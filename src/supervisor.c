@@ -50,7 +50,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->max_trees = config->max_trees;
     sup->active_trees = 0;
     sup->next_tree_id = 1;
-    sup->monitor_running = 0;
+    atomic_store(&sup->monitor_running, 0);
 
     /* Keyspace partitioning (default: enabled) */
     sup->use_keyspace_partitioning = config->use_keyspace_partitioning;
@@ -952,10 +952,10 @@ void supervisor_start(supervisor_t *sup) {
     pthread_mutex_unlock(&sup->trees_lock);
 
     /* Start monitor thread */
-    sup->monitor_running = 1;
+    atomic_store(&sup->monitor_running, 1);
     if (pthread_create(&sup->monitor_thread, NULL, monitor_thread_func, sup) != 0) {
         log_msg(LOG_ERROR, "[supervisor] Failed to create monitor thread");
-        sup->monitor_running = 0;
+        atomic_store(&sup->monitor_running, 0);
     }
 
     log_msg(LOG_DEBUG, "[supervisor] Started %d trees", sup->active_trees);
@@ -970,7 +970,7 @@ void supervisor_stop(supervisor_t *sup) {
 
     /* Stop monitor thread */
     log_msg(LOG_DEBUG, "[supervisor] Stopping monitor thread...");
-    sup->monitor_running = 0;
+    atomic_store(&sup->monitor_running, 0);
 
     /* Wait for monitor thread with timeout detection */
     if (sup->monitor_thread) {
@@ -1136,14 +1136,14 @@ static void *monitor_thread_func(void *arg) {
 
     log_msg(LOG_DEBUG, "[supervisor] Monitor thread started");
 
-    while (sup->monitor_running) {
+    while (atomic_load(&sup->monitor_running)) {
         /* Sleep in small chunks (1 second) to be responsive to shutdown */
-        for (int i = 0; i < 10 && sup->monitor_running; i++) {
+        for (int i = 0; i < 10 && atomic_load(&sup->monitor_running); i++) {
             struct timespec ts = {1, 0};
             nanosleep(&ts, NULL);
         }
 
-        if (!sup->monitor_running) {
+        if (!atomic_load(&sup->monitor_running)) {
             break;
         }
 

@@ -1020,7 +1020,7 @@ shutdown:
     /* Signal supervisor to respawn this tree (deferred destruction)
      * Only for voluntary shutdowns (rate-based), not supervisor-requested shutdowns.
      * The monitor thread will handle destruction asynchronously to avoid self-join deadlock. */
-    if (tree->shutdown_reason == SHUTDOWN_REASON_RATE_BASED) {
+    if (atomic_load(&tree->shutdown_reason) == SHUTDOWN_REASON_RATE_BASED) {
         atomic_store(&tree->needs_respawn, true);
     }
 
@@ -1088,7 +1088,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Initialize phase and shutdown flag */
     atomic_store(&tree->current_phase, TREE_PHASE_BOOTSTRAP);
-    tree->shutdown_reason = SHUTDOWN_REASON_NONE;
+    atomic_store(&tree->shutdown_reason, SHUTDOWN_REASON_NONE);
     atomic_store(&tree->shutdown_requested, false);
     atomic_store(&tree->needs_respawn, false);
 
@@ -1431,7 +1431,7 @@ void thread_tree_request_shutdown(thread_tree_t *tree, shutdown_reason_t reason)
                 tree->tree_id,
                 reason == SHUTDOWN_REASON_RATE_BASED ? "rate-based" :
                 reason == SHUTDOWN_REASON_SUPERVISOR ? "supervisor" : "unknown");
-        tree->shutdown_reason = reason;
+        atomic_store(&tree->shutdown_reason, reason);
         atomic_store(&tree->current_phase, TREE_PHASE_SHUTTING_DOWN);
 
         /* Stage 3: Signal infohash queue to wake up waiting threads */
