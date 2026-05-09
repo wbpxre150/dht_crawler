@@ -55,6 +55,16 @@ void batch_writer_set_failure_bloom(batch_writer_t *writer,
                                      const char *failure_bloom_path);
 
 /**
+ * Configure daily backup (triggered on first flush after midnight each day)
+ * @param writer Batch writer instance
+ * @param db_path Source database file path
+ * @param backup_path_tmpl Destination path template; %DATE% replaced with YYYY-MM-DD
+ */
+void batch_writer_set_backup(batch_writer_t *writer,
+                             const char *db_path,
+                             const char *backup_path_tmpl);
+
+/**
  * Add torrent metadata to batch
  * @param writer Batch writer instance
  * @param metadata Torrent metadata to write

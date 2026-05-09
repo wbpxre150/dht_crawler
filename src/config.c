@@ -54,6 +54,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->batch_size = 1000;
     config->flush_interval = 60;
 
+    /* Daily backup defaults */
+    config->backup_enabled = 0;
+    strncpy(config->backup_path,
+            "/home/adam/external_hdd/dht_crawler_backup/torrent.db.bak.%DATE%",
+            sizeof(config->backup_path) - 1);
+
     /* wbpxre-dht defaults */
     config->wbpxre_ping_workers = 10;
     config->wbpxre_find_node_workers = 20;
@@ -255,6 +261,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->batch_size = atoi(value);
         } else if (strcmp(key, "flush_interval") == 0) {
             config->flush_interval = atoi(value);
+        } else if (strcmp(key, "backup_enabled") == 0) {
+            config->backup_enabled = atoi(value);
+        } else if (strcmp(key, "backup_path") == 0) {
+            strncpy(config->backup_path, value, sizeof(config->backup_path) - 1);
         }
         /* Metadata fetcher settings */
         else if (strcmp(key, "max_concurrent_connections") == 0) {

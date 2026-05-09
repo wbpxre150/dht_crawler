@@ -6,6 +6,10 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <errno.h>
 
 struct batch_writer {
     database_t *db;
@@ -38,6 +42,11 @@ struct batch_writer {
 
     /* Rolling 60-minute window for hourly statistics */
     minute_stat_t hourly_stats[60];
+
+    /* Daily backup */
+    char *backup_db_path;    /* Source database file path */
+    char *backup_path_tmpl;  /* Destination template; %DATE% -> YYYY-MM-DD */
+    int   last_backup_yday;  /* tm_yday of last successful backup; -1 = never */
 };
 
 /* Background thread for periodic flush.
@@ -102,6 +111,9 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->flush_thread_running = false;
     writer->total_written = 0;
     writer->total_flushes = 0;
+    writer->backup_db_path = NULL;
+    writer->backup_path_tmpl = NULL;
+    writer->last_backup_yday = -1;
 
     /* Allocate batch array */
     writer->batch = calloc(batch_capacity, sizeof(torrent_metadata_t*));
@@ -200,6 +212,144 @@ void batch_writer_set_failure_bloom(batch_writer_t *writer,
     writer->failure_bloom_path = failure_bloom_path;
     log_msg(LOG_DEBUG, "Failure bloom filter connected to batch writer for persistence (path: %s)",
             failure_bloom_path ? failure_bloom_path : "(null)");
+}
+
+void batch_writer_set_backup(batch_writer_t *writer,
+                             const char *db_path,
+                             const char *backup_path_tmpl) {
+    if (!writer || !db_path || !backup_path_tmpl) {
+        return;
+    }
+    free(writer->backup_db_path);
+    free(writer->backup_path_tmpl);
+    writer->backup_db_path   = strdup(db_path);
+    writer->backup_path_tmpl = strdup(backup_path_tmpl);
+    log_msg(LOG_INFO, "Daily backup configured: %s", backup_path_tmpl);
+}
+
+/* Recursively create directories for path (like mkdir -p). */
+static void make_dirs(const char *path) {
+    char tmp[2048];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+/* Delete backup files in dir whose date suffix is older than 2 days ago. */
+static void prune_old_backups(const char *tmpl) {
+    /* Extract directory from template */
+    const char *last_slash = strrchr(tmpl, '/');
+    if (!last_slash) {
+        return;
+    }
+
+    char dir[1024];
+    size_t dir_len = last_slash - tmpl;
+    if (dir_len >= sizeof(dir)) {
+        return;
+    }
+    memcpy(dir, tmpl, dir_len);
+    dir[dir_len] = '\0';
+
+    /* Extract filename prefix (between last '/' and '%DATE%') */
+    const char *fname_start = last_slash + 1;
+    const char *date_marker = strstr(fname_start, "%DATE%");
+    size_t prefix_len = date_marker ? (size_t)(date_marker - fname_start) : strlen(fname_start);
+
+    /* Cutoff: anything with a date before 2 days ago gets deleted */
+    time_t cutoff = time(NULL) - 2 * 86400;
+
+    DIR *dp = opendir(dir);
+    if (!dp) {
+        return;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        /* Must start with the filename prefix */
+        if (strncmp(ent->d_name, fname_start, prefix_len) != 0) {
+            continue;
+        }
+
+        /* Parse YYYY-MM-DD date suffix after the prefix */
+        const char *date_part = ent->d_name + prefix_len;
+        int year = 0, month = 0, day = 0;
+        if (sscanf(date_part, "%4d-%2d-%2d", &year, &month, &day) != 3) {
+            continue;
+        }
+
+        struct tm file_tm = {0};
+        file_tm.tm_year = year - 1900;
+        file_tm.tm_mon  = month - 1;
+        file_tm.tm_mday = day;
+        time_t file_time = mktime(&file_tm);
+        if (file_time < cutoff) {
+            char full_path[2048];
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir, ent->d_name);
+            if (unlink(full_path) == 0) {
+                log_msg(LOG_INFO, "Pruned old backup: %s", full_path);
+            } else {
+                log_msg(LOG_WARN, "Failed to prune old backup %s: %s",
+                        full_path, strerror(errno));
+            }
+        }
+    }
+
+    closedir(dp);
+}
+
+/* Perform the daily VACUUM INTO backup and prune old backups.
+ * Called from batch_writer_flush() outside the mutex. */
+static void do_backup(batch_writer_t *writer) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+
+    /* Build destination path: replace %DATE% with YYYY-MM-DD */
+    char date_str[16];
+    strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
+
+    char dest[2048];
+    const char *tmpl = writer->backup_path_tmpl;
+    const char *placeholder = strstr(tmpl, "%DATE%");
+    if (!placeholder) {
+        snprintf(dest, sizeof(dest), "%s", tmpl);
+    } else {
+        snprintf(dest, sizeof(dest), "%.*s%s%s",
+                 (int)(placeholder - tmpl), tmpl,
+                 date_str, placeholder + 6);
+    }
+
+    /* Ensure destination directory exists */
+    char dir_tmp[2048];
+    snprintf(dir_tmp, sizeof(dir_tmp), "%s", dest);
+    char *last_slash = strrchr(dir_tmp, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        make_dirs(dir_tmp);
+    }
+
+    /* Remove stale file at dest so VACUUM INTO starts clean */
+    remove(dest);
+
+    log_msg(LOG_INFO, "Starting daily database backup -> %s", dest);
+    int rc = database_vacuum_into(writer->db, dest);
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "Daily backup failed for %s; will retry next flush", dest);
+        /* Reset yday so the next flush retries */
+        uv_mutex_lock(&writer->mutex);
+        writer->last_backup_yday = -1;
+        uv_mutex_unlock(&writer->mutex);
+        return;
+    }
+
+    log_msg(LOG_INFO, "Daily backup complete: %s", dest);
+    prune_old_backups(writer->backup_path_tmpl);
 }
 
 int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata) {
@@ -442,10 +592,25 @@ int batch_writer_flush(batch_writer_t *writer) {
         }
     }
 
+    /* Check if a daily backup is due: new calendar day and data was written */
+    bool should_backup = false;
+    if (writer->backup_path_tmpl && written > 0) {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        if (t->tm_yday != writer->last_backup_yday) {
+            writer->last_backup_yday = t->tm_yday;
+            should_backup = true;
+        }
+    }
+
     /* Clear flush-in-progress flag */
     writer->flush_in_progress = false;
 
     uv_mutex_unlock(&writer->mutex);
+
+    if (should_backup) {
+        do_backup(writer);
+    }
 
     return (ret == 0) ? 0 : -1;
 }
@@ -586,5 +751,7 @@ void batch_writer_cleanup(batch_writer_t *writer) {
     pthread_mutex_destroy(&writer->flush_thread_mutex);
     uv_mutex_destroy(&writer->mutex);
     free(writer->batch);
+    free(writer->backup_db_path);
+    free(writer->backup_path_tmpl);
     free(writer);
 }

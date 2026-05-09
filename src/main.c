@@ -580,6 +580,11 @@ int main(int argc, char *argv[]) {
             batch_writer_set_bloom(g_batch_writer, g_bloom, config.bloom_path);
         }
 
+        /* Configure daily backup */
+        if (config.backup_enabled) {
+            batch_writer_set_backup(g_batch_writer, config.db_path, config.backup_path);
+        }
+
         /* Create supervisor config */
         supervisor_config_t sup_config = {
             .max_trees = config.num_trees,

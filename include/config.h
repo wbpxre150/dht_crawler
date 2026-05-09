@@ -46,6 +46,10 @@ typedef struct {
     int batch_size;
     int flush_interval;              /* seconds */
 
+    /* Daily backup settings */
+    int backup_enabled;
+    char backup_path[1024];          /* Destination path; %DATE% replaced with YYYY-MM-DD */
+
     /* wbpxre-dht settings */
     int wbpxre_ping_workers;
     int wbpxre_find_node_workers;
