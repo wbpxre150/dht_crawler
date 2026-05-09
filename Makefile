@@ -79,7 +79,7 @@ $(BUILD_DIR)/civetweb.o: $(LIB_DIR)/civetweb/src/civetweb.c | $(BUILD_DIR)
 
 libbloom:
 	@echo "Building libbloom..."
-	@cd $(LIB_DIR)/libbloom && $(MAKE)
+	@cd $(LIB_DIR)/libbloom && $(MAKE) LDFLAGS=""
 
 clean:
 	rm -rf $(BUILD_DIR)
