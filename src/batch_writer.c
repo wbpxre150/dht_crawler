@@ -305,7 +305,14 @@ static void prune_old_backups(const char *tmpl) {
 }
 
 /* Perform the daily VACUUM INTO backup and prune old backups.
- * Called from batch_writer_flush() outside the mutex. */
+ * Called from batch_writer_flush() outside the mutex.
+ *
+ * IMPORTANT: opens a SEPARATE read-only SQLite connection rather than reusing
+ * writer->db->db.  SQLite documents that after a connection receives
+ * SQLITE_CORRUPT it must not be used again; if we ran VACUUM INTO on the
+ * shared connection and it hit a corrupt page, all subsequent inserts on that
+ * connection would crash.  A private connection is completely isolated: any
+ * error it encounters leaves the main connection unaffected. */
 static void do_backup(batch_writer_t *writer) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -338,15 +345,19 @@ static void do_backup(batch_writer_t *writer) {
     remove(dest);
 
     log_msg(LOG_INFO, "Starting daily database backup -> %s", dest);
-    int rc = database_vacuum_into(writer->db, dest);
-    if (rc != 0) {
+
+    /* Use database_recover rather than VACUUM INTO: recover does a row-by-row
+     * copy into a fresh database, skipping any corrupt pages.  Even a partially
+     * corrupt source produces a fully consistent, usable backup. */
+    int recovered = database_recover(writer->backup_db_path, dest);
+    if (recovered < 0) {
         log_msg(LOG_ERROR, "Daily backup failed for %s; will retry next flush", dest);
-        /* Reset yday so the next flush retries */
         uv_mutex_lock(&writer->mutex);
         writer->last_backup_yday = -1;
         uv_mutex_unlock(&writer->mutex);
         return;
     }
+    log_msg(LOG_INFO, "Daily backup recovered %d torrents -> %s", recovered, dest);
 
     log_msg(LOG_INFO, "Daily backup complete: %s", dest);
     prune_old_backups(writer->backup_path_tmpl);
