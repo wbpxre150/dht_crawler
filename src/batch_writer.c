@@ -30,8 +30,10 @@ struct batch_writer {
     int flush_interval_sec;
 
     uv_mutex_t mutex;
+    uv_cond_t backup_done;
     bool running;
     bool flush_in_progress;  /* Prevents concurrent flush operations */
+    bool backup_in_progress; /* Blocks flushes during rsync backup */
 
     uint64_t total_written;
     uint64_t total_flushes;
@@ -108,6 +110,7 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->flush_interval_sec = flush_interval_sec;
     writer->running = true;
     writer->flush_in_progress = false;
+    writer->backup_in_progress = false;
     writer->flush_thread_running = false;
     writer->total_written = 0;
     writer->total_flushes = 0;
@@ -126,6 +129,14 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     /* Initialize mutex */
     if (uv_mutex_init(&writer->mutex) != 0) {
         log_msg(LOG_ERROR, "Failed to initialize batch writer mutex");
+        free(writer->batch);
+        free(writer);
+        return NULL;
+    }
+
+    if (uv_cond_init(&writer->backup_done) != 0) {
+        log_msg(LOG_ERROR, "Failed to initialize backup_done condition variable");
+        uv_mutex_destroy(&writer->mutex);
         free(writer->batch);
         free(writer);
         return NULL;
@@ -241,83 +252,92 @@ static void make_dirs(const char *path) {
     mkdir(tmp, 0755);
 }
 
-/* Delete backup files in dir whose date suffix is older than 2 days ago. */
-static void prune_old_backups(const char *tmpl) {
-    /* Extract directory from template */
+/* Find the most recent backup file matching the template pattern.
+ * Returns 1 and fills out[] if found, 0 if none exist. */
+static int find_latest_backup(const char *tmpl, char *out, size_t out_sz) {
     const char *last_slash = strrchr(tmpl, '/');
-    if (!last_slash) {
-        return;
-    }
+    if (!last_slash) return 0;
 
     char dir[1024];
     size_t dir_len = last_slash - tmpl;
-    if (dir_len >= sizeof(dir)) {
-        return;
-    }
+    if (dir_len >= sizeof(dir)) return 0;
     memcpy(dir, tmpl, dir_len);
     dir[dir_len] = '\0';
 
-    /* Extract filename prefix (between last '/' and '%DATE%') */
     const char *fname_start = last_slash + 1;
     const char *date_marker = strstr(fname_start, "%DATE%");
     size_t prefix_len = date_marker ? (size_t)(date_marker - fname_start) : strlen(fname_start);
 
-    /* Cutoff: anything with a date before 2 days ago gets deleted */
-    time_t cutoff = time(NULL) - 2 * 86400;
+    DIR *dp = opendir(dir);
+    if (!dp) return 0;
+
+    char best_name[256] = {0};
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (strncmp(ent->d_name, fname_start, prefix_len) != 0) continue;
+        /* Pick lexicographically largest (most recent date string) */
+        if (strcmp(ent->d_name, best_name) > 0) {
+            snprintf(best_name, sizeof(best_name), "%s", ent->d_name);
+        }
+    }
+    closedir(dp);
+
+    if (best_name[0] == '\0') return 0;
+    snprintf(out, out_sz, "%s/%s", dir, best_name);
+    return 1;
+}
+
+/* Delete all backup files matching the template pattern except keep_path. */
+static void delete_old_backups(const char *tmpl, const char *keep_path) {
+    const char *last_slash = strrchr(tmpl, '/');
+    if (!last_slash) return;
+
+    char dir[1024];
+    size_t dir_len = last_slash - tmpl;
+    if (dir_len >= sizeof(dir)) return;
+    memcpy(dir, tmpl, dir_len);
+    dir[dir_len] = '\0';
+
+    const char *fname_start = last_slash + 1;
+    const char *date_marker = strstr(fname_start, "%DATE%");
+    size_t prefix_len = date_marker ? (size_t)(date_marker - fname_start) : strlen(fname_start);
 
     DIR *dp = opendir(dir);
-    if (!dp) {
-        return;
-    }
+    if (!dp) return;
 
     struct dirent *ent;
     while ((ent = readdir(dp)) != NULL) {
-        /* Must start with the filename prefix */
-        if (strncmp(ent->d_name, fname_start, prefix_len) != 0) {
-            continue;
-        }
+        if (strncmp(ent->d_name, fname_start, prefix_len) != 0) continue;
 
-        /* Parse YYYY-MM-DD date suffix after the prefix */
-        const char *date_part = ent->d_name + prefix_len;
-        int year = 0, month = 0, day = 0;
-        if (sscanf(date_part, "%4d-%2d-%2d", &year, &month, &day) != 3) {
-            continue;
-        }
+        char full_path[2048];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir, ent->d_name);
+        if (strcmp(full_path, keep_path) == 0) continue;
 
-        struct tm file_tm = {0};
-        file_tm.tm_year = year - 1900;
-        file_tm.tm_mon  = month - 1;
-        file_tm.tm_mday = day;
-        time_t file_time = mktime(&file_tm);
-        if (file_time < cutoff) {
-            char full_path[2048];
-            snprintf(full_path, sizeof(full_path), "%s/%s", dir, ent->d_name);
-            if (unlink(full_path) == 0) {
-                log_msg(LOG_INFO, "Pruned old backup: %s", full_path);
-            } else {
-                log_msg(LOG_WARN, "Failed to prune old backup %s: %s",
-                        full_path, strerror(errno));
-            }
+        if (unlink(full_path) == 0) {
+            log_msg(LOG_INFO, "Removed old backup: %s", full_path);
+        } else {
+            log_msg(LOG_WARN, "Failed to remove old backup %s: %s", full_path, strerror(errno));
         }
     }
 
     closedir(dp);
 }
 
-/* Perform the daily VACUUM INTO backup and prune old backups.
+/* Perform the daily rsync backup.
  * Called from batch_writer_flush() outside the mutex.
  *
- * IMPORTANT: opens a SEPARATE read-only SQLite connection rather than reusing
- * writer->db->db.  SQLite documents that after a connection receives
- * SQLITE_CORRUPT it must not be used again; if we ran VACUUM INTO on the
- * shared connection and it hit a corrupt page, all subsequent inserts on that
- * connection would crash.  A private connection is completely isolated: any
- * error it encounters leaves the main connection unaffected. */
+ * Sets backup_in_progress to block concurrent flushes for the duration of
+ * the rsync.  The WAL is already checkpointed before this is called, so the
+ * main db file is self-consistent and safe to copy with rsync.
+ *
+ * rsync writes to a .inprogress file; on success it is renamed to today's
+ * dated path and any other old backup files are deleted, leaving exactly one
+ * backup on disk at all times. */
 static void do_backup(batch_writer_t *writer) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
 
-    /* Build destination path: replace %DATE% with YYYY-MM-DD */
+    /* Build today's dated destination path */
     char date_str[16];
     strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
 
@@ -341,26 +361,57 @@ static void do_backup(batch_writer_t *writer) {
         make_dirs(dir_tmp);
     }
 
-    /* Remove stale file at dest so VACUUM INTO starts clean */
-    remove(dest);
+    /* Find the most recent existing backup to use as the rsync base.
+     * rsync will delta-transfer only the new SQLite pages appended since the
+     * last backup, making each daily run very fast.  If no prior backup exists
+     * rsync falls back to a full copy. */
+    char rsync_target[2048];
+    int have_prev = find_latest_backup(writer->backup_path_tmpl, rsync_target, sizeof(rsync_target));
+    if (!have_prev) {
+        snprintf(rsync_target, sizeof(rsync_target), "%s", dest);
+    }
 
-    log_msg(LOG_INFO, "Starting daily database backup -> %s", dest);
+    log_msg(LOG_INFO, "Starting daily database backup: %s -> %s (base: %s)",
+            writer->backup_db_path, dest, have_prev ? rsync_target : "none");
 
-    /* Use database_recover rather than VACUUM INTO: recover does a row-by-row
-     * copy into a fresh database, skipping any corrupt pages.  Even a partially
-     * corrupt source produces a fully consistent, usable backup. */
-    int recovered = database_recover(writer->backup_db_path, dest);
-    if (recovered < 0) {
-        log_msg(LOG_ERROR, "Daily backup failed for %s; will retry next flush", dest);
+    /* Block concurrent flushes so no checkpoint touches the db file mid-copy */
+    uv_mutex_lock(&writer->mutex);
+    writer->backup_in_progress = true;
+    uv_mutex_unlock(&writer->mutex);
+
+    /* Paths are from trusted config, not user input. */
+    char cmd[6144];
+    snprintf(cmd, sizeof(cmd), "rsync -a --quiet '%s' '%s'",
+             writer->backup_db_path, rsync_target);
+    int rc = system(cmd);
+
+    uv_mutex_lock(&writer->mutex);
+    writer->backup_in_progress = false;
+    uv_cond_broadcast(&writer->backup_done);
+    uv_mutex_unlock(&writer->mutex);
+
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "Daily backup rsync failed (exit %d); will retry next flush", rc);
         uv_mutex_lock(&writer->mutex);
         writer->last_backup_yday = -1;
         uv_mutex_unlock(&writer->mutex);
         return;
     }
-    log_msg(LOG_INFO, "Daily backup recovered %d torrents -> %s", recovered, dest);
+
+    /* Rename the updated file to today's dated name if it isn't already */
+    if (have_prev && strcmp(rsync_target, dest) != 0) {
+        if (rename(rsync_target, dest) != 0) {
+            log_msg(LOG_ERROR, "Daily backup rename %s -> %s failed: %s",
+                    rsync_target, dest, strerror(errno));
+            uv_mutex_lock(&writer->mutex);
+            writer->last_backup_yday = -1;
+            uv_mutex_unlock(&writer->mutex);
+            return;
+        }
+    }
 
     log_msg(LOG_INFO, "Daily backup complete: %s", dest);
-    prune_old_backups(writer->backup_path_tmpl);
+    delete_old_backups(writer->backup_path_tmpl, dest);
 }
 
 int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata) {
@@ -479,6 +530,11 @@ int batch_writer_flush(batch_writer_t *writer) {
     }
 
     uv_mutex_lock(&writer->mutex);
+
+    /* Wait for any in-progress backup to finish before touching the db file */
+    while (writer->backup_in_progress) {
+        uv_cond_wait(&writer->backup_done, &writer->mutex);
+    }
 
     /* Prevent concurrent flushes - if one is already in progress, skip this one */
     if (writer->flush_in_progress) {
@@ -760,6 +816,7 @@ void batch_writer_cleanup(batch_writer_t *writer) {
     /* Cleanup */
     pthread_cond_destroy(&writer->flush_thread_cond);
     pthread_mutex_destroy(&writer->flush_thread_mutex);
+    uv_cond_destroy(&writer->backup_done);
     uv_mutex_destroy(&writer->mutex);
     free(writer->batch);
     free(writer->backup_db_path);
