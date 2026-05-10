@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 
 /* Forward declarations */
@@ -41,7 +42,8 @@ typedef struct {
     int node_count;
     int interval;                     /* Suggested query interval */
     int num;                          /* Total infohashes node claims to have */
-    const uint8_t *sender_id;         /* Sender's node ID (20 bytes, NOT owned) */
+    uint8_t sender_id[20];           /* Sender's node ID (copied from packet) */
+    bool has_sender_id;              /* Whether sender_id was present */
 } tree_sample_response_t;
 
 /* Parsed get_peers response (Stage 4) */

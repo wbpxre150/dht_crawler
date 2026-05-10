@@ -545,15 +545,15 @@ static void *bep51_worker_func(void *arg) {
                                                        &response_pkt.from, &response) == 0) {
                 /* Mark node as BEP51-capable (responded successfully, even if 0 infohashes) */
                 tree_routing_mark_bep51_capable(rt, node.node_id);
-                /* NEW: Submit sender to BEP51 cache with configured percentage */
+                /* Submit sender to BEP51 cache with configured percentage */
                 supervisor_t *sup = (supervisor_t *)tree->supervisor_ctx;
-                if (sup && sup->bep51_cache && sup->bep51_cache_submit_percent > 0) {
+                bep51_cache_t *cache = sup ? sup->bep51_cache : NULL;
+                if (cache && sup->bep51_cache_submit_percent > 0) {
                     /* Random sampling: 5% = rand() % 100 < 5 */
                     int random_pct = rand() % 100;
                     if (random_pct < sup->bep51_cache_submit_percent) {
-                        /* Extract sender node ID from response (already parsed) */
-                        if (response.sender_id) {
-                            bep51_cache_add_node(sup->bep51_cache, response.sender_id, &response_pkt.from);
+                        if (response.has_sender_id) {
+                            bep51_cache_add_node(cache, response.sender_id, &response_pkt.from);
                             atomic_fetch_add(&tree->bep51_nodes_cached, 1);  /* Stats counter */
                         }
                     }

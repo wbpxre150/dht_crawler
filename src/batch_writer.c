@@ -34,6 +34,7 @@ struct batch_writer {
     bool running;
     bool flush_in_progress;  /* Prevents concurrent flush operations */
     bool backup_in_progress; /* Blocks flushes during rsync backup */
+    bool backup_inhibited;   /* Set during shutdown to prevent new backups from starting */
 
     uint64_t total_written;
     uint64_t total_flushes;
@@ -235,7 +236,32 @@ void batch_writer_set_backup(batch_writer_t *writer,
     free(writer->backup_path_tmpl);
     writer->backup_db_path   = strdup(db_path);
     writer->backup_path_tmpl = strdup(backup_path_tmpl);
-    log_msg(LOG_INFO, "Daily backup configured: %s", backup_path_tmpl);
+
+    /* If today's backup already exists, mark it done so a restart doesn't
+     * re-run the backup until tomorrow. */
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char date_str[16];
+    strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
+
+    char today_dest[2048];
+    const char *ph = strstr(backup_path_tmpl, "%DATE%");
+    if (ph) {
+        snprintf(today_dest, sizeof(today_dest), "%.*s%s%s",
+                 (int)(ph - backup_path_tmpl), backup_path_tmpl,
+                 date_str, ph + 6);
+    } else {
+        snprintf(today_dest, sizeof(today_dest), "%s", backup_path_tmpl);
+    }
+
+    struct stat st;
+    if (stat(today_dest, &st) == 0) {
+        writer->last_backup_yday = t->tm_yday;
+        log_msg(LOG_INFO, "Daily backup configured: %s (today's backup already exists, skipping until tomorrow)",
+                backup_path_tmpl);
+    } else {
+        log_msg(LOG_INFO, "Daily backup configured: %s", backup_path_tmpl);
+    }
 }
 
 /* Recursively create directories for path (like mkdir -p). */
@@ -381,7 +407,7 @@ static void do_backup(batch_writer_t *writer) {
 
     /* Paths are from trusted config, not user input. */
     char cmd[6144];
-    snprintf(cmd, sizeof(cmd), "rsync -a --quiet '%s' '%s'",
+    snprintf(cmd, sizeof(cmd), "rsync -a --no-whole-file --inplace --quiet '%s' '%s'",
              writer->backup_db_path, rsync_target);
     int rc = system(cmd);
 
@@ -659,9 +685,10 @@ int batch_writer_flush(batch_writer_t *writer) {
         }
     }
 
-    /* Check if a daily backup is due: new calendar day and data was written */
+    /* Check if a daily backup is due: new calendar day, data was written,
+     * and the writer is not shutting down. */
     bool should_backup = false;
-    if (writer->backup_path_tmpl && written > 0) {
+    if (writer->running && !writer->backup_inhibited && writer->backup_path_tmpl && written > 0) {
         time_t now = time(NULL);
         struct tm *t = localtime(&now);
         if (t->tm_yday != writer->last_backup_yday) {
@@ -754,6 +781,13 @@ uint64_t batch_writer_get_file_count(batch_writer_t *writer) {
     uv_mutex_unlock(&writer->mutex);
 
     return count;
+}
+
+void batch_writer_inhibit_backup(batch_writer_t *writer) {
+    if (!writer) return;
+    uv_mutex_lock(&writer->mutex);
+    writer->backup_inhibited = true;
+    uv_mutex_unlock(&writer->mutex);
 }
 
 void batch_writer_shutdown(batch_writer_t *writer) {

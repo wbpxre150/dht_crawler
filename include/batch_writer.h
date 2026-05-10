@@ -113,6 +113,12 @@ uint64_t batch_writer_get_torrent_count(batch_writer_t *writer);
 uint64_t batch_writer_get_file_count(batch_writer_t *writer);
 
 /**
+ * Prevent any new daily backup from starting (call before supervisor shutdown)
+ * @param writer Batch writer instance
+ */
+void batch_writer_inhibit_backup(batch_writer_t *writer);
+
+/**
  * Shutdown batch writer (flush pending writes)
  * @param writer Batch writer instance
  */

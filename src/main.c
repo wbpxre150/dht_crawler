@@ -443,6 +443,30 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_WARN, "Failed to initialize torrent search module, title extraction will be basic");
     }
 
+    /* Integrity check: auto-recover if database is corrupted from a previous crash.
+     * Skip if file doesn't exist yet (fresh install). */
+    if (access(g_app_ctx.db_path, F_OK) == 0) {
+        int nerrors = database_integrity_check(g_app_ctx.db_path);
+        /* nerrors > 0: counted integrity errors; nerrors == -1: query itself failed (severe corruption) */
+        if (nerrors != 0) {
+            log_msg(LOG_WARN, "Database integrity check failed (result=%d) — attempting auto-recovery", nerrors);
+            char tmp_path[512];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.recover.tmp", g_app_ctx.db_path);
+            int nrows = database_recover(g_app_ctx.db_path, tmp_path);
+            if (nrows < 0) {
+                log_msg(LOG_ERROR, "Auto-recovery failed; starting with corrupted database");
+                unlink(tmp_path);
+            } else {
+                if (rename(tmp_path, g_app_ctx.db_path) != 0) {
+                    log_msg(LOG_ERROR, "Auto-recovery: failed to replace database: %s", strerror(errno));
+                    unlink(tmp_path);
+                } else {
+                    log_msg(LOG_WARN, "Auto-recovery complete: %d torrents recovered", nrows);
+                }
+            }
+        }
+    }
+
     /* Initialize database */
     log_msg(LOG_DEBUG, "Initializing database: %s", g_app_ctx.db_path);
     rc = database_init(&g_database, g_app_ctx.db_path, &g_app_ctx);
@@ -771,6 +795,7 @@ int main(int argc, char *argv[]) {
         }
 
         log_msg(LOG_DEBUG, "Step 3: Stopping supervisor (stops all trees)...");
+        batch_writer_inhibit_backup(g_batch_writer);
         supervisor_stop(g_supervisor);
 
         log_msg(LOG_DEBUG, "Step 4: Flushing batch writer...");

@@ -344,7 +344,7 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
         return old_partition;
     }
 
-    log_msg(LOG_INFO, "[supervisor] Partition %u is dead (%d consecutive low-rate respawns)",
+    log_msg(LOG_DEBUG, "[supervisor] Partition %u is dead (%d consecutive low-rate respawns)",
             old_partition, sup->partition_stats[old_partition].consecutive_zero_respawns);
 
     /* If tree is away from home, return home first */
@@ -352,7 +352,7 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
     if (old_partition != home) {
         /* Reset home's death counter to give it a fresh chance */
         sup->partition_stats[home].consecutive_zero_respawns = 0;
-        log_msg(LOG_INFO, "[supervisor] Returning slot %d from partition %u to home partition %u",
+        log_msg(LOG_DEBUG, "[supervisor] Returning slot %d from partition %u to home partition %u",
                 slot_index, old_partition, home);
         return home;
     }
@@ -404,7 +404,7 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
     }
 
     if (found_alternative && best_partition != old_partition) {
-        log_msg(LOG_INFO, "[supervisor] Migrating slot %d from home partition %u to partition %u "
+        log_msg(LOG_DEBUG, "[supervisor] Migrating slot %d from home partition %u to partition %u "
                 "(target avg rate=%.4f, %d trees)",
                 slot_index, old_partition, best_partition,
                 best_rate,
@@ -450,7 +450,7 @@ static int move_to_draining(supervisor_t *sup, int slot_index) {
     sup->trees[slot_index] = NULL;
     sup->active_trees--;
 
-    log_msg(LOG_INFO, "[tree %u] Moved to draining list (slot %d, draining=%d/%d, active_connections=%d)",
+    log_msg(LOG_DEBUG, "[tree %u] Moved to draining list (slot %d, draining=%d/%d, active_connections=%d)",
             tree->tree_id, slot_index, sup->draining_count, sup->max_draining_trees,
             (int)atomic_load(&tree->active_connections));
 
@@ -488,7 +488,7 @@ static void monitor_draining_trees(supervisor_t *sup) {
         }
 
         if (should_destroy) {
-            log_msg(LOG_INFO, "[tree %u] Destroying draining tree (reason: %s, drain_time=%.0fs, final_connections=%d)",
+            log_msg(LOG_DEBUG, "[tree %u] Destroying draining tree (reason: %s, drain_time=%.0fs, final_connections=%d)",
                     dt->tree->tree_id, reason, drain_time, active_conns);
 
             /* Get stats before destruction */
@@ -1062,6 +1062,26 @@ void supervisor_destroy(supervisor_t *sup) {
         }
     }
 
+    /* Destroy any remaining draining trees BEFORE shared resources.
+     * Draining trees still have worker threads running that may access
+     * the bep51_cache, bloom filters, and shared node pool.  Joining
+     * them here prevents use-after-free when those resources are freed
+     * below. */
+    if (sup->draining_trees) {
+        pthread_mutex_lock(&sup->draining_lock);
+        for (int i = 0; i < sup->draining_count; i++) {
+            if (sup->draining_trees[i].tree) {
+                log_msg(LOG_WARN, "[supervisor] Destroying draining tree %u (slot %d) during supervisor cleanup",
+                        sup->draining_trees[i].tree->tree_id, sup->draining_trees[i].original_slot);
+                thread_tree_destroy(sup->draining_trees[i].tree);
+            }
+        }
+        pthread_mutex_unlock(&sup->draining_lock);
+        pthread_mutex_destroy(&sup->draining_lock);
+        free(sup->draining_trees);
+        sup->draining_trees = NULL;
+    }
+
     /* Save BEP51 cache to disk */
     if (sup->bep51_cache) {
         log_msg(LOG_DEBUG, "[supervisor] Saving BEP51 cache to %s", sup->bep51_cache_path);
@@ -1094,21 +1114,6 @@ void supervisor_destroy(supervisor_t *sup) {
     if (sup->shared_socket) {
         tree_socket_destroy(sup->shared_socket);
         sup->shared_socket = NULL;
-    }
-
-    /* Destroy any remaining draining trees */
-    if (sup->draining_trees) {
-        pthread_mutex_lock(&sup->draining_lock);
-        for (int i = 0; i < sup->draining_count; i++) {
-            if (sup->draining_trees[i].tree) {
-                log_msg(LOG_WARN, "[supervisor] Destroying draining tree %u (slot %d) during supervisor cleanup",
-                        sup->draining_trees[i].tree->tree_id, sup->draining_trees[i].original_slot);
-                thread_tree_destroy(sup->draining_trees[i].tree);
-            }
-        }
-        pthread_mutex_unlock(&sup->draining_lock);
-        pthread_mutex_destroy(&sup->draining_lock);
-        free(sup->draining_trees);
     }
 
     pthread_mutex_destroy(&sup->trees_lock);
@@ -1221,7 +1226,7 @@ static void *monitor_thread_func(void *arg) {
                         continue;  /* Wait for draining slot to free up */
                     }
 
-                    log_msg(LOG_INFO, "[tree %u] Respawning (this_tree_active_connections=%d <= threshold=%d)",
+                    log_msg(LOG_DEBUG, "[tree %u] Respawning (this_tree_active_connections=%d <= threshold=%d)",
                             tree_id, this_tree_active_conns, sup->respawn_spawn_threshold);
 
                     /* Accumulate statistics from dying tree */
@@ -1275,7 +1280,7 @@ static void *monitor_thread_func(void *arg) {
                     thread_tree_start(new_tree);
                     sup->active_trees++;
 
-                    log_msg(LOG_INFO, "[tree %u] Replacement tree started (slot=%d, draining_count=%d)",
+                    log_msg(LOG_DEBUG, "[tree %u] Replacement tree started (slot=%d, draining_count=%d)",
                             new_tree->tree_id, i, sup->draining_count);
                 } else {
                     /* Not ready yet - log periodically */
@@ -1330,12 +1335,12 @@ static void *monitor_thread_func(void *arg) {
 
                 if (sup->rate_below_since[i] == 0) {
                     sup->rate_below_since[i] = now_check;
-                    log_msg(LOG_WARN, "[tree %u] EMA rate %.4f/s < dynamic threshold %.4f/s - grace period starts (%ds)",
+                    log_msg(LOG_DEBUG, "[tree %u] EMA rate %.4f/s < dynamic threshold %.4f/s - grace period starts (%ds)",
                             tree_id, ema_rate, dynamic_threshold, sup->rate_grace_period_sec);
                 } else {
                     double below_duration = difftime(now_check, sup->rate_below_since[i]);
                     if (below_duration >= (double)sup->rate_grace_period_sec) {
-                        log_msg(LOG_INFO, "[tree %u] EMA rate %.4f/s < threshold %.4f/s for %.0fs - requesting respawn",
+                        log_msg(LOG_DEBUG, "[tree %u] EMA rate %.4f/s < threshold %.4f/s for %.0fs - requesting respawn",
                                 tree_id, ema_rate, dynamic_threshold, below_duration);
                         if (!atomic_load(&tree->shutdown_requested)) {
                             thread_tree_request_shutdown(tree, SHUTDOWN_REASON_RATE_BASED);
