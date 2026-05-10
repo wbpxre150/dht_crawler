@@ -510,19 +510,13 @@ int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata)
         }
     }
 
-    /* Check if batch is full BEFORE writing - prevent buffer overflow */
-    if (writer->batch_size >= writer->batch_capacity) {
-        /* Batch is full, need to flush first */
-        log_msg(LOG_DEBUG, "Batch full, flushing %zu items before adding new item", writer->batch_capacity);
-        uv_mutex_unlock(&writer->mutex);
-
-        int flush_result = batch_writer_flush(writer);
-
-        /* Re-acquire lock and add the item after flush */
-        uv_mutex_lock(&writer->mutex);
-
+    /* Flush until space is available. A single flush attempt is not enough:
+     * during a long backup hold, hundreds of threads park on backup_done;
+     * when it fires they all wake simultaneously, one does the real flush
+     * (batch_size -> 0), but the rest return 0 and still need to add.
+     * Without a re-check they would all write past batch[capacity-1]. */
+    while (writer->batch_size >= writer->batch_capacity) {
         if (!writer->running) {
-            /* Writer was shut down during flush, cleanup and fail */
             if (copy->name) free(copy->name);
             if (copy->files) {
                 for (int32_t j = 0; j < copy->num_files; j++) {
@@ -534,12 +528,10 @@ int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata)
             uv_mutex_unlock(&writer->mutex);
             return -1;
         }
-
-        /* Add to batch after flush (batch_size should now be < capacity) */
-        writer->batch[writer->batch_size++] = copy;
+        log_msg(LOG_DEBUG, "Batch full (%zu items), flushing before add", writer->batch_size);
         uv_mutex_unlock(&writer->mutex);
-
-        return flush_result;
+        batch_writer_flush(writer);
+        uv_mutex_lock(&writer->mutex);
     }
 
     /* Add to batch - we've verified there's space */

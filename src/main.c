@@ -197,6 +197,7 @@ int main(int argc, char *argv[]) {
     bool compact_db = false;
     bool check_db = false;
     bool recover_db = false;
+    bool skip_integrity_check = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
@@ -208,6 +209,7 @@ int main(int argc, char *argv[]) {
             printf("  --check-database         Run an integrity check on the database and report any errors\n");
             printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
             printf("                           database, then replacing the original\n");
+            printf("  --dont-check-database    Skip the automatic integrity check at startup\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -220,6 +222,8 @@ int main(int argc, char *argv[]) {
             check_db = true;
         } else if (strcmp(argv[i], "--recover-database") == 0) {
             recover_db = true;
+        } else if (strcmp(argv[i], "--dont-check-database") == 0) {
+            skip_integrity_check = true;
         }
     }
 
@@ -465,8 +469,8 @@ int main(int argc, char *argv[]) {
     }
 
     /* Integrity check: auto-recover if database is corrupted from a previous crash.
-     * Skip if file doesn't exist yet (fresh install). */
-    if (access(g_app_ctx.db_path, F_OK) == 0) {
+     * Skip if file doesn't exist yet (fresh install) or --dont-check-database was passed. */
+    if (!skip_integrity_check && access(g_app_ctx.db_path, F_OK) == 0) {
         int nerrors = database_integrity_check(g_app_ctx.db_path);
         /* nerrors > 0: counted integrity errors; nerrors == -1: query itself failed (severe corruption) */
         if (nerrors != 0) {
