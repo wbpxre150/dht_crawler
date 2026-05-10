@@ -344,11 +344,32 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        int chk = database_integrity_check(tmp_path);
+        if (chk != 0) {
+            log_msg(LOG_ERROR, "--recover-database: recovered database failed integrity check (%d errors); aborting.", chk);
+            unlink(tmp_path);
+            return 1;
+        }
+
+        /* Remove stale WAL/SHM from the original (corrupted) database before rename */
+        char wal_path[PATH_MAX], shm_path[PATH_MAX];
+        snprintf(wal_path, sizeof(wal_path), "%s-wal", g_app_ctx.db_path);
+        snprintf(shm_path, sizeof(shm_path), "%s-shm", g_app_ctx.db_path);
+        unlink(wal_path);
+        unlink(shm_path);
+
         if (rename(tmp_path, g_app_ctx.db_path) != 0) {
             log_msg(LOG_ERROR, "--recover-database: failed to replace database: %s", strerror(errno));
             log_msg(LOG_ERROR, "Recovered copy left at %s", tmp_path);
             return 1;
         }
+
+        /* Clean up any WAL/SHM left by the tmp database */
+        char tmp_wal[PATH_MAX], tmp_shm[PATH_MAX];
+        snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+        snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+        unlink(tmp_wal);
+        unlink(tmp_shm);
 
         log_msg(LOG_INFO, "--recover-database: complete. %d torrents recovered.", nrows);
         return 0;
@@ -450,18 +471,43 @@ int main(int argc, char *argv[]) {
         /* nerrors > 0: counted integrity errors; nerrors == -1: query itself failed (severe corruption) */
         if (nerrors != 0) {
             log_msg(LOG_WARN, "Database integrity check failed (result=%d) — attempting auto-recovery", nerrors);
-            char tmp_path[512];
+            char tmp_path[PATH_MAX];
             snprintf(tmp_path, sizeof(tmp_path), "%s.recover.tmp", g_app_ctx.db_path);
-            int nrows = database_recover(g_app_ctx.db_path, tmp_path);
-            if (nrows < 0) {
-                log_msg(LOG_ERROR, "Auto-recovery failed; starting with corrupted database");
-                unlink(tmp_path);
+
+            if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
+                log_msg(LOG_ERROR, "Auto-recovery: insufficient disk space; skipping recovery");
             } else {
-                if (rename(tmp_path, g_app_ctx.db_path) != 0) {
-                    log_msg(LOG_ERROR, "Auto-recovery: failed to replace database: %s", strerror(errno));
+                unlink(tmp_path);
+                int nrows = database_recover(g_app_ctx.db_path, tmp_path);
+                if (nrows < 0) {
+                    log_msg(LOG_ERROR, "Auto-recovery failed; starting with corrupted database");
                     unlink(tmp_path);
                 } else {
-                    log_msg(LOG_WARN, "Auto-recovery complete: %d torrents recovered", nrows);
+                    int chk = database_integrity_check(tmp_path);
+                    if (chk != 0) {
+                        log_msg(LOG_ERROR, "Auto-recovery: recovered database failed integrity check (%d errors); aborting rename", chk);
+                        unlink(tmp_path);
+                    } else {
+                        /* Remove stale WAL/SHM from the original (corrupted) database before rename */
+                        char wal_path[PATH_MAX], shm_path[PATH_MAX];
+                        snprintf(wal_path, sizeof(wal_path), "%s-wal", g_app_ctx.db_path);
+                        snprintf(shm_path, sizeof(shm_path), "%s-shm", g_app_ctx.db_path);
+                        unlink(wal_path);
+                        unlink(shm_path);
+
+                        if (rename(tmp_path, g_app_ctx.db_path) != 0) {
+                            log_msg(LOG_ERROR, "Auto-recovery: failed to replace database: %s", strerror(errno));
+                            unlink(tmp_path);
+                        } else {
+                            /* Clean up any WAL/SHM left by the tmp database */
+                            char tmp_wal[PATH_MAX], tmp_shm[PATH_MAX];
+                            snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+                            snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+                            unlink(tmp_wal);
+                            unlink(tmp_shm);
+                            log_msg(LOG_WARN, "Auto-recovery complete: %d torrents recovered", nrows);
+                        }
+                    }
                 }
             }
         }

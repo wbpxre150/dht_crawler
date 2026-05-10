@@ -983,7 +983,14 @@ int database_recover(const char *src_path, const char *dst_path) {
 
     sqlite3_exec(dst, "COMMIT;", NULL, NULL, NULL);
     sqlite3_exec(dst, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
-    sqlite3_exec(dst, "VACUUM;", NULL, NULL, NULL);
+
+    /* Checkpoint + truncate WAL so the recovered DB is self-contained before rename.
+     * Avoids leaving a .recover.tmp-wal sidecar that becomes orphaned after rename. */
+    int nLog = 0, nCkpt = 0;
+    int ckpt_rc = sqlite3_wal_checkpoint_v2(dst, NULL, SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
+    if (ckpt_rc != SQLITE_OK)
+        log_msg(LOG_WARN, "recover: WAL checkpoint returned %d: %s (%d/%d frames)",
+                ckpt_rc, sqlite3_errstr(ckpt_rc), nCkpt, nLog);
 
     sqlite3_close(src);
     sqlite3_close(dst);
