@@ -31,6 +31,7 @@ struct batch_writer {
 
     uv_mutex_t mutex;
     uv_cond_t backup_done;
+    uv_cond_t flush_done;    /* Signaled when flush_in_progress clears */
     bool running;
     bool flush_in_progress;  /* Prevents concurrent flush operations */
     bool backup_in_progress; /* Blocks flushes during rsync backup */
@@ -137,6 +138,15 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
 
     if (uv_cond_init(&writer->backup_done) != 0) {
         log_msg(LOG_ERROR, "Failed to initialize backup_done condition variable");
+        uv_mutex_destroy(&writer->mutex);
+        free(writer->batch);
+        free(writer);
+        return NULL;
+    }
+
+    if (uv_cond_init(&writer->flush_done) != 0) {
+        log_msg(LOG_ERROR, "Failed to initialize flush_done condition variable");
+        uv_cond_destroy(&writer->backup_done);
         uv_mutex_destroy(&writer->mutex);
         free(writer->batch);
         free(writer);
@@ -554,11 +564,11 @@ int batch_writer_flush(batch_writer_t *writer) {
         uv_cond_wait(&writer->backup_done, &writer->mutex);
     }
 
-    /* Prevent concurrent flushes - if one is already in progress, skip this one */
-    if (writer->flush_in_progress) {
-        uv_mutex_unlock(&writer->mutex);
-        log_msg(LOG_DEBUG, "Skipping flush - another flush already in progress");
-        return 0;
+    /* Prevent concurrent flushes - wait for the in-progress one to finish.
+     * Returning 0 immediately would cause callers (batch_writer_add) to spin
+     * in a tight busy-wait loop, burning all CPU cores. */
+    while (writer->flush_in_progress) {
+        uv_cond_wait(&writer->flush_done, &writer->mutex);
     }
 
     if (writer->batch_size == 0) {
@@ -689,8 +699,9 @@ int batch_writer_flush(batch_writer_t *writer) {
         }
     }
 
-    /* Clear flush-in-progress flag */
+    /* Clear flush-in-progress flag and wake any threads waiting for space */
     writer->flush_in_progress = false;
+    uv_cond_broadcast(&writer->flush_done);
 
     uv_mutex_unlock(&writer->mutex);
 
@@ -843,6 +854,7 @@ void batch_writer_cleanup(batch_writer_t *writer) {
     pthread_cond_destroy(&writer->flush_thread_cond);
     pthread_mutex_destroy(&writer->flush_thread_mutex);
     uv_cond_destroy(&writer->backup_done);
+    uv_cond_destroy(&writer->flush_done);
     uv_mutex_destroy(&writer->mutex);
     free(writer->batch);
     free(writer->backup_db_path);
