@@ -659,6 +659,14 @@ int main(int argc, char *argv[]) {
             batch_writer_set_backup(g_batch_writer, config.db_path, config.backup_path);
         }
 
+        /* Configure SSH incremental backup */
+        if (config.ssh_backup_enabled && config.ssh_host[0]) {
+            batch_writer_set_ssh_backup(g_batch_writer,
+                config.ssh_host, config.ssh_user,
+                config.ssh_dest_path, config.ssh_key_path,
+                config.ssh_bookmark_path);
+        }
+
         /* Create supervisor config */
         supervisor_config_t sup_config = {
             .max_trees = config.num_trees,

@@ -55,14 +55,31 @@ void batch_writer_set_failure_bloom(batch_writer_t *writer,
                                      const char *failure_bloom_path);
 
 /**
- * Configure daily backup (triggered on first flush after midnight each day)
+ * Configure daily incremental backup (triggered on first flush after midnight each day).
+ * Appends only rows not yet present in the backup database; creates it on first run.
  * @param writer Batch writer instance
  * @param db_path Source database file path
- * @param backup_path_tmpl Destination path template; %DATE% replaced with YYYY-MM-DD
+ * @param backup_dest Destination backup database file path
  */
 void batch_writer_set_backup(batch_writer_t *writer,
                              const char *db_path,
-                             const char *backup_path_tmpl);
+                             const char *backup_dest);
+
+/**
+ * Configure SSH incremental backup (runs in detached thread; batch writer is never blocked).
+ * Each day's new rows are dumped as INSERT OR IGNORE SQL, compressed with zstd, and streamed
+ * to a remote server. Files are named incremental_YYYYMMDD_START-END.sql.zst.
+ * @param writer        Batch writer instance
+ * @param host          SSH hostname or IP
+ * @param user          SSH username
+ * @param dest_path     Remote directory path for dump files
+ * @param key_path      Path to SSH private key (NULL or empty = use SSH default)
+ * @param bookmark_path Local path for watermark file tracking last sent row IDs
+ */
+void batch_writer_set_ssh_backup(batch_writer_t *writer,
+                                  const char *host, const char *user,
+                                  const char *dest_path, const char *key_path,
+                                  const char *bookmark_path);
 
 /**
  * Add torrent metadata to batch

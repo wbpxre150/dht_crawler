@@ -57,8 +57,16 @@ void config_init_defaults(crawler_config_t *config) {
     /* Daily backup defaults */
     config->backup_enabled = 0;
     strncpy(config->backup_path,
-            "/home/adam/external_hdd/dht_crawler_backup/torrent.db.bak.%DATE%",
+            "/home/adam/external_hdd/dht_crawler_backup/torrent.db.bak",
             sizeof(config->backup_path) - 1);
+
+    /* SSH incremental backup defaults */
+    config->ssh_backup_enabled = 0;
+    config->ssh_host[0]        = '\0';
+    config->ssh_user[0]        = '\0';
+    strncpy(config->ssh_dest_path,     "/backups/dht",             sizeof(config->ssh_dest_path)     - 1);
+    config->ssh_key_path[0]    = '\0';
+    strncpy(config->ssh_bookmark_path, "data/ssh_backup_ids.txt",  sizeof(config->ssh_bookmark_path) - 1);
 
     /* wbpxre-dht defaults */
     config->wbpxre_ping_workers = 10;
@@ -265,6 +273,18 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->backup_enabled = atoi(value);
         } else if (strcmp(key, "backup_path") == 0) {
             strncpy(config->backup_path, value, sizeof(config->backup_path) - 1);
+        } else if (strcmp(key, "ssh_backup_enabled") == 0) {
+            config->ssh_backup_enabled = atoi(value);
+        } else if (strcmp(key, "ssh_host") == 0) {
+            strncpy(config->ssh_host, value, sizeof(config->ssh_host) - 1);
+        } else if (strcmp(key, "ssh_user") == 0) {
+            strncpy(config->ssh_user, value, sizeof(config->ssh_user) - 1);
+        } else if (strcmp(key, "ssh_dest_path") == 0) {
+            strncpy(config->ssh_dest_path, value, sizeof(config->ssh_dest_path) - 1);
+        } else if (strcmp(key, "ssh_key_path") == 0) {
+            strncpy(config->ssh_key_path, value, sizeof(config->ssh_key_path) - 1);
+        } else if (strcmp(key, "ssh_bookmark_path") == 0) {
+            strncpy(config->ssh_bookmark_path, value, sizeof(config->ssh_bookmark_path) - 1);
         }
         /* Metadata fetcher settings */
         else if (strcmp(key, "max_concurrent_connections") == 0) {

@@ -7,9 +7,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <sys/stat.h>
-#include <dirent.h>
 #include <unistd.h>
 #include <errno.h>
+#include <inttypes.h>
 
 struct batch_writer {
     database_t *db;
@@ -48,9 +48,17 @@ struct batch_writer {
     minute_stat_t hourly_stats[60];
 
     /* Daily backup */
-    char *backup_db_path;    /* Source database file path */
-    char *backup_path_tmpl;  /* Destination template; %DATE% -> YYYY-MM-DD */
-    int   last_backup_yday;  /* tm_yday of last successful backup; -1 = never */
+    char *backup_db_path;       /* Source database file path */
+    char *backup_dest_path;     /* Destination backup database file path */
+    char *backup_sentinel_path; /* Path for last_backup_date.txt persistence file */
+    char  last_backup_date[9];  /* YYYYMMDD of last successful backup, empty = never */
+
+    /* SSH incremental backup */
+    char *ssh_host;
+    char *ssh_user;
+    char *ssh_dest_path;
+    char *ssh_key_path;       /* NULL = use SSH default key */
+    char *ssh_bookmark_path;
 };
 
 /* Background thread for periodic flush.
@@ -117,8 +125,14 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->total_written = 0;
     writer->total_flushes = 0;
     writer->backup_db_path = NULL;
-    writer->backup_path_tmpl = NULL;
-    writer->last_backup_yday = -1;
+    writer->backup_dest_path = NULL;
+    writer->backup_sentinel_path = NULL;
+    writer->last_backup_date[0] = '\0';
+    writer->ssh_host = NULL;
+    writer->ssh_user = NULL;
+    writer->ssh_dest_path = NULL;
+    writer->ssh_key_path = NULL;
+    writer->ssh_bookmark_path = NULL;
 
     /* Allocate batch array */
     writer->batch = calloc(batch_capacity, sizeof(torrent_metadata_t*));
@@ -238,40 +252,244 @@ void batch_writer_set_failure_bloom(batch_writer_t *writer,
 
 void batch_writer_set_backup(batch_writer_t *writer,
                              const char *db_path,
-                             const char *backup_path_tmpl) {
-    if (!writer || !db_path || !backup_path_tmpl) {
+                             const char *backup_dest) {
+    if (!writer || !db_path || !backup_dest) {
         return;
     }
     free(writer->backup_db_path);
-    free(writer->backup_path_tmpl);
+    free(writer->backup_dest_path);
+    free(writer->backup_sentinel_path);
     writer->backup_db_path   = strdup(db_path);
-    writer->backup_path_tmpl = strdup(backup_path_tmpl);
+    writer->backup_dest_path = strdup(backup_dest);
 
-    /* If today's backup already exists, mark it done so a restart doesn't
-     * re-run the backup until tomorrow. */
+    /* Derive sentinel path: <dir of db_path>/last_backup_date.txt */
+    char sentinel[2048];
+    snprintf(sentinel, sizeof(sentinel), "%s", db_path);
+    char *slash = strrchr(sentinel, '/');
+    if (slash) {
+        slash[1] = '\0';
+        strncat(sentinel, "last_backup_date.txt", sizeof(sentinel) - strlen(sentinel) - 1);
+    } else {
+        snprintf(sentinel, sizeof(sentinel), "last_backup_date.txt");
+    }
+    writer->backup_sentinel_path = strdup(sentinel);
+
+    /* Restore persisted backup date so a restart doesn't re-trigger the backup */
+    writer->last_backup_date[0] = '\0';
+    FILE *sf = fopen(writer->backup_sentinel_path, "r");
+    if (sf) {
+        char buf[16] = {0};
+        if (fgets(buf, sizeof(buf), sf)) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' '))
+                buf[--len] = '\0';
+            if (len == 8) {
+                memcpy(writer->last_backup_date, buf, 9);
+                log_msg(LOG_INFO, "Backup sentinel restored: last backup was %s",
+                        writer->last_backup_date);
+            }
+        }
+        fclose(sf);
+    }
+
+    log_msg(LOG_INFO, "Daily incremental backup configured: %s", backup_dest);
+}
+
+void batch_writer_set_ssh_backup(batch_writer_t *writer,
+                                  const char *host, const char *user,
+                                  const char *dest_path, const char *key_path,
+                                  const char *bookmark_path) {
+    if (!writer || !host || !user || !dest_path || !bookmark_path) return;
+    free(writer->ssh_host);          writer->ssh_host          = strdup(host);
+    free(writer->ssh_user);          writer->ssh_user          = strdup(user);
+    free(writer->ssh_dest_path);     writer->ssh_dest_path     = strdup(dest_path);
+    free(writer->ssh_key_path);
+    writer->ssh_key_path = (key_path && key_path[0]) ? strdup(key_path) : NULL;
+    free(writer->ssh_bookmark_path); writer->ssh_bookmark_path = strdup(bookmark_path);
+    log_msg(LOG_INFO, "SSH incremental backup configured: %s@%s:%s", user, host, dest_path);
+}
+
+/* Read last_torrent_id and last_prefix_id from bookmark file.
+ * Returns 0 on success, -1 if file absent or unparseable. */
+static int read_ssh_bookmark(const char *path,
+                              int64_t *out_torrent_id, int64_t *out_prefix_id) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    int64_t torrent_id = -1, prefix_id = -1;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        int64_t val;
+        if (sscanf(line, "last_torrent_id=%"SCNd64, &val) == 1)
+            torrent_id = val;
+        else if (sscanf(line, "last_prefix_id=%"SCNd64, &val) == 1)
+            prefix_id = val;
+    }
+    fclose(f);
+
+    if (torrent_id < 0 || prefix_id < 0) return -1;
+    *out_torrent_id = torrent_id;
+    *out_prefix_id  = prefix_id;
+    return 0;
+}
+
+/* Write bookmark atomically via .tmp + rename. Returns 0 on success. */
+static int write_ssh_bookmark(const char *path,
+                               int64_t torrent_id, int64_t prefix_id) {
+    char tmp_path[2048];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) return -1;
+    fprintf(f, "last_torrent_id=%"PRId64"\n", torrent_id);
+    fprintf(f, "last_prefix_id=%"PRId64"\n",  prefix_id);
+    fclose(f);
+    return rename(tmp_path, path);
+}
+
+/* Query MAX(id) from a table on an already-open connection.
+ * Returns 0 on success. */
+static int query_max_id(sqlite3 *db, const char *table, int64_t *out) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT COALESCE(MAX(id), 0) FROM %s", table);
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) *out = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_ROW) ? 0 : -1;
+}
+
+typedef struct {
+    char src_db_path[1024];
+    char backup_dest_path[1024]; /* local backup DB for first-run init */
+    char bookmark_path[1024];
+    char ssh_host[256];
+    char ssh_user[128];
+    char ssh_dest_path[1024];
+    char ssh_key_path[512];      /* empty string = no -i flag */
+} ssh_backup_args_t;
+
+static void *ssh_backup_thread_func(void *arg) {
+    ssh_backup_args_t *args = (ssh_backup_args_t *)arg;
+
+    int64_t last_torrent_id, last_prefix_id;
+
+    if (read_ssh_bookmark(args->bookmark_path,
+                          &last_torrent_id, &last_prefix_id) != 0) {
+        /* First run: initialise bookmark from local backup DB if present,
+         * otherwise from the live DB. Skip today's dump either way. */
+        sqlite3 *init_db = NULL;
+        const char *init_path = args->backup_dest_path[0]
+                                ? args->backup_dest_path
+                                : args->src_db_path;
+        int64_t t_id = 0, p_id = 0;
+        if (sqlite3_open_v2(init_path, &init_db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+            query_max_id(init_db, "torrents",      &t_id);
+            query_max_id(init_db, "path_prefixes", &p_id);
+            sqlite3_close(init_db);
+        }
+        write_ssh_bookmark(args->bookmark_path, t_id, p_id);
+        log_msg(LOG_INFO, "SSH backup: initialised bookmark at torrent_id=%"PRId64
+                ", prefix_id=%"PRId64" (skipping today's dump)", t_id, p_id);
+        free(args);
+        return NULL;
+    }
+
+    /* Open fresh read-only connection to source to get current MAX ids */
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(args->src_db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "SSH backup: failed to open source database");
+        if (db) sqlite3_close(db);
+        free(args);
+        return NULL;
+    }
+
+    int64_t max_torrent_id = 0, max_prefix_id = 0;
+    query_max_id(db, "torrents",      &max_torrent_id);
+    query_max_id(db, "path_prefixes", &max_prefix_id);
+    sqlite3_close(db);
+
+    if (max_torrent_id <= last_torrent_id) {
+        log_msg(LOG_DEBUG, "SSH backup: no new torrents since last dump (max=%"PRId64
+                ", last=%"PRId64")", max_torrent_id, last_torrent_id);
+        free(args);
+        return NULL;
+    }
+
+    /* Build dated filename: incremental_YYYYMMDD_START-END.sql.zst */
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     char date_str[16];
-    strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
+    strftime(date_str, sizeof(date_str), "%Y%m%d", t);
+    char filename[256];
+    snprintf(filename, sizeof(filename), "incremental_%s_%"PRId64"-%"PRId64".sql.zst",
+             date_str, last_torrent_id + 1, max_torrent_id);
 
-    char today_dest[2048];
-    const char *ph = strstr(backup_path_tmpl, "%DATE%");
-    if (ph) {
-        snprintf(today_dest, sizeof(today_dest), "%.*s%s%s",
-                 (int)(ph - backup_path_tmpl), backup_path_tmpl,
-                 date_str, ph + 6);
+    /* Build shell pipeline */
+    char key_flag[640] = "";
+    if (args->ssh_key_path[0])
+        snprintf(key_flag, sizeof(key_flag), "-i '%s' ", args->ssh_key_path);
+
+    char cmd[16384];
+    snprintf(cmd, sizeof(cmd),
+        "{ "
+        "sqlite3 '%s' \".mode insert path_prefixes\" "
+            "\"SELECT * FROM path_prefixes WHERE id > %"PRId64" AND id <= %"PRId64";\" ; "
+        "sqlite3 '%s' \".mode insert torrents\" "
+            "\"SELECT * FROM torrents WHERE id > %"PRId64" AND id <= %"PRId64";\" ; "
+        "sqlite3 '%s' \".mode insert torrent_files\" "
+            "\"SELECT * FROM torrent_files WHERE torrent_id > %"PRId64" AND torrent_id <= %"PRId64";\" ; "
+        "} | sed 's/^INSERT INTO /INSERT OR IGNORE INTO /' "
+        "| zstd -T0 "
+        "| ssh %s'%s@%s' \"mkdir -p '%s' && cat > '%s/%s'\"",
+        args->src_db_path, last_prefix_id,  max_prefix_id,
+        args->src_db_path, last_torrent_id, max_torrent_id,
+        args->src_db_path, last_torrent_id, max_torrent_id,
+        key_flag, args->ssh_user, args->ssh_host,
+        args->ssh_dest_path, args->ssh_dest_path, filename);
+
+    log_msg(LOG_INFO, "SSH backup: sending %s (%"PRId64" new torrents)",
+            filename, max_torrent_id - last_torrent_id);
+
+    int rc = system(cmd);
+
+    if (rc == 0) {
+        write_ssh_bookmark(args->bookmark_path, max_torrent_id, max_prefix_id);
+        log_msg(LOG_INFO, "SSH backup complete: %s", filename);
     } else {
-        snprintf(today_dest, sizeof(today_dest), "%s", backup_path_tmpl);
+        log_msg(LOG_ERROR, "SSH backup failed (exit %d); will retry next trigger", rc);
     }
 
-    struct stat st;
-    if (stat(today_dest, &st) == 0) {
-        writer->last_backup_yday = t->tm_yday;
-        log_msg(LOG_INFO, "Daily backup configured: %s (today's backup already exists, skipping until tomorrow)",
-                backup_path_tmpl);
-    } else {
-        log_msg(LOG_INFO, "Daily backup configured: %s", backup_path_tmpl);
+    free(args);
+    return NULL;
+}
+
+static void do_ssh_backup(batch_writer_t *writer) {
+    if (!writer->ssh_host || !writer->ssh_bookmark_path) return;
+
+    ssh_backup_args_t *args = calloc(1, sizeof(ssh_backup_args_t));
+    if (!args) return;
+
+    if (writer->backup_db_path)
+        snprintf(args->src_db_path, sizeof(args->src_db_path), "%s", writer->backup_db_path);
+    if (writer->backup_dest_path)
+        snprintf(args->backup_dest_path, sizeof(args->backup_dest_path), "%s", writer->backup_dest_path);
+    snprintf(args->bookmark_path,  sizeof(args->bookmark_path),  "%s", writer->ssh_bookmark_path);
+    snprintf(args->ssh_host,       sizeof(args->ssh_host),       "%s", writer->ssh_host);
+    snprintf(args->ssh_user,       sizeof(args->ssh_user),       "%s", writer->ssh_user);
+    snprintf(args->ssh_dest_path,  sizeof(args->ssh_dest_path),  "%s", writer->ssh_dest_path);
+    if (writer->ssh_key_path)
+        snprintf(args->ssh_key_path, sizeof(args->ssh_key_path), "%s", writer->ssh_key_path);
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, ssh_backup_thread_func, args) != 0) {
+        log_msg(LOG_ERROR, "SSH backup: failed to start thread");
+        free(args);
     }
+    pthread_attr_destroy(&attr);
 }
 
 /* Recursively create directories for path (like mkdir -p). */
@@ -288,166 +506,145 @@ static void make_dirs(const char *path) {
     mkdir(tmp, 0755);
 }
 
-/* Find the most recent backup file matching the template pattern.
- * Returns 1 and fills out[] if found, 0 if none exist. */
-static int find_latest_backup(const char *tmpl, char *out, size_t out_sz) {
-    const char *last_slash = strrchr(tmpl, '/');
-    if (!last_slash) return 0;
-
-    char dir[1024];
-    size_t dir_len = last_slash - tmpl;
-    if (dir_len >= sizeof(dir)) return 0;
-    memcpy(dir, tmpl, dir_len);
-    dir[dir_len] = '\0';
-
-    const char *fname_start = last_slash + 1;
-    const char *date_marker = strstr(fname_start, "%DATE%");
-    size_t prefix_len = date_marker ? (size_t)(date_marker - fname_start) : strlen(fname_start);
-
-    DIR *dp = opendir(dir);
-    if (!dp) return 0;
-
-    char best_name[256] = {0};
-    struct dirent *ent;
-    while ((ent = readdir(dp)) != NULL) {
-        if (strncmp(ent->d_name, fname_start, prefix_len) != 0) continue;
-        /* Pick lexicographically largest (most recent date string) */
-        if (strcmp(ent->d_name, best_name) > 0) {
-            snprintf(best_name, sizeof(best_name), "%s", ent->d_name);
-        }
-    }
-    closedir(dp);
-
-    if (best_name[0] == '\0') return 0;
-    snprintf(out, out_sz, "%s/%s", dir, best_name);
-    return 1;
-}
-
-/* Delete all backup files matching the template pattern except keep_path. */
-static void delete_old_backups(const char *tmpl, const char *keep_path) {
-    const char *last_slash = strrchr(tmpl, '/');
-    if (!last_slash) return;
-
-    char dir[1024];
-    size_t dir_len = last_slash - tmpl;
-    if (dir_len >= sizeof(dir)) return;
-    memcpy(dir, tmpl, dir_len);
-    dir[dir_len] = '\0';
-
-    const char *fname_start = last_slash + 1;
-    const char *date_marker = strstr(fname_start, "%DATE%");
-    size_t prefix_len = date_marker ? (size_t)(date_marker - fname_start) : strlen(fname_start);
-
-    DIR *dp = opendir(dir);
-    if (!dp) return;
-
-    struct dirent *ent;
-    while ((ent = readdir(dp)) != NULL) {
-        if (strncmp(ent->d_name, fname_start, prefix_len) != 0) continue;
-
-        char full_path[2048];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir, ent->d_name);
-        if (strcmp(full_path, keep_path) == 0) continue;
-
-        if (unlink(full_path) == 0) {
-            log_msg(LOG_INFO, "Removed old backup: %s", full_path);
-        } else {
-            log_msg(LOG_WARN, "Failed to remove old backup %s: %s", full_path, strerror(errno));
-        }
-    }
-
-    closedir(dp);
-}
-
-/* Perform the daily rsync backup.
- * Called from batch_writer_flush() outside the mutex.
- *
- * Sets backup_in_progress to block concurrent flushes for the duration of
- * the rsync.  The WAL is already checkpointed before this is called, so the
- * main db file is self-consistent and safe to copy with rsync.
- *
- * rsync writes to a .inprogress file; on success it is renamed to today's
- * dated path and any other old backup files are deleted, leaving exactly one
- * backup on disk at all times. */
+/* Perform the daily incremental backup using SQLite ATTACH.
+ * Opens the backup DB as the primary connection, attaches the live DB as a
+ * read-only source, then appends only rows with id > MAX(id) already in the
+ * backup.  The backup DB is created with the full schema on the first run so
+ * it is immediately usable after a restore with no rebuild step. */
 static void do_backup(batch_writer_t *writer) {
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-
-    /* Build today's dated destination path */
-    char date_str[16];
-    strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
-
-    char dest[2048];
-    const char *tmpl = writer->backup_path_tmpl;
-    const char *placeholder = strstr(tmpl, "%DATE%");
-    if (!placeholder) {
-        snprintf(dest, sizeof(dest), "%s", tmpl);
-    } else {
-        snprintf(dest, sizeof(dest), "%.*s%s%s",
-                 (int)(placeholder - tmpl), tmpl,
-                 date_str, placeholder + 6);
-    }
-
     /* Ensure destination directory exists */
     char dir_tmp[2048];
-    snprintf(dir_tmp, sizeof(dir_tmp), "%s", dest);
-    char *last_slash = strrchr(dir_tmp, '/');
-    if (last_slash) {
-        *last_slash = '\0';
+    snprintf(dir_tmp, sizeof(dir_tmp), "%s", writer->backup_dest_path);
+    char *slash = strrchr(dir_tmp, '/');
+    if (slash) {
+        *slash = '\0';
         make_dirs(dir_tmp);
     }
 
-    /* Find the most recent existing backup to use as the rsync base.
-     * rsync will delta-transfer only the new SQLite pages appended since the
-     * last backup, making each daily run very fast.  If no prior backup exists
-     * rsync falls back to a full copy. */
-    char rsync_target[2048];
-    int have_prev = find_latest_backup(writer->backup_path_tmpl, rsync_target, sizeof(rsync_target));
-    if (!have_prev) {
-        snprintf(rsync_target, sizeof(rsync_target), "%s", dest);
-    }
-
-    log_msg(LOG_INFO, "Starting daily database backup: %s -> %s (base: %s)",
-            writer->backup_db_path, dest, have_prev ? rsync_target : "none");
-
-    /* Block concurrent flushes so no checkpoint touches the db file mid-copy */
     uv_mutex_lock(&writer->mutex);
     writer->backup_in_progress = true;
     uv_mutex_unlock(&writer->mutex);
 
-    /* Paths are from trusted config, not user input. */
-    char cmd[6144];
-    snprintf(cmd, sizeof(cmd), "rsync -a --no-whole-file --inplace --quiet '%s' '%s'",
-             writer->backup_db_path, rsync_target);
-    int rc = system(cmd);
+    log_msg(LOG_INFO, "Starting incremental backup -> %s", writer->backup_dest_path);
+
+    sqlite3 *bak = NULL;
+    int rc = sqlite3_open(writer->backup_dest_path, &bak);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Backup: failed to open backup database: %s",
+                bak ? sqlite3_errmsg(bak) : "unknown error");
+        if (bak) sqlite3_close(bak);
+        goto done_fail;
+    }
+
+    /* Create schema on first run — mirrors src/database.c but without FTS
+     * delete triggers since the backup is append-only. */
+    char *err = NULL;
+    rc = sqlite3_exec(bak,
+        "CREATE TABLE IF NOT EXISTS torrents ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  info_hash BLOB(20) NOT NULL UNIQUE,"
+        "  name TEXT NOT NULL,"
+        "  size_bytes INTEGER NOT NULL,"
+        "  total_peers INTEGER DEFAULT 0,"
+        "  added_timestamp INTEGER NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS idx_torrents_added"
+        "  ON torrents(added_timestamp DESC);"
+        "CREATE TABLE IF NOT EXISTS path_prefixes ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  prefix TEXT NOT NULL UNIQUE);"
+        "CREATE TABLE IF NOT EXISTS torrent_files ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  torrent_id INTEGER NOT NULL,"
+        "  prefix_id INTEGER,"
+        "  filename TEXT NOT NULL,"
+        "  size_bytes INTEGER NOT NULL,"
+        "  file_index SMALLINT NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS idx_files_torrent"
+        "  ON torrent_files(torrent_id);"
+        "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_search USING fts5("
+        "  name, tokenize='porter unicode61',"
+        "  content='torrents', content_rowid='id');"
+        "CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5("
+        "  filename, tokenize='trigram',"
+        "  content='torrent_files', content_rowid='id');"
+        "CREATE TRIGGER IF NOT EXISTS torrents_ai AFTER INSERT ON torrents BEGIN"
+        "  INSERT INTO torrent_search(rowid, name) VALUES (new.id, new.name); END;"
+        "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON torrent_files BEGIN"
+        "  INSERT INTO file_search(rowid, filename) VALUES (new.id, new.filename); END;",
+        NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Backup: schema creation failed: %s", err);
+        sqlite3_free(err);
+        sqlite3_close(bak);
+        goto done_fail;
+    }
+
+    /* Attach the live database as source */
+    char sql[4096];
+    sqlite3_snprintf(sizeof(sql), sql,
+        "ATTACH DATABASE %Q AS src", writer->backup_db_path);
+    rc = sqlite3_exec(bak, sql, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Backup: failed to attach source database: %s", err);
+        sqlite3_free(err);
+        sqlite3_close(bak);
+        goto done_fail;
+    }
+
+    /* Append only new rows in a single atomic transaction.
+     * path_prefixes is small; INSERT OR IGNORE handles the full sync safely. */
+    rc = sqlite3_exec(bak,
+        "BEGIN;"
+        "INSERT OR IGNORE INTO path_prefixes SELECT * FROM src.path_prefixes;"
+        "INSERT OR IGNORE INTO torrents"
+        "  SELECT * FROM src.torrents"
+        "  WHERE id > (SELECT COALESCE(MAX(id), 0) FROM torrents);"
+        "INSERT OR IGNORE INTO torrent_files"
+        "  SELECT * FROM src.torrent_files"
+        "  WHERE id > (SELECT COALESCE(MAX(id), 0) FROM torrent_files);"
+        "COMMIT;",
+        NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Backup: incremental insert failed: %s", err);
+        sqlite3_free(err);
+        sqlite3_exec(bak, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_exec(bak, "DETACH DATABASE src", NULL, NULL, NULL);
+        sqlite3_close(bak);
+        goto done_fail;
+    }
+
+    sqlite3_exec(bak, "DETACH DATABASE src", NULL, NULL, NULL);
+    sqlite3_close(bak);
+    log_msg(LOG_INFO, "Incremental backup complete: %s", writer->backup_dest_path);
+
+    /* Persist today's date so a restart won't re-trigger the backup */
+    if (writer->backup_sentinel_path) {
+        FILE *sf = fopen(writer->backup_sentinel_path, "w");
+        if (sf) {
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            char today[9];
+            strftime(today, sizeof(today), "%Y%m%d", t);
+            fprintf(sf, "%s\n", today);
+            fclose(sf);
+        } else {
+            log_msg(LOG_WARN, "Backup: failed to write sentinel file: %s",
+                    writer->backup_sentinel_path);
+        }
+    }
 
     uv_mutex_lock(&writer->mutex);
     writer->backup_in_progress = false;
     uv_cond_broadcast(&writer->backup_done);
     uv_mutex_unlock(&writer->mutex);
+    return;
 
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "Daily backup rsync failed (exit %d); will retry next flush", rc);
-        uv_mutex_lock(&writer->mutex);
-        writer->last_backup_yday = -1;
-        uv_mutex_unlock(&writer->mutex);
-        return;
-    }
-
-    /* Rename the updated file to today's dated name if it isn't already */
-    if (have_prev && strcmp(rsync_target, dest) != 0) {
-        if (rename(rsync_target, dest) != 0) {
-            log_msg(LOG_ERROR, "Daily backup rename %s -> %s failed: %s",
-                    rsync_target, dest, strerror(errno));
-            uv_mutex_lock(&writer->mutex);
-            writer->last_backup_yday = -1;
-            uv_mutex_unlock(&writer->mutex);
-            return;
-        }
-    }
-
-    log_msg(LOG_INFO, "Daily backup complete: %s", dest);
-    delete_old_backups(writer->backup_path_tmpl, dest);
+done_fail:
+    uv_mutex_lock(&writer->mutex);
+    writer->backup_in_progress = false;
+    writer->last_backup_date[0] = '\0'; /* Allow retry on next flush */
+    uv_cond_broadcast(&writer->backup_done);
+    uv_mutex_unlock(&writer->mutex);
 }
 
 int batch_writer_add(batch_writer_t *writer, const torrent_metadata_t *metadata) {
@@ -690,11 +887,13 @@ int batch_writer_flush(batch_writer_t *writer) {
     /* Check if a daily backup is due: new calendar day, data was written,
      * and the writer is not shutting down. */
     bool should_backup = false;
-    if (writer->running && !writer->backup_inhibited && writer->backup_path_tmpl && written > 0) {
+    if (writer->running && !writer->backup_inhibited && writer->backup_dest_path && written > 0) {
         time_t now = time(NULL);
         struct tm *t = localtime(&now);
-        if (t->tm_yday != writer->last_backup_yday) {
-            writer->last_backup_yday = t->tm_yday;
+        char today[9];
+        strftime(today, sizeof(today), "%Y%m%d", t);
+        if (strcmp(today, writer->last_backup_date) != 0) {
+            memcpy(writer->last_backup_date, today, 9);
             should_backup = true;
         }
     }
@@ -707,6 +906,7 @@ int batch_writer_flush(batch_writer_t *writer) {
 
     if (should_backup) {
         do_backup(writer);
+        do_ssh_backup(writer);
     }
 
     return (ret == 0) ? 0 : -1;
@@ -858,6 +1058,12 @@ void batch_writer_cleanup(batch_writer_t *writer) {
     uv_mutex_destroy(&writer->mutex);
     free(writer->batch);
     free(writer->backup_db_path);
-    free(writer->backup_path_tmpl);
+    free(writer->backup_dest_path);
+    free(writer->backup_sentinel_path);
+    free(writer->ssh_host);
+    free(writer->ssh_user);
+    free(writer->ssh_dest_path);
+    free(writer->ssh_key_path);
+    free(writer->ssh_bookmark_path);
     free(writer);
 }

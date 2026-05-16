@@ -50,6 +50,14 @@ typedef struct {
     int backup_enabled;
     char backup_path[1024];          /* Destination path; %DATE% replaced with YYYY-MM-DD */
 
+    /* SSH incremental backup */
+    int  ssh_backup_enabled;
+    char ssh_host[256];
+    char ssh_user[128];
+    char ssh_dest_path[1024];
+    char ssh_key_path[512];
+    char ssh_bookmark_path[1024];
+
     /* wbpxre-dht settings */
     int wbpxre_ping_workers;
     int wbpxre_find_node_workers;
