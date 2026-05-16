@@ -59,6 +59,11 @@ struct batch_writer {
     char *ssh_dest_path;
     char *ssh_key_path;       /* NULL = use SSH default key */
     char *ssh_bookmark_path;
+
+    /* rclone incremental backup */
+    char *rclone_remote;
+    char *rclone_dest_path;
+    char *rclone_bookmark_path;
 };
 
 /* Background thread for periodic flush.
@@ -309,6 +314,17 @@ void batch_writer_set_ssh_backup(batch_writer_t *writer,
     log_msg(LOG_INFO, "SSH incremental backup configured: %s@%s:%s", user, host, dest_path);
 }
 
+void batch_writer_set_rclone_backup(batch_writer_t *writer,
+                                     const char *remote,
+                                     const char *dest_path,
+                                     const char *bookmark_path) {
+    if (!writer || !remote || !dest_path || !bookmark_path) return;
+    free(writer->rclone_remote);        writer->rclone_remote        = strdup(remote);
+    free(writer->rclone_dest_path);     writer->rclone_dest_path     = strdup(dest_path);
+    free(writer->rclone_bookmark_path); writer->rclone_bookmark_path = strdup(bookmark_path);
+    log_msg(LOG_INFO, "rclone incremental backup configured: %s:%s", remote, dest_path);
+}
+
 /* Read last_torrent_id and last_prefix_id from bookmark file.
  * Returns 0 on success, -1 if file absent or unparseable. */
 static int read_ssh_bookmark(const char *path,
@@ -367,6 +383,8 @@ typedef struct {
     char ssh_user[128];
     char ssh_dest_path[1024];
     char ssh_key_path[512];      /* empty string = no -i flag */
+    int64_t pre_backup_torrent_id; /* backup DB max torrent id before do_backup() ran */
+    int64_t pre_backup_prefix_id;  /* backup DB max prefix id before do_backup() ran */
 } ssh_backup_args_t;
 
 static void *ssh_backup_thread_func(void *arg) {
@@ -376,23 +394,13 @@ static void *ssh_backup_thread_func(void *arg) {
 
     if (read_ssh_bookmark(args->bookmark_path,
                           &last_torrent_id, &last_prefix_id) != 0) {
-        /* First run: initialise bookmark from local backup DB if present,
-         * otherwise from the live DB. Skip today's dump either way. */
-        sqlite3 *init_db = NULL;
-        const char *init_path = args->backup_dest_path[0]
-                                ? args->backup_dest_path
-                                : args->src_db_path;
-        int64_t t_id = 0, p_id = 0;
-        if (sqlite3_open_v2(init_path, &init_db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-            query_max_id(init_db, "torrents",      &t_id);
-            query_max_id(init_db, "path_prefixes", &p_id);
-            sqlite3_close(init_db);
-        }
-        write_ssh_bookmark(args->bookmark_path, t_id, p_id);
-        log_msg(LOG_INFO, "SSH backup: initialised bookmark at torrent_id=%"PRId64
-                ", prefix_id=%"PRId64" (skipping today's dump)", t_id, p_id);
-        free(args);
-        return NULL;
+        /* First run: use the pre-backup max ids captured before do_backup() ran.
+         * This ensures we dump exactly the same rows that do_backup() just copied
+         * to the local backup DB. */
+        last_torrent_id = args->pre_backup_torrent_id;
+        last_prefix_id  = args->pre_backup_prefix_id;
+        log_msg(LOG_INFO, "SSH backup: no bookmark found, starting from pre-backup ids "
+                "torrent_id=%"PRId64", prefix_id=%"PRId64, last_torrent_id, last_prefix_id);
     }
 
     /* Open fresh read-only connection to source to get current MAX ids */
@@ -471,7 +479,8 @@ static void *ssh_backup_thread_func(void *arg) {
     return NULL;
 }
 
-static void do_ssh_backup(batch_writer_t *writer) {
+static void do_ssh_backup(batch_writer_t *writer,
+                          int64_t pre_backup_torrent_id, int64_t pre_backup_prefix_id) {
     if (!writer->ssh_host || !writer->ssh_bookmark_path) return;
 
     ssh_backup_args_t *args = calloc(1, sizeof(ssh_backup_args_t));
@@ -487,6 +496,8 @@ static void do_ssh_backup(batch_writer_t *writer) {
     snprintf(args->ssh_dest_path,  sizeof(args->ssh_dest_path),  "%s", writer->ssh_dest_path);
     if (writer->ssh_key_path)
         snprintf(args->ssh_key_path, sizeof(args->ssh_key_path), "%s", writer->ssh_key_path);
+    args->pre_backup_torrent_id = pre_backup_torrent_id;
+    args->pre_backup_prefix_id  = pre_backup_prefix_id;
 
     pthread_t tid;
     pthread_attr_t attr;
@@ -494,6 +505,125 @@ static void do_ssh_backup(batch_writer_t *writer) {
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&tid, &attr, ssh_backup_thread_func, args) != 0) {
         log_msg(LOG_ERROR, "SSH backup: failed to start thread");
+        free(args);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+typedef struct {
+    char src_db_path[1024];
+    char backup_dest_path[1024];
+    char bookmark_path[1024];
+    char rclone_remote[256];
+    char rclone_dest_path[1024];
+    int64_t pre_backup_torrent_id; /* backup DB max torrent id before do_backup() ran */
+    int64_t pre_backup_prefix_id;  /* backup DB max prefix id before do_backup() ran */
+} rclone_backup_args_t;
+
+static void *rclone_backup_thread_func(void *arg) {
+    rclone_backup_args_t *args = (rclone_backup_args_t *)arg;
+
+    int64_t last_torrent_id, last_prefix_id;
+
+    if (read_ssh_bookmark(args->bookmark_path,
+                          &last_torrent_id, &last_prefix_id) != 0) {
+        /* First run: use the pre-backup max ids captured before do_backup() ran.
+         * This ensures we dump exactly the same rows that do_backup() just copied
+         * to the local backup DB. */
+        last_torrent_id = args->pre_backup_torrent_id;
+        last_prefix_id  = args->pre_backup_prefix_id;
+        log_msg(LOG_INFO, "rclone backup: no bookmark found, starting from pre-backup ids "
+                "torrent_id=%"PRId64", prefix_id=%"PRId64, last_torrent_id, last_prefix_id);
+    }
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(args->src_db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rclone backup: failed to open source database");
+        if (db) sqlite3_close(db);
+        free(args);
+        return NULL;
+    }
+
+    int64_t max_torrent_id = 0, max_prefix_id = 0;
+    query_max_id(db, "torrents",      &max_torrent_id);
+    query_max_id(db, "path_prefixes", &max_prefix_id);
+    sqlite3_close(db);
+
+    if (max_torrent_id <= last_torrent_id) {
+        log_msg(LOG_DEBUG, "rclone backup: no new torrents since last dump (max=%"PRId64
+                ", last=%"PRId64")", max_torrent_id, last_torrent_id);
+        free(args);
+        return NULL;
+    }
+
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char date_str[16];
+    strftime(date_str, sizeof(date_str), "%Y%m%d", t);
+    char filename[256];
+    snprintf(filename, sizeof(filename), "incremental_%s_%"PRId64"-%"PRId64".sql.zst",
+             date_str, last_torrent_id + 1, max_torrent_id);
+
+    const char *dump_db = args->backup_dest_path[0]
+                          ? args->backup_dest_path
+                          : args->src_db_path;
+
+    char cmd[16384];
+    snprintf(cmd, sizeof(cmd),
+        "{ "
+        "sqlite3 '%s' \".mode insert path_prefixes\" "
+            "\"SELECT * FROM path_prefixes WHERE id > %"PRId64" AND id <= %"PRId64";\" ; "
+        "sqlite3 '%s' \".mode insert torrents\" "
+            "\"SELECT * FROM torrents WHERE id > %"PRId64" AND id <= %"PRId64";\" ; "
+        "sqlite3 '%s' \".mode insert torrent_files\" "
+            "\"SELECT * FROM torrent_files WHERE torrent_id > %"PRId64" AND torrent_id <= %"PRId64";\" ; "
+        "} | sed 's/^INSERT INTO /INSERT OR IGNORE INTO /' "
+        "| zstd -T0 "
+        "| rclone rcat '%s:%s/%s'",
+        dump_db, last_prefix_id,  max_prefix_id,
+        dump_db, last_torrent_id, max_torrent_id,
+        dump_db, last_torrent_id, max_torrent_id,
+        args->rclone_remote, args->rclone_dest_path, filename);
+
+    log_msg(LOG_INFO, "rclone backup: sending %s (%"PRId64" new torrents)",
+            filename, max_torrent_id - last_torrent_id);
+
+    int rc = system(cmd);
+
+    if (rc == 0) {
+        write_ssh_bookmark(args->bookmark_path, max_torrent_id, max_prefix_id);
+        log_msg(LOG_INFO, "rclone backup complete: %s", filename);
+    } else {
+        log_msg(LOG_ERROR, "rclone backup failed (exit %d); will retry next trigger", rc);
+    }
+
+    free(args);
+    return NULL;
+}
+
+static void do_rclone_backup(batch_writer_t *writer,
+                             int64_t pre_backup_torrent_id, int64_t pre_backup_prefix_id) {
+    if (!writer->rclone_remote || !writer->rclone_bookmark_path) return;
+
+    rclone_backup_args_t *args = calloc(1, sizeof(rclone_backup_args_t));
+    if (!args) return;
+
+    if (writer->backup_db_path)
+        snprintf(args->src_db_path, sizeof(args->src_db_path), "%s", writer->backup_db_path);
+    if (writer->backup_dest_path)
+        snprintf(args->backup_dest_path, sizeof(args->backup_dest_path), "%s", writer->backup_dest_path);
+    snprintf(args->bookmark_path,    sizeof(args->bookmark_path),    "%s", writer->rclone_bookmark_path);
+    snprintf(args->rclone_remote,    sizeof(args->rclone_remote),    "%s", writer->rclone_remote);
+    snprintf(args->rclone_dest_path, sizeof(args->rclone_dest_path), "%s", writer->rclone_dest_path);
+    args->pre_backup_torrent_id = pre_backup_torrent_id;
+    args->pre_backup_prefix_id  = pre_backup_prefix_id;
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, rclone_backup_thread_func, args) != 0) {
+        log_msg(LOG_ERROR, "rclone backup: failed to start thread");
         free(args);
     }
     pthread_attr_destroy(&attr);
@@ -912,8 +1042,22 @@ int batch_writer_flush(batch_writer_t *writer) {
     uv_mutex_unlock(&writer->mutex);
 
     if (should_backup) {
+        /* Capture backup DB max ids BEFORE do_backup() updates it.
+         * These are passed to SSH/rclone as the first-run bookmark starting point
+         * so their first dump covers exactly the same rows as the local backup. */
+        int64_t pre_backup_torrent_id = 0, pre_backup_prefix_id = 0;
+        if (writer->backup_dest_path) {
+            sqlite3 *pre_db = NULL;
+            if (sqlite3_open_v2(writer->backup_dest_path, &pre_db,
+                                SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                query_max_id(pre_db, "torrents",      &pre_backup_torrent_id);
+                query_max_id(pre_db, "path_prefixes", &pre_backup_prefix_id);
+                sqlite3_close(pre_db);
+            }
+        }
         do_backup(writer);
-        do_ssh_backup(writer);
+        do_ssh_backup(writer, pre_backup_torrent_id, pre_backup_prefix_id);
+        do_rclone_backup(writer, pre_backup_torrent_id, pre_backup_prefix_id);
     }
 
     return (ret == 0) ? 0 : -1;
@@ -1072,5 +1216,8 @@ void batch_writer_cleanup(batch_writer_t *writer) {
     free(writer->ssh_dest_path);
     free(writer->ssh_key_path);
     free(writer->ssh_bookmark_path);
+    free(writer->rclone_remote);
+    free(writer->rclone_dest_path);
+    free(writer->rclone_bookmark_path);
     free(writer);
 }

@@ -68,6 +68,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->ssh_key_path[0]    = '\0';
     strncpy(config->ssh_bookmark_path, "data/ssh_backup_ids.txt",  sizeof(config->ssh_bookmark_path) - 1);
 
+    /* rclone incremental backup defaults */
+    config->rclone_backup_enabled = 0;
+    config->rclone_remote[0]      = '\0';
+    config->rclone_dest_path[0]   = '\0';
+    strncpy(config->rclone_bookmark_path, "data/rclone_backup_ids.txt", sizeof(config->rclone_bookmark_path) - 1);
+
     /* wbpxre-dht defaults */
     config->wbpxre_ping_workers = 10;
     config->wbpxre_find_node_workers = 20;
@@ -285,6 +291,14 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             strncpy(config->ssh_key_path, value, sizeof(config->ssh_key_path) - 1);
         } else if (strcmp(key, "ssh_bookmark_path") == 0) {
             strncpy(config->ssh_bookmark_path, value, sizeof(config->ssh_bookmark_path) - 1);
+        } else if (strcmp(key, "rclone_backup_enabled") == 0) {
+            config->rclone_backup_enabled = atoi(value);
+        } else if (strcmp(key, "rclone_remote") == 0) {
+            strncpy(config->rclone_remote, value, sizeof(config->rclone_remote) - 1);
+        } else if (strcmp(key, "rclone_dest_path") == 0) {
+            strncpy(config->rclone_dest_path, value, sizeof(config->rclone_dest_path) - 1);
+        } else if (strcmp(key, "rclone_bookmark_path") == 0) {
+            strncpy(config->rclone_bookmark_path, value, sizeof(config->rclone_bookmark_path) - 1);
         }
         /* Metadata fetcher settings */
         else if (strcmp(key, "max_concurrent_connections") == 0) {

@@ -82,6 +82,20 @@ void batch_writer_set_ssh_backup(batch_writer_t *writer,
                                   const char *bookmark_path);
 
 /**
+ * Configure rclone incremental backup (runs in detached thread; batch writer is never blocked).
+ * Each day's new rows are dumped as INSERT OR IGNORE SQL, compressed with zstd, and streamed
+ * via rclone rcat to the configured remote. Files are named incremental_YYYYMMDD_START-END.sql.zst.
+ * @param writer        Batch writer instance
+ * @param remote        rclone remote name (e.g. "r2")
+ * @param dest_path     Destination path within the remote (e.g. "dht-backup/dht_crawler_backup")
+ * @param bookmark_path Local path for watermark file tracking last sent row IDs
+ */
+void batch_writer_set_rclone_backup(batch_writer_t *writer,
+                                     const char *remote,
+                                     const char *dest_path,
+                                     const char *bookmark_path);
+
+/**
  * Add torrent metadata to batch
  * @param writer Batch writer instance
  * @param metadata Torrent metadata to write

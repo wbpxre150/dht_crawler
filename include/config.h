@@ -58,6 +58,12 @@ typedef struct {
     char ssh_key_path[512];
     char ssh_bookmark_path[1024];
 
+    /* rclone incremental backup */
+    int  rclone_backup_enabled;
+    char rclone_remote[256];         /* rclone remote name, e.g. "r2" */
+    char rclone_dest_path[1024];     /* bucket path, e.g. "dht-backup/dht_crawler_backup" */
+    char rclone_bookmark_path[1024]; /* local bookmark file */
+
     /* wbpxre-dht settings */
     int wbpxre_ping_workers;
     int wbpxre_find_node_workers;

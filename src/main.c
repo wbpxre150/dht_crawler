@@ -667,6 +667,14 @@ int main(int argc, char *argv[]) {
                 config.ssh_bookmark_path);
         }
 
+        /* Configure rclone incremental backup */
+        if (config.rclone_backup_enabled && config.rclone_remote[0]) {
+            batch_writer_set_rclone_backup(g_batch_writer,
+                config.rclone_remote,
+                config.rclone_dest_path,
+                config.rclone_bookmark_path);
+        }
+
         /* Create supervisor config */
         supervisor_config_t sup_config = {
             .max_trees = config.num_trees,
