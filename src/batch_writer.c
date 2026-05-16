@@ -425,7 +425,14 @@ static void *ssh_backup_thread_func(void *arg) {
     snprintf(filename, sizeof(filename), "incremental_%s_%"PRId64"-%"PRId64".sql.zst",
              date_str, last_torrent_id + 1, max_torrent_id);
 
-    /* Build shell pipeline */
+    /* Build shell pipeline.
+     * Use the local backup DB (already up-to-date from do_backup()) as the
+     * dump source so that sqlite3 readers don't hold WAL locks on the live DB
+     * for the full duration of the SSH transfer. */
+    const char *dump_db = args->backup_dest_path[0]
+                          ? args->backup_dest_path
+                          : args->src_db_path;
+
     char key_flag[640] = "";
     if (args->ssh_key_path[0])
         snprintf(key_flag, sizeof(key_flag), "-i '%s' ", args->ssh_key_path);
@@ -442,9 +449,9 @@ static void *ssh_backup_thread_func(void *arg) {
         "} | sed 's/^INSERT INTO /INSERT OR IGNORE INTO /' "
         "| zstd -T0 "
         "| ssh %s'%s@%s' \"mkdir -p '%s' && cat > '%s/%s'\"",
-        args->src_db_path, last_prefix_id,  max_prefix_id,
-        args->src_db_path, last_torrent_id, max_torrent_id,
-        args->src_db_path, last_torrent_id, max_torrent_id,
+        dump_db, last_prefix_id,  max_prefix_id,
+        dump_db, last_torrent_id, max_torrent_id,
+        dump_db, last_torrent_id, max_torrent_id,
         key_flag, args->ssh_user, args->ssh_host,
         args->ssh_dest_path, args->ssh_dest_path, filename);
 
