@@ -150,8 +150,8 @@ void config_init_defaults(crawler_config_t *config) {
     config->respawn_drain_timeout_sec = 120;           /* Force destroy after 120 seconds */
     config->max_draining_trees = 8;                    /* Max 8 draining trees simultaneously */
 
-    /* Thread tree mode toggle - disabled by default for safety */
-    config->use_thread_trees = 0;                   /* 0=old architecture */
+    /* Thread tree mode toggle - stable and production-ready */
+    config->use_thread_trees = 1;                   /* 1=thread tree architecture */
 
     /* Keyspace partitioning - enabled by default */
     config->use_keyspace_partitioning = 1;          /* 1=enabled (evenly distributed node IDs) */
