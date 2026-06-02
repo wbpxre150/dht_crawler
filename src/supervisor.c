@@ -341,6 +341,9 @@ int supervisor_bootstrap(supervisor_t *sup) {
     int target = sup->global_bootstrap_target > 0 ? sup->global_bootstrap_target : 1000;
     int timeout_s = sup->global_bootstrap_timeout_sec > 0 ? sup->global_bootstrap_timeout_sec : 60;
     int nworkers = sup->global_bootstrap_workers > 0 ? sup->global_bootstrap_workers : 20;
+    int required = sup->global_bootstrap_target;
+    if (required < 100) required = 100;
+    if (required > sup->bep51_cache_capacity) required = sup->bep51_cache_capacity;
 
     log_msg(LOG_INFO, "Supervisor bootstrap starting (target=%d, timeout=%ds, workers=%d)",
             target, timeout_s, nworkers);
@@ -417,7 +420,6 @@ int supervisor_bootstrap(supervisor_t *sup) {
 
     int final_count = tree_routing_get_count(rt);
     int elapsed = (int)(time(NULL) - start);
-    log_msg(LOG_INFO, "Supervisor bootstrap: %d nodes in %ds", final_count, elapsed);
 
     int added_to_cache = 0;
     tree_node_t *node, *tmp;
@@ -426,11 +428,15 @@ int supervisor_bootstrap(supervisor_t *sup) {
             added_to_cache++;
         }
     }
-    log_msg(LOG_INFO, "Supervisor bootstrap: %d nodes submitted to BEP51 cache", added_to_cache);
+    log_msg(LOG_INFO, "Supervisor bootstrap: %d nodes in %ds (%d submitted to BEP51 cache)",
+            final_count, elapsed, added_to_cache);
 
-    if (bep51_cache_get_count(sup->bep51_cache) < 100) {
-        log_msg(LOG_WARN, "[supervisor_bootstrap] Only %zu nodes in BEP51 cache (< 100), bootstrap considered failed",
-                bep51_cache_get_count(sup->bep51_cache));
+    size_t cache_count = bep51_cache_get_count(sup->bep51_cache);
+    if (cache_count >= (size_t)required) {
+        log_msg(LOG_INFO, "[supervisor_bootstrap] Bootstrap complete: %zu nodes in BEP51 cache", cache_count);
+    } else {
+        log_msg(LOG_ERROR, "[supervisor_bootstrap] Bootstrap failed: %zu nodes in cache, need %d. Aborting startup.",
+                cache_count, required);
     }
 
 cleanup:
@@ -442,7 +448,7 @@ cleanup:
     sup->bootstrap_socket = NULL;
     sup->bootstrap_routing_table = NULL;
 
-    return (bep51_cache_get_count(sup->bep51_cache) >= 100) ? 0 : -1;
+    return (bep51_cache_get_count(sup->bep51_cache) >= (size_t)required) ? 0 : -1;
 
 }
 
@@ -795,14 +801,14 @@ void supervisor_start(supervisor_t *sup) {
     }
 
     /* Supervisor-level bootstrap: if cache is cold (fresh data dir), run
-     * a parallel URL bootstrap to collect nodes, then persist them to the cache.
-     * On warm restart the cache has enough nodes and this step is skipped.
-     * Bootstrap must yield >= 100 nodes or we abort startup — trees cannot
-     * bootstrap from dead router URLs anymore. */
-    if (bep51_cache_get_count(sup->bep51_cache) < 100) {
+     * a parallel URL bootstrap to collect nodes. After timeout, startup
+     * ABORTS if fewer than global_bootstrap_target nodes were found (the
+     * cache is saved for next attempt). On warm restart the cache is warm
+     * and this step is skipped entirely. */
+    if (bep51_cache_get_count(sup->bep51_cache) < (size_t)sup->global_bootstrap_target) {
         log_msg(LOG_INFO, "BEP51 cache cold (%zu nodes), running supervisor bootstrap",
                 bep51_cache_get_count(sup->bep51_cache));
-        if (supervisor_bootstrap(sup) != 0 || bep51_cache_get_count(sup->bep51_cache) < 100) {
+        if (supervisor_bootstrap(sup) != 0) {
             log_msg(LOG_ERROR, "Supervisor bootstrap failed and BEP51 cache is empty; aborting startup");
             /* Save partial cache for next attempt */
             bep51_cache_save_to_file(sup->bep51_cache, sup->bep51_cache_path);

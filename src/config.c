@@ -286,7 +286,7 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Supervisor-level global bootstrap settings */
         else if (strcmp(key, "global_bootstrap_target") == 0) {
             config->global_bootstrap_target = atoi(value);
-            if (config->global_bootstrap_target < 100) config->global_bootstrap_target = 100;
+            if (config->global_bootstrap_target < 200) config->global_bootstrap_target = 200;
             if (config->global_bootstrap_target > 10000) config->global_bootstrap_target = 10000;
         } else if (strcmp(key, "global_bootstrap_timeout_sec") == 0) {
             config->global_bootstrap_timeout_sec = atoi(value);
