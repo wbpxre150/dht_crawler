@@ -8,6 +8,7 @@
 #include "tree_socket.h"
 #include "tree_dispatcher.h"
 #include "tree_protocol.h"
+#include "refresh_protocol.h"
 #include "tree_routing.h"
 #include "keyspace.h"
 #include "tree_infohash_queue.h"
@@ -237,12 +238,10 @@ static void *supervisor_bootstrap_worker_func(void *arg) {
     tree_dispatcher_t *dispatcher = ctx->dispatcher;
     tree_response_queue_t *q = ctx->queue;
     atomic_bool *shutdown_flag = ctx->shutdown_flag;
-
     unsigned char my_id[20];
     FILE *ur = fopen("/dev/urandom", "rb");
     if (ur) { fread(my_id, 1, 20, ur); fclose(ur); }
     else { for (int i = 0; i < 20; i++) my_id[i] = (unsigned char)(rand() % 256); }
-
     while (!atomic_load(shutdown_flag)) {
         /* Pick a random node from routing table to query */
         tree_node_t node;
@@ -250,84 +249,33 @@ static void *supervisor_bootstrap_worker_func(void *arg) {
             usleep(10000);
             continue;
         }
-
         /* Generate random target */
         uint8_t target[20];
         for (int i = 0; i < 20; i++) target[i] = (unsigned char)(rand() % 256);
-
-        /* Generate TID and register */
+        /* Generate TID, register, send, and wait for response */
         uint8_t tid[4];
         int tid_len = tree_protocol_gen_tid(tid);
         tree_dispatcher_register_tid(dispatcher, tid, tid_len, q);
-
-        /* Send find_node */
-        uint8_t send_tid[4];
-        int send_tid_len = tree_protocol_gen_tid(send_tid);
-        tree_dispatcher_register_tid(dispatcher, send_tid, send_tid_len, q);
-        int send_rc = tree_send_find_node(NULL, sock, send_tid, send_tid_len, target, &node.addr);
-        tree_dispatcher_unregister_tid(dispatcher, send_tid, send_tid_len);
-        if (send_rc != 0) {
+        int send_rc = tree_send_find_node(my_id, sock, tid, tid_len, target, &node.addr);
+        if (send_rc < 0) {
             tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
             usleep(10000);
             continue;
         }
-
         /* Wait for response */
         tree_response_t response_pkt;
         if (tree_response_queue_pop(q, &response_pkt, 1500) == 0) {
-            uint8_t *payload = response_pkt.data;
-            int payload_len = response_pkt.len;
-            if (payload_len >= 26) {
-                /* Parse find_node response for node list */
-                if (payload[0] == 0 && payload[1] == 0 && payload[2] == 'o' && payload[3] == 'k') {
-                    const uint8_t *nodes_ptr = payload + 26;
-                    int remaining = payload_len - 26;
-                    if (remaining > 4) {
-                        int nodes_data_len = nodes_ptr[0] * 256 + nodes_ptr[1];
-                        if (nodes_data_len > 0 && nodes_data_len + 4 <= remaining) {
-                            int ip_len = nodes_ptr[2];
-                            int data_offset = 4 + ip_len;
-                            if (data_offset + 4 <= nodes_data_len) {
-                                uint16_t port = (nodes_ptr[data_offset] << 8) | nodes_ptr[data_offset + 1];
-                                const uint8_t *nid_ptr = nodes_ptr + data_offset + 2;
-                                int nid_remaining = nodes_data_len - data_offset - 2;
-
-                                struct sockaddr_in sin;
-                                memset(&sin, 0, sizeof(sin));
-                                sin.sin_family = AF_INET;
-                                sin.sin_port = htons(port);
-                                if (ip_len == 4) {
-                                    memcpy(&sin.sin_addr, nodes_ptr + 2, 4);
-                                }
-
-                                while (nid_remaining >= 24) {
-                                    uint8_t nid[20];
-                                    memcpy(nid, nid_ptr, 20);
-                                    nid_remaining -= 24;
-                                    nid_ptr += 24;
-
-                                    tree_node_t tn;
-                                    memcpy(tn.node_id, nid, 20);
-                                    tn.addr = (struct sockaddr_storage){0};
-                                    memcpy(&tn.addr, &sin, sizeof(sin));
-                                    tn.last_seen = time(NULL);
-                                    tn.last_queried = 0;
-                                    tn.fail_count = 0;
-                                    tn.bep51_status = BEP51_UNKNOWN;
-                                    tn.next = NULL;
-                                    tree_routing_add_node(rt, nid, &tn.addr);
-                                }
-                            }
-                        }
-                    }
+            refresh_find_node_response_t resp;
+            if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
+                                                  &response_pkt.from, &resp) == 0) {
+                for (int n = 0; n < resp.node_count; n++) {
+                    tree_routing_add_node(rt, resp.nodes[n], &resp.addrs[n]);
                 }
             }
         }
-
         tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
         usleep(10000);  /* 10ms */
     }
-
     tree_response_queue_destroy(q);
     free(ctx);
     return NULL;
@@ -338,11 +286,15 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
                                           tree_socket_t *sock,
                                           tree_dispatcher_t *dispatcher,
                                           time_t deadline) {
+    unsigned char our_id[20];
+    FILE *ur = fopen("/dev/urandom", "rb");
+    if (ur) { fread(our_id, 1, 20, ur); fclose(ur); }
+    else { for (int i = 0; i < 20; i++) our_id[i] = (unsigned char)(rand() % 256); }
     int bootstrapped = 0;
     for (int i = 0; BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
         struct addrinfo hints, *res;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
+        hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_DGRAM;
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", BOOTSTRAP_PORTS[i]);
@@ -354,65 +306,23 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
         struct sockaddr_storage addr;
         memcpy(&addr, res->ai_addr, res->ai_addrlen);
         freeaddrinfo(res);
-
         uint8_t target[20];
         for (int j = 0; j < 20; j++) target[j] = (unsigned char)(rand() % 256);
-
         uint8_t tid[4];
         int tid_len = tree_protocol_gen_tid(tid);
         tree_response_queue_t *q = tree_response_queue_create(4);
         tree_dispatcher_register_tid(dispatcher, tid, tid_len, q);
-
-        int send_rc = tree_send_find_node(NULL, sock, tid, tid_len, target, &addr);
-
+        int send_rc = tree_send_find_node(our_id, sock, tid, tid_len, target, &addr);
         tree_response_t response_pkt;
-        if (send_rc == 0 && tree_response_queue_pop(q, &response_pkt, 1500) == 0) {
-            uint8_t *payload = response_pkt.data;
-            int payload_len = response_pkt.len;
-            if (payload_len >= 26 && payload[0] == 0 && payload[1] == 0 && payload[2] == 'o' && payload[3] == 'k') {
-                const uint8_t *nodes_ptr = payload + 26;
-                int remaining = payload_len - 26;
-                if (remaining > 4) {
-                    int nodes_data_len = nodes_ptr[0] * 256 + nodes_ptr[1];
-                    if (nodes_data_len > 0 && nodes_data_len + 4 <= remaining) {
-                        int ip_len = nodes_ptr[2];
-                        int data_offset = 4 + ip_len;
-                        if (data_offset + 4 <= nodes_data_len) {
-                            uint16_t port = (nodes_ptr[data_offset] << 8) | nodes_ptr[data_offset + 1];
-                            const uint8_t *nid_ptr = nodes_ptr + data_offset + 2;
-                            int nid_remaining = nodes_data_len - data_offset - 2;
-
-                            struct sockaddr_in sin;
-                            memset(&sin, 0, sizeof(sin));
-                            sin.sin_family = AF_INET;
-                            sin.sin_port = htons(port);
-                            if (ip_len == 4) {
-                                memcpy(&sin.sin_addr, nodes_ptr + 2, 4);
-                            }
-
-                            while (nid_remaining >= 24) {
-                                uint8_t nid[20];
-                                memcpy(nid, nid_ptr, 20);
-                                nid_remaining -= 24;
-                                nid_ptr += 24;
-
-                                tree_node_t tn;
-                                memcpy(tn.node_id, nid, 20);
-                                tn.addr = (struct sockaddr_storage){0};
-                                memcpy(&tn.addr, &sin, sizeof(sin));
-                                tn.last_seen = time(NULL);
-                                tn.last_queried = 0;
-                                tn.fail_count = 0;
-                                tn.bep51_status = BEP51_UNKNOWN;
-                                tn.next = NULL;
-                                tree_routing_add_node(rt, nid, &tn.addr);
-                            }
-                        }
-                    }
+        if (send_rc > 0 && tree_response_queue_pop(q, &response_pkt, 1500) == 0) {
+            refresh_find_node_response_t resp;
+            if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
+                                                  &response_pkt.from, &resp) == 0) {
+                for (int n = 0; n < resp.node_count; n++) {
+                    tree_routing_add_node(rt, resp.nodes[n], &resp.addrs[n]);
                 }
             }
         }
-
         tree_response_queue_destroy(q);
         tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
         bootstrapped++;

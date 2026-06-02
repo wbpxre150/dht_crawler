@@ -84,7 +84,7 @@ int tree_send_ping(struct thread_tree *tree, void *sock,
  * @param dest Destination address
  * @return 0 on success, -1 on error
  */
-int tree_send_find_node(struct thread_tree *tree, void *sock,
+int tree_send_find_node(const uint8_t *node_id, void *sock,
                         const uint8_t *tid, int tid_len,
                         const uint8_t *target,
                         const struct sockaddr_storage *dest);

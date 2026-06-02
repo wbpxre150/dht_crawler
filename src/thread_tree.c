@@ -143,7 +143,7 @@ static void *find_node_worker_func(void *arg) {
             uint8_t tid[4];
             int tid_len = tree_protocol_gen_tid(tid);
             tree_dispatcher_register_tid(dispatcher, tid, tid_len, my_queue);
-            tree_send_find_node(tree, sock, tid, tid_len, target, &nodes[0].addr);
+            tree_send_find_node(tree->node_id, sock, tid, tid_len, target, &nodes[0].addr);
             queries_sent++;
 
             tree_response_t response_pkt;
@@ -196,7 +196,7 @@ static void *find_node_worker_func(void *arg) {
             }
 
             /* Send find_node query with our TID */
-            int send_result = tree_send_find_node(tree, sock, tid, tid_len, target, &nodes[i].addr);
+            int send_result = tree_send_find_node(tree->node_id, sock, tid, tid_len, target, &nodes[i].addr);
             queries_sent++;
 
             /* DEBUG: Log every send */

@@ -235,6 +235,7 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
 
 void batch_writer_set_bloom(batch_writer_t *writer, bloom_filter_t *bloom, const char *bloom_path) {
     if (!writer) {
+        log_msg(LOG_WARN, "batch_writer_set_bloom: writer is NULL");
         return;
     }
     writer->bloom = bloom;

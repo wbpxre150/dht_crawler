@@ -649,6 +649,8 @@ int main(int argc, char *argv[]) {
     supervisor_config_t sup_config = {
         .max_trees = config.num_trees,
         .use_keyspace_partitioning = config.use_keyspace_partitioning,
+        .batch_writer = g_batch_writer,
+        .bloom_filter = g_bloom,
         .dht_port = config.dht_port,
         /* Bloom filter settings for failure tracking */
         .failure_bloom_capacity = config.failure_bloom_capacity,

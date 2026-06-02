@@ -120,21 +120,19 @@ int tree_send_ping(struct thread_tree *tree, void *sock,
     return tree_socket_send((tree_socket_t *)sock, buf, len, dest);
 }
 
-int tree_send_find_node(struct thread_tree *tree, void *sock,
+int tree_send_find_node(const uint8_t *node_id, void *sock,
                         const uint8_t *tid, int tid_len,
                         const uint8_t *target,
                         const struct sockaddr_storage *dest) {
-    if (!tree || !sock || !tid || tid_len <= 0 || !target || !dest) {
+    if (!node_id || !sock || !tid || tid_len <= 0 || !target || !dest) {
         return -1;
     }
-
     uint8_t buf[256];
     int len = build_find_node_query(buf, sizeof(buf), tid, tid_len,
-                                     tree->node_id, target);
+                                     node_id, target);
     if (len <= 0) {
         return -1;
     }
-
     return tree_socket_send((tree_socket_t *)sock, buf, len, dest);
 }
 
