@@ -934,65 +934,76 @@ static void *bootstrap_thread_func(void *arg) {
     time_t deadline = time(NULL) + timeout;
     int have_minimum = 0;
     tree_find_node_response_t find_node_resp;
-    log_msg(LOG_DEBUG, "[tree %u] Tree-native bootstrap starting (timeout=%ds)",
-            tree->tree_id, timeout);
-    /* Phase A: query every URL-bootstrap host once with a random find_node target */
-    for (int i = 0; TREE_BOOTSTRAP_HOSTS[i] != NULL; i++) {
-        struct sockaddr_storage addr;
-        if (tree_resolve_hostname(TREE_BOOTSTRAP_HOSTS[i],
-                                  TREE_BOOTSTRAP_PORTS[i], &addr) != 0) {
-            log_msg(LOG_WARN, "[tree %u] DNS resolution failed for %s",
-                    tree->tree_id, TREE_BOOTSTRAP_HOSTS[i]);
-            continue;
-        }
-        uint8_t target[20];
-        generate_random_target(target);
-        uint8_t tid[4];
-        int tid_len = tree_protocol_gen_tid(tid);
-        tree_dispatcher_register_tid(dispatcher, tid, tid_len, bq);
-        int rc = tree_send_find_node(tree, sock, tid, tid_len, target, &addr);
-        if (rc == 0) {
-            tree_response_t response_pkt;
-            if (tree_response_queue_pop(bq, &response_pkt, 1000) == 0) {
-                tree_response_type_t resp_type = tree_handle_response(tree,
-                    response_pkt.data, response_pkt.len, &response_pkt.from, &find_node_resp);
-                if (resp_type == TREE_RESP_FIND_NODE && find_node_resp.node_count > 0) {
-                    for (int j = 0; j < find_node_resp.node_count; j++) {
-                        tree_routing_add_node(rt, find_node_resp.nodes[j],
-                                              &find_node_resp.addrs[j]);
-                    }
-                    log_msg(LOG_DEBUG, "[tree %u] Bootstrap: %d nodes from %s",
-                            tree->tree_id, find_node_resp.node_count, TREE_BOOTSTRAP_HOSTS[i]);
-                }
-            }
-        }
-        tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
-        if (tree_routing_get_count(rt) >= 100) {
-            have_minimum = 1;
-            break;
-        }
-        if (time(NULL) >= deadline) {
-            break;
-        }
-    }
-    /* Phase B: if still < 100 nodes, fall back to BEP51 cache */
-    if (!have_minimum && tree->supervisor && tree->supervisor->bep51_cache) {
+    log_msg(LOG_DEBUG, "[tree %u] Bootstrap starting (timeout=%ds)", tree->tree_id, timeout);
+
+    /* Phase A: BEP51 cache first (primary on warm restart).
+     * The supervisor bootstrap populates the cache before trees spawn,
+     * so on warm restart the cache should already be warm. */
+    if (tree->supervisor && tree->supervisor->bep51_cache) {
         bep51_cache_t *cache = tree->supervisor->bep51_cache;
         size_t cache_count = bep51_cache_get_count(cache);
-        if (cache_count >= 100) {
-            tree_node_t *warm = malloc(tree->find_node_target_nodes * sizeof(tree_node_t));
+        if (cache_count > 0) {
+            size_t want = (size_t)tree->find_node_target_nodes;
+            if (want > 5000) want = 5000;  /* cap to avoid 96MB allocation */
+            tree_node_t *warm = malloc(want * sizeof(tree_node_t));
             if (warm) {
-                int got = bep51_cache_get_random(cache, warm, tree->find_node_target_nodes);
+                int got = bep51_cache_get_random(cache, warm, (int)want);
                 for (int i = 0; i < got; i++) {
                     tree_routing_add_node(rt, warm[i].node_id, &warm[i].addr);
                 }
                 free(warm);
-                if (tree_routing_get_count(rt) >= 100) {
-                    have_minimum = 1;
-                }
+                log_msg(LOG_DEBUG, "[tree %u] Cache bootstrap: %d nodes (rt=%d)",
+                        tree->tree_id, got, tree_routing_get_count(rt));
             }
         }
     }
+
+    /* Phase B: per-tree URL fallback only if cache didn't give us >= 100 */
+    if (tree_routing_get_count(rt) < 100) {
+        log_msg(LOG_DEBUG, "[tree %u] Cache insufficient, doing per-tree URL bootstrap",
+                tree->tree_id);
+        for (int i = 0; TREE_BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
+            struct sockaddr_storage addr;
+            if (tree_resolve_hostname(TREE_BOOTSTRAP_HOSTS[i],
+                                      TREE_BOOTSTRAP_PORTS[i], &addr) != 0) {
+                log_msg(LOG_WARN, "[tree %u] DNS resolution failed for %s",
+                        tree->tree_id, TREE_BOOTSTRAP_HOSTS[i]);
+                continue;
+            }
+            uint8_t target[20];
+            generate_random_target(target);
+            uint8_t tid[4];
+            int tid_len = tree_protocol_gen_tid(tid);
+            tree_dispatcher_register_tid(dispatcher, tid, tid_len, bq);
+            int rc = tree_send_find_node(tree, sock, tid, tid_len, target, &addr);
+            if (rc == 0) {
+                tree_response_t response_pkt;
+                if (tree_response_queue_pop(bq, &response_pkt, 1000) == 0) {
+                    tree_response_type_t resp_type = tree_handle_response(tree,
+                        response_pkt.data, response_pkt.len, &response_pkt.from, &find_node_resp);
+                    if (resp_type == TREE_RESP_FIND_NODE && find_node_resp.node_count > 0) {
+                        for (int j = 0; j < find_node_resp.node_count; j++) {
+                            tree_routing_add_node(rt, find_node_resp.nodes[j],
+                                                  &find_node_resp.addrs[j]);
+                        }
+                        log_msg(LOG_DEBUG, "[tree %u] Bootstrap: %d nodes from %s",
+                                tree->tree_id, find_node_resp.node_count, TREE_BOOTSTRAP_HOSTS[i]);
+                    }
+                }
+            }
+            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+            if (tree_routing_get_count(rt) >= 100) {
+                have_minimum = 1;
+                break;
+            }
+            if (time(NULL) >= deadline) {
+                break;
+            }
+        }
+    }
+
+    if (tree_routing_get_count(rt) >= 100) have_minimum = 1;
+
     if (!have_minimum) {
         log_msg(LOG_ERROR, "[tree %u] Bootstrap failed: routing table has %d nodes after %ds",
                 tree->tree_id, tree_routing_get_count(rt), timeout);

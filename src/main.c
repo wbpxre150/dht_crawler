@@ -690,7 +690,11 @@ int main(int argc, char *argv[]) {
         .respawn_spawn_threshold = config.respawn_spawn_threshold,
         .respawn_drain_timeout_sec = config.respawn_drain_timeout_sec,
         .max_draining_trees = config.max_draining_trees,
-        /* Porn filter settings */
+        /* Supervisor-level global bootstrap */
+        .global_bootstrap_target = config.global_bootstrap_target,
+        .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
+        .global_bootstrap_workers = config.global_bootstrap_workers,
+        /* Porn filter settings 
         .porn_filter_enabled = config.porn_filter_enabled,
         /* Adaptive keyspace partitioning */
         .dead_partition_threshold = config.dead_partition_threshold,

@@ -338,10 +338,13 @@ static void *bootstrap_thread_func(void *arg) {
     tree_socket_t *sock = thread->socket;
     refresh_dispatcher_t *dispatcher = thread->dispatcher;
     log_msg(LOG_INFO, "Refresh thread bootstrap starting");
-    time_t deadline = time(NULL) + 30;
+    time_t deadline = time(NULL) + 60;  /* Extended from 30s for DNS resilience */
     int have_minimum = 0;
-    /* Phase A: URL bootstrap via find_node queries to known DHT routers */
-    for (int i = 0; REFRESH_BOOTSTRAP_HOSTS[i] != NULL; i++) {
+    /* Phase A: URL bootstrap via find_node queries to known DHT routers.
+     * Each host is tried up to 2 times with 1.5s backoff between attempts
+     * to handle transient DNS failures. */
+    for (int pass = 0; pass < 2 && !have_minimum; pass++) {
+        for (int i = 0; REFRESH_BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
         struct sockaddr_storage addr;
         if (refresh_resolve_hostname(REFRESH_BOOTSTRAP_HOSTS[i],
                                      REFRESH_BOOTSTRAP_PORTS[i], &addr) != 0) {
@@ -371,8 +374,13 @@ static void *bootstrap_thread_func(void *arg) {
         int cur = tree_routing_get_count(rt);
         if (cur >= 100) { have_minimum = 1; break; }
         if (time(NULL) >= deadline) break;
+        }
+        /* Backoff between passes for DNS to recover */
+        if (!have_minimum && pass < 1) {
+            usleep(1500000);  /* 1.5s backoff */
+        }
     }
-    /* Phase B: BEP51 cache fallback */
+    /* Phase B: BEP51 cache fallback 
     if (!have_minimum && thread->bep51_cache) {
         bep51_cache_t *cache = thread->bep51_cache;
         size_t cc = bep51_cache_get_count(cache);

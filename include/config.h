@@ -81,6 +81,10 @@ typedef struct {
     /* Thread tree Stage 2 settings (Global Bootstrap - REMOVED in Stage 5) */
     /* Thread tree bootstrap settings */
     int tree_bootstrap_timeout_sec;    /* Tree-native bootstrap timeout (default: 30) */
+    /* Supervisor-level global bootstrap (cold start) */
+    int global_bootstrap_target;       /* Default: 1000. Nodes collected by supervisor bootstrap. */
+    int global_bootstrap_timeout_sec;  /* Default: 60. Hard cap on supervisor bootstrap. */
+    int global_bootstrap_workers;      /* Default: 20. Parallel find_node workers for supervisor bootstrap. */
 
     /* Thread tree Stage 2 settings (find_node/bootstrap) */
     int tree_find_node_workers;          /* find_node workers per tree for bootstrap (default: 10) */

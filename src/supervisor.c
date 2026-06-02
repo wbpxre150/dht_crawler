@@ -22,7 +22,28 @@
 static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree, uint32_t partition_index);
 static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *tree, int slot_index);
 static void *monitor_thread_func(void *arg);
+static void *supervisor_bootstrap_worker_func(void *arg);
+int supervisor_bootstrap(supervisor_t *sup);
 
+
+/* Built-in DHT bootstrap routers for supervisor-level bootstrap */
+static const char *BOOTSTRAP_HOSTS[] = {
+    "router.bittorrent.com", "dht.transmissionbt.com", "dht.libtorrent.org",
+    "dht.aelitis.com",       "router.bitcomet.com",     "dht.anacrolix.link",
+    NULL
+};
+static const int BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069 };
+
+/* Worker context for supervisor bootstrap iterative phase */
+typedef struct {
+    tree_routing_table_t *rt;
+    tree_socket_t *sock;
+    tree_dispatcher_t *dispatcher;
+    tree_response_queue_t *queue;
+    uint8_t node_id[20];
+    atomic_bool *shutdown_flag;
+    int worker_id;
+} sup_bootstrap_worker_ctx_t;
 supervisor_t *supervisor_create(supervisor_config_t *config) {
     if (!config || config->max_trees <= 0) {
         log_msg(LOG_ERROR, "[supervisor] Invalid config");
@@ -65,9 +86,11 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Tree bootstrap settings */
     sup->tree_bootstrap_timeout_sec = config->tree_bootstrap_timeout_sec > 0 ? config->tree_bootstrap_timeout_sec : 30;
-    
-    
-    
+
+    /* Supervisor-level global bootstrap settings */
+    sup->global_bootstrap_target = config->global_bootstrap_target > 0 ? config->global_bootstrap_target : 1000;
+    sup->global_bootstrap_timeout_sec = config->global_bootstrap_timeout_sec > 0 ? config->global_bootstrap_timeout_sec : 60;
+    sup->global_bootstrap_workers = config->global_bootstrap_workers > 0 ? config->global_bootstrap_workers : 20;
 
     /* Stage 3 settings (BEP51) */
     sup->infohash_queue_capacity = config->infohash_queue_capacity > 0 ? config->infohash_queue_capacity : 5000;
@@ -208,6 +231,310 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
  * @param partition_index Keyspace partition to assign this tree to
  * @return Pointer to new tree, or NULL on error
  */
+/* Supervisor bootstrap worker: iteratively discover nodes by querying random RT entries */
+static void *supervisor_bootstrap_worker_func(void *arg) {
+    sup_bootstrap_worker_ctx_t *ctx = (sup_bootstrap_worker_ctx_t *)arg;
+    tree_routing_table_t *rt = ctx->rt;
+    tree_socket_t *sock = ctx->sock;
+    tree_dispatcher_t *dispatcher = ctx->dispatcher;
+    tree_response_queue_t *q = ctx->queue;
+    atomic_bool *shutdown_flag = ctx->shutdown_flag;
+
+    unsigned char my_id[20];
+    FILE *ur = fopen("/dev/urandom", "rb");
+    if (ur) { fread(my_id, 1, 20, ur); fclose(ur); }
+    else { for (int i = 0; i < 20; i++) my_id[i] = (unsigned char)(rand() % 256); }
+
+    while (!atomic_load(shutdown_flag)) {
+        /* Pick a random node from routing table to query */
+        tree_node_t node;
+        if (tree_routing_get_random_nodes(rt, &node, 1) < 1) {
+            usleep(10000);
+            continue;
+        }
+
+        /* Generate random target */
+        uint8_t target[20];
+        for (int i = 0; i < 20; i++) target[i] = (unsigned char)(rand() % 256);
+
+        /* Generate TID and register */
+        uint8_t tid[4];
+        int tid_len = tree_protocol_gen_tid(tid);
+        tree_dispatcher_register_tid(dispatcher, tid, tid_len, q);
+
+        /* Send find_node */
+        uint8_t send_tid[4];
+        int send_tid_len = tree_protocol_gen_tid(send_tid);
+        tree_dispatcher_register_tid(dispatcher, send_tid, send_tid_len, q);
+        int send_rc = tree_send_find_node(NULL, sock, send_tid, send_tid_len, target, &node.addr);
+        tree_dispatcher_unregister_tid(dispatcher, send_tid, send_tid_len);
+        if (send_rc != 0) {
+            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+            usleep(10000);
+            continue;
+        }
+
+        /* Wait for response */
+        tree_response_t response_pkt;
+        if (tree_response_queue_pop(q, &response_pkt, 1500) == 0) {
+            uint8_t *payload = response_pkt.data;
+            int payload_len = response_pkt.len;
+            if (payload_len >= 26) {
+                /* Parse find_node response for node list */
+                if (payload[0] == 0 && payload[1] == 0 && payload[2] == 'o' && payload[3] == 'k') {
+                    const uint8_t *nodes_ptr = payload + 26;
+                    int remaining = payload_len - 26;
+                    if (remaining > 4) {
+                        int nodes_data_len = nodes_ptr[0] * 256 + nodes_ptr[1];
+                        if (nodes_data_len > 0 && nodes_data_len + 4 <= remaining) {
+                            int ip_len = nodes_ptr[2];
+                            int data_offset = 4 + ip_len;
+                            if (data_offset + 4 <= nodes_data_len) {
+                                uint16_t port = (nodes_ptr[data_offset] << 8) | nodes_ptr[data_offset + 1];
+                                const uint8_t *nid_ptr = nodes_ptr + data_offset + 2;
+                                int nid_remaining = nodes_data_len - data_offset - 2;
+
+                                struct sockaddr_in sin;
+                                memset(&sin, 0, sizeof(sin));
+                                sin.sin_family = AF_INET;
+                                sin.sin_port = htons(port);
+                                if (ip_len == 4) {
+                                    memcpy(&sin.sin_addr, nodes_ptr + 2, 4);
+                                }
+
+                                while (nid_remaining >= 24) {
+                                    uint8_t nid[20];
+                                    memcpy(nid, nid_ptr, 20);
+                                    nid_remaining -= 24;
+                                    nid_ptr += 24;
+
+                                    tree_node_t tn;
+                                    memcpy(tn.node_id, nid, 20);
+                                    tn.addr = (struct sockaddr_storage){0};
+                                    memcpy(&tn.addr, &sin, sizeof(sin));
+                                    tn.last_seen = time(NULL);
+                                    tn.last_queried = 0;
+                                    tn.fail_count = 0;
+                                    tn.bep51_status = BEP51_UNKNOWN;
+                                    tn.next = NULL;
+                                    tree_routing_add_node(rt, nid, &tn.addr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+        usleep(10000);  /* 10ms */
+    }
+
+    tree_response_queue_destroy(q);
+    free(ctx);
+    return NULL;
+}
+
+/* Phase A: resolve bootstrap hosts and query them for nodes */
+static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
+                                          tree_socket_t *sock,
+                                          tree_dispatcher_t *dispatcher,
+                                          time_t deadline) {
+    int bootstrapped = 0;
+    for (int i = 0; BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", BOOTSTRAP_PORTS[i]);
+        int ret = getaddrinfo(BOOTSTRAP_HOSTS[i], port_str, &hints, &res);
+        if (ret != 0) {
+            log_msg(LOG_WARN, "[supervisor_bootstrap] DNS failed for %s", BOOTSTRAP_HOSTS[i]);
+            continue;
+        }
+        struct sockaddr_storage addr;
+        memcpy(&addr, res->ai_addr, res->ai_addrlen);
+        freeaddrinfo(res);
+
+        uint8_t target[20];
+        for (int j = 0; j < 20; j++) target[j] = (unsigned char)(rand() % 256);
+
+        uint8_t tid[4];
+        int tid_len = tree_protocol_gen_tid(tid);
+        tree_response_queue_t *q = tree_response_queue_create(4);
+        tree_dispatcher_register_tid(dispatcher, tid, tid_len, q);
+
+        int send_rc = tree_send_find_node(NULL, sock, tid, tid_len, target, &addr);
+
+        tree_response_t response_pkt;
+        if (send_rc == 0 && tree_response_queue_pop(q, &response_pkt, 1500) == 0) {
+            uint8_t *payload = response_pkt.data;
+            int payload_len = response_pkt.len;
+            if (payload_len >= 26 && payload[0] == 0 && payload[1] == 0 && payload[2] == 'o' && payload[3] == 'k') {
+                const uint8_t *nodes_ptr = payload + 26;
+                int remaining = payload_len - 26;
+                if (remaining > 4) {
+                    int nodes_data_len = nodes_ptr[0] * 256 + nodes_ptr[1];
+                    if (nodes_data_len > 0 && nodes_data_len + 4 <= remaining) {
+                        int ip_len = nodes_ptr[2];
+                        int data_offset = 4 + ip_len;
+                        if (data_offset + 4 <= nodes_data_len) {
+                            uint16_t port = (nodes_ptr[data_offset] << 8) | nodes_ptr[data_offset + 1];
+                            const uint8_t *nid_ptr = nodes_ptr + data_offset + 2;
+                            int nid_remaining = nodes_data_len - data_offset - 2;
+
+                            struct sockaddr_in sin;
+                            memset(&sin, 0, sizeof(sin));
+                            sin.sin_family = AF_INET;
+                            sin.sin_port = htons(port);
+                            if (ip_len == 4) {
+                                memcpy(&sin.sin_addr, nodes_ptr + 2, 4);
+                            }
+
+                            while (nid_remaining >= 24) {
+                                uint8_t nid[20];
+                                memcpy(nid, nid_ptr, 20);
+                                nid_remaining -= 24;
+                                nid_ptr += 24;
+
+                                tree_node_t tn;
+                                memcpy(tn.node_id, nid, 20);
+                                tn.addr = (struct sockaddr_storage){0};
+                                memcpy(&tn.addr, &sin, sizeof(sin));
+                                tn.last_seen = time(NULL);
+                                tn.last_queried = 0;
+                                tn.fail_count = 0;
+                                tn.bep51_status = BEP51_UNKNOWN;
+                                tn.next = NULL;
+                                tree_routing_add_node(rt, nid, &tn.addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tree_response_queue_destroy(q);
+        tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+        bootstrapped++;
+        if (tree_routing_get_count(rt) >= 100 || bootstrapped >= 2) break;
+    }
+    if (tree_routing_get_count(rt) < 100) {
+        log_msg(LOG_WARN, "[supervisor_bootstrap] URL bootstrap got only %d nodes; relying on iterative workers",
+                tree_routing_get_count(rt));
+    }
+}
+
+/* Main supervisor bootstrap function */
+int supervisor_bootstrap(supervisor_t *sup) {
+    int target = sup->global_bootstrap_target > 0 ? sup->global_bootstrap_target : 1000;
+    int timeout_s = sup->global_bootstrap_timeout_sec > 0 ? sup->global_bootstrap_timeout_sec : 60;
+    int nworkers = sup->global_bootstrap_workers > 0 ? sup->global_bootstrap_workers : 20;
+
+    log_msg(LOG_INFO, "Supervisor bootstrap starting (target=%d, timeout=%ds, workers=%d)",
+            target, timeout_s, nworkers);
+
+    unsigned char our_id[20];
+    FILE *ur = fopen("/dev/urandom", "rb");
+    if (ur) { fread(our_id, 1, 20, ur); fclose(ur); }
+    else { for (int i = 0; i < 20; i++) our_id[i] = (unsigned char)(rand() % 256); }
+    sup->bootstrap_routing_table = tree_routing_create(our_id);
+    tree_routing_set_bucket_capacity((tree_routing_table_t *)sup->bootstrap_routing_table, 20);
+
+    sup->bootstrap_socket = tree_socket_create(0);
+    if (!sup->bootstrap_socket) {
+        log_msg(LOG_ERROR, "[supervisor_bootstrap] Failed to create ephemeral socket");
+        tree_routing_destroy((tree_routing_table_t *)sup->bootstrap_routing_table);
+        sup->bootstrap_routing_table = NULL;
+        return -1;
+    }
+
+    sup->bootstrap_dispatcher = tree_dispatcher_create(NULL, (tree_socket_t *)sup->bootstrap_socket);
+    if (!sup->bootstrap_dispatcher) {
+        log_msg(LOG_ERROR, "[supervisor_bootstrap] Failed to create dispatcher");
+        tree_socket_destroy((tree_socket_t *)sup->bootstrap_socket);
+        tree_routing_destroy((tree_routing_table_t *)sup->bootstrap_routing_table);
+        sup->bootstrap_socket = NULL;
+        sup->bootstrap_routing_table = NULL;
+        return -1;
+    }
+    tree_dispatcher_start((tree_dispatcher_t *)sup->bootstrap_dispatcher);
+
+    time_t start = time(NULL);
+    time_t deadline = start + timeout_s;
+    tree_routing_table_t *rt = (tree_routing_table_t *)sup->bootstrap_routing_table;
+
+    bootstrap_phase_a_url_lookup(rt, (tree_socket_t *)sup->bootstrap_socket,
+                                 (tree_dispatcher_t *)sup->bootstrap_dispatcher, deadline);
+
+    atomic_bool shutdown_flag = false;
+    sup->bootstrap_worker_count = nworkers;
+    sup->bootstrap_workers = calloc(nworkers, sizeof(pthread_t));
+    if (!sup->bootstrap_workers) {
+        log_msg(LOG_ERROR, "[supervisor_bootstrap] Failed to allocate worker array");
+        goto cleanup;
+    }
+
+    for (int i = 0; i < nworkers; i++) {
+        sup_bootstrap_worker_ctx_t *ctx = malloc(sizeof(sup_bootstrap_worker_ctx_t));
+        if (!ctx) { nworkers = i; break; }
+        ctx->rt = rt;
+        ctx->sock = (tree_socket_t *)sup->bootstrap_socket;
+        ctx->dispatcher = (tree_dispatcher_t *)sup->bootstrap_dispatcher;
+        ctx->queue = tree_response_queue_create(4);
+        ctx->shutdown_flag = &shutdown_flag;
+        ctx->worker_id = i;
+        if (!ctx->queue) { free(ctx); nworkers = i; break; }
+        int rc = pthread_create(&sup->bootstrap_workers[i], NULL,
+                                supervisor_bootstrap_worker_func, ctx);
+        if (rc != 0) { tree_response_queue_destroy(ctx->queue); free(ctx); nworkers = i; break; }
+    }
+
+    while (time(NULL) < deadline) {
+        int n = tree_routing_get_count(rt);
+        if (n >= target) break;
+        usleep(200000);
+    }
+
+    atomic_store(&shutdown_flag, true);
+    for (int i = 0; i < nworkers; i++) {
+        if (sup->bootstrap_workers[i]) pthread_join(sup->bootstrap_workers[i], NULL);
+    }
+    free(sup->bootstrap_workers);
+    sup->bootstrap_workers = NULL;
+    sup->bootstrap_worker_count = 0;
+
+    int final_count = tree_routing_get_count(rt);
+    int elapsed = (int)(time(NULL) - start);
+    log_msg(LOG_INFO, "Supervisor bootstrap: %d nodes in %ds", final_count, elapsed);
+
+    int added_to_cache = 0;
+    tree_node_t *node, *tmp;
+    HASH_ITER(hh_flat, rt->flat_index_head, node, tmp) {
+        if (bep51_cache_add_node(sup->bep51_cache, node->node_id, &node->addr) == 0) {
+            added_to_cache++;
+        }
+    }
+    log_msg(LOG_INFO, "Supervisor bootstrap: %d nodes submitted to BEP51 cache", added_to_cache);
+
+    if (final_count < 100) {
+        log_msg(LOG_WARN, "[supervisor_bootstrap] Only %d nodes collected; per-tree URL bootstrap may still be needed", final_count);
+    }
+
+cleanup:
+    tree_dispatcher_stop((tree_dispatcher_t *)sup->bootstrap_dispatcher);
+    tree_dispatcher_destroy((tree_dispatcher_t *)sup->bootstrap_dispatcher);
+    tree_socket_destroy((tree_socket_t *)sup->bootstrap_socket);
+    tree_routing_destroy((tree_routing_table_t *)sup->bootstrap_routing_table);
+    sup->bootstrap_dispatcher = NULL;
+    sup->bootstrap_socket = NULL;
+    sup->bootstrap_routing_table = NULL;
+
+    return (final_count >= 100) ? 0 : -1;
+}
+
+
 static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree, uint32_t partition_index) {
     tree_config_t config = {
         /* Keyspace partitioning */
@@ -553,6 +880,21 @@ void supervisor_start(supervisor_t *sup) {
     int cache_loaded = bep51_cache_load_from_file(sup->bep51_cache, sup->bep51_cache_path);
     if (cache_loaded == 0) {
         log_msg(LOG_DEBUG, "[supervisor] Cache loaded successfully: %zu nodes", bep51_cache_get_count(sup->bep51_cache));
+    }
+
+    /* Supervisor-level bootstrap: if cache is cold (fresh data dir), run
+     * a parallel URL bootstrap to collect >= 1000 nodes, then persist
+     * them to the cache. On warm restart the cache has enough nodes
+     * and this step is skipped entirely. */
+    if (bep51_cache_get_count(sup->bep51_cache) < 100) {
+        log_msg(LOG_INFO, "BEP51 cache cold (%zu nodes), running supervisor bootstrap",
+                bep51_cache_get_count(sup->bep51_cache));
+        if (supervisor_bootstrap(sup) != 0) {
+            log_msg(LOG_WARN, "Supervisor bootstrap failed; per-tree URL bootstrap will still run");
+        }
+    } else {
+        log_msg(LOG_INFO, "BEP51 cache warm (%zu nodes), skipping supervisor bootstrap",
+                bep51_cache_get_count(sup->bep51_cache));
     }
 
     /* Create shared socket and dispatcher when using fixed port */

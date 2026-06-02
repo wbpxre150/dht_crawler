@@ -105,6 +105,11 @@ typedef struct supervisor_config {
     int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration */
     int max_trees_per_partition;         /* Max trees per partition */
 
+    /* Supervisor-level global bootstrap */
+    int global_bootstrap_target;         /* Target node count for global bootstrap */
+    int global_bootstrap_timeout_sec;    /* Timeout for global bootstrap */
+    int global_bootstrap_workers;        /* Worker count for global bootstrap */
+
     /* Respawn overlapping configuration */
     int respawn_spawn_threshold;         /* Spawn replacement when connections below threshold */
     int respawn_drain_timeout_sec;       /* Force destroy after drain timeout */
@@ -198,6 +203,18 @@ typedef struct supervisor {
     int respawn_spawn_threshold;
     int respawn_drain_timeout_sec;
     int max_draining_trees;
+
+    /* Supervisor-level global bootstrap config */
+    int global_bootstrap_target;         /* Target node count for global bootstrap */
+    int global_bootstrap_timeout_sec;    /* Timeout for global bootstrap */
+    int global_bootstrap_workers;        /* Worker count for global bootstrap */
+
+    /* Supervisor bootstrap ephemeral state (torn down after bootstrap) */
+    void *bootstrap_routing_table;       /* tree_routing_table_t* */
+    void *bootstrap_socket;              /* tree_socket_t* */
+    void *bootstrap_dispatcher;          /* tree_dispatcher_t* */
+    pthread_t *bootstrap_workers;        /* worker thread handles */
+    int bootstrap_worker_count;
 
     /* Draining trees */
     draining_tree_t *draining_trees;

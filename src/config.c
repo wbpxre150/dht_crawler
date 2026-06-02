@@ -67,7 +67,12 @@ void config_init_defaults(crawler_config_t *config) {
     /* Tree bootstrap timeout default */
     config->tree_bootstrap_timeout_sec = 30;
 
-    /* Language filter defaults */
+    /* Supervisor-level global bootstrap defaults */
+    config->global_bootstrap_target = 1000;
+    config->global_bootstrap_timeout_sec = 60;
+    config->global_bootstrap_workers = 20;
+
+    /* Language filter defaults 
     config->language_filter_non_latin_threshold = 33; /* Filter if >33% non-Latin characters */
 
     /* Thread tree defaults (Stage 1) */
@@ -285,6 +290,20 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->tree_bootstrap_timeout_sec = atoi(value);
             if (config->tree_bootstrap_timeout_sec < 10) config->tree_bootstrap_timeout_sec = 10;
             if (config->tree_bootstrap_timeout_sec > 600) config->tree_bootstrap_timeout_sec = 600;
+        }
+        /* Supervisor-level global bootstrap settings */
+        else if (strcmp(key, "global_bootstrap_target") == 0) {
+            config->global_bootstrap_target = atoi(value);
+            if (config->global_bootstrap_target < 100) config->global_bootstrap_target = 100;
+            if (config->global_bootstrap_target > 10000) config->global_bootstrap_target = 10000;
+        } else if (strcmp(key, "global_bootstrap_timeout_sec") == 0) {
+            config->global_bootstrap_timeout_sec = atoi(value);
+            if (config->global_bootstrap_timeout_sec < 10) config->global_bootstrap_timeout_sec = 10;
+            if (config->global_bootstrap_timeout_sec > 300) config->global_bootstrap_timeout_sec = 300;
+        } else if (strcmp(key, "global_bootstrap_workers") == 0) {
+            config->global_bootstrap_workers = atoi(value);
+            if (config->global_bootstrap_workers < 1) config->global_bootstrap_workers = 1;
+            if (config->global_bootstrap_workers > 50) config->global_bootstrap_workers = 50;
         }
         /* Thread tree Stage 2 settings (find_node/bootstrap) */
         else if (strcmp(key, "tree_find_node_workers") == 0) {
