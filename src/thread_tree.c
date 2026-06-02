@@ -18,8 +18,6 @@
 #include <string.h>
 #include <time.h>
 #include <stdatomic.h>
-#include <netdb.h>
-#include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/socket.h>
 
@@ -892,34 +890,9 @@ static void tree_start_bep51_phase(thread_tree_t *tree) {
     tree_start_bep51_workers(tree);
 }
 
-/* Built-in DHT bootstrap routers. Resolved via getaddrinfo() and pinged once each. */
-static const char *TREE_BOOTSTRAP_HOSTS[] = {
-    "router.bittorrent.com",
-    "dht.transmissionbt.com",
-    "dht.libtorrent.org",
-    "dht.aelitis.com",
-    "router.bitcomet.com",
-    "dht.anacrolix.link",
-    NULL
-};
-static const int TREE_BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069 };
-/* Helper: resolve hostname to sockaddr_storage */
-static int tree_resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-    int ret = getaddrinfo(hostname, port_str, &hints, &res);
-    if (ret != 0) {
-        return -1;
-    }
-    memcpy(addr, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-    return 0;
-}
-/* Bootstrap thread function - Tree-native URL bootstrap with BEP51 cache fallback */
+/* Bootstrap thread function — samples nodes from the BEP51 cache only.
+ * URL bootstrap was removed; the supervisor bootstrap must succeed before
+ * trees are spawned. */
 static void *bootstrap_thread_func(void *arg) {
     thread_tree_t *tree = (thread_tree_t *)arg;
     tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
@@ -930,15 +903,8 @@ static void *bootstrap_thread_func(void *arg) {
         log_msg(LOG_ERROR, "[tree %u] Missing required bootstrap resources", tree->tree_id);
         goto shutdown;
     }
-    int timeout = tree->tree_bootstrap_timeout_sec > 0 ? tree->tree_bootstrap_timeout_sec : 30;
-    time_t deadline = time(NULL) + timeout;
-    int have_minimum = 0;
-    tree_find_node_response_t find_node_resp;
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap starting (timeout=%ds)", tree->tree_id, timeout);
 
-    /* Phase A: BEP51 cache first (primary on warm restart).
-     * The supervisor bootstrap populates the cache before trees spawn,
-     * so on warm restart the cache should already be warm. */
+    /* Pull find_node_target_nodes random entries from the BEP51 cache */
     if (tree->supervisor && tree->supervisor->bep51_cache) {
         bep51_cache_t *cache = tree->supervisor->bep51_cache;
         size_t cache_count = bep51_cache_get_count(cache);
@@ -958,60 +924,16 @@ static void *bootstrap_thread_func(void *arg) {
         }
     }
 
-    /* Phase B: per-tree URL fallback only if cache didn't give us >= 100 */
     if (tree_routing_get_count(rt) < 100) {
-        log_msg(LOG_DEBUG, "[tree %u] Cache insufficient, doing per-tree URL bootstrap",
-                tree->tree_id);
-        for (int i = 0; TREE_BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
-            struct sockaddr_storage addr;
-            if (tree_resolve_hostname(TREE_BOOTSTRAP_HOSTS[i],
-                                      TREE_BOOTSTRAP_PORTS[i], &addr) != 0) {
-                log_msg(LOG_WARN, "[tree %u] DNS resolution failed for %s",
-                        tree->tree_id, TREE_BOOTSTRAP_HOSTS[i]);
-                continue;
-            }
-            uint8_t target[20];
-            generate_random_target(target);
-            uint8_t tid[4];
-            int tid_len = tree_protocol_gen_tid(tid);
-            tree_dispatcher_register_tid(dispatcher, tid, tid_len, bq);
-            int rc = tree_send_find_node(tree, sock, tid, tid_len, target, &addr);
-            if (rc == 0) {
-                tree_response_t response_pkt;
-                if (tree_response_queue_pop(bq, &response_pkt, 1000) == 0) {
-                    tree_response_type_t resp_type = tree_handle_response(tree,
-                        response_pkt.data, response_pkt.len, &response_pkt.from, &find_node_resp);
-                    if (resp_type == TREE_RESP_FIND_NODE && find_node_resp.node_count > 0) {
-                        for (int j = 0; j < find_node_resp.node_count; j++) {
-                            tree_routing_add_node(rt, find_node_resp.nodes[j],
-                                                  &find_node_resp.addrs[j]);
-                        }
-                        log_msg(LOG_DEBUG, "[tree %u] Bootstrap: %d nodes from %s",
-                                tree->tree_id, find_node_resp.node_count, TREE_BOOTSTRAP_HOSTS[i]);
-                    }
-                }
-            }
-            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
-            if (tree_routing_get_count(rt) >= 100) {
-                have_minimum = 1;
-                break;
-            }
-            if (time(NULL) >= deadline) {
-                break;
-            }
-        }
-    }
-
-    if (tree_routing_get_count(rt) >= 100) have_minimum = 1;
-
-    if (!have_minimum) {
-        log_msg(LOG_ERROR, "[tree %u] Bootstrap failed: routing table has %d nodes after %ds",
-                tree->tree_id, tree_routing_get_count(rt), timeout);
+        log_msg(LOG_ERROR, "[tree %u] Bootstrap failed: BEP51 cache yielded only %d nodes (expected >= 100)",
+                tree->tree_id, tree_routing_get_count(rt));
         goto shutdown;
     }
+
     int final_count = tree_routing_get_count(rt);
     log_msg(LOG_INFO, "[tree %u] Bootstrap complete: %d nodes in routing table",
             tree->tree_id, final_count);
+
     /* Start find_node workers to continuously discover new nodes */
     tree_start_find_node_workers(tree);
     /* Start throttle monitor */

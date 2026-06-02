@@ -27,12 +27,12 @@ int supervisor_bootstrap(supervisor_t *sup);
 
 
 /* Built-in DHT bootstrap routers for supervisor-level bootstrap */
+/* Three bootstrap routers that are reliably alive in 2025-2026 */
 static const char *BOOTSTRAP_HOSTS[] = {
-    "router.bittorrent.com", "dht.transmissionbt.com", "dht.libtorrent.org",
-    "dht.aelitis.com",       "router.bitcomet.com",     "dht.anacrolix.link",
+    "dht.transmissionbt.com", "dht.libtorrent.org", "router.silotis.us",
     NULL
 };
-static const int BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069 };
+static const int BOOTSTRAP_PORTS[] = { 6881, 25401, 6881 };
 
 /* Worker context for supervisor bootstrap iterative phase */
 typedef struct {
@@ -84,8 +84,6 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->num_get_peers_workers = config->num_get_peers_workers;
     sup->num_metadata_workers = config->num_metadata_workers;
 
-    /* Tree bootstrap settings */
-    sup->tree_bootstrap_timeout_sec = config->tree_bootstrap_timeout_sec > 0 ? config->tree_bootstrap_timeout_sec : 30;
 
     /* Supervisor-level global bootstrap settings */
     sup->global_bootstrap_target = config->global_bootstrap_target > 0 ? config->global_bootstrap_target : 1000;
@@ -216,8 +214,8 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
-    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_timeout=%ds, draining_slots=%d, spawn_threshold=%d, drain_timeout=%ds",
-            sup->max_trees, sup->tree_bootstrap_timeout_sec, sup->max_draining_trees,
+    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, draining_slots=%d, spawn_threshold=%d, drain_timeout=%ds",
+            sup->max_trees, sup->max_draining_trees,
             sup->respawn_spawn_threshold, sup->respawn_drain_timeout_sec);
 
     return sup;
@@ -344,7 +342,7 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
     for (int i = 0; BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
         struct addrinfo hints, *res;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", BOOTSTRAP_PORTS[i]);
@@ -518,8 +516,9 @@ int supervisor_bootstrap(supervisor_t *sup) {
     }
     log_msg(LOG_INFO, "Supervisor bootstrap: %d nodes submitted to BEP51 cache", added_to_cache);
 
-    if (final_count < 100) {
-        log_msg(LOG_WARN, "[supervisor_bootstrap] Only %d nodes collected; per-tree URL bootstrap may still be needed", final_count);
+    if (bep51_cache_get_count(sup->bep51_cache) < 100) {
+        log_msg(LOG_WARN, "[supervisor_bootstrap] Only %zu nodes in BEP51 cache (< 100), bootstrap considered failed",
+                bep51_cache_get_count(sup->bep51_cache));
     }
 
 cleanup:
@@ -531,7 +530,8 @@ cleanup:
     sup->bootstrap_socket = NULL;
     sup->bootstrap_routing_table = NULL;
 
-    return (final_count >= 100) ? 0 : -1;
+    return (bep51_cache_get_count(sup->bep51_cache) >= 100) ? 0 : -1;
+
 }
 
 
@@ -883,14 +883,21 @@ void supervisor_start(supervisor_t *sup) {
     }
 
     /* Supervisor-level bootstrap: if cache is cold (fresh data dir), run
-     * a parallel URL bootstrap to collect >= 1000 nodes, then persist
-     * them to the cache. On warm restart the cache has enough nodes
-     * and this step is skipped entirely. */
+     * a parallel URL bootstrap to collect nodes, then persist them to the cache.
+     * On warm restart the cache has enough nodes and this step is skipped.
+     * Bootstrap must yield >= 100 nodes or we abort startup — trees cannot
+     * bootstrap from dead router URLs anymore. */
     if (bep51_cache_get_count(sup->bep51_cache) < 100) {
         log_msg(LOG_INFO, "BEP51 cache cold (%zu nodes), running supervisor bootstrap",
                 bep51_cache_get_count(sup->bep51_cache));
-        if (supervisor_bootstrap(sup) != 0) {
-            log_msg(LOG_WARN, "Supervisor bootstrap failed; per-tree URL bootstrap will still run");
+        if (supervisor_bootstrap(sup) != 0 || bep51_cache_get_count(sup->bep51_cache) < 100) {
+            log_msg(LOG_ERROR, "Supervisor bootstrap failed and BEP51 cache is empty; aborting startup");
+            /* Save partial cache for next attempt */
+            bep51_cache_save_to_file(sup->bep51_cache, sup->bep51_cache_path);
+            /* Clean up shared resources */
+            bloom_filter_cleanup(sup->failure_bloom);
+            bep51_cache_destroy(sup->bep51_cache);
+            return;
         }
     } else {
         log_msg(LOG_INFO, "BEP51 cache warm (%zu nodes), skipping supervisor bootstrap",

@@ -64,8 +64,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->porn_filter_enabled = 0;                /* Disabled by default */
     strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
 
-    /* Tree bootstrap timeout default */
-    config->tree_bootstrap_timeout_sec = 30;
 
     /* Supervisor-level global bootstrap defaults */
     config->global_bootstrap_target = 1000;
@@ -285,12 +283,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (config->num_trees < 1) config->num_trees = 1;
             if (config->num_trees > 64) config->num_trees = 64;
         }
-        /* Tree bootstrap settings */
-        else if (strcmp(key, "tree_bootstrap_timeout_sec") == 0) {
-            config->tree_bootstrap_timeout_sec = atoi(value);
-            if (config->tree_bootstrap_timeout_sec < 10) config->tree_bootstrap_timeout_sec = 10;
-            if (config->tree_bootstrap_timeout_sec > 600) config->tree_bootstrap_timeout_sec = 600;
-        }
         /* Supervisor-level global bootstrap settings */
         else if (strcmp(key, "global_bootstrap_target") == 0) {
             config->global_bootstrap_target = atoi(value);
@@ -480,14 +472,13 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
         {"log-level",   required_argument, 0, 'l'},
         {"config",      required_argument, 0, 'c'},
         {"help",        no_argument,       0, '?'},
-        {"tree-bootstrap-timeout", required_argument, 0, 'T'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:d:l:c:T?", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:l:c?", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 config->dht_port = atoi(optarg);
@@ -511,14 +502,10 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
             case 'c':
                 /* Config file is loaded separately */
                 break;
-            case 'T':
-                config->tree_bootstrap_timeout_sec = atoi(optarg);
-                break;
             case '?':
             default:
                 fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
                 fprintf(stderr, "Options:\n");
-                fprintf(stderr, "  -T, --tree-bootstrap-timeout SEC  Tree bootstrap timeout in seconds (default: 30)\n");
                 fprintf(stderr, "  -p, --port PORT          DHT port (default: 6881)\n");
                 fprintf(stderr, "  -d, --db-path PATH       Database path (default: data/torrents.db)\n");
                 fprintf(stderr, "  -l, --log-level LEVEL    Log level: DEBUG|INFO|WARN|ERROR (default: INFO)\n");

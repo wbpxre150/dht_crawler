@@ -54,7 +54,6 @@ typedef struct tree_config {
     uint32_t num_partitions;        /* Total partitions in the system */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (vs random node ID) */
     int dht_port;                   /* DHT UDP port (0 = ephemeral) */
-    int tree_bootstrap_timeout_sec; /* Tree-native bootstrap deadline (default: 30) */
 
     /* Shared socket/dispatcher from supervisor (NULL = create private) */
     struct tree_socket *shared_socket;
@@ -150,8 +149,6 @@ typedef struct thread_tree {
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;
 
-    /* Tree-native bootstrap timeout */
-    int tree_bootstrap_timeout_sec;
 
     /* Phase management */
     atomic_int current_phase;  /* Use atomic_int to store tree_phase_t enum values */

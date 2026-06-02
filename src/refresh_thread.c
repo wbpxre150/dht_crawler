@@ -314,15 +314,15 @@ int refresh_thread_submit_request(refresh_thread_t *thread,
 
 /* Built-in DHT bootstrap routers for refresh thread */
 static const char *REFRESH_BOOTSTRAP_HOSTS[] = {
-    "router.bittorrent.com", "dht.transmissionbt.com", "dht.libtorrent.org",
-    "dht.aelitis.com", "router.bitcomet.com", "dht.anacrolix.link", NULL
+    "dht.transmissionbt.com", "dht.libtorrent.org", "router.silotis.us",
+    NULL
 };
-static const int REFRESH_BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069 };
+static const int REFRESH_BOOTSTRAP_PORTS[] = { 6881, 25401, 6881 };
 /* Helper: resolve hostname to sockaddr_storage for refresh thread */
 static int refresh_resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);

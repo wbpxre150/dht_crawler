@@ -658,7 +658,6 @@ int main(int argc, char *argv[]) {
         .num_get_peers_workers = config.tree_get_peers_workers,
         .num_metadata_workers = config.tree_metadata_workers,
         /* Tree bootstrap settings */
-        .tree_bootstrap_timeout_sec = config.tree_bootstrap_timeout_sec,
         /* BEP51 cache settings */
         .bep51_cache_capacity = config.bep51_cache_capacity,
         .bep51_cache_submit_percent = config.bep51_cache_submit_percent,
@@ -714,6 +713,13 @@ int main(int argc, char *argv[]) {
     
     /* Start supervisor (spawns all trees) */
     supervisor_start(g_supervisor);
+    if (g_supervisor->active_trees == 0) {
+        log_msg(LOG_ERROR, "Supervisor started 0 trees (bootstrap failed); aborting");
+        batch_writer_cleanup(g_batch_writer);
+        database_cleanup(&g_database);
+        bloom_filter_cleanup(g_bloom);
+        return 1;
+    }
     
     /* Create shared refresh query store for HTTP API */
     log_msg(LOG_DEBUG, "Creating refresh query store...");

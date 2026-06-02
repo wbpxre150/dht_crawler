@@ -99,7 +99,6 @@ typedef struct supervisor_config {
     bool porn_filter_enabled;
 
     /* Tree bootstrap settings */
-    int tree_bootstrap_timeout_sec;    /* Tree-native bootstrap deadline (default: 30) */
 
     /* Keyspace partitioning */
     int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration */
@@ -191,7 +190,6 @@ typedef struct supervisor {
     bool porn_filter_enabled;
 
     /* Tree bootstrap settings */
-    int tree_bootstrap_timeout_sec;
 
     /* Keyspace partitioning */
     partition_stats_t *partition_stats;  /* Per-partition stats */
