@@ -172,6 +172,45 @@ int tree_parse_compact_nodes(const uint8_t *compact, size_t compact_len,
 
         node_count++;
     }
+    return node_count;
+}
+
+/* Parse compact IPv6 node info (38 bytes per node: 20 id + 16 ip + 2 port).
+ * BEP7 extension returned in the "nodes6" key. */
+int tree_parse_compact_nodes6(const uint8_t *compact, size_t compact_len,
+                               uint8_t out_ids[][20],
+                               struct sockaddr_storage *out_addrs,
+                               int max_nodes) {
+    if (!compact || !out_ids || !out_addrs) {
+        return 0;
+    }
+
+    int node_count = 0;
+    size_t pos = 0;
+
+    while (pos + 38 <= compact_len && node_count < max_nodes) {
+        memcpy(out_ids[node_count], compact + pos, 20);
+        pos += 20;
+
+        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&out_addrs[node_count];
+        memset(addr, 0, sizeof(*addr));
+        addr->sin6_family = AF_INET6;
+        memcpy(&addr->sin6_addr, compact + pos, 16);
+        pos += 16;
+        memcpy(&addr->sin6_port, compact + pos, 2);  /* Network order */
+        pos += 2;
+
+        bool is_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (addr->sin6_addr.s6_addr[i] != 0) { is_zero = false; break; }
+        }
+        uint16_t port = ntohs(addr->sin6_port);
+        if (is_zero || port == 0) {
+            continue;
+        }
+
+        node_count++;
+    }
 
     return node_count;
 }
@@ -192,10 +231,11 @@ tree_response_type_t tree_handle_response(struct thread_tree *tree,
         bencode_free(&bc);
         return TREE_RESP_NONE;
     }
-
     const char *response_type = NULL;
     const uint8_t *nodes_data = NULL;
     size_t nodes_len = 0;
+    const uint8_t *nodes6_data = NULL;
+    size_t nodes6_len = 0;
     const uint8_t *sender_id = NULL;
 
     /* Parse the response dictionary */
@@ -222,6 +262,9 @@ tree_response_type_t tree_handle_response(struct thread_tree *tree,
                         if (rkeylen == 5 && memcmp(rkey, "nodes", 5) == 0 && type == BENCODE_STRING) {
                             nodes_data = bc.tok;
                             nodes_len = bc.toklen;
+                        } else if (rkeylen == 6 && memcmp(rkey, "nodes6", 6) == 0 && type == BENCODE_STRING) {
+                            nodes6_data = bc.tok;
+                            nodes6_len = bc.toklen;
                         } else if (rkeylen == 2 && memcmp(rkey, "id", 2) == 0 && type == BENCODE_STRING) {
                             if (bc.toklen == 20) {
                                 sender_id = bc.tok;
@@ -241,10 +284,16 @@ tree_response_type_t tree_handle_response(struct thread_tree *tree,
     }
 
     /* If we got nodes, parse them */
-    if (nodes_data && nodes_len > 0 && out_response) {
-        out_response->node_count = tree_parse_compact_nodes(
-            nodes_data, nodes_len,
-            out_response->nodes, out_response->addrs, 256);
+    if (out_response && (nodes_data || nodes6_data)) {
+        if (nodes6_data) {
+            out_response->node_count = tree_parse_compact_nodes6(
+                nodes6_data, nodes6_len,
+                out_response->nodes, out_response->addrs, 256);
+        } else {
+            out_response->node_count = tree_parse_compact_nodes(
+                nodes_data, nodes_len,
+                out_response->nodes, out_response->addrs, 256);
+        }
 
         /* Add sender to routing table if we have their ID */
         if (sender_id && tree->routing_table) {
@@ -445,6 +494,8 @@ int tree_handle_get_peers_response(struct thread_tree *tree,
     const char *response_type = NULL;
     const uint8_t *nodes_data = NULL;
     size_t nodes_len = 0;
+    const uint8_t *nodes6_data = NULL;
+    size_t nodes6_len = 0;
     const uint8_t *token_data = NULL;
     size_t token_len = 0;
     const uint8_t *sender_id = NULL;
@@ -485,6 +536,9 @@ int tree_handle_get_peers_response(struct thread_tree *tree,
                         } else if (rkeylen == 5 && memcmp(rkey, "nodes", 5) == 0 && type == BENCODE_STRING) {
                             nodes_data = bc.tok;
                             nodes_len = bc.toklen;
+                        } else if (rkeylen == 6 && memcmp(rkey, "nodes6", 6) == 0 && type == BENCODE_STRING) {
+                            nodes6_data = bc.tok;
+                            nodes6_len = bc.toklen;
                         } else if (rkeylen == 5 && memcmp(rkey, "token", 5) == 0 && type == BENCODE_STRING) {
                             token_data = bc.tok;
                             token_len = bc.toklen;
@@ -507,7 +561,11 @@ int tree_handle_get_peers_response(struct thread_tree *tree,
     }
 
     /* Parse nodes (for iterative lookup) */
-    if (nodes_data && nodes_len > 0) {
+    if (nodes6_data && nodes6_len > 0) {
+        out_response->node_count = tree_parse_compact_nodes6(
+            nodes6_data, nodes6_len,
+            out_response->nodes, out_response->node_addrs, 256);
+    } else if (nodes_data && nodes_len > 0) {
         out_response->node_count = tree_parse_compact_nodes(
             nodes_data, nodes_len,
             out_response->nodes, out_response->node_addrs, 256);
@@ -552,6 +610,8 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
     size_t samples_len = 0;
     const uint8_t *nodes_data = NULL;
     size_t nodes_len = 0;
+    const uint8_t *nodes6_data = NULL;
+    size_t nodes6_len = 0;
     const uint8_t *sender_id = NULL;
 
     /* Parse the response dictionary */
@@ -581,6 +641,9 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
                         } else if (rkeylen == 5 && memcmp(rkey, "nodes", 5) == 0 && type == BENCODE_STRING) {
                             nodes_data = bc.tok;
                             nodes_len = bc.toklen;
+                        } else if (rkeylen == 6 && memcmp(rkey, "nodes6", 6) == 0 && type == BENCODE_STRING) {
+                            nodes6_data = bc.tok;
+                            nodes6_len = bc.toklen;
                         } else if (rkeylen == 2 && memcmp(rkey, "id", 2) == 0 && type == BENCODE_STRING) {
                             if (bc.toklen == 20) {
                                 sender_id = bc.tok;
@@ -625,7 +688,11 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
     }
 
     /* Parse nodes */
-    if (nodes_data && nodes_len > 0) {
+    if (nodes6_data && nodes6_len > 0) {
+        out_response->node_count = tree_parse_compact_nodes6(
+            nodes6_data, nodes6_len,
+            out_response->nodes, out_response->addrs, 256);
+    } else if (nodes_data && nodes_len > 0) {
         out_response->node_count = tree_parse_compact_nodes(
             nodes_data, nodes_len,
             out_response->nodes, out_response->addrs, 256);
@@ -636,7 +703,6 @@ int tree_handle_sample_infohashes_response(struct thread_tree *tree,
         tree_routing_add_node((tree_routing_table_t *)tree->routing_table,
                               sender_id, from);
     }
-
     return 0;
 }
 

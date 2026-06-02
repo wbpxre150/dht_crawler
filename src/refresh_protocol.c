@@ -97,6 +97,8 @@ int refresh_parse_find_node_response(const uint8_t *data, size_t len,
     const char *response_type = NULL;
     const uint8_t *nodes_data = NULL;
     size_t nodes_len = 0;
+    const uint8_t *nodes6_data = NULL;
+    size_t nodes6_len = 0;
     const uint8_t *sender_id = NULL;
 
     /* Parse the response dictionary */
@@ -123,6 +125,9 @@ int refresh_parse_find_node_response(const uint8_t *data, size_t len,
                         if (rkeylen == 5 && memcmp(rkey, "nodes", 5) == 0 && type == BENCODE_STRING) {
                             nodes_data = bc.tok;
                             nodes_len = bc.toklen;
+                        } else if (rkeylen == 6 && memcmp(rkey, "nodes6", 6) == 0 && type == BENCODE_STRING) {
+                            nodes6_data = bc.tok;
+                            nodes6_len = bc.toklen;
                         } else if (rkeylen == 2 && memcmp(rkey, "id", 2) == 0 && type == BENCODE_STRING) {
                             if (bc.toklen == 20) {
                                 sender_id = bc.tok;
@@ -141,8 +146,12 @@ int refresh_parse_find_node_response(const uint8_t *data, size_t len,
         return -1;
     }
 
-    /* Parse nodes */
-    if (nodes_data && nodes_len > 0) {
+    /* Parse nodes (prefer v6 if both present) */
+    if (nodes6_data && nodes6_len > 0) {
+        out->node_count = parse_compact_nodes6(
+            nodes6_data, nodes6_len,
+            out->nodes, out->addrs, 256);
+    } else if (nodes_data && nodes_len > 0) {
         out->node_count = parse_compact_nodes(
             nodes_data, nodes_len,
             out->nodes, out->addrs, 256);
@@ -178,6 +187,8 @@ int refresh_parse_get_peers_response(const uint8_t *data, size_t len,
     const char *response_type = NULL;
     const uint8_t *nodes_data = NULL;
     size_t nodes_len = 0;
+    const uint8_t *nodes6_data = NULL;
+    size_t nodes6_len = 0;
     const uint8_t *token_data = NULL;
     size_t token_len = 0;
     const uint8_t *sender_id = NULL;
@@ -207,7 +218,6 @@ int refresh_parse_get_peers_response(const uint8_t *data, size_t len,
                             /* Parse values list - each item is a compact peer string */
                             while ((type = bencode_next(&bc)) != BENCODE_LIST_END && type > 0) {
                                 if (type == BENCODE_STRING && bc.toklen >= 6) {
-                                    /* Parse compact peers from this string */
                                     int parsed = parse_compact_peers(
                                         bc.tok, bc.toklen,
                                         &out->peers[out->peer_count],
@@ -218,6 +228,9 @@ int refresh_parse_get_peers_response(const uint8_t *data, size_t len,
                         } else if (rkeylen == 5 && memcmp(rkey, "nodes", 5) == 0 && type == BENCODE_STRING) {
                             nodes_data = bc.tok;
                             nodes_len = bc.toklen;
+                        } else if (rkeylen == 6 && memcmp(rkey, "nodes6", 6) == 0 && type == BENCODE_STRING) {
+                            nodes6_data = bc.tok;
+                            nodes6_len = bc.toklen;
                         } else if (rkeylen == 5 && memcmp(rkey, "token", 5) == 0 && type == BENCODE_STRING) {
                             token_data = bc.tok;
                             token_len = bc.toklen;
@@ -240,7 +253,11 @@ int refresh_parse_get_peers_response(const uint8_t *data, size_t len,
     }
 
     /* Parse nodes (for iterative lookup) */
-    if (nodes_data && nodes_len > 0) {
+    if (nodes6_data && nodes6_len > 0) {
+        out->node_count = parse_compact_nodes6(
+            nodes6_data, nodes6_len,
+            out->nodes, out->node_addrs, 256);
+    } else if (nodes_data && nodes_len > 0) {
         out->node_count = parse_compact_nodes(
             nodes_data, nodes_len,
             out->nodes, out->node_addrs, 256);

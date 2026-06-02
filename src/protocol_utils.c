@@ -1,6 +1,7 @@
 #include "protocol_utils.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -172,6 +173,46 @@ int parse_compact_nodes(const uint8_t *compact, size_t compact_len,
         uint16_t port = ntohs(addr->sin_port);
         if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
             /* Invalid address, skip this node */
+            continue;
+        }
+
+        node_count++;
+    }
+    return node_count;
+}
+
+/* Parse compact IPv6 node info (38 bytes per node: 20 id + 16 ip + 2 port).
+ * BEP7 extension returned in the "nodes6" key by IPv6-capable DHT nodes. */
+int parse_compact_nodes6(const uint8_t *compact, size_t compact_len,
+                         uint8_t out_ids[][20],
+                         struct sockaddr_storage *out_addrs,
+                         int max_nodes) {
+    if (!compact || !out_ids || !out_addrs) {
+        return 0;
+    }
+
+    int node_count = 0;
+    size_t pos = 0;
+
+    while (pos + 38 <= compact_len && node_count < max_nodes) {
+        memcpy(out_ids[node_count], compact + pos, 20);
+        pos += 20;
+
+        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&out_addrs[node_count];
+        memset(addr, 0, sizeof(*addr));
+        addr->sin6_family = AF_INET6;
+        memcpy(&addr->sin6_addr, compact + pos, 16);
+        pos += 16;
+        memcpy(&addr->sin6_port, compact + pos, 2);  /* Network order */
+        pos += 2;
+
+        /* Reject all-zeros and port 0; keep link-local? Allow ::1 etc. */
+        bool is_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (addr->sin6_addr.s6_addr[i] != 0) { is_zero = false; break; }
+        }
+        uint16_t port = ntohs(addr->sin6_port);
+        if (is_zero || port == 0) {
             continue;
         }
 

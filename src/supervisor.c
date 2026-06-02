@@ -325,9 +325,6 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
                 }
             }
         }
-        tree_response_queue_destroy(q);
-        tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
-        bootstrapped++;
         if (tree_routing_get_count(rt) >= 100 || bootstrapped >= 2) break;
     }
     if (tree_routing_get_count(rt) < 100) {

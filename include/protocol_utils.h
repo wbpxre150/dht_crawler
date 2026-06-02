@@ -71,6 +71,15 @@ int parse_compact_nodes(const uint8_t *compact, size_t compact_len,
                         int max_nodes);
 
 /**
+ * Parse compact IPv6 node info (38 bytes per node: 20 id + 16 ip + 2 port).
+ * Mirrors parse_compact_nodes for BEP7 nodes6 responses.
+ */
+int parse_compact_nodes6(const uint8_t *compact, size_t compact_len,
+                         uint8_t out_ids[][20],
+                         struct sockaddr_storage *out_addrs,
+                         int max_nodes);
+
+/**
  * Parse compact peer info (6 bytes per peer: 4 ip + 2 port)
  * @param compact Compact peer data
  * @param compact_len Length of compact data
