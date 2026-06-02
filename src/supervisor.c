@@ -27,13 +27,15 @@ static void *supervisor_bootstrap_worker_func(void *arg);
 int supervisor_bootstrap(supervisor_t *sup);
 
 
-/* Built-in DHT bootstrap routers for supervisor-level bootstrap */
-/* Three bootstrap routers that are reliably alive in 2025-2026 */
-static const char *BOOTSTRAP_HOSTS[] = {
-    "dht.transmissionbt.com", "dht.libtorrent.org", "router.silotis.us",
-    NULL
-};
-static const int BOOTSTRAP_PORTS[] = { 6881, 25401, 6881 };
+    /* Built-in DHT bootstrap routers for supervisor-level bootstrap */
+    static const char *BOOTSTRAP_HOSTS[] = {
+        "router.bittorrent.com", "dht.transmissionbt.com", "dht.libtorrent.org",
+        "dht.aelitis.com", "router.bitcomet.com", "dht.anacrolix.link",
+        "router.utorrent.com", "dht.vuze.com", "router.bittorrent.cloud",
+        "router.silotis.us",
+        NULL
+    };
+    static const int BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069, 6881, 6881, 42069, 6881 };
 
 /* Worker context for supervisor bootstrap iterative phase */
 typedef struct {
@@ -294,7 +296,7 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
     for (int i = 0; BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
         struct addrinfo hints, *res;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+       hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", BOOTSTRAP_PORTS[i]);

@@ -17,7 +17,7 @@ tree_socket_t *tree_socket_create(int port) {
     }
 
     /* Create UDP socket */
-    sock->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    sock->fd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (sock->fd < 0) {
         log_msg(LOG_ERROR, "[tree_socket] Failed to create socket: %s", strerror(errno));
         free(sock);
@@ -36,6 +36,10 @@ tree_socket_t *tree_socket_create(int port) {
     /* Allow address reuse */
     int opt = 1;
     setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    /* Enable dual-stack: receive IPv4-mapped IPv6 addresses */
+    int off = 0;
+    setsockopt(sock->fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
 
     /* Enable port sharing with load balancing (for shared DHT port) */
 #if defined(__FreeBSD__)
@@ -100,11 +104,11 @@ tree_socket_t *tree_socket_create(int port) {
     }
 
     /* Bind to address */
-    struct sockaddr_in addr;
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((uint16_t)port);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons((uint16_t)port);
 
     if (bind(sock->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         log_msg(LOG_ERROR, "[tree_socket] Failed to bind fd=%d to port %d: %s", sock->fd, port, strerror(errno));
@@ -168,12 +172,6 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
         return -1;
     }
 
-    /* IPv4 socket can't send to IPv6 addresses */
-    if (dest->ss_family == AF_INET6) {
-        log_msg(LOG_ERROR, "[tree_socket] Cannot send IPv6 through IPv4 socket");
-        pthread_mutex_unlock(&sock->send_lock);
-        return -1;
-    }
 
     /* DEBUG: Log destination before sending */
     char ip_str[INET6_ADDRSTRLEN] = {0};
@@ -182,6 +180,10 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
         const struct sockaddr_in *sin = (const struct sockaddr_in *)dest;
         inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
         port = ntohs(sin->sin_port);
+    } else if (dest->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)dest;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ip_str, sizeof(ip_str));
+        port = ntohs(sin6->sin6_port);
     }
 
     static atomic_ulong send_count = 0;
