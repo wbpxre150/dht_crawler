@@ -13,16 +13,17 @@
 
 /* Binary file format constants */
 #define BEP51_CACHE_MAGIC "BEP1"
-#define BEP51_CACHE_VERSION 1
+#define BEP51_CACHE_VERSION 2
 #define BEP51_CACHE_HEADER_SIZE 12
-#define BEP51_CACHE_RECORD_SIZE 26
+#define BEP51_CACHE_RECORD_SIZE 39
 #define BEP51_CACHE_CHECKSUM_SIZE 32
 #define BEP51_CACHE_FAMILY_IPV4 0x04
 #define BEP51_CACHE_FAMILY_IPV6 0x06
 
-/* File record format (26 bytes):
+/* File record format (39 bytes, version 2):
  * 20 bytes: node_id
- *  4 bytes: IPv4 address (network byte order)
+ *  1 byte:  address family (0x04=IPv4, 0x06=IPv6)
+ * 16 bytes: IP address (zero-padded to 16 bytes for IPv4)
  *  2 bytes: port (network byte order)
  */
 
@@ -318,27 +319,33 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path) {
         uint8_t *rec = records + (i * BEP51_CACHE_RECORD_SIZE);
 
         uint8_t *node_id = rec;
-        uint32_t ip;
+        uint8_t family = rec[20];
         uint16_t port;
-
-        memcpy(&ip, rec + 20, 4);
-        memcpy(&port, rec + 24, 2);
-
-        ip = ntohl(ip);
+        memcpy(&port, rec + 37, 2);
         port = ntohs(port);
 
-        /* Sanity check */
-        if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
+        if (port == 0) {
             continue;
         }
 
-        /* Convert to sockaddr_storage */
         struct sockaddr_storage addr;
         memset(&addr, 0, sizeof(addr));
-        struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
-        sin->sin_family = AF_INET;
-        sin->sin_addr.s_addr = htonl(ip);
-        sin->sin_port = htons(port);
+
+        if (family == BEP51_CACHE_FAMILY_IPV4) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
+            sin->sin_family = AF_INET;
+            uint32_t ip;
+            memcpy(&ip, rec + 21 + 12, 4);
+            sin->sin_addr.s_addr = ip;  /* already network byte order */
+            sin->sin_port = htons(port);
+        } else if (family == BEP51_CACHE_FAMILY_IPV6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
+            sin6->sin6_family = AF_INET6;
+            memcpy(&sin6->sin6_addr, rec + 21, 16);
+            sin6->sin6_port = htons(port);
+        } else {
+            continue;
+        }
 
         /* Add to cache (bypasses mutex, we're in single-threaded init) */
         if (bep51_cache_add_node(cache, node_id, &addr) == 0) {
@@ -348,6 +355,37 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path) {
 
     free(records);
     log_msg(LOG_DEBUG, "[bep51_cache] Loaded %d/%u nodes from cache", loaded, node_count);
+    return 0;
+}
+
+static int write_record(FILE *fp, const bep51_cache_node_t *node) {
+    uint8_t rec[BEP51_CACHE_RECORD_SIZE];
+    memset(rec, 0, BEP51_CACHE_RECORD_SIZE);
+
+    /* Copy node_id */
+    memcpy(rec, node->node_id, 20);
+
+    uint16_t port;
+    if (node->addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&node->addr;
+        rec[20] = BEP51_CACHE_FAMILY_IPV4;
+        /* IPv4 address goes in the last 4 bytes of the 16-byte field */
+        memcpy(rec + 21 + 12, &sin->sin_addr.s_addr, 4);
+        port = sin->sin_port;
+    } else if (node->addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&node->addr;
+        rec[20] = BEP51_CACHE_FAMILY_IPV6;
+        memcpy(rec + 21, &sin6->sin6_addr, 16);
+        port = sin6->sin6_port;
+    } else {
+        return -1;
+    }
+
+    memcpy(rec + 37, &port, 2);
+
+    if (fwrite(rec, 1, BEP51_CACHE_RECORD_SIZE, fp) != BEP51_CACHE_RECORD_SIZE) {
+        return -1;
+    }
     return 0;
 }
 
@@ -401,29 +439,9 @@ int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path) {
             continue;
         }
 
-        /* Write 20-byte node_id */
-        if (fwrite(node->node_id, 1, 20, fp) != 20) {
+        /* Write record using helper */
+        if (write_record(fp, node) != 0) {
             log_msg(LOG_ERROR, "[bep51_cache] Failed to write node record");
-            fclose(fp);
-            pthread_mutex_unlock(&cache->lock);
-            unlink(temp_path);
-            return -1;
-        }
-
-        /* Write IPv4 address */
-        struct sockaddr_in *sin = (struct sockaddr_in *)&node->addr;
-        uint32_t ip = htonl(sin->sin_addr.s_addr);
-        uint16_t port = htons(sin->sin_port);
-
-        if (fwrite(&ip, 1, 4, fp) != 4) {
-            log_msg(LOG_ERROR, "[bep51_cache] Failed to write IP");
-            fclose(fp);
-            pthread_mutex_unlock(&cache->lock);
-            unlink(temp_path);
-            return -1;
-        }
-        if (fwrite(&port, 1, 2, fp) != 2) {
-            log_msg(LOG_ERROR, "[bep51_cache] Failed to write port");
             fclose(fp);
             pthread_mutex_unlock(&cache->lock);
             unlink(temp_path);
