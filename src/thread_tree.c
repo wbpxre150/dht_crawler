@@ -974,6 +974,11 @@ static void *bootstrap_thread_func(void *arg) {
         }
     }
 
+    /* Bootstrap success threshold: 100 nodes is the minimum for a
+     * useful routing table. The TARGET (i.e. how many nodes we aim to
+     * gather) is tree->find_node_target_nodes, sourced from the
+     * supervisor's bep51_cache_capacity. Replaces the historical
+     * hardcode of 1500 that lived in dht_manager.c. */
     if (got < 100) {
         log_msg(LOG_ERROR, "[tree %u] Insufficient nodes for bootstrap: got %d, need at least 100 (pool: %zu, cache: %zu)",
                 tree->tree_id, got,
@@ -1055,9 +1060,10 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
         log_msg(LOG_DEBUG, "[tree %u] Using random node ID", tree_id);
     }
 
-    /* Stage 2 config */
-    tree->bootstrap_timeout_sec = config->bootstrap_timeout_sec > 0 ? config->bootstrap_timeout_sec : 30;
-    tree->routing_threshold = config->routing_threshold > 0 ? config->routing_threshold : 500;
+    /* Routing target sourced from bep51_cache_capacity (passed via supervisor) */
+    tree->find_node_target_nodes = config->find_node_target_nodes > 0
+                                    ? config->find_node_target_nodes
+                                    : 10000;
 
     /* Stage 3 config */
     tree->infohash_queue_capacity = config->infohash_queue_capacity > 0 ? config->infohash_queue_capacity : 5000;
@@ -1076,7 +1082,6 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
-    tree->num_bootstrap_workers = config->num_bootstrap_workers > 0 ? config->num_bootstrap_workers : 10;
     tree->num_find_node_workers = config->num_find_node_workers > 0 ? config->num_find_node_workers : 30;
     tree->num_bep51_workers = config->num_bep51_workers;
     tree->num_get_peers_workers = config->num_get_peers_workers;
@@ -1148,15 +1153,6 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     /* Initialize lifecycle tracking */
     tree->creation_time = time(NULL);
 
-    /* Allocate thread handle arrays */
-    if (tree->num_bootstrap_workers > 0) {
-        tree->bootstrap_workers = calloc(tree->num_bootstrap_workers, sizeof(pthread_t));
-        if (!tree->bootstrap_workers) {
-            log_msg(LOG_ERROR, "[tree %u] Failed to allocate bootstrap workers", tree_id);
-            thread_tree_destroy(tree);
-            return NULL;
-        }
-    }
 
     if (tree->num_find_node_workers > 0) {
         tree->find_node_workers = calloc(tree->num_find_node_workers, sizeof(pthread_t));
@@ -1271,17 +1267,6 @@ void thread_tree_destroy(thread_tree_t *tree) {
     }
     log_msg(LOG_DEBUG, "[tree %u] Bootstrap thread joined", tree->tree_id);
 
-    /* Join bootstrap workers */
-    log_msg(LOG_DEBUG, "[tree %u] Joining %d bootstrap workers...", tree->tree_id, tree->num_bootstrap_workers);
-    if (tree->bootstrap_workers) {
-        for (int i = 0; i < tree->num_bootstrap_workers; i++) {
-            if (tree->bootstrap_workers[i]) {
-                pthread_join(tree->bootstrap_workers[i], NULL);
-            }
-        }
-        free(tree->bootstrap_workers);
-    }
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap workers joined", tree->tree_id);
 
     /* Join find_node workers */
     log_msg(LOG_DEBUG, "[tree %u] Joining %d find_node workers...", tree->tree_id, tree->num_find_node_workers);

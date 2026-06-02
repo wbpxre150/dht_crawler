@@ -60,15 +60,12 @@ typedef struct tree_config {
     struct tree_socket *shared_socket;
     struct tree_dispatcher *shared_dispatcher;
 
-    int num_bootstrap_workers;      /* Stage 2: Find_node workers for bootstrap (default: 10) */
     int num_find_node_workers;      /* Continuous find_node workers (default: 30) */
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
 
-    /* Stage 2: Bootstrap settings */
-    int bootstrap_timeout_sec;      /* Bootstrap phase timeout */
-    int routing_threshold;          /* Nodes required before BEP51 phase */
+    int find_node_target_nodes;       /* Routing target — sourced from supervisor's bep51_cache_capacity */
 
     /* Stage 3: BEP51 settings */
     int infohash_queue_capacity;    /* Infohash queue size (default: 5000) */
@@ -133,9 +130,6 @@ typedef struct thread_tree {
     struct bloom_filter *shared_bloom;     /* Stage 3: Shared bloom filter (thread-safe) */
     struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
 
-    /* Stage 2 config */
-    int bootstrap_timeout_sec;
-    int routing_threshold;
 
     /* Stage 3 config */
     int infohash_queue_capacity;
@@ -175,7 +169,6 @@ typedef struct thread_tree {
 
     /* Thread handles */
     pthread_t bootstrap_thread;
-    pthread_t *bootstrap_workers;   /* Stage 2: Find_node workers for bootstrap */
     pthread_t *find_node_workers;   /* Continuous find_node workers */
     pthread_t *bep51_threads;
     pthread_t *get_peers_threads;
@@ -184,8 +177,8 @@ typedef struct thread_tree {
     pthread_t throttle_monitor_thread;  /* Monitors queue size for throttling */
 
     /* Thread counts */
-    int num_bootstrap_workers;      /* Stage 2: Number of bootstrap find_node workers */
     int num_find_node_workers;      /* Continuous find_node workers */
+    int find_node_target_nodes;
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
