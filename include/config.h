@@ -78,10 +78,9 @@ typedef struct {
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */
 
     /* Thread tree Stage 2 settings (Global Bootstrap - NEW) */
-    int global_bootstrap_target;         /* Target nodes for shared pool (default: 5000) */
-    int global_bootstrap_timeout_sec;    /* Global bootstrap timeout (default: 60) */
-    int global_bootstrap_workers;        /* Bootstrap worker threads (default: 50) */
-    int per_tree_sample_size;            /* Nodes each tree samples from pool (default: 1000) */
+    /* Thread tree Stage 2 settings (Global Bootstrap - REMOVED in Stage 5) */
+    /* Thread tree bootstrap settings */
+    int tree_bootstrap_timeout_sec;    /* Tree-native bootstrap timeout (default: 30) */
 
     /* Thread tree Stage 2 settings (find_node/bootstrap) */
     int tree_find_node_workers;          /* find_node workers per tree for bootstrap (default: 10) */

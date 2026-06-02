@@ -2,9 +2,9 @@
 #define THREAD_TREE_H
 
 #include <stdint.h>
-#include <stdatomic.h>
-#include <pthread.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 
 /* Forward declarations */
@@ -17,31 +17,30 @@ struct tree_dispatcher;
 
 /**
  * Thread Tree: Isolated DHT crawler unit with private state
- *
- * Each thread tree has its own:
- * - Node ID (for DHT identity)
+ * Each tree operates independently with its own:
+ * - Node ID (keyspace partitioned or random)
  * - Routing table
- * - Infohash queue
- * - Peers queue
- * - Worker threads
+ * - UDP socket/dispatcher (or shared with supervisor)
+ * - Infohash queue, peers queue
  *
- * Only shared resources are batch_writer and bloom_filter from supervisor.
+ * Trees are managed by a supervisor that monitors performance
+ * and respawns underperforming trees.
  */
 
 /* Phase of the thread tree lifecycle */
 typedef enum {
-    TREE_PHASE_BOOTSTRAP,       /* Initial bootstrap phase */
-    TREE_PHASE_BEP51,           /* sample_infohashes discovery */
-    TREE_PHASE_GET_PEERS,       /* get_peers for peer discovery */
-    TREE_PHASE_METADATA,        /* Metadata fetching */
+    TREE_PHASE_BOOTSTRAP,       /* Gathering initial nodes */
+    TREE_PHASE_BEP51,           /* Active BEP51 discovery */
+    TREE_PHASE_GET_PEERS,       /* Active get_peers discovery */
+    TREE_PHASE_METADATA,        /* Active metadata fetching */
     TREE_PHASE_SHUTTING_DOWN    /* Graceful shutdown in progress */
 } tree_phase_t;
 
 /* Reason for shutdown */
 typedef enum {
-    SHUTDOWN_REASON_NONE,           /* Not shutting down */
-    SHUTDOWN_REASON_RATE_BASED,     /* Low metadata rate (voluntary) */
-    SHUTDOWN_REASON_SUPERVISOR      /* Supervisor requested (forced) */
+    SHUTDOWN_REASON_NONE,
+    SHUTDOWN_REASON_RATE_BASED,
+    SHUTDOWN_REASON_SUPERVISOR
 } shutdown_reason_t;
 
 /* Forward declarations for shared resources */
@@ -55,6 +54,7 @@ typedef struct tree_config {
     uint32_t num_partitions;        /* Total partitions in the system */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (vs random node ID) */
     int dht_port;                   /* DHT UDP port (0 = ephemeral) */
+    int tree_bootstrap_timeout_sec; /* Tree-native bootstrap deadline (default: 30) */
 
     /* Shared socket/dispatcher from supervisor (NULL = create private) */
     struct tree_socket *shared_socket;
@@ -126,6 +126,9 @@ typedef struct thread_tree {
     bool owns_socket;              /* true = destroy socket on cleanup */
     bool owns_dispatcher;          /* true = destroy dispatcher on cleanup */
 
+    /* Per-tree bootstrap response queue */
+    struct tree_response_queue *bootstrap_response_queue;
+
     /* Shared resources (from supervisor) */
     struct bloom_filter *shared_bloom;     /* Stage 3: Shared bloom filter (thread-safe) */
     struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
@@ -146,6 +149,9 @@ typedef struct thread_tree {
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;
+
+    /* Tree-native bootstrap timeout */
+    int tree_bootstrap_timeout_sec;
 
     /* Phase management */
     atomic_int current_phase;  /* Use atomic_int to store tree_phase_t enum values */
@@ -213,7 +219,7 @@ typedef struct thread_tree {
     /* Supervisor callback */
     void (*on_shutdown)(struct thread_tree *tree);
     void *supervisor_ctx;
-    struct supervisor *supervisor;  /* NEW: Backlink to supervisor for accessing shared_node_pool */
+    struct supervisor *supervisor;  /* Backlink to supervisor for accessing shared bep51_cache */
 } thread_tree_t;
 
 /**

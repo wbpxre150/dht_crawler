@@ -8,7 +8,6 @@
 #include "refresh_protocol.h"
 #include "refresh_dispatcher.h"
 #include "tree_response_queue.h"
-#include "shared_node_pool.h"
 #include "refresh_query.h"
 #include "dht_crawler.h"
 #include <stdlib.h>
@@ -76,24 +75,21 @@ static void *get_peers_worker_func(void *arg);
 /* ========================================================================== */
 
 refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
-                                       shared_node_pool_t *shared_pool,
-                                       refresh_query_store_t *query_store) {
-    if (!config || !shared_pool || !query_store) {
+                                       refresh_query_store_t *query_store,
+                                       bep51_cache_t *bep51_cache) {
+    if (!config || !query_store) {
         log_msg(LOG_ERROR, "refresh_thread_create: invalid arguments");
         return NULL;
     }
-
     refresh_thread_t *thread = malloc(sizeof(refresh_thread_t));
     if (!thread) {
         log_msg(LOG_ERROR, "refresh_thread_create: malloc failed");
         return NULL;
     }
-
     memset(thread, 0, sizeof(refresh_thread_t));
     thread->config = *config;
-    thread->shared_node_pool = shared_pool;
     thread->refresh_query_store = query_store;
-
+    thread->bep51_cache = bep51_cache;
     /* Generate random node ID */
     generate_random_node_id(thread->node_id);
 
@@ -316,92 +312,115 @@ int refresh_thread_submit_request(refresh_thread_t *thread,
 /*                          BOOTSTRAP THREAD                                  */
 /* ========================================================================== */
 
+/* Built-in DHT bootstrap routers for refresh thread */
+static const char *REFRESH_BOOTSTRAP_HOSTS[] = {
+    "router.bittorrent.com", "dht.transmissionbt.com", "dht.libtorrent.org",
+    "dht.aelitis.com", "router.bitcomet.com", "dht.anacrolix.link", NULL
+};
+static const int REFRESH_BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069 };
+/* Helper: resolve hostname to sockaddr_storage for refresh thread */
+static int refresh_resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    int ret = getaddrinfo(hostname, port_str, &hints, &res);
+    if (ret != 0) { return -1; }
+    memcpy(addr, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    return 0;
+}
 static void *bootstrap_thread_func(void *arg) {
     refresh_thread_t *thread = (refresh_thread_t *)arg;
-    tree_node_t sampled_nodes[1000];
-    int sample_size = thread->config.bootstrap_sample_size;
-
+    tree_routing_table_t *rt = thread->routing_table;
+    tree_socket_t *sock = thread->socket;
+    refresh_dispatcher_t *dispatcher = thread->dispatcher;
     log_msg(LOG_INFO, "Refresh thread bootstrap starting");
-
-    /* Wait for shared node pool to have sufficient nodes */
-    while (!atomic_load(&thread->shutdown_requested)) {
-        int pool_size = (int)shared_node_pool_get_count(thread->shared_node_pool);
-        if (pool_size >= sample_size) {
-            break;
+    time_t deadline = time(NULL) + 30;
+    int have_minimum = 0;
+    /* Phase A: URL bootstrap via find_node queries to known DHT routers */
+    for (int i = 0; REFRESH_BOOTSTRAP_HOSTS[i] != NULL; i++) {
+        struct sockaddr_storage addr;
+        if (refresh_resolve_hostname(REFRESH_BOOTSTRAP_HOSTS[i],
+                                     REFRESH_BOOTSTRAP_PORTS[i], &addr) != 0) {
+            log_msg(LOG_WARN, "Refresh bootstrap: DNS failed for %s", REFRESH_BOOTSTRAP_HOSTS[i]);
+            continue;
         }
-        log_msg(LOG_DEBUG, "Refresh thread waiting for shared pool (%d/%d nodes)",
-                pool_size, sample_size);
-        sleep(1);
+        uint8_t target[20];
+        for (int j = 0; j < 20; j++) target[j] = (uint8_t)(rand() % 256);
+        uint8_t tid[4];
+        int tid_len = tree_protocol_gen_tid(tid);
+        tree_response_queue_t *q = tree_response_queue_create(4);
+        refresh_dispatcher_register_tid(dispatcher, tid, tid_len, q);
+        refresh_send_find_node(thread->node_id, sock, tid, tid_len, target, &addr);
+        tree_response_t response_pkt;
+        if (tree_response_queue_pop(q, &response_pkt, 1000) == 0) {
+            refresh_find_node_response_t resp;
+            if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
+                                                 &response_pkt.from, &resp) == 0) {
+                for (int j = 0; j < resp.node_count; j++) {
+                    tree_routing_add_node(rt, resp.nodes[j], &resp.addrs[j]);
+                }
+                log_msg(LOG_DEBUG, "Refresh bootstrap: %d nodes from %s", resp.node_count, REFRESH_BOOTSTRAP_HOSTS[i]);
+            }
+        }
+        tree_response_queue_destroy(q);
+        refresh_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+        int cur = tree_routing_get_count(rt);
+        if (cur >= 100) { have_minimum = 1; break; }
+        if (time(NULL) >= deadline) break;
     }
-
-    if (atomic_load(&thread->shutdown_requested)) {
-        log_msg(LOG_INFO, "Refresh thread bootstrap aborted (shutdown requested)");
-        return NULL;
+    /* Phase B: BEP51 cache fallback */
+    if (!have_minimum && thread->bep51_cache) {
+        bep51_cache_t *cache = thread->bep51_cache;
+        size_t cc = bep51_cache_get_count(cache);
+        if (cc >= 100) {
+            tree_node_t *warm = malloc(cc * sizeof(tree_node_t));
+            if (warm) {
+                int got = bep51_cache_get_random(cache, warm, (int)cc);
+                for (int i = 0; i < got; i++) {
+                    tree_routing_add_node(rt, warm[i].node_id, &warm[i].addr);
+                }
+                free(warm);
+                if (tree_routing_get_count(rt) >= 100) have_minimum = 1;
+            }
+        }
     }
-
-    /* Sample nodes from shared pool */
-    int got = shared_node_pool_get_random(thread->shared_node_pool, sampled_nodes, sample_size);
-    if (got < 100) {
-        log_msg(LOG_ERROR, "Refresh thread bootstrap failed: insufficient nodes (%d/%d)",
-                got, sample_size);
-        return NULL;
+    if (!have_minimum) {
+        log_msg(LOG_WARN, "Refresh bootstrap incomplete: %d nodes (expected >= 100)",
+                tree_routing_get_count(rt));
+    } else {
+        log_msg(LOG_INFO, "Refresh bootstrap: %d nodes in routing table", tree_routing_get_count(rt));
     }
-
-    log_msg(LOG_INFO, "Refresh thread bootstrap: sampled %d nodes from shared pool", got);
-
-    /* Add nodes to routing table */
-    for (int i = 0; i < got; i++) {
-        tree_routing_add_node(thread->routing_table, sampled_nodes[i].node_id, &sampled_nodes[i].addr);
-    }
-
-    /* Set bucket capacity to normal mode (8) */
     tree_routing_set_bucket_capacity(thread->routing_table, 8);
-
-    log_msg(LOG_INFO, "Refresh thread routing table populated with %d nodes", got);
-
     /* Start find_node workers */
     for (int i = 0; i < thread->config.find_node_worker_count; i++) {
         find_node_worker_ctx_t *ctx = malloc(sizeof(find_node_worker_ctx_t));
-        if (!ctx) {
-            log_msg(LOG_ERROR, "Failed to allocate find_node worker context");
-            continue;
-        }
+        if (!ctx) { log_msg(LOG_ERROR, "Failed to allocate find_node worker context"); continue; }
         ctx->thread = thread;
         ctx->worker_id = i;
         ctx->response_queue = tree_response_queue_create(10);
-        if (!ctx->response_queue) {
-            log_msg(LOG_ERROR, "Failed to create response queue for find_node worker %d", i);
-            free(ctx);
-            continue;
-        }
-
+        if (!ctx->response_queue) { log_msg(LOG_ERROR, "Failed to create response queue"); free(ctx); continue; }
         if (pthread_create(&thread->find_node_workers[i], NULL, find_node_worker_func, ctx) != 0) {
             log_msg(LOG_ERROR, "Failed to create find_node worker %d", i);
             tree_response_queue_destroy(ctx->response_queue);
             free(ctx);
         }
     }
-
     /* Start ping workers */
     for (int i = 0; i < thread->config.ping_worker_count; i++) {
         ping_worker_ctx_t *ctx = malloc(sizeof(ping_worker_ctx_t));
-        if (!ctx) {
-            log_msg(LOG_ERROR, "Failed to allocate ping worker context");
-            continue;
-        }
+        if (!ctx) continue;
         ctx->thread = thread;
         ctx->worker_id = i;
-
-        if (pthread_create(&thread->ping_workers[i], NULL, ping_worker_func, ctx) != 0) {
-            log_msg(LOG_ERROR, "Failed to create ping worker %d", i);
-            free(ctx);
-        }
+        if (pthread_create(&thread->ping_workers[i], NULL, ping_worker_func, ctx) != 0) free(ctx);
     }
-
-    /* Mark as initialized */
+    /* Mark as initialized even if bootstrap was partial — get_peers workers
+     * handle uninitialized routing table gracefully. */
     atomic_store(&thread->initialized, true);
     log_msg(LOG_INFO, "Refresh thread bootstrap complete, ready to process requests");
-
     return NULL;
 }
 

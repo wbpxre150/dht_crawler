@@ -6,9 +6,9 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "refresh_query.h"
+#include "bep51_cache.h"
 
 /* Forward declarations */
-typedef struct shared_node_pool shared_node_pool_t;
 typedef struct tree_routing_table tree_routing_table_t;
 typedef struct tree_socket tree_socket_t;
 typedef struct refresh_dispatcher refresh_dispatcher_t;
@@ -40,7 +40,7 @@ typedef struct refresh_thread {
     refresh_request_queue_t *request_queue;
 
     /* External references (not owned) */
-    shared_node_pool_t *shared_node_pool;
+    bep51_cache_t *bep51_cache;
     refresh_query_store_t *refresh_query_store;
 
     /* Worker threads */
@@ -58,13 +58,13 @@ typedef struct refresh_thread {
 /**
  * Create a new refresh thread
  * @param config Configuration
- * @param shared_pool Shared node pool for bootstrap
  * @param query_store Refresh query store for HTTP coordination
+ * @param bep51_cache BEP51 cache for bootstrap fallback
  * @return New refresh thread, or NULL on error
  */
 refresh_thread_t *refresh_thread_create(const refresh_thread_config_t *config,
-                                       shared_node_pool_t *shared_pool,
-                                       refresh_query_store_t *query_store);
+                                       refresh_query_store_t *query_store,
+                                       bep51_cache_t *bep51_cache);
 
 /**
  * Start the refresh thread (spawns workers)

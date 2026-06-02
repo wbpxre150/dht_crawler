@@ -2,38 +2,44 @@
 #define SUPERVISOR_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <pthread.h>
-#include <time.h>
+#include <stdatomic.h>
 #include "thread_tree.h"
 
 /* Forward declarations */
 struct batch_writer;
 struct bloom_filter;
-struct shared_node_pool;
 struct tree_socket;
 struct tree_dispatcher;
 
 /* Per-partition performance tracking for adaptive keyspace */
 typedef struct partition_stats {
-    int consecutive_zero_respawns;     /* Consecutive respawns with zero metadata */
-    int current_tree_count;            /* Active trees currently in this partition */
+    int current_tree_count;           /* Active trees in this partition */
+    int dead_consecutive;             /* Consecutive zero-rate respawns */
+    int total_respawns;               /* Total respawns for this partition */
+    double metadata_rate;             /* Metadata rate (metadata/sec) */
 } partition_stats_t;
 
 /* Draining tree tracking */
 typedef struct draining_tree {
-    thread_tree_t *tree;           /* Pointer to draining tree */
-    time_t drain_start_time;       /* When tree entered draining state */
-    int original_slot;             /* Original slot index in active trees array */
+    thread_tree_t *tree;              /* Tree being drained */
+    int slot_index;                   /* Original slot */
+    int original_slot;                /* Original slot before migration */
+    uint32_t partition_index;         /* Partition this tree belongs to */
+    time_t drain_start;               /* When drain started */
+    bool migrated;                    /* True if migrated from home */
 } draining_tree_t;
 
 /**
  * Supervisor: Manages multiple thread trees for DHT crawling
  *
- * The supervisor:
- * - Maintains an array of thread trees
- * - Monitors tree performance (metadata rate)
- * - Replaces underperforming trees
- * - Provides shared resources (batch_writer, bloom_filter) to all trees
+ * Responsibilities:
+ * - Maintain a pool of thread trees across max_trees slots
+ * - Monitor tree performance (metadata rate) and trigger respawns
+ * - Handle tree crashes and respawn with perturbed node IDs
+ * - Keyspace partitioning for even coverage
+ * - Draining trees during respawn to avoid connection drops
  */
 
 /* Configuration for supervisor */
@@ -42,17 +48,17 @@ typedef struct supervisor_config {
     bool use_keyspace_partitioning; /* Enable keyspace partitioning (default: true) */
     int dht_port;                   /* DHT UDP port (0 = ephemeral, otherwise shared with SO_REUSEPORT) */
 
+    /* Shared resources */
+    struct batch_writer *batch_writer;
+    struct bloom_filter *bloom_filter;
     /* Worker counts per tree */
     int num_find_node_workers;
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
-
-    /* Stage 2 settings (Global Bootstrap - NEW) */
-    int global_bootstrap_target;         /* Target nodes for shared pool (default: 5000) */
-    int global_bootstrap_timeout_sec;    /* Global bootstrap timeout (default: 60) */
-    int global_bootstrap_workers;        /* Bootstrap worker threads (default: 50) */
-    int per_tree_sample_size;            /* Nodes each tree samples from pool (default: 1000) */
+    /* Bloom filter configuration */
+    uint64_t failure_bloom_capacity;
+    double bloom_error_rate;
 
     /* BEP51 cache settings */
     char bep51_cache_path[512];          /* Cache file path */
@@ -77,45 +83,44 @@ typedef struct supervisor_config {
     int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
 
     /* Stage 5 settings */
-    int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
+    int tcp_connect_timeout_ms;
+    int parallel_peers;
 
     /* Metadata rate-based respawn settings */
-    double min_metadata_rate;          /* Floor for dynamic threshold (default: 0.01) */
-    double dynamic_rate_margin;        /* Margin subtracted from per-tree average (default: 0.02) */
-    int rate_check_interval_sec;       /* Rate check interval (default: 60) */
-    int rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
-    int min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
-    int require_empty_queue;           /* Only respawn if queue empty (default: 1) */
-    double rate_ema_alpha;             /* EMA smoothing alpha for metadata rate (default: 0.3) */
-
-    /* Respawn overlapping configuration */
-    int respawn_spawn_threshold;       /* Spawn replacement when connections drop below this */
-    int respawn_drain_timeout_sec;     /* Force destroy draining tree after this timeout */
-    int max_draining_trees;            /* Maximum trees allowed in draining state */
+    double min_metadata_rate;          /* Floor for dynamic threshold */
+    double dynamic_rate_margin;        /* Margin subtracted from per-tree average */
+    int rate_check_interval_sec;
+    int rate_grace_period_sec;
+    int min_lifetime_minutes;
+    bool require_empty_queue;
+    double rate_ema_alpha;             /* EMA smoothing alpha (0.0-1.0) */
 
     /* Porn filter settings */
-    int porn_filter_enabled;           /* Enable porn filter (0=disabled, 1=enabled) */
+    bool porn_filter_enabled;
 
-    /* Adaptive keyspace partitioning settings */
-    int dead_partition_threshold;       /* Consecutive zero-metadata respawns before migration (default: 3) */
-    int max_trees_per_partition;        /* Max trees allowed in one partition (default: 4) */
+    /* Tree bootstrap settings */
+    int tree_bootstrap_timeout_sec;    /* Tree-native bootstrap deadline (default: 30) */
 
-    /* Shared resources */
-    struct batch_writer *batch_writer;
-    struct bloom_filter *bloom_filter;
+    /* Keyspace partitioning */
+    int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration */
+    int max_trees_per_partition;         /* Max trees per partition */
 
-    /* Bloom filter settings for failure tracking */
-    uint64_t failure_bloom_capacity;     /* Capacity for failure bloom filter */
-    double bloom_error_rate;             /* Error rate for bloom filters */
+    /* Respawn overlapping configuration */
+    int respawn_spawn_threshold;         /* Spawn replacement when connections below threshold */
+    int respawn_drain_timeout_sec;       /* Force destroy after drain timeout */
+    int max_draining_trees;              /* Maximum draining trees */
 } supervisor_config_t;
 
 /* Supervisor structure */
 typedef struct supervisor {
-    thread_tree_t **trees;          /* Array of tree pointers */
-    int max_trees;
-    int active_trees;
-    pthread_mutex_t trees_lock;
+    int max_trees;                  /* Maximum concurrent trees */
+    int active_trees;               /* Currently active trees */
+    uint32_t next_tree_id;          /* Monotonic counter for tree IDs */
+    atomic_int monitor_running;     /* Flag for monitor thread loop */
+
+    /* Tree array (indexed by slot) */
+    thread_tree_t **trees;          /* Array of thread_tree pointers */
+    pthread_mutex_t trees_lock;     /* Protects trees array access */
 
     /* Keyspace partitioning */
     bool use_keyspace_partitioning; /* Enable keyspace partitioning */
@@ -126,7 +131,6 @@ typedef struct supervisor {
     struct bloom_filter *bloom_filter;
     struct bloom_filter *failure_bloom;        /* NEW: Failure bloom filter for two-strike filtering */
     const char *failure_bloom_path;            /* NEW: Persistence path for failure bloom */
-    struct shared_node_pool *shared_node_pool;  /* Shared bootstrap node pool */
     struct bep51_cache *bep51_cache;            /* BEP51 node cache for persistent bootstrap */
 
     /* Shared socket and dispatcher for all trees (when using fixed port) */
@@ -142,12 +146,6 @@ typedef struct supervisor {
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
-
-    /* Stage 2 settings (Global Bootstrap - NEW) */
-    int global_bootstrap_target;
-    int global_bootstrap_timeout_sec;
-    int global_bootstrap_workers;
-    int per_tree_sample_size;
 
     /* BEP51 cache settings */
     char bep51_cache_path[512];
@@ -181,44 +179,44 @@ typedef struct supervisor {
     int rate_check_interval_sec;
     int rate_grace_period_sec;
     int min_lifetime_minutes;
-    int require_empty_queue;
-    double rate_ema_alpha;             /* EMA smoothing alpha for metadata rate */
-
-    /* Per-slot grace period tracking for dynamic rate respawn */
-    time_t *rate_below_since;          /* Array[max_trees]: when each tree first went below threshold (0=not below) */
+    bool require_empty_queue;
+    double rate_ema_alpha;
 
     /* Porn filter settings */
-    int porn_filter_enabled;           /* Enable porn filter */
+    bool porn_filter_enabled;
 
-    /* Tree ID counter */
-    uint32_t next_tree_id;
+    /* Tree bootstrap settings */
+    int tree_bootstrap_timeout_sec;
+
+    /* Keyspace partitioning */
+    partition_stats_t *partition_stats;  /* Per-partition stats */
+    uint32_t *home_partitions;           /* Home partition for each slot */
+    int dead_partition_threshold;
+    int max_trees_per_partition;
+
+    /* Respawn overlapping configuration */
+    int respawn_spawn_threshold;
+    int respawn_drain_timeout_sec;
+    int max_draining_trees;
+
+    /* Draining trees */
+    draining_tree_t *draining_trees;
+    int draining_count;
+    pthread_mutex_t draining_lock;
+
+    /* Rate-based respawn tracking */
+    time_t *rate_below_since;    /* When rate dropped below threshold per slot */
+
+    /* Cumulative statistics (persisted across tree respawns) */
+    atomic_uint_fast64_t cumulative_metadata_count;
+    atomic_uint_fast64_t cumulative_first_strike_failures;
+    atomic_uint_fast64_t cumulative_second_strike_failures;
+    atomic_uint_fast64_t cumulative_filtered_count;
+    atomic_uint_fast64_t cumulative_metadata_attempts;
 
     /* Monitor thread */
     pthread_t monitor_thread;
-    atomic_int monitor_running;
 
-    /* Cumulative statistics (persist across tree respawns) */
-    atomic_uint_least64_t cumulative_metadata_count;
-    atomic_uint_least64_t cumulative_first_strike_failures;
-    atomic_uint_least64_t cumulative_second_strike_failures;
-    atomic_uint_least64_t cumulative_filtered_count;
-    atomic_uint_least64_t cumulative_metadata_attempts;
-
-    /* Draining trees management */
-    draining_tree_t *draining_trees;   /* Array of trees in draining state */
-    int draining_count;                 /* Current number of draining trees */
-    int max_draining_trees;             /* Maximum allowed draining trees (from config) */
-    pthread_mutex_t draining_lock;      /* Protects draining_trees array */
-
-    /* Respawn configuration */
-    int respawn_spawn_threshold;        /* Spawn replacement at this connection count */
-    int respawn_drain_timeout_sec;      /* Force destroy after this timeout */
-
-    /* Adaptive keyspace partitioning */
-    partition_stats_t *partition_stats;  /* Array of size max_trees (one per partition) */
-    uint32_t *home_partitions;           /* Array[max_trees]: home partition per slot */
-    int dead_partition_threshold;        /* Consecutive zero-metadata respawns before migration */
-    int max_trees_per_partition;         /* Max trees allowed in one partition */
 } supervisor_t;
 
 /**
@@ -255,10 +253,10 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree);
 /**
  * Get supervisor statistics
  * @param sup Supervisor instance
- * @param out_active_trees Output: number of active trees
- * @param out_total_metadata Output: total metadata fetched across all trees
- * @param out_first_strike Output: total first-strike failures (optional, can be NULL)
- * @param out_second_strike Output: total second-strike failures (optional, can be NULL)
+ * @param out_active_trees Pointer to store active tree count
+ * @param out_total_metadata Pointer to store cumulative metadata count
+ * @param out_first_strike Pointer to store cumulative first strike failures
+ * @param out_second_strike Pointer to store cumulative second strike failures
  */
 void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata,
                      uint64_t *out_first_strike, uint64_t *out_second_strike);
@@ -273,9 +271,9 @@ int supervisor_get_total_connections(supervisor_t *sup);
 /**
  * Get draining tree statistics (for debugging/monitoring)
  * @param sup Supervisor instance
- * @param count Output: current number of draining trees
- * @param max_count Output: maximum draining trees allowed
- * @param total_connections Output: total connections across draining trees
+ * @param out_count Number of currently draining trees
+ * @param out_max_count Maximum draining trees allowed
+ * @param out_total_connections Total connections across draining trees
  */
 void supervisor_get_draining_stats(supervisor_t *sup, int *count, int *max_count, int *total_connections);
 

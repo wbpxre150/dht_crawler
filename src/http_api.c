@@ -550,8 +550,8 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(part, "partition", i);
                 cJSON_AddNumberToObject(part, "avg_metadata_rate",
                     partition_rates ? partition_rates[i] : 0.0);
-                cJSON_AddNumberToObject(part, "consecutive_zero_respawns",
-                    api->supervisor->partition_stats[i].consecutive_zero_respawns);
+                cJSON_AddNumberToObject(part, "dead_consecutive",
+                    api->supervisor->partition_stats[i].dead_consecutive);
                 cJSON_AddNumberToObject(part, "current_tree_count",
                     api->supervisor->partition_stats[i].current_tree_count);
                 cJSON_AddItemToArray(partitions_array, part);

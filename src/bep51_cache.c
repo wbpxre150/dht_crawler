@@ -1,5 +1,6 @@
+#define _DEFAULT_SOURCE  /* For usleep */
+
 #include "bep51_cache.h"
-#include "shared_node_pool.h"
 #include "tree_routing.h"
 #include "dht_crawler.h"
 #include <stdlib.h>
@@ -299,75 +300,85 @@ int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path) {
     /* Build header */
     uint8_t header[BEP51_CACHE_HEADER_SIZE];
     memcpy(header, BEP51_CACHE_MAGIC, 4);
-
     uint32_t version = htonl(BEP51_CACHE_VERSION);
     memcpy(header + 4, &version, 4);
-
     uint32_t node_count = htonl((uint32_t)count);
     memcpy(header + 8, &node_count, 4);
 
-    /* Write header */
     if (fwrite(header, 1, BEP51_CACHE_HEADER_SIZE, fp) != BEP51_CACHE_HEADER_SIZE) {
         log_msg(LOG_ERROR, "[bep51_cache] Failed to write header");
         fclose(fp);
-        unlink(temp_path);
         pthread_mutex_unlock(&cache->lock);
+        unlink(temp_path);
         return -1;
     }
 
-    /* Initialize SHA-256 context */
-    SHA256_CTX sha_ctx;
-    SHA256_Init(&sha_ctx);
-    SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
-
-    /* Write records */
-    bep51_cache_node_t *node, *tmp;
+    /* Iterate FIFO and write records */
     int written = 0;
-
-    HASH_ITER(hh, cache->nodes_hash, node, tmp) {
-        /* Only support IPv4 */
-        if (node->addr.ss_family != AF_INET) {
+    for (size_t i = 0; i < cache->capacity; i++) {
+        bep51_cache_node_t *node = cache->nodes_fifo[i];
+        if (!node) {
             continue;
         }
 
-        struct sockaddr_in *sin = (struct sockaddr_in *)&node->addr;
-        uint32_t ip = htonl(ntohl(sin->sin_addr.s_addr));
-        uint16_t port = htons(ntohs(sin->sin_port));
-
-        /* Build record */
-        uint8_t record[BEP51_CACHE_RECORD_SIZE];
-        memcpy(record, node->node_id, 20);
-        memcpy(record + 20, &ip, 4);
-        memcpy(record + 24, &port, 2);
-
-        /* Write and update checksum */
-        if (fwrite(record, 1, BEP51_CACHE_RECORD_SIZE, fp) != BEP51_CACHE_RECORD_SIZE) {
-            log_msg(LOG_ERROR, "[bep51_cache] Failed to write record %d", written);
+        /* Write 20-byte node_id */
+        if (fwrite(node->node_id, 1, 20, fp) != 20) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to write node record");
             fclose(fp);
-            unlink(temp_path);
             pthread_mutex_unlock(&cache->lock);
+            unlink(temp_path);
             return -1;
         }
 
-        SHA256_Update(&sha_ctx, record, BEP51_CACHE_RECORD_SIZE);
+        /* Write IPv4 address */
+        struct sockaddr_in *sin = (struct sockaddr_in *)&node->addr;
+        uint32_t ip = htonl(sin->sin_addr.s_addr);
+        uint16_t port = htons(sin->sin_port);
+
+        if (fwrite(&ip, 1, 4, fp) != 4) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to write IP");
+            fclose(fp);
+            pthread_mutex_unlock(&cache->lock);
+            unlink(temp_path);
+            return -1;
+        }
+        if (fwrite(&port, 1, 2, fp) != 2) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to write port");
+            fclose(fp);
+            pthread_mutex_unlock(&cache->lock);
+            unlink(temp_path);
+            return -1;
+        }
+
         written++;
     }
 
-    pthread_mutex_unlock(&cache->lock);
-
-    /* Finalize checksum */
+    /* Compute SHA-256 checksum of header + records */
+    SHA256_CTX sha_ctx;
     uint8_t checksum[BEP51_CACHE_CHECKSUM_SIZE];
+    SHA256_Init(&sha_ctx);
+    SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
+    fseek(fp, BEP51_CACHE_HEADER_SIZE, SEEK_SET);
+    /* Read and hash records */
+    uint8_t *rec_buf = malloc(BEP51_CACHE_RECORD_SIZE);
+    if (rec_buf) {
+        while (fread(rec_buf, 1, BEP51_CACHE_RECORD_SIZE, fp) == BEP51_CACHE_RECORD_SIZE) {
+            SHA256_Update(&sha_ctx, rec_buf, BEP51_CACHE_RECORD_SIZE);
+        }
+        free(rec_buf);
+    }
     SHA256_Final(checksum, &sha_ctx);
 
-    /* Write checksum */
     if (fwrite(checksum, 1, BEP51_CACHE_CHECKSUM_SIZE, fp) != BEP51_CACHE_CHECKSUM_SIZE) {
         log_msg(LOG_ERROR, "[bep51_cache] Failed to write checksum");
         fclose(fp);
+        pthread_mutex_unlock(&cache->lock);
         unlink(temp_path);
         return -1;
     }
 
     fclose(fp);
+    pthread_mutex_unlock(&cache->lock);
 
     /* Atomic rename */
     if (rename(temp_path, path) != 0) {
@@ -379,36 +390,6 @@ int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path) {
 
     log_msg(LOG_DEBUG, "[bep51_cache] Saved %d nodes to %s", written, path);
     return 0;
-}
-
-int bep51_cache_populate_shared_pool(bep51_cache_t *cache,
-                                     struct shared_node_pool *pool,
-                                     int max_nodes) {
-    if (!cache || !pool) {
-        return 0;
-    }
-
-    pthread_mutex_lock(&cache->lock);
-
-    int transferred = 0;
-    bep51_cache_node_t *node, *tmp;
-
-    HASH_ITER(hh, cache->nodes_hash, node, tmp) {
-        if (transferred >= max_nodes) {
-            break;
-        }
-
-        /* Add to shared pool */
-        int rc = shared_node_pool_add_node(pool, node->node_id, &node->addr);
-        if (rc == 0) {
-            transferred++;
-        }
-    }
-
-    pthread_mutex_unlock(&cache->lock);
-
-    log_msg(LOG_DEBUG, "[bep51_cache] Transferred %d nodes to shared pool", transferred);
-    return transferred;
 }
 
 size_t bep51_cache_get_count(bep51_cache_t *cache) {

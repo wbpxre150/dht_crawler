@@ -1,3 +1,4 @@
+# Status: see PLAN.md and CODE_CLEANUP_*.md for the cleanup roadmap.
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

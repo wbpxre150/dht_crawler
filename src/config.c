@@ -64,17 +64,14 @@ void config_init_defaults(crawler_config_t *config) {
     config->porn_filter_enabled = 0;                /* Disabled by default */
     strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
 
+    /* Tree bootstrap timeout default */
+    config->tree_bootstrap_timeout_sec = 30;
+
     /* Language filter defaults */
     config->language_filter_non_latin_threshold = 33; /* Filter if >33% non-Latin characters */
 
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
-
-    /* Thread tree Stage 2 defaults (Global Bootstrap - NEW) */
-    config->global_bootstrap_target = 5000;         /* Target 5000 nodes in shared pool */
-    config->global_bootstrap_timeout_sec = 60;      /* 60 second global bootstrap timeout */
-    config->global_bootstrap_workers = 50;          /* 50 worker threads for bootstrap */
-    config->per_tree_sample_size = 1000;            /* Each tree samples 1000 nodes */
 
     /* Thread tree Stage 2 defaults (find_node/bootstrap) */
     config->tree_find_node_workers = 10;            /* 10 find_node workers per tree */
@@ -283,23 +280,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (config->num_trees < 1) config->num_trees = 1;
             if (config->num_trees > 64) config->num_trees = 64;
         }
-        /* Thread tree Stage 2 settings (Global Bootstrap - NEW) */
-        else if (strcmp(key, "global_bootstrap_target") == 0) {
-            config->global_bootstrap_target = atoi(value);
-            if (config->global_bootstrap_target < 1000) config->global_bootstrap_target = 1000;
-            if (config->global_bootstrap_target > 50000) config->global_bootstrap_target = 50000;
-        } else if (strcmp(key, "global_bootstrap_timeout_sec") == 0) {
-            config->global_bootstrap_timeout_sec = atoi(value);
-            if (config->global_bootstrap_timeout_sec < 10) config->global_bootstrap_timeout_sec = 10;
-            if (config->global_bootstrap_timeout_sec > 600) config->global_bootstrap_timeout_sec = 600;
-        } else if (strcmp(key, "global_bootstrap_workers") == 0) {
-            config->global_bootstrap_workers = atoi(value);
-            if (config->global_bootstrap_workers < 1) config->global_bootstrap_workers = 1;
-            if (config->global_bootstrap_workers > 200) config->global_bootstrap_workers = 200;
-        } else if (strcmp(key, "per_tree_sample_size") == 0) {
-            config->per_tree_sample_size = atoi(value);
-            if (config->per_tree_sample_size < 100) config->per_tree_sample_size = 100;
-            if (config->per_tree_sample_size > 10000) config->per_tree_sample_size = 10000;
+        /* Tree bootstrap settings */
+        else if (strcmp(key, "tree_bootstrap_timeout_sec") == 0) {
+            config->tree_bootstrap_timeout_sec = atoi(value);
+            if (config->tree_bootstrap_timeout_sec < 10) config->tree_bootstrap_timeout_sec = 10;
+            if (config->tree_bootstrap_timeout_sec > 600) config->tree_bootstrap_timeout_sec = 600;
         }
         /* Thread tree Stage 2 settings (find_node/bootstrap) */
         else if (strcmp(key, "tree_find_node_workers") == 0) {
@@ -476,13 +461,14 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
         {"log-level",   required_argument, 0, 'l'},
         {"config",      required_argument, 0, 'c'},
         {"help",        no_argument,       0, '?'},
+        {"tree-bootstrap-timeout", required_argument, 0, 'T'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:d:l:c?", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:l:c:T?", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 config->dht_port = atoi(optarg);
@@ -506,10 +492,14 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
             case 'c':
                 /* Config file is loaded separately */
                 break;
+            case 'T':
+                config->tree_bootstrap_timeout_sec = atoi(optarg);
+                break;
             case '?':
             default:
                 fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
                 fprintf(stderr, "Options:\n");
+                fprintf(stderr, "  -T, --tree-bootstrap-timeout SEC  Tree bootstrap timeout in seconds (default: 30)\n");
                 fprintf(stderr, "  -p, --port PORT          DHT port (default: 6881)\n");
                 fprintf(stderr, "  -d, --db-path PATH       Database path (default: data/torrents.db)\n");
                 fprintf(stderr, "  -l, --log-level LEVEL    Log level: DEBUG|INFO|WARN|ERROR (default: INFO)\n");
@@ -538,3 +528,4 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "Logging:");
     log_msg(LOG_DEBUG, "  Level: %s", log_levels[config->log_level]);
 }
+

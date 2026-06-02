@@ -650,8 +650,6 @@ int main(int argc, char *argv[]) {
         .max_trees = config.num_trees,
         .use_keyspace_partitioning = config.use_keyspace_partitioning,
         .dht_port = config.dht_port,
-        .batch_writer = g_batch_writer,
-        .bloom_filter = g_bloom,
         /* Bloom filter settings for failure tracking */
         .failure_bloom_capacity = config.failure_bloom_capacity,
         .bloom_error_rate = config.bloom_error_rate,
@@ -659,11 +657,8 @@ int main(int argc, char *argv[]) {
         .num_bep51_workers = config.tree_bep51_workers,
         .num_get_peers_workers = config.tree_get_peers_workers,
         .num_metadata_workers = config.tree_metadata_workers,
-        /* Stage 2 settings (Global Bootstrap - NEW) */
-        .global_bootstrap_target = config.global_bootstrap_target,
-        .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
-        .global_bootstrap_workers = config.global_bootstrap_workers,
-        .per_tree_sample_size = config.per_tree_sample_size,
+        /* Tree bootstrap settings */
+        .tree_bootstrap_timeout_sec = config.tree_bootstrap_timeout_sec,
         /* BEP51 cache settings */
         .bep51_cache_capacity = config.bep51_cache_capacity,
         .bep51_cache_submit_percent = config.bep51_cache_submit_percent,
@@ -744,8 +739,8 @@ int main(int argc, char *argv[]) {
     };
     
     g_refresh_thread = refresh_thread_create(&refresh_config,
-                                              g_supervisor->shared_node_pool,
-                                              g_refresh_query_store);
+                                              g_refresh_query_store,
+                                              g_supervisor->bep51_cache);
     if (!g_refresh_thread) {
         log_msg(LOG_ERROR, "Failed to create refresh thread");
         supervisor_stop(g_supervisor);

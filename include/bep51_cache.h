@@ -8,7 +8,6 @@
 #include "uthash.h"
 
 /* Forward declarations */
-struct shared_node_pool;
 struct tree_node;
 
 /**
@@ -67,17 +66,6 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path);
  * @return 0 on success, -1 on failure
  */
 int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path);
-
-/**
- * Populate shared_node_pool from cache
- * @param cache The cache
- * @param pool The shared node pool to populate
- * @param max_nodes Maximum nodes to transfer
- * @return Number of nodes transferred
- */
-int bep51_cache_populate_shared_pool(bep51_cache_t *cache,
-                                     struct shared_node_pool *pool,
-                                     int max_nodes);
 
 /**
  * Get current node count in cache (thread-safe)

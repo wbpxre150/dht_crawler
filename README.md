@@ -97,7 +97,6 @@ Supervisor
 Shared Resources:
 ├── Batch Writer (SQLite transactions)
 ├── Bloom Filters (deduplication + failure tracking)
-├── Shared Node Pool (global bootstrap)
 └── BEP51 Cache (persistent high-quality nodes)
 ```
 
@@ -111,7 +110,7 @@ Shared Resources:
 
 Each thread tree implements a concurrent pipeline:
 
-1. **Bootstrap**: Sample nodes from shared pool + BEP51 cache
+1. **Bootstrap**: Contact built-in DHT routers + BEP51 cache as fallback
 2. **Find_Node Workers**: Discover DHT nodes to populate routing table
 3. **BEP51 Workers**: Query `sample_infohashes` to discover infohashes
 4. **Get_Peers Workers**: Query DHT for peers that have each infohash
@@ -206,8 +205,8 @@ porn_filter_enabled = 0
 
 ### Custom Bootstrap Nodes
 
-The shared node pool uses hardcoded bootstrap nodes. To add custom nodes, edit `shared_node_pool.c:bootstrap_from_well_known_nodes()`.
-
+Bootstrap nodes are hardcoded in `src/thread_tree.c`. To add custom
+routers, edit the `TREE_BOOTSTRAP_HOSTS` array there.
 ## Monitoring
 
 ### Log Levels
@@ -271,8 +270,7 @@ Bottlenecks:
 
 **No torrents being discovered:**
 - Check firewall allows UDP 6881
-- Verify bootstrap works: logs should show "Global bootstrap complete"
-- Increase `tree_bep51_workers` if BEP51 queries are slow
+- Verify bootstrap works: logs should show "Tree-native bootstrap complete"
 
 **High CPU usage:**
 - Reduce worker counts in config.ini
@@ -296,9 +294,9 @@ dht_crawler/
 │   ├── supervisor.c  Thread tree lifecycle management
 │   ├── thread_tree.c Thread tree implementation
 │   ├── tree_*.c      DHT protocol, routing, queues
-│   ├── metadata_fetcher.c  BEP 9/10 metadata fetching
 │   ├── batch_writer.c      Batched database writes
-│   └── http_api.c    REST API endpoints
+│   ├── tree_metadata.c     BEP 9/10 metadata fetching
+│   ├── http_api.c          REST API endpoints
 ├── include/          Header files
 ├── lib/              Third-party libraries (submodules)
 │   ├── bencode-c/    Bencode parser
@@ -327,6 +325,5 @@ Contributions welcome! Areas for improvement:
 
 ## Acknowledgments
 
-- [wbpxre-dht](lib/wbpxre-dht/): Custom DHT library implementing BEP 51
 - [bitmagnet](https://github.com/bitmagnetio/bitmagnet): Inspiration for multi-pipeline architecture
 - BitTorrent BEPs: [5](http://www.bittorrent.org/beps/bep_0005.html), [9](http://www.bittorrent.org/beps/bep_0009.html), [10](http://www.bittorrent.org/beps/bep_0010.html), [51](http://www.bittorrent.org/beps/bep_0051.html)

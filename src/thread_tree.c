@@ -10,7 +10,6 @@
 #include "tree_dispatcher.h"
 #include "tree_response_queue.h"
 #include "bloom_filter.h"
-#include "shared_node_pool.h"
 #include "bep51_cache.h"
 #include "supervisor.h"
 #include "dht_crawler.h"
@@ -893,142 +892,134 @@ static void tree_start_bep51_phase(thread_tree_t *tree) {
     tree_start_bep51_workers(tree);
 }
 
-/* Bootstrap thread function - NEW SIMPLIFIED VERSION using shared node pool */
+/* Built-in DHT bootstrap routers. Resolved via getaddrinfo() and pinged once each. */
+static const char *TREE_BOOTSTRAP_HOSTS[] = {
+    "router.bittorrent.com",
+    "dht.transmissionbt.com",
+    "dht.libtorrent.org",
+    "dht.aelitis.com",
+    "router.bitcomet.com",
+    "dht.anacrolix.link",
+    NULL
+};
+static const int TREE_BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069 };
+/* Helper: resolve hostname to sockaddr_storage */
+static int tree_resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    int ret = getaddrinfo(hostname, port_str, &hints, &res);
+    if (ret != 0) {
+        return -1;
+    }
+    memcpy(addr, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    return 0;
+}
+/* Bootstrap thread function - Tree-native URL bootstrap with BEP51 cache fallback */
 static void *bootstrap_thread_func(void *arg) {
     thread_tree_t *tree = (thread_tree_t *)arg;
-
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap thread started (using shared node pool)", tree->tree_id);
-
     tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
-
-    if (!rt) {
-        log_msg(LOG_ERROR, "[tree %u] Missing routing table", tree->tree_id);
+    tree_socket_t *sock = (tree_socket_t *)tree->socket;
+    tree_dispatcher_t *dispatcher = tree->dispatcher;
+    tree_response_queue_t *bq = tree->bootstrap_response_queue;
+    if (!rt || !sock || !dispatcher || !bq) {
+        log_msg(LOG_ERROR, "[tree %u] Missing required bootstrap resources", tree->tree_id);
         goto shutdown;
     }
-
-    /* Check if supervisor and shared_node_pool are available */
-    if (!tree->supervisor || !tree->supervisor->shared_node_pool) {
-        log_msg(LOG_ERROR, "[tree %u] No shared node pool available, cannot bootstrap", tree->tree_id);
-        goto shutdown;
+    int timeout = tree->tree_bootstrap_timeout_sec > 0 ? tree->tree_bootstrap_timeout_sec : 30;
+    time_t deadline = time(NULL) + timeout;
+    int have_minimum = 0;
+    tree_find_node_response_t find_node_resp;
+    log_msg(LOG_DEBUG, "[tree %u] Tree-native bootstrap starting (timeout=%ds)",
+            tree->tree_id, timeout);
+    /* Phase A: query every URL-bootstrap host once with a random find_node target */
+    for (int i = 0; TREE_BOOTSTRAP_HOSTS[i] != NULL; i++) {
+        struct sockaddr_storage addr;
+        if (tree_resolve_hostname(TREE_BOOTSTRAP_HOSTS[i],
+                                  TREE_BOOTSTRAP_PORTS[i], &addr) != 0) {
+            log_msg(LOG_WARN, "[tree %u] DNS resolution failed for %s",
+                    tree->tree_id, TREE_BOOTSTRAP_HOSTS[i]);
+            continue;
+        }
+        uint8_t target[20];
+        generate_random_target(target);
+        uint8_t tid[4];
+        int tid_len = tree_protocol_gen_tid(tid);
+        tree_dispatcher_register_tid(dispatcher, tid, tid_len, bq);
+        int rc = tree_send_find_node(tree, sock, tid, tid_len, target, &addr);
+        if (rc == 0) {
+            tree_response_t response_pkt;
+            if (tree_response_queue_pop(bq, &response_pkt, 1000) == 0) {
+                tree_response_type_t resp_type = tree_handle_response(tree,
+                    response_pkt.data, response_pkt.len, &response_pkt.from, &find_node_resp);
+                if (resp_type == TREE_RESP_FIND_NODE && find_node_resp.node_count > 0) {
+                    for (int j = 0; j < find_node_resp.node_count; j++) {
+                        tree_routing_add_node(rt, find_node_resp.nodes[j],
+                                              &find_node_resp.addrs[j]);
+                    }
+                    log_msg(LOG_DEBUG, "[tree %u] Bootstrap: %d nodes from %s",
+                            tree->tree_id, find_node_resp.node_count, TREE_BOOTSTRAP_HOSTS[i]);
+                }
+            }
+        }
+        tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+        if (tree_routing_get_count(rt) >= 100) {
+            have_minimum = 1;
+            break;
+        }
+        if (time(NULL) >= deadline) {
+            break;
+        }
     }
-
-    shared_node_pool_t *pool = tree->supervisor->shared_node_pool;
-    bep51_cache_t *bep51_cache = tree->supervisor->bep51_cache;
-    int sample_size = tree->supervisor->per_tree_sample_size;
-
-    /* Sample random nodes from the shared pool */
-    tree_node_t *sampled_nodes = malloc(sample_size * sizeof(tree_node_t));
-    if (!sampled_nodes) {
-        log_msg(LOG_ERROR, "[tree %u] Failed to allocate memory for sampled nodes", tree->tree_id);
-        goto shutdown;
-    }
-
-    int got = 0;
-    bool used_cache_primary = false;
-
-    /* NEW: Check if BEP51 cache is full - if so, use as PRIMARY source */
-    if (bep51_cache) {
-        size_t cache_count = bep51_cache_get_count(bep51_cache);
-        size_t cache_capacity = bep51_cache->capacity;
-
-        if (cache_count >= cache_capacity) {
-            /* Cache is full - use as PRIMARY source */
-            log_msg(LOG_DEBUG, "[tree %u] BEP51 cache is full (%zu/%zu), using as PRIMARY bootstrap source",
-                    tree->tree_id, cache_count, cache_capacity);
-            got = bep51_cache_get_random(bep51_cache, sampled_nodes, sample_size);
-            log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from BEP51 cache (primary)", tree->tree_id, got);
-            used_cache_primary = true;
-
-            /* Fallback to shared pool if cache insufficient */
-            if (got < 100) {
-                log_msg(LOG_DEBUG, "[tree %u] BEP51 cache returned insufficient nodes (%d), falling back to shared pool",
-                        tree->tree_id, got);
-                size_t pool_count = shared_node_pool_get_count(pool);
-                if (pool_count >= 100) {
-                    got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
-                    log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool (fallback)", tree->tree_id, got);
+    /* Phase B: if still < 100 nodes, fall back to BEP51 cache */
+    if (!have_minimum && tree->supervisor && tree->supervisor->bep51_cache) {
+        bep51_cache_t *cache = tree->supervisor->bep51_cache;
+        size_t cache_count = bep51_cache_get_count(cache);
+        if (cache_count >= 100) {
+            tree_node_t *warm = malloc(tree->find_node_target_nodes * sizeof(tree_node_t));
+            if (warm) {
+                int got = bep51_cache_get_random(cache, warm, tree->find_node_target_nodes);
+                for (int i = 0; i < got; i++) {
+                    tree_routing_add_node(rt, warm[i].node_id, &warm[i].addr);
+                }
+                free(warm);
+                if (tree_routing_get_count(rt) >= 100) {
+                    have_minimum = 1;
                 }
             }
         }
     }
-
-    /* EXISTING LOGIC: If cache not full, use shared pool as primary (original behavior) */
-    if (!used_cache_primary) {
-        /* Try shared node pool first */
-        size_t pool_count = shared_node_pool_get_count(pool);
-        if (pool_count >= 100) {
-            got = shared_node_pool_get_random(pool, sampled_nodes, sample_size);
-            log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from shared pool (pool has %zu)",
-                    tree->tree_id, got, pool_count);
-        }
-
-        /* Fall back to BEP51 cache if shared pool is depleted */
-        if (got < 100 && bep51_cache) {
-            size_t cache_count = bep51_cache_get_count(bep51_cache);
-            if (cache_count >= 100) {
-                log_msg(LOG_DEBUG, "[tree %u] Shared pool depleted (%d nodes), falling back to BEP51 cache (%zu nodes)",
-                        tree->tree_id, got, cache_count);
-                got = bep51_cache_get_random(bep51_cache, sampled_nodes, sample_size);
-                log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes from BEP51 cache (fallback)", tree->tree_id, got);
-            }
-        }
-    }
-
-    /* Bootstrap success threshold: 100 nodes is the minimum for a
-     * useful routing table. The TARGET (i.e. how many nodes we aim to
-     * gather) is tree->find_node_target_nodes, sourced from the
-     * supervisor's bep51_cache_capacity. Replaces the historical
-     * hardcode of 1500 that lived in dht_manager.c. */
-    if (got < 100) {
-        log_msg(LOG_ERROR, "[tree %u] Insufficient nodes for bootstrap: got %d, need at least 100 (pool: %zu, cache: %zu)",
-                tree->tree_id, got,
-                shared_node_pool_get_count(pool),
-                bep51_cache ? bep51_cache_get_count(bep51_cache) : 0);
-        free(sampled_nodes);
+    if (!have_minimum) {
+        log_msg(LOG_ERROR, "[tree %u] Bootstrap failed: routing table has %d nodes after %ds",
+                tree->tree_id, tree_routing_get_count(rt), timeout);
         goto shutdown;
     }
-
-    log_msg(LOG_DEBUG, "[tree %u] Sampled %d nodes for bootstrap", tree->tree_id, got);
-
-    /* Add sampled nodes to routing table */
-    for (int i = 0; i < got; i++) {
-        tree_routing_add_node(rt, sampled_nodes[i].node_id, &sampled_nodes[i].addr);
-    }
-
-    free(sampled_nodes);
-
     int final_count = tree_routing_get_count(rt);
-    log_msg(LOG_DEBUG, "[tree %u] Bootstrap complete: %d nodes in routing table",
+    log_msg(LOG_INFO, "[tree %u] Bootstrap complete: %d nodes in routing table",
             tree->tree_id, final_count);
-
     /* Start find_node workers to continuously discover new nodes */
     tree_start_find_node_workers(tree);
-
-    /* Start throttle monitor to control find_node worker pausing */
+    /* Start throttle monitor */
     tree_start_throttle_monitor(tree);
-
-    /* Transition to BEP51 phase to discover infohashes */
-    log_msg(LOG_DEBUG, "[tree %u] Transitioning to BEP51 phase (sample_infohashes)", tree->tree_id);
+    /* Transition to BEP51 phase */
+    log_msg(LOG_DEBUG, "[tree %u] Transitioning to BEP51 phase", tree->tree_id);
     atomic_store(&tree->current_phase, TREE_PHASE_BEP51);
     tree_start_bep51_workers(tree);
-
     /* Wait for shutdown */
     while (!atomic_load(&tree->shutdown_requested)) {
-        struct timespec ts = {1, 0};  /* 1 second */
+        struct timespec ts = {1, 0};
         nanosleep(&ts, NULL);
     }
-
 shutdown:
     log_msg(LOG_DEBUG, "[tree %u] Bootstrap thread exiting (final: %d nodes)",
-            tree->tree_id, tree->routing_table ? tree_routing_get_count(tree->routing_table) : 0);
-
-    /* Signal supervisor to respawn this tree (deferred destruction)
-     * Only for voluntary shutdowns (rate-based), not supervisor-requested shutdowns.
-     * The monitor thread will handle destruction asynchronously to avoid self-join deadlock. */
+            tree->tree_id, rt ? tree_routing_get_count(rt) : 0);
     if (atomic_load(&tree->shutdown_reason) == SHUTDOWN_REASON_RATE_BASED) {
         atomic_store(&tree->needs_respawn, true);
     }
-
     return NULL;
 }
 
@@ -1242,6 +1233,13 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
             return NULL;
         }
     }
+    /* Per-tree bootstrap response queue */
+    tree->bootstrap_response_queue = tree_response_queue_create(8);
+    if (!tree->bootstrap_response_queue) {
+        log_msg(LOG_ERROR, "[tree %u] Failed to create bootstrap response queue", tree_id);
+        thread_tree_destroy(tree);
+        return NULL;
+    }
 
     int port = tree_socket_get_port(tree->socket);
     log_msg(LOG_DEBUG, "[tree %u] Created with node_id %02x%02x%02x%02x... on port %d",
@@ -1354,6 +1352,10 @@ void thread_tree_destroy(thread_tree_t *tree) {
     }
 
     /* Stage 3: Cleanup infohash queue */
+    /* Bootstrap response queue */
+    if (tree->bootstrap_response_queue) {
+        tree_response_queue_destroy(tree->bootstrap_response_queue);
+    }
     if (tree->infohash_queue) {
         tree_infohash_queue_destroy(tree->infohash_queue);
     }

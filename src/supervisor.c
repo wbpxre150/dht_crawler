@@ -4,7 +4,6 @@
 #include "dht_crawler.h"
 #include "batch_writer.h"
 #include "bloom_filter.h"
-#include "shared_node_pool.h"
 #include "bep51_cache.h"
 #include "tree_socket.h"
 #include "tree_dispatcher.h"
@@ -15,7 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
@@ -51,7 +49,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->bloom_filter = config->bloom_filter;
     sup->failure_bloom = NULL;  /* Will be initialized during start */
     sup->failure_bloom_path = "data/failure_bloom.dat";
-    sup->shared_node_pool = NULL;  /* Will be created during bootstrap */
+      /* Will be created during bootstrap */
     sup->shared_socket = NULL;     /* Will be created if dht_port > 0 */
     sup->shared_dispatcher = NULL; /* Will be created if dht_port > 0 */
 
@@ -65,11 +63,11 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->num_get_peers_workers = config->num_get_peers_workers;
     sup->num_metadata_workers = config->num_metadata_workers;
 
-    /* Stage 2 settings (Global Bootstrap - NEW) */
-    sup->global_bootstrap_target = config->global_bootstrap_target > 0 ? config->global_bootstrap_target : 5000;
-    sup->global_bootstrap_timeout_sec = config->global_bootstrap_timeout_sec > 0 ? config->global_bootstrap_timeout_sec : 60;
-    sup->global_bootstrap_workers = config->global_bootstrap_workers > 0 ? config->global_bootstrap_workers : 50;
-    sup->per_tree_sample_size = config->per_tree_sample_size > 0 ? config->per_tree_sample_size : 1000;
+    /* Tree bootstrap settings */
+    sup->tree_bootstrap_timeout_sec = config->tree_bootstrap_timeout_sec > 0 ? config->tree_bootstrap_timeout_sec : 30;
+    
+    
+    
 
     /* Stage 3 settings (BEP51) */
     sup->infohash_queue_capacity = config->infohash_queue_capacity > 0 ? config->infohash_queue_capacity : 5000;
@@ -195,8 +193,8 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         return NULL;
     }
 
-    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_target=%d, draining_slots=%d, spawn_threshold=%d, drain_timeout=%ds",
-            sup->max_trees, sup->global_bootstrap_target, sup->max_draining_trees,
+    log_msg(LOG_DEBUG, "[supervisor] Created with max_trees=%d, bootstrap_timeout=%ds, draining_slots=%d, spawn_threshold=%d, drain_timeout=%ds",
+            sup->max_trees, sup->tree_bootstrap_timeout_sec, sup->max_draining_trees,
             sup->respawn_spawn_threshold, sup->respawn_drain_timeout_sec);
 
     return sup;
@@ -317,28 +315,28 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
     bool was_zero_rate = (tree->metadata_rate < sup->min_metadata_rate);
 
     if (was_zero_rate) {
-        sup->partition_stats[old_partition].consecutive_zero_respawns++;
+        sup->partition_stats[old_partition].dead_consecutive++;
         log_msg(LOG_DEBUG, "[supervisor] Partition %u: zero-rate respawn #%d (tree had rate=%.4f)",
-                old_partition, sup->partition_stats[old_partition].consecutive_zero_respawns,
+                old_partition, sup->partition_stats[old_partition].dead_consecutive,
                 tree->metadata_rate);
     } else {
-        sup->partition_stats[old_partition].consecutive_zero_respawns = 0;
+        sup->partition_stats[old_partition].dead_consecutive = 0;
     }
 
     /* Check if partition is dead */
-    if (sup->partition_stats[old_partition].consecutive_zero_respawns < sup->dead_partition_threshold) {
+    if (sup->partition_stats[old_partition].dead_consecutive < sup->dead_partition_threshold) {
         /* Partition is still viable, stay */
         return old_partition;
     }
 
     log_msg(LOG_DEBUG, "[supervisor] Partition %u is dead (%d consecutive low-rate respawns)",
-            old_partition, sup->partition_stats[old_partition].consecutive_zero_respawns);
+            old_partition, sup->partition_stats[old_partition].dead_consecutive);
 
     /* If tree is away from home, return home first */
     uint32_t home = sup->home_partitions[slot_index];
     if (old_partition != home) {
         /* Reset home's death counter to give it a fresh chance */
-        sup->partition_stats[home].consecutive_zero_respawns = 0;
+        sup->partition_stats[home].dead_consecutive = 0;
         log_msg(LOG_DEBUG, "[supervisor] Returning slot %d from partition %u to home partition %u",
                 slot_index, old_partition, home);
         return home;
@@ -373,7 +371,7 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
         }
 
         /* Skip dead partitions */
-        if (sup->partition_stats[p].consecutive_zero_respawns >= sup->dead_partition_threshold) {
+        if (sup->partition_stats[p].dead_consecutive >= sup->dead_partition_threshold) {
             continue;
         }
 
@@ -427,7 +425,7 @@ static int move_to_draining(supervisor_t *sup, int slot_index) {
 
     /* Add to draining list */
     sup->draining_trees[sup->draining_count].tree = tree;
-    sup->draining_trees[sup->draining_count].drain_start_time = time(NULL);
+    sup->draining_trees[sup->draining_count].drain_start = time(NULL);
     sup->draining_trees[sup->draining_count].original_slot = slot_index;
     sup->draining_count++;
 
@@ -460,7 +458,7 @@ static void monitor_draining_trees(supervisor_t *sup) {
 
         int active_conns = atomic_load(&dt->tree->active_connections);
         time_t now = time(NULL);
-        double drain_time = difftime(now, dt->drain_start_time);
+        double drain_time = difftime(now, dt->drain_start);
 
         bool should_destroy = false;
         const char *reason = NULL;
@@ -510,40 +508,6 @@ static void monitor_draining_trees(supervisor_t *sup) {
     pthread_mutex_unlock(&sup->draining_lock);
 }
 
-/* Helper: resolve hostname to sockaddr_storage */
-static int resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    int ret = getaddrinfo(hostname, port_str, &hints, &res);
-    if (ret != 0) {
-        return -1;
-    }
-
-    memcpy(addr, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-    return 0;
-}
-
-/* Helper: generate random node ID */
-static void generate_random_node_id(uint8_t *node_id) {
-    srand((unsigned int)(time(NULL) ^ (uintptr_t)node_id));
-    for (int i = 0; i < 20; i++) {
-        node_id[i] = (uint8_t)(rand() % 256);
-    }
-}
-
-/* Helper: generate random target */
-static void generate_random_target(uint8_t *target) {
-    for (int i = 0; i < 20; i++) {
-        target[i] = (uint8_t)(rand() % 256);
-    }
-}
 
 void supervisor_start(supervisor_t *sup) {
     if (!sup) {
@@ -584,33 +548,12 @@ void supervisor_start(supervisor_t *sup) {
         return;
     }
 
-    /* Create shared node pool for global bootstrap */
-    sup->shared_node_pool = shared_node_pool_create(sup->global_bootstrap_target);
-    if (!sup->shared_node_pool) {
-        log_msg(LOG_ERROR, "[supervisor] Failed to create shared node pool");
-        bloom_filter_cleanup(sup->failure_bloom);
-        bep51_cache_destroy(sup->bep51_cache);
-        return;
-    }
-
-    /* Try to load cache and populate shared pool */
+    /* Try to load BEP51 cache for fallback bootstrap */
     log_msg(LOG_DEBUG, "[supervisor] Attempting to load BEP51 cache from %s", sup->bep51_cache_path);
     int cache_loaded = bep51_cache_load_from_file(sup->bep51_cache, sup->bep51_cache_path);
-
     if (cache_loaded == 0) {
-        /* Cache loaded successfully, populate shared_node_pool */
-        int populated = bep51_cache_populate_shared_pool(sup->bep51_cache,
-                                                          sup->shared_node_pool,
-                                                          sup->global_bootstrap_target);
-        log_msg(LOG_DEBUG, "[supervisor] Populated %d nodes from cache into shared pool", populated);
+        log_msg(LOG_DEBUG, "[supervisor] Cache loaded successfully: %zu nodes", bep51_cache_get_count(sup->bep51_cache));
     }
-
-    size_t nodes_from_cache = shared_node_pool_get_count(sup->shared_node_pool);
-    log_msg(LOG_DEBUG, "[supervisor] Shared pool has %zu nodes from cache", nodes_from_cache);
-
-
-    size_t nodes_collected = shared_node_pool_get_count(sup->shared_node_pool);
-    log_msg(LOG_DEBUG, "[supervisor] Bootstrap finished: %zu nodes available", nodes_collected);
 
     /* Create shared socket and dispatcher when using fixed port */
     if (sup->dht_port > 0) {
@@ -619,7 +562,6 @@ void supervisor_start(supervisor_t *sup) {
             log_msg(LOG_ERROR, "[supervisor] Failed to create shared socket on port %d", sup->dht_port);
             bloom_filter_cleanup(sup->failure_bloom);
             bep51_cache_destroy(sup->bep51_cache);
-            shared_node_pool_destroy(sup->shared_node_pool);
             return;
         }
 
@@ -630,7 +572,6 @@ void supervisor_start(supervisor_t *sup) {
             sup->shared_socket = NULL;
             bloom_filter_cleanup(sup->failure_bloom);
             bep51_cache_destroy(sup->bep51_cache);
-            shared_node_pool_destroy(sup->shared_node_pool);
             return;
         }
 
@@ -642,7 +583,6 @@ void supervisor_start(supervisor_t *sup) {
             sup->shared_dispatcher = NULL;
             bloom_filter_cleanup(sup->failure_bloom);
             bep51_cache_destroy(sup->bep51_cache);
-            shared_node_pool_destroy(sup->shared_node_pool);
             return;
         }
 
@@ -814,11 +754,6 @@ void supervisor_destroy(supervisor_t *sup) {
         sup->failure_bloom = NULL;
     }
 
-    /* Cleanup shared node pool */
-    if (sup->shared_node_pool) {
-        shared_node_pool_destroy(sup->shared_node_pool);
-        sup->shared_node_pool = NULL;
-    }
 
     /* Cleanup shared dispatcher and socket */
     if (sup->shared_dispatcher) {
