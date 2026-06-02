@@ -17,6 +17,8 @@
 #define BEP51_CACHE_HEADER_SIZE 12
 #define BEP51_CACHE_RECORD_SIZE 26
 #define BEP51_CACHE_CHECKSUM_SIZE 32
+#define BEP51_CACHE_FAMILY_IPV4 0x04
+#define BEP51_CACHE_FAMILY_IPV6 0x06
 
 /* File record format (26 bytes):
  * 20 bytes: node_id
@@ -61,6 +63,90 @@ bep51_cache_t *bep51_cache_create(size_t capacity) {
     return cache;
 }
 
+
+/**
+ * Normalize and validate an address for cache storage.
+ * Accepts AF_INET, AF_INET6 (native and IPv4-mapped).
+ * IPv4-mapped IPv6 is converted to native AF_INET.
+ * Rejects all-zero / broadcast IPv4, all-zero IPv6, port 0.
+ * @param in         Input socket address
+ * @param out        Output normalized socket address
+ * @param out_family On-disk family byte (0x04 or 0x06)
+ * @param out_port   Port in host byte order
+ * @return 0 on success, -1 on validation failure
+ */
+static int normalize_addr_for_cache(const struct sockaddr_storage *in,
+                                     struct sockaddr_storage *out,
+                                     uint8_t *out_family,
+                                     uint16_t *out_port) {
+    if (!in || !out || !out_family || !out_port) {
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    if (in->ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)in;
+        uint32_t ip = ntohl(sin->sin_addr.s_addr);
+        uint16_t port = ntohs(sin->sin_port);
+
+        if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
+            return -1;
+        }
+
+        memcpy(out, in, sizeof(struct sockaddr_in));
+        *out_family = BEP51_CACHE_FAMILY_IPV4;
+        *out_port = port;
+        return 0;
+    }
+
+    if (in->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)in;
+        uint16_t port = ntohs(sin6->sin6_port);
+
+        if (port == 0) {
+            return -1;
+        }
+
+        /* Reject all-zero IPv6 address (::) */
+        const uint8_t *s6 = sin6->sin6_addr.s6_addr;
+        int all_zero = 1;
+        for (int i = 0; i < 16; i++) {
+            if (s6[i] != 0) { all_zero = 0; break; }
+        }
+        if (all_zero) {
+            return -1;
+        }
+
+        /* Check for IPv4-mapped IPv6 (::ffff:a.b.c.d) */
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            uint32_t ipv4;
+            memcpy(&ipv4, s6 + 12, 4);
+            uint32_t ip = ntohl(ipv4);
+
+            if (ip == 0 || ip == 0xFFFFFFFF) {
+                return -1;
+            }
+
+            /* Store as native AF_INET */
+            struct sockaddr_in *out_sin = (struct sockaddr_in *)out;
+            out_sin->sin_family = AF_INET;
+            out_sin->sin_addr.s_addr = ipv4;
+            out_sin->sin_port = sin6->sin6_port;
+            *out_family = BEP51_CACHE_FAMILY_IPV4;
+            *out_port = port;
+            return 0;
+        }
+
+        /* Native IPv6 */
+        memcpy(out, in, sizeof(struct sockaddr_in6));
+        *out_family = BEP51_CACHE_FAMILY_IPV6;
+        *out_port = port;
+        return 0;
+    }
+
+    return -1;
+}
 int bep51_cache_add_node(bep51_cache_t *cache,
                          const uint8_t node_id[20],
                          const struct sockaddr_storage *addr) {
@@ -68,17 +154,11 @@ int bep51_cache_add_node(bep51_cache_t *cache,
         return -1;
     }
 
-    /* Only support IPv4 for now */
-    if (addr->ss_family != AF_INET) {
-        return -1;
-    }
-
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    uint32_t ip = ntohl(sin->sin_addr.s_addr);
-    uint16_t port = ntohs(sin->sin_port);
-
-    /* Sanity check: skip invalid IPs */
-    if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
+    /* Normalize and validate address */
+    struct sockaddr_storage normalized;
+    uint8_t addr_family;
+    uint16_t addr_port;
+    if (normalize_addr_for_cache(addr, &normalized, &addr_family, &addr_port) != 0) {
         return -1;
     }
 
@@ -102,7 +182,7 @@ int bep51_cache_add_node(bep51_cache_t *cache,
     }
 
     memcpy(new_node->node_id, node_id, 20);
-    memcpy(&new_node->addr, addr, sizeof(struct sockaddr_storage));
+    memcpy(&new_node->addr, &normalized, sizeof(struct sockaddr_storage));
 
     /* FIFO eviction if cache is full */
     if (cache->count >= cache->capacity) {
