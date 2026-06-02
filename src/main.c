@@ -1,8 +1,5 @@
 #include "dht_crawler.h"
-#include "dht_manager.h"
 #include "database.h"
-#include "infohash_queue.h"
-#include "metadata_fetcher.h"
 #include "http_api.h"
 #include "bloom_filter.h"
 #include "porn_filter.h"
@@ -26,10 +23,7 @@
 
 /* Global application context */
 static app_context_t g_app_ctx;
-static dht_manager_t g_dht_mgr;  /* Single DHT instance (old architecture) */
 static database_t g_database;
-static infohash_queue_t g_queue;
-static metadata_fetcher_t g_fetcher;
 static http_api_t g_http_api;
 static bloom_filter_t *g_bloom = NULL;
 
@@ -390,13 +384,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Initialize infohash queue */
-    log_msg(LOG_DEBUG, "Initializing infohash queue (capacity: %d)...", INFOHASH_QUEUE_SIZE);
-    rc = infohash_queue_init(&g_queue, INFOHASH_QUEUE_SIZE);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "Failed to initialize infohash queue: %d", rc);
-        return 1;
-    }
 
     /* Initialize bloom filter for duplicate detection */
     if (config.bloom_enabled) {
@@ -404,7 +391,6 @@ int main(int argc, char *argv[]) {
         if (config.bloom_persist) {
             if (ensure_parent_directory_exists(config.bloom_path) != 0) {
                 log_msg(LOG_ERROR, "Failed to create directory for bloom filter");
-                infohash_queue_cleanup(&g_queue);
                 return 1;
             }
         }
@@ -415,7 +401,6 @@ int main(int argc, char *argv[]) {
             g_bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
             if (!g_bloom) {
                 log_msg(LOG_ERROR, "Failed to initialize bloom filter");
-                infohash_queue_cleanup(&g_queue);
                 return 1;
             }
 
@@ -525,7 +510,6 @@ int main(int argc, char *argv[]) {
         porn_filter_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
 
@@ -535,7 +519,6 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_ERROR, "Failed to create database schema: %d", rc);
         database_cleanup(&g_database);
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
 
@@ -555,14 +538,12 @@ int main(int argc, char *argv[]) {
             log_msg(LOG_ERROR, "--porn-filter-update requires porn_filter_enabled=1 in config.ini. Aborting.");
             database_cleanup(&g_database);
             bloom_filter_cleanup(g_bloom);
-            infohash_queue_cleanup(&g_queue);
             return 1;
         }
         if (porn_filter_get_keyword_count() < 0) {
             log_msg(LOG_ERROR, "--porn-filter-update: porn filter failed to initialize earlier. Aborting.");
             database_cleanup(&g_database);
             bloom_filter_cleanup(g_bloom);
-            infohash_queue_cleanup(&g_queue);
             return 1;
         }
 
@@ -574,7 +555,6 @@ int main(int argc, char *argv[]) {
             porn_filter_cleanup();
             language_filter_cleanup();
             bloom_filter_cleanup(g_bloom);
-            infohash_queue_cleanup(&g_queue);
             cleanup_app_context(&g_app_ctx);
             return rrc;
         }
@@ -593,9 +573,7 @@ int main(int argc, char *argv[]) {
             porn_filter_cleanup();
             language_filter_cleanup();
             bloom_filter_cleanup(g_bloom);
-            infohash_queue_cleanup(&g_queue);
             cleanup_app_context(&g_app_ctx);
-            return 1;
         }
 
         /* Remove any leftover temp file from a previous failed run */
@@ -609,7 +587,6 @@ int main(int argc, char *argv[]) {
         porn_filter_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
 
         if (crc != 0) {
             log_msg(LOG_ERROR, "Compaction failed; original database unchanged.");
@@ -630,434 +607,265 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /*******************************************************************
-     * Stage 6: Branch based on architecture selection
-     *******************************************************************/
-    if (config.use_thread_trees) {
-        /*******************************************************************
-         * NEW ARCHITECTURE: Thread Tree Supervisor
-         *******************************************************************/
-        log_msg(LOG_DEBUG, "=== Starting Thread Tree Architecture ===");
-
-        /* Create shared batch writer for all trees */
-        g_batch_writer = batch_writer_init(&g_database, config.batch_size,
-                                            config.flush_interval, g_app_ctx.loop);
-        if (!g_batch_writer) {
-            log_msg(LOG_ERROR, "Failed to create batch writer");
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        /* Connect bloom filter to batch writer */
-        if (g_bloom && config.bloom_persist) {
-            batch_writer_set_bloom(g_batch_writer, g_bloom, config.bloom_path);
-        }
-
-        /* Configure daily backup */
-        if (config.backup_enabled) {
-            batch_writer_set_backup(g_batch_writer, config.db_path, config.backup_path);
-        }
-
-        /* Configure SSH incremental backup */
-        if (config.ssh_backup_enabled && config.ssh_host[0]) {
-            batch_writer_set_ssh_backup(g_batch_writer,
-                config.ssh_host, config.ssh_user,
-                config.ssh_dest_path, config.ssh_key_path,
-                config.ssh_bookmark_path);
-        }
-
-        /* Configure rclone incremental backup */
-        if (config.rclone_backup_enabled && config.rclone_remote[0]) {
-            batch_writer_set_rclone_backup(g_batch_writer,
-                config.rclone_remote,
-                config.rclone_dest_path,
-                config.rclone_bookmark_path);
-        }
-
-        /* Create supervisor config */
-        supervisor_config_t sup_config = {
-            .max_trees = config.num_trees,
-            .use_keyspace_partitioning = config.use_keyspace_partitioning,
-            .dht_port = config.dht_port,
-            .batch_writer = g_batch_writer,
-            .bloom_filter = g_bloom,
-            /* Bloom filter settings for failure tracking */
-            .failure_bloom_capacity = config.failure_bloom_capacity,
-            .bloom_error_rate = config.bloom_error_rate,
-            .num_find_node_workers = config.tree_find_node_workers,
-            .num_bep51_workers = config.tree_bep51_workers,
-            .num_get_peers_workers = config.tree_get_peers_workers,
-            .num_metadata_workers = config.tree_metadata_workers,
-            /* Stage 2 settings (Global Bootstrap - NEW) */
-            .global_bootstrap_target = config.global_bootstrap_target,
-            .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
-            .global_bootstrap_workers = config.global_bootstrap_workers,
-            .per_tree_sample_size = config.per_tree_sample_size,
-            /* BEP51 cache settings */
-            .bep51_cache_capacity = config.bep51_cache_capacity,
-            .bep51_cache_submit_percent = config.bep51_cache_submit_percent,
-            /* Stage 3 settings (BEP51) */
-            .infohash_queue_capacity = config.tree_infohash_queue_capacity,
-            .bep51_query_interval_ms = config.tree_bep51_query_interval_ms,
-            .bep51_node_cooldown_sec = config.bep51_node_cooldown_sec,
-            /* Stage 4 settings (get_peers) */
-            .peers_queue_capacity = config.tree_peers_queue_capacity,
-            .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,
-            /* Find_node throttling settings */
-            .infohash_pause_threshold = config.tree_infohash_pause_threshold,
-            .infohash_resume_threshold = config.tree_infohash_resume_threshold,
-            /* Get_peers throttling settings */
-            .peers_pause_threshold = config.tree_peers_pause_threshold,
-            .peers_resume_threshold = config.tree_peers_resume_threshold,
-            /* Stage 5 settings */
-            .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
-            .parallel_peers = config.tree_parallel_peers,
-            /* Metadata rate-based respawn settings */
-            .min_metadata_rate = config.min_metadata_rate,
-            .dynamic_rate_margin = config.dynamic_rate_margin,
-            .rate_check_interval_sec = config.tree_rate_check_interval_sec,
-            .rate_grace_period_sec = config.tree_rate_grace_period_sec,
-            .min_lifetime_minutes = config.tree_min_lifetime_minutes,
-            .require_empty_queue = config.tree_require_empty_queue,
-            .rate_ema_alpha = config.tree_rate_ema_alpha,
-            /* Respawn overlapping configuration */
-            .respawn_spawn_threshold = config.respawn_spawn_threshold,
-            .respawn_drain_timeout_sec = config.respawn_drain_timeout_sec,
-            .max_draining_trees = config.max_draining_trees,
-            /* Porn filter settings */
-            .porn_filter_enabled = config.porn_filter_enabled,
-            /* Adaptive keyspace partitioning */
-            .dead_partition_threshold = config.dead_partition_threshold,
-            .max_trees_per_partition = config.max_trees_per_partition
-        };
-        /* Copy BEP51 cache path (can't use string literal in struct initializer) */
-        strncpy(sup_config.bep51_cache_path, config.bep51_cache_path, sizeof(sup_config.bep51_cache_path) - 1);
-
-        g_supervisor = supervisor_create(&sup_config);
-        if (!g_supervisor) {
-            log_msg(LOG_ERROR, "Failed to create supervisor");
-            batch_writer_cleanup(g_batch_writer);
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        /* Start supervisor (spawns all trees) */
-        supervisor_start(g_supervisor);
-
-        /* Create shared refresh query store for HTTP API */
-        log_msg(LOG_DEBUG, "Creating refresh query store...");
-        g_refresh_query_store = refresh_query_store_init(1009, 10);
-        if (!g_refresh_query_store) {
-            log_msg(LOG_ERROR, "Failed to create refresh query store");
-            supervisor_stop(g_supervisor);
-            supervisor_destroy(g_supervisor);
-            batch_writer_cleanup(g_batch_writer);
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        /* Create and start refresh thread */
-        log_msg(LOG_DEBUG, "Creating refresh thread...");
-        refresh_thread_config_t refresh_config = {
-            .dht_port = 0,  /* Use ephemeral port (not 6881) to avoid conflict with shared socket */
-            .bootstrap_sample_size = config.refresh_bootstrap_sample_size,
-            .routing_table_target = config.refresh_routing_table_target,
-            .ping_worker_count = config.refresh_ping_workers,
-            .find_node_worker_count = config.refresh_find_node_workers,
-            .get_peers_worker_count = config.refresh_get_peers_workers,
-            .request_queue_capacity = config.refresh_request_queue_capacity,
-            .get_peers_timeout_ms = config.refresh_get_peers_timeout_ms,
-            .max_iterations = config.refresh_max_iterations
-        };
-
-        g_refresh_thread = refresh_thread_create(&refresh_config,
-                                                  g_supervisor->shared_node_pool,
-                                                  g_refresh_query_store);
-        if (!g_refresh_thread) {
-            log_msg(LOG_ERROR, "Failed to create refresh thread");
-            supervisor_stop(g_supervisor);
-            supervisor_destroy(g_supervisor);
-            batch_writer_cleanup(g_batch_writer);
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        rc = refresh_thread_start(g_refresh_thread);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to start refresh thread");
-            refresh_thread_destroy(g_refresh_thread);
-            supervisor_stop(g_supervisor);
-            supervisor_destroy(g_supervisor);
-            batch_writer_cleanup(g_batch_writer);
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        /* Initialize HTTP API (minimal - no DHT manager in thread tree mode) */
-        log_msg(LOG_DEBUG, "Initializing HTTP API for thread tree mode...");
-        rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, NULL,
-                           g_batch_writer, NULL, HTTP_API_PORT);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to initialize HTTP API: %d", rc);
-            refresh_thread_request_shutdown(g_refresh_thread);
-            refresh_thread_destroy(g_refresh_thread);
-            supervisor_stop(g_supervisor);
-            supervisor_destroy(g_supervisor);
-            batch_writer_cleanup(g_batch_writer);
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        /* Set supervisor reference for stats */
-        http_api_set_supervisor(&g_http_api, g_supervisor);
-
-        /* Set refresh thread for /refresh endpoint */
-        http_api_set_refresh_thread(&g_http_api, g_refresh_thread);
-
-        /* Set refresh query store for /refresh endpoint */
-        http_api_set_refresh_query_store(&g_http_api, g_refresh_query_store);
-
-        /* Start HTTP API */
-        log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
-        rc = http_api_start(&g_http_api);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "Failed to start HTTP API: %d", rc);
-            supervisor_stop(g_supervisor);
-            supervisor_destroy(g_supervisor);
-            http_api_cleanup(&g_http_api);
-            batch_writer_cleanup(g_batch_writer);
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
-        log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
-                config.num_trees, config.tree_bep51_workers,
-                config.tree_get_peers_workers, config.tree_metadata_workers);
-        log_msg(LOG_DEBUG, "HTTP API available at http://localhost:%d/", HTTP_API_PORT);
-        log_msg(LOG_DEBUG, "Press Ctrl+C to stop.");
-
-        /* Wait for shutdown signal (blocking) */
-        while (g_app_ctx.running) {
-            sleep(1);
-        }
-
-        /* Graceful shutdown sequence for thread tree mode */
-        log_msg(LOG_DEBUG, "=== Beginning thread tree shutdown sequence ===");
-
-        log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
-        http_api_stop(&g_http_api);
-
-        log_msg(LOG_DEBUG, "Step 2: Stopping refresh thread...");
-        if (g_refresh_thread) {
-            refresh_thread_request_shutdown(g_refresh_thread);
-        }
-
-        log_msg(LOG_DEBUG, "Step 3: Stopping supervisor (stops all trees)...");
-        batch_writer_inhibit_backup(g_batch_writer);
-        supervisor_stop(g_supervisor);
-
-        log_msg(LOG_DEBUG, "Step 4: Flushing batch writer...");
-        batch_writer_flush(g_batch_writer);
-
-        log_msg(LOG_DEBUG, "=== Thread tree shutdown complete, beginning cleanup ===");
-
-        /* Save bloom filter */
-        if (g_bloom && config.bloom_persist) {
-            log_msg(LOG_DEBUG, "Saving bloom filter to %s...", config.bloom_path);
-            if (bloom_filter_save(g_bloom, config.bloom_path) == 0) {
-                log_msg(LOG_DEBUG, "Bloom filter saved successfully");
-            } else {
-                log_msg(LOG_WARN, "Failed to save bloom filter");
-            }
-        }
-
-        /* Cleanup - cleanup_app_context must be called before batch_writer_cleanup
-         * to avoid use-after-free in uv_loop_close() */
-        http_api_cleanup(&g_http_api);
-        if (g_refresh_thread) {
-            refresh_thread_destroy(g_refresh_thread);
-        }
-        supervisor_destroy(g_supervisor);
-        cleanup_app_context(&g_app_ctx);
-        batch_writer_cleanup(g_batch_writer);
-        if (g_refresh_query_store) {
-            refresh_query_store_cleanup(g_refresh_query_store);
-        }
-        database_cleanup(&g_database);
-        torrent_search_cleanup();
-        porn_filter_cleanup();
-        language_filter_cleanup();
-        bloom_filter_cleanup(g_bloom);
-
-        log_msg(LOG_DEBUG, "DHT Crawler (thread tree mode) stopped.");
-        return 0;
-    }
-
-    /*******************************************************************
-     * OLD ARCHITECTURE: Single DHT instance with metadata fetcher
-     * (Kept for backward compatibility - set use_thread_trees=0)
-     *******************************************************************/
-    log_msg(LOG_DEBUG, "=== Starting Old Architecture (use_thread_trees=0) ===");
-
-    /* Connect bloom filter and database to queue for read-only duplicate checking */
-    if (g_bloom) {
-        infohash_queue_set_bloom(&g_queue, g_bloom);
-        infohash_queue_set_database(&g_queue, (struct database *)&g_database);
-        log_msg(LOG_DEBUG, "Bloom filter duplicate detection enabled");
-    } else {
-        /* If bloom filter is disabled, still need to connect database for duplicate checking */
-        infohash_queue_set_database(&g_queue, (struct database *)&g_database);
-        log_msg(LOG_DEBUG, "Bloom filter disabled - using database-only duplicate detection");
-    }
-
-    /* Initialize DHT manager */
-    log_msg(LOG_DEBUG, "Initializing DHT manager...");
-    rc = dht_manager_init(&g_dht_mgr, &g_app_ctx, &g_queue, &config);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "Failed to initialize DHT manager: %d", rc);
+    log_msg(LOG_DEBUG, "=== Starting Thread Tree Architecture ===");
+    
+    /* Create shared batch writer for all trees */
+    g_batch_writer = batch_writer_init(&g_database, config.batch_size,
+                                        config.flush_interval, g_app_ctx.loop);
+    if (!g_batch_writer) {
+        log_msg(LOG_ERROR, "Failed to create batch writer");
         database_cleanup(&g_database);
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
-
-    /* Initialize metadata fetcher */
-    log_msg(LOG_DEBUG, "Initializing metadata fetcher...");
-
-    rc = metadata_fetcher_init(&g_fetcher, &g_app_ctx, &g_queue, &g_database, &config);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "Failed to initialize metadata fetcher: %d", rc);
-        dht_manager_cleanup(&g_dht_mgr);
-        database_cleanup(&g_database);
-        bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
-        return 1;
-    }
-
-    /* Set metadata fetcher reference in DHT manager for statistics */
-    dht_manager_set_metadata_fetcher(&g_dht_mgr, &g_fetcher);
-
-    /* Connect bloom filter to batch writer for persistence after each batch write
-     * This ensures bloom filter on disk stays synchronized with database */
+    
+    /* Connect bloom filter to batch writer */
     if (g_bloom && config.bloom_persist) {
-        metadata_fetcher_set_bloom_filter(&g_fetcher, g_bloom, config.bloom_path);
+        batch_writer_set_bloom(g_batch_writer, g_bloom, config.bloom_path);
     }
-
-    /* Start DHT manager */
-    log_msg(LOG_DEBUG, "Starting DHT crawler...");
-    rc = dht_manager_start(&g_dht_mgr);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "Failed to start DHT manager: %d", rc);
-        dht_manager_cleanup(&g_dht_mgr);
-        metadata_fetcher_cleanup(&g_fetcher);
+    
+    /* Configure daily backup */
+    if (config.backup_enabled) {
+        batch_writer_set_backup(g_batch_writer, config.db_path, config.backup_path);
+    }
+    
+    /* Configure SSH incremental backup */
+    if (config.ssh_backup_enabled && config.ssh_host[0]) {
+        batch_writer_set_ssh_backup(g_batch_writer,
+            config.ssh_host, config.ssh_user,
+            config.ssh_dest_path, config.ssh_key_path,
+            config.ssh_bookmark_path);
+    }
+    
+    /* Configure rclone incremental backup */
+    if (config.rclone_backup_enabled && config.rclone_remote[0]) {
+        batch_writer_set_rclone_backup(g_batch_writer,
+            config.rclone_remote,
+            config.rclone_dest_path,
+            config.rclone_bookmark_path);
+    }
+    
+    /* Create supervisor config */
+    supervisor_config_t sup_config = {
+        .max_trees = config.num_trees,
+        .use_keyspace_partitioning = config.use_keyspace_partitioning,
+        .dht_port = config.dht_port,
+        .batch_writer = g_batch_writer,
+        .bloom_filter = g_bloom,
+        /* Bloom filter settings for failure tracking */
+        .failure_bloom_capacity = config.failure_bloom_capacity,
+        .bloom_error_rate = config.bloom_error_rate,
+        .num_find_node_workers = config.tree_find_node_workers,
+        .num_bep51_workers = config.tree_bep51_workers,
+        .num_get_peers_workers = config.tree_get_peers_workers,
+        .num_metadata_workers = config.tree_metadata_workers,
+        /* Stage 2 settings (Global Bootstrap - NEW) */
+        .global_bootstrap_target = config.global_bootstrap_target,
+        .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
+        .global_bootstrap_workers = config.global_bootstrap_workers,
+        .per_tree_sample_size = config.per_tree_sample_size,
+        /* BEP51 cache settings */
+        .bep51_cache_capacity = config.bep51_cache_capacity,
+        .bep51_cache_submit_percent = config.bep51_cache_submit_percent,
+        /* Stage 3 settings (BEP51) */
+        .infohash_queue_capacity = config.tree_infohash_queue_capacity,
+        .bep51_query_interval_ms = config.tree_bep51_query_interval_ms,
+        .bep51_node_cooldown_sec = config.bep51_node_cooldown_sec,
+        /* Stage 4 settings (get_peers) */
+        .peers_queue_capacity = config.tree_peers_queue_capacity,
+        .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,
+        /* Find_node throttling settings */
+        .infohash_pause_threshold = config.tree_infohash_pause_threshold,
+        .infohash_resume_threshold = config.tree_infohash_resume_threshold,
+        /* Get_peers throttling settings */
+        .peers_pause_threshold = config.tree_peers_pause_threshold,
+        .peers_resume_threshold = config.tree_peers_resume_threshold,
+        /* Stage 5 settings */
+        .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
+        .parallel_peers = config.tree_parallel_peers,
+        /* Metadata rate-based respawn settings */
+        .min_metadata_rate = config.min_metadata_rate,
+        .dynamic_rate_margin = config.dynamic_rate_margin,
+        .rate_check_interval_sec = config.tree_rate_check_interval_sec,
+        .rate_grace_period_sec = config.tree_rate_grace_period_sec,
+        .min_lifetime_minutes = config.tree_min_lifetime_minutes,
+        .require_empty_queue = config.tree_require_empty_queue,
+        .rate_ema_alpha = config.tree_rate_ema_alpha,
+        /* Respawn overlapping configuration */
+        .respawn_spawn_threshold = config.respawn_spawn_threshold,
+        .respawn_drain_timeout_sec = config.respawn_drain_timeout_sec,
+        .max_draining_trees = config.max_draining_trees,
+        /* Porn filter settings */
+        .porn_filter_enabled = config.porn_filter_enabled,
+        /* Adaptive keyspace partitioning */
+        .dead_partition_threshold = config.dead_partition_threshold,
+        .max_trees_per_partition = config.max_trees_per_partition
+    };
+    /* Copy BEP51 cache path (can't use string literal in struct initializer) */
+    strncpy(sup_config.bep51_cache_path, config.bep51_cache_path, sizeof(sup_config.bep51_cache_path) - 1);
+    
+    g_supervisor = supervisor_create(&sup_config);
+    if (!g_supervisor) {
+        log_msg(LOG_ERROR, "Failed to create supervisor");
+        batch_writer_cleanup(g_batch_writer);
         database_cleanup(&g_database);
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
-
-    /* Start metadata fetcher */
-    log_msg(LOG_DEBUG, "Starting metadata fetcher...");
-    rc = metadata_fetcher_start(&g_fetcher);
-    if (rc != 0) {
-        log_msg(LOG_ERROR, "Failed to start metadata fetcher: %d", rc);
-        dht_manager_stop(&g_dht_mgr);
-        dht_manager_cleanup(&g_dht_mgr);
-        metadata_fetcher_cleanup(&g_fetcher);
+    
+    /* Start supervisor (spawns all trees) */
+    supervisor_start(g_supervisor);
+    
+    /* Create shared refresh query store for HTTP API */
+    log_msg(LOG_DEBUG, "Creating refresh query store...");
+    g_refresh_query_store = refresh_query_store_init(1009, 10);
+    if (!g_refresh_query_store) {
+        log_msg(LOG_ERROR, "Failed to create refresh query store");
+        supervisor_stop(g_supervisor);
+        supervisor_destroy(g_supervisor);
+        batch_writer_cleanup(g_batch_writer);
         database_cleanup(&g_database);
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
-
-    /* Initialize HTTP API */
-    log_msg(LOG_DEBUG, "Initializing HTTP API...");
-    rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, &g_dht_mgr,
-                       g_fetcher.batch_writer, &g_fetcher, HTTP_API_PORT);
+    
+    /* Create and start refresh thread */
+    log_msg(LOG_DEBUG, "Creating refresh thread...");
+    refresh_thread_config_t refresh_config = {
+        .dht_port = 0,  /* Use ephemeral port (not 6881) to avoid conflict with shared socket */
+        .bootstrap_sample_size = config.refresh_bootstrap_sample_size,
+        .routing_table_target = config.refresh_routing_table_target,
+        .ping_worker_count = config.refresh_ping_workers,
+        .find_node_worker_count = config.refresh_find_node_workers,
+        .get_peers_worker_count = config.refresh_get_peers_workers,
+        .request_queue_capacity = config.refresh_request_queue_capacity,
+        .get_peers_timeout_ms = config.refresh_get_peers_timeout_ms,
+        .max_iterations = config.refresh_max_iterations
+    };
+    
+    g_refresh_thread = refresh_thread_create(&refresh_config,
+                                              g_supervisor->shared_node_pool,
+                                              g_refresh_query_store);
+    if (!g_refresh_thread) {
+        log_msg(LOG_ERROR, "Failed to create refresh thread");
+        supervisor_stop(g_supervisor);
+        supervisor_destroy(g_supervisor);
+        batch_writer_cleanup(g_batch_writer);
+        database_cleanup(&g_database);
+        bloom_filter_cleanup(g_bloom);
+        return 1;
+    }
+    
+    rc = refresh_thread_start(g_refresh_thread);
+    if (rc != 0) {
+        log_msg(LOG_ERROR, "Failed to start refresh thread");
+        refresh_thread_destroy(g_refresh_thread);
+        supervisor_stop(g_supervisor);
+        supervisor_destroy(g_supervisor);
+        batch_writer_cleanup(g_batch_writer);
+        database_cleanup(&g_database);
+        bloom_filter_cleanup(g_bloom);
+        return 1;
+    }
+    
+    /* Initialize HTTP API (minimal - no DHT manager in thread tree mode) */
+    log_msg(LOG_DEBUG, "Initializing HTTP API for thread tree mode...");
+    rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, g_batch_writer, HTTP_API_PORT);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize HTTP API: %d", rc);
-        dht_manager_stop(&g_dht_mgr);
-        metadata_fetcher_stop(&g_fetcher);
-        dht_manager_cleanup(&g_dht_mgr);
-        metadata_fetcher_cleanup(&g_fetcher);
+        refresh_thread_request_shutdown(g_refresh_thread);
+        refresh_thread_destroy(g_refresh_thread);
+        supervisor_stop(g_supervisor);
+        supervisor_destroy(g_supervisor);
+        batch_writer_cleanup(g_batch_writer);
         database_cleanup(&g_database);
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
-
+    
+    /* Set supervisor reference for stats */
+    http_api_set_supervisor(&g_http_api, g_supervisor);
+    
+    /* Set refresh thread for /refresh endpoint */
+    http_api_set_refresh_thread(&g_http_api, g_refresh_thread);
+    
+    /* Set refresh query store for /refresh endpoint */
+    http_api_set_refresh_query_store(&g_http_api, g_refresh_query_store);
+    
     /* Start HTTP API */
     log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
     rc = http_api_start(&g_http_api);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to start HTTP API: %d", rc);
-        dht_manager_stop(&g_dht_mgr);
-        metadata_fetcher_stop(&g_fetcher);
-        dht_manager_cleanup(&g_dht_mgr);
-        metadata_fetcher_cleanup(&g_fetcher);
+        supervisor_stop(g_supervisor);
+        supervisor_destroy(g_supervisor);
         http_api_cleanup(&g_http_api);
+        batch_writer_cleanup(g_batch_writer);
         database_cleanup(&g_database);
         bloom_filter_cleanup(g_bloom);
-        infohash_queue_cleanup(&g_queue);
         return 1;
     }
-
-    log_msg(LOG_DEBUG, "DHT crawler is running.");
+    
+    log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
+    log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
+            config.num_trees, config.tree_bep51_workers,
+            config.tree_get_peers_workers, config.tree_metadata_workers);
     log_msg(LOG_DEBUG, "HTTP API available at http://localhost:%d/", HTTP_API_PORT);
     log_msg(LOG_DEBUG, "Press Ctrl+C to stop.");
-
-    /* Main event loop - blocks until uv_stop() is called or no active handles remain */
-    log_msg(LOG_DEBUG, "Starting main event loop (loop=%p)", g_app_ctx.loop);
-    uv_run(g_app_ctx.loop, UV_RUN_DEFAULT);
-    log_msg(LOG_DEBUG, "Main event loop exited");
-
-    /* Cleanup */
-    log_msg(LOG_DEBUG, "=== Beginning graceful shutdown sequence ===");
-
+    
+    /* Wait for shutdown signal (blocking) */
+    while (g_app_ctx.running) {
+        sleep(1);
+    }
+    
+    /* Graceful shutdown sequence for thread tree mode */
+    log_msg(LOG_DEBUG, "=== Beginning thread tree shutdown sequence ===");
+    
     log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
     http_api_stop(&g_http_api);
-
-    log_msg(LOG_DEBUG, "Step 2: Stopping metadata fetcher (joins all worker threads)...");
-    metadata_fetcher_stop(&g_fetcher);
-
-    log_msg(LOG_DEBUG, "Step 3: Stopping DHT manager (stops DHT network participation)...");
-    dht_manager_stop(&g_dht_mgr);
-
-    log_msg(LOG_DEBUG, "=== Shutdown sequence complete, beginning cleanup ===");
-
-    /* Save bloom filter statistics and persist to disk */
-    if (g_bloom) {
-        /* Save bloom filter to disk if persistence is enabled */
-        if (config.bloom_persist) {
-            log_msg(LOG_DEBUG, "Saving bloom filter to %s...", config.bloom_path);
-            if (bloom_filter_save(g_bloom, config.bloom_path) == 0) {
-                log_msg(LOG_DEBUG, "Bloom filter saved successfully");
-            } else {
-                log_msg(LOG_WARN, "Failed to save bloom filter");
-            }
+    
+    log_msg(LOG_DEBUG, "Step 2: Stopping refresh thread...");
+    if (g_refresh_thread) {
+        refresh_thread_request_shutdown(g_refresh_thread);
+    }
+    
+    log_msg(LOG_DEBUG, "Step 3: Stopping supervisor (stops all trees)...");
+    batch_writer_inhibit_backup(g_batch_writer);
+    supervisor_stop(g_supervisor);
+    
+    log_msg(LOG_DEBUG, "Step 4: Flushing batch writer...");
+    batch_writer_flush(g_batch_writer);
+    
+    log_msg(LOG_DEBUG, "=== Thread tree shutdown complete, beginning cleanup ===");
+    
+    /* Save bloom filter */
+    if (g_bloom && config.bloom_persist) {
+        log_msg(LOG_DEBUG, "Saving bloom filter to %s...", config.bloom_path);
+        if (bloom_filter_save(g_bloom, config.bloom_path) == 0) {
+            log_msg(LOG_DEBUG, "Bloom filter saved successfully");
+        } else {
+            log_msg(LOG_WARN, "Failed to save bloom filter");
         }
     }
-
-    /* Now proceed with cleanup - all handles are guaranteed to be closed */
+    
+    /* Cleanup - cleanup_app_context must be called before batch_writer_cleanup
+     * to avoid use-after-free in uv_loop_close() */
     http_api_cleanup(&g_http_api);
-    dht_manager_cleanup(&g_dht_mgr);
-    metadata_fetcher_cleanup(&g_fetcher);
+    if (g_refresh_thread) {
+        refresh_thread_destroy(g_refresh_thread);
+    }
+    supervisor_destroy(g_supervisor);
+    cleanup_app_context(&g_app_ctx);
+    batch_writer_cleanup(g_batch_writer);
+    if (g_refresh_query_store) {
+        refresh_query_store_cleanup(g_refresh_query_store);
+    }
     database_cleanup(&g_database);
     torrent_search_cleanup();
     porn_filter_cleanup();
     language_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
-    infohash_queue_cleanup(&g_queue);
-    cleanup_app_context(&g_app_ctx);
-
-    log_msg(LOG_DEBUG, "DHT Crawler stopped.");
+    
+    log_msg(LOG_DEBUG, "DHT Crawler (thread tree mode) stopped.");
     return 0;
 }

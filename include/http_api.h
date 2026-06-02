@@ -3,8 +3,6 @@
 
 #include "dht_crawler.h"
 #include "database.h"
-#include "dht_manager.h"
-#include "metadata_fetcher.h"
 #include "refresh_query.h"
 
 /* Forward declarations */
@@ -21,9 +19,7 @@ typedef struct {
     void *mg_ctx;  /* CivetWeb context */
     app_context_t *app_ctx;
     database_t *database;
-    dht_manager_t *dht_manager;
     struct batch_writer *batch_writer;
-    metadata_fetcher_t *metadata_fetcher;
     struct supervisor *supervisor;  /* Stage 6: Thread tree supervisor */
     struct refresh_thread *refresh_thread;  /* Refresh thread for /refresh endpoint */
     refresh_query_store_t *refresh_query_store;  /* Direct access for /refresh endpoint */
@@ -45,8 +41,7 @@ typedef struct {
 
 /* Function declarations */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  dht_manager_t *dht_manager, struct batch_writer *batch_writer,
-                  metadata_fetcher_t *metadata_fetcher, int port);
+                  struct batch_writer *batch_writer, int port);
 int http_api_start(http_api_t *api);
 void http_api_stop(http_api_t *api);
 void http_api_cleanup(http_api_t *api);

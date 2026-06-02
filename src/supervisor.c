@@ -10,7 +10,6 @@
 #include "tree_dispatcher.h"
 #include "tree_protocol.h"
 #include "tree_routing.h"
-#include "wbpxre_dht.h"
 #include "keyspace.h"
 #include "tree_infohash_queue.h"
 #include <stdlib.h>
@@ -20,20 +19,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-/* Bootstrap nodes (reused from thread_tree.c) */
-static const char *BOOTSTRAP_NODES[] = {
-    "router.bittorrent.com",
-    "dht.transmissionbt.com",
-    "router.utorrent.com",
-    NULL
-};
-static const int BOOTSTRAP_PORT = 6881;
 
 /* Forward declaration of internal helpers */
 static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree, uint32_t partition_index);
 static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *tree, int slot_index);
 static void *monitor_thread_func(void *arg);
-static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec, int num_workers);
 
 supervisor_t *supervisor_create(supervisor_config_t *config) {
     if (!config || config->max_trees <= 0) {
@@ -558,263 +548,6 @@ static void generate_random_target(uint8_t *target) {
     }
 }
 
-/* Bootstrap worker context */
-typedef struct global_bootstrap_ctx {
-    shared_node_pool_t *pool;
-    tree_routing_table_t *routing_table;
-    tree_socket_t *socket;
-    uint8_t node_id[20];
-    atomic_bool *shutdown_flag;
-    int worker_id;
-} global_bootstrap_ctx_t;
-
-/* Global bootstrap worker: aggressively queries nodes */
-static void *global_bootstrap_worker_func(void *arg) {
-    global_bootstrap_ctx_t *ctx = (global_bootstrap_ctx_t *)arg;
-
-    log_msg(LOG_DEBUG, "[global_bootstrap] Worker %d started", ctx->worker_id);
-
-    while (!atomic_load(ctx->shutdown_flag)) {
-        /* Get random nodes from routing table */
-        tree_node_t nodes[8];
-        int got = tree_routing_get_random_nodes(ctx->routing_table, nodes, 8);
-
-        if (got == 0) {
-            /* No nodes yet, wait a bit */
-            usleep(100000);  /* 100ms */
-            continue;
-        }
-
-        /* Query each node with a random target to explore keyspace */
-        for (int i = 0; i < got; i++) {
-            uint8_t random_target[20];
-            generate_random_target(random_target);
-
-            /* Build and send find_node query */
-            /* Note: We can't use tree_send_find_node since we don't have a thread_tree */
-            /* So we'll just send queries manually or reuse the socket */
-            /* For simplicity, let's create a minimal send here */
-
-            /* Actually, we need to build the bencode message - let's skip this for now */
-            /* and just let the main loop handle everything */
-            (void)random_target;  /* Suppress warning */
-        }
-
-        /* Rate limit */
-        usleep(10000);  /* 10ms */
-    }
-
-    free(ctx);
-    log_msg(LOG_DEBUG, "[global_bootstrap] Worker %d exiting", ctx->worker_id);
-    return NULL;
-}
-
-/**
- * Perform global bootstrap to collect nodes into shared pool
- * Uses wbpxre_dht for proven bootstrap implementation
- * @param sup Supervisor instance
- * @param target_nodes Target number of nodes to collect (e.g., 5000)
- * @param timeout_sec Maximum time to spend bootstrapping
- * @param num_workers Number of worker threads to use (unused, kept for API compatibility)
- * @return 0 on success (reached target or timeout), -1 on error
- */
-static int global_bootstrap(supervisor_t *sup, int target_nodes, int timeout_sec, int num_workers) {
-    log_msg(LOG_DEBUG, "[global_bootstrap] Starting (target: %d nodes, timeout: %ds, workers: %d)",
-            target_nodes, timeout_sec, num_workers);
-
-    time_t start_time = time(NULL);
-
-    /* Create temporary wbpxre_dht instance for bootstrap */
-    wbpxre_config_t config = {0};
-    config.port = 0;  /* Ephemeral port */
-    generate_random_node_id(config.node_id);
-    config.max_routing_table_nodes = target_nodes * 3;  /* Allow plenty of space */
-    config.triple_routing_threshold = target_nodes;
-
-    /* Configure timeouts for parallel queries */
-    config.query_timeout = 5;  /* 5 second timeout per query */
-
-    /* Enable find_node workers for parallel bootstrap queries */
-    config.ping_workers = 0;
-    config.find_node_workers = num_workers > 0 ? num_workers : 20;  /* Default 20 parallel workers */
-    config.sample_infohashes_workers = 0;  /* Not needed during bootstrap */
-    config.get_peers_workers = 0;  /* Not needed during bootstrap */
-
-    /* Configure queue capacities for bootstrap */
-    config.discovered_nodes_capacity = 10000;
-    config.find_node_queue_capacity = 5000;
-    config.sample_infohashes_capacity = 100;  /* Small, not used */
-
-    wbpxre_dht_t *bootstrap_dht = wbpxre_dht_init(&config);
-    if (!bootstrap_dht) {
-        log_msg(LOG_ERROR, "[global_bootstrap] Failed to initialize wbpxre_dht");
-        return -1;
-    }
-
-    /* Start the DHT (this starts the UDP reader thread needed for synchronous queries) */
-    if (wbpxre_dht_start(bootstrap_dht) != 0) {
-        log_msg(LOG_ERROR, "[global_bootstrap] Failed to start wbpxre_dht");
-        wbpxre_dht_cleanup(bootstrap_dht);
-        return -1;
-    }
-
-    /* Wait for UDP reader to be ready */
-    if (wbpxre_dht_wait_ready(bootstrap_dht, 5) != 0) {
-        log_msg(LOG_ERROR, "[global_bootstrap] DHT not ready after 5 seconds");
-        wbpxre_dht_stop(bootstrap_dht);
-        wbpxre_dht_cleanup(bootstrap_dht);
-        return -1;
-    }
-
-    log_msg(LOG_DEBUG, "[global_bootstrap] DHT started and ready");
-
-    /* Bootstrap from known routers (synchronous) */
-    int bootstrapped = 0;
-    for (int i = 0; BOOTSTRAP_NODES[i] != NULL; i++) {
-        log_msg(LOG_DEBUG, "[global_bootstrap] Bootstrapping from %s:%d",
-                BOOTSTRAP_NODES[i], BOOTSTRAP_PORT);
-
-        int rc = wbpxre_dht_bootstrap(bootstrap_dht, BOOTSTRAP_NODES[i], BOOTSTRAP_PORT);
-        if (rc == 0) {
-            bootstrapped++;
-            log_msg(LOG_DEBUG, "[global_bootstrap] Successfully bootstrapped from %s",
-                    BOOTSTRAP_NODES[i]);
-
-            /* Early exit after 2 successful bootstraps */
-            if (bootstrapped >= 2) {
-                break;
-            }
-        } else {
-            log_msg(LOG_WARN, "[global_bootstrap] Failed to bootstrap from %s",
-                    BOOTSTRAP_NODES[i]);
-        }
-    }
-
-    if (bootstrapped == 0) {
-        log_msg(LOG_ERROR, "[global_bootstrap] Failed to bootstrap from any known routers");
-        wbpxre_dht_stop(bootstrap_dht);
-        wbpxre_dht_cleanup(bootstrap_dht);
-        return -1;
-    }
-
-    /* Let worker threads discover nodes in parallel
-     * The find_node_feeder and find_node_worker threads will automatically
-     * query nodes from the routing table and discover new nodes */
-    log_msg(LOG_DEBUG, "[global_bootstrap] Worker threads discovering nodes in parallel (workers: %d)",
-            config.find_node_workers);
-
-    int last_logged_count = 0;
-    int poll_count = 0;
-
-    while (1) {
-        /* Check timeout */
-        time_t elapsed = time(NULL) - start_time;
-        if (elapsed > timeout_sec) {
-            int good_nodes = 0, dubious_nodes = 0;
-            wbpxre_dht_nodes(bootstrap_dht, &good_nodes, &dubious_nodes);
-            log_msg(LOG_WARN, "[global_bootstrap] Timeout reached after %ld seconds (%d nodes discovered)",
-                    elapsed, good_nodes);
-            break;
-        }
-
-        /* Get current node count */
-        int good_nodes = 0, dubious_nodes = 0;
-        wbpxre_dht_nodes(bootstrap_dht, &good_nodes, &dubious_nodes);
-
-        /* Log progress every 10 polls (2 seconds) */
-        if (poll_count % 10 == 0 && good_nodes != last_logged_count) {
-            log_msg(LOG_DEBUG, "[global_bootstrap] Progress: %d nodes discovered (%.1f sec elapsed)",
-                    good_nodes, (double)elapsed);
-            last_logged_count = good_nodes;
-        }
-
-        /* Check if we have enough nodes */
-        if (good_nodes >= target_nodes) {
-            log_msg(LOG_DEBUG, "[global_bootstrap] Reached target: %d nodes in %ld seconds",
-                    good_nodes, elapsed);
-            break;
-        }
-
-        /* Poll every 200ms to check progress */
-        usleep(200000);
-        poll_count++;
-    }
-
-    /* Extract nodes from wbpxre routing table and add to shared pool */
-    log_msg(LOG_DEBUG, "[global_bootstrap] Extracting nodes from routing table to shared pool");
-
-    tribuf_controller_t *ctrl = bootstrap_dht->routing_controller;
-    wbpxre_routing_table_t *table = tribuf_get_readable_table(ctrl);
-
-    if (!table) {
-        table = tribuf_get_filling_table(ctrl);
-    }
-
-    int nodes_added = 0;
-    if (table) {
-        /* Get nodes from the table using get_sample_candidates (works like get_all) */
-        wbpxre_routing_node_t *nodes[10000];
-        const uint8_t *node_id = tribuf_get_filling_node_id(ctrl);
-
-        if (node_id) {
-            int count = wbpxre_routing_table_get_sample_candidates(table, node_id,
-                                                                   nodes, 10000);
-
-            log_msg(LOG_DEBUG, "[global_bootstrap] Extracted %d nodes from routing table", count);
-
-            /* Add each node to the shared pool */
-            for (int i = 0; i < count; i++) {
-                /* Validate port is not 0 */
-                if (nodes[i]->addr.port == 0) {
-                    log_msg(LOG_DEBUG, "[global_bootstrap] Skipping node with invalid port 0: %s",
-                            nodes[i]->addr.ip);
-                    free(nodes[i]);
-                    continue;
-                }
-
-                struct sockaddr_storage addr;
-                memset(&addr, 0, sizeof(addr));
-                struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
-
-                /* Convert wbpxre_node_addr_t (ip string + port) to sockaddr_in */
-                sin->sin_family = AF_INET;
-                sin->sin_port = htons(nodes[i]->addr.port);
-
-                /* Convert IP string to binary format */
-                if (inet_pton(AF_INET, nodes[i]->addr.ip, &sin->sin_addr) != 1) {
-                    /* Invalid IP address, skip this node */
-                    log_msg(LOG_DEBUG, "[global_bootstrap] Skipping node with invalid IP: %s",
-                            nodes[i]->addr.ip);
-                    free(nodes[i]);
-                    continue;
-                }
-
-                int rc = shared_node_pool_add_node(sup->shared_node_pool,
-                                                   nodes[i]->id,
-                                                   &addr);
-                if (rc == 0) {
-                    nodes_added++;
-                }
-
-                /* Free the node */
-                free(nodes[i]);
-            }
-        }
-    }
-
-    size_t final_count = shared_node_pool_get_count(sup->shared_node_pool);
-    time_t elapsed = time(NULL) - start_time;
-
-    log_msg(LOG_DEBUG, "[global_bootstrap] Complete: added %d nodes to shared pool (%zu total) in %ld seconds",
-            nodes_added, final_count, elapsed);
-
-    /* Stop and cleanup */
-    wbpxre_dht_stop(bootstrap_dht);
-    wbpxre_dht_cleanup(bootstrap_dht);
-
-    return (final_count >= 1000) ? 0 : -1;  /* Need at least 1000 nodes to be useful */
-}
-
 void supervisor_start(supervisor_t *sup) {
     if (!sup) {
         return;
@@ -878,22 +611,6 @@ void supervisor_start(supervisor_t *sup) {
     size_t nodes_from_cache = shared_node_pool_get_count(sup->shared_node_pool);
     log_msg(LOG_DEBUG, "[supervisor] Shared pool has %zu nodes from cache", nodes_from_cache);
 
-    /* Only run URL bootstrap if we don't have enough nodes from cache */
-    if (nodes_from_cache < 1000) {
-        log_msg(LOG_DEBUG, "[supervisor] Insufficient cache nodes (%zu), running URL bootstrap",
-                nodes_from_cache);
-
-        int rc = global_bootstrap(sup, sup->global_bootstrap_target,
-                                 sup->global_bootstrap_timeout_sec,
-                                 sup->global_bootstrap_workers);
-        if (rc != 0) {
-            log_msg(LOG_ERROR, "[supervisor] Global bootstrap failed");
-            /* Continue anyway with whatever nodes we got */
-        }
-    } else {
-        log_msg(LOG_DEBUG, "[supervisor] Using %zu cached nodes, skipping URL bootstrap",
-                nodes_from_cache);
-    }
 
     size_t nodes_collected = shared_node_pool_get_count(sup->shared_node_pool);
     log_msg(LOG_DEBUG, "[supervisor] Bootstrap finished: %zu nodes available", nodes_collected);
