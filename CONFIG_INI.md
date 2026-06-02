@@ -48,6 +48,9 @@ ignored.
 ## Tree-Native Bootstrap
 
 | tree_bootstrap_timeout_sec | 30 | config.c default; supervisor.c set; thread_tree.c read |
+| global_bootstrap_target | 1000 | config.c default; supervisor.c read |
+| global_bootstrap_timeout_sec | 60 | config.c default; supervisor.c read |
+| global_bootstrap_workers | 20 | config.c default; supervisor.c read |
 
 ## Thread Tree Architecture
 
@@ -124,8 +127,7 @@ config.ini they are silently ignored:
   `max_metadata_size_mb`, `batch_writes_enabled`, all `wbpxre_*`,
   all `peer_retry_*`, `triple_routing_threshold`,
   `triple_routing_rotation_time`, `use_thread_trees`,
-  `global_bootstrap_target`, `global_bootstrap_workers`,
-  `global_bootstrap_timeout_sec`, `per_tree_sample_size`,
+  `per_tree_sample_size`,
   `max_concurrent_connections`, `tcp_connect_timeout_sec`,
   `connection_timeout_sec`, `max_connection_lifetime_sec`.
 
