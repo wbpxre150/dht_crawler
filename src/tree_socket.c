@@ -23,6 +23,7 @@ tree_socket_t *tree_socket_create(int port) {
         free(sock);
         return NULL;
     }
+    sock->domain = AF_INET6;
 
     log_msg(LOG_DEBUG, "[tree_socket] Created socket with fd=%d", sock->fd);
 
@@ -161,11 +162,30 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
         return -1;
     }
 
+    struct sockaddr_in6 mapped;  /* For IPv4-to-mapped-IPv6 conversion */
+    const struct sockaddr *send_addr;
     socklen_t addrlen;
     if (dest->ss_family == AF_INET) {
-        addrlen = sizeof(struct sockaddr_in);
+        if (sock->domain == AF_INET6) {
+            /* Convert to IPv4-mapped IPv6 for AF_INET6 socket:
+             * an AF_INET6 socket cannot send to a raw AF_INET sockaddr;
+             * Linux requires IPv4-mapped IPv6 format (::ffff:a.b.c.d). */
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)dest;
+            memset(&mapped, 0, sizeof(mapped));
+            mapped.sin6_family = AF_INET6;
+            mapped.sin6_port         = sin->sin_port;
+            mapped.sin6_addr.s6_addr[10] = 0xff;
+            mapped.sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&mapped.sin6_addr.s6_addr[12], &sin->sin_addr, 4);
+            send_addr = (const struct sockaddr *)&mapped;
+            addrlen   = sizeof(mapped);
+        } else {
+            send_addr = (const struct sockaddr *)dest;
+            addrlen   = sizeof(struct sockaddr_in);
+        }
     } else if (dest->ss_family == AF_INET6) {
-        addrlen = sizeof(struct sockaddr_in6);
+        send_addr = (const struct sockaddr *)dest;
+        addrlen   = sizeof(struct sockaddr_in6);
     } else {
         log_msg(LOG_ERROR, "[tree_socket] Unknown address family: %d", dest->ss_family);
         pthread_mutex_unlock(&sock->send_lock);
@@ -189,7 +209,7 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
     static atomic_ulong send_count = 0;
     atomic_fetch_add(&send_count, 1);
 
-    ssize_t sent = sendto(sock->fd, data, len, 0, (const struct sockaddr *)dest, addrlen);
+    ssize_t sent = sendto(sock->fd, data, len, 0, send_addr, addrlen);
 
     /* Handle EAGAIN/EWOULDBLOCK/ENOBUFS with backoff - send buffer is full */
     if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {

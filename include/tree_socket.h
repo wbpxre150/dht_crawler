@@ -15,6 +15,7 @@
 
 typedef struct tree_socket {
     int fd;
+    int domain;  /* AF_INET or AF_INET6 */
     struct sockaddr_storage local_addr;
     pthread_mutex_t send_lock;
 } tree_socket_t;
