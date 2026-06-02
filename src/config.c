@@ -16,12 +16,6 @@ void config_init_defaults(crawler_config_t *config) {
     /* DHT defaults */
     config->dht_port = 6881;
 
-    /* Discovery defaults */
-    config->targeted_search_percentage = 30;
-    
-    /* HTTP defaults */
-    config->http_port = 8080;
-    
     /* Database defaults */
     strncpy(config->db_path, "data/torrents.db", sizeof(config->db_path) - 1);
     
@@ -36,21 +30,13 @@ void config_init_defaults(crawler_config_t *config) {
     config->bloom_persist = 1;
     strncpy(config->bloom_path, "data/bloom.dat", sizeof(config->bloom_path) - 1);
 
-    /* Phase 4: Worker Pool defaults */
-    config->scaling_factor = 10;
-    config->metadata_workers = 100;
-
     /* Metadata fetcher defaults */
     config->max_concurrent_connections = 2000;
     config->tcp_connect_timeout_sec = 10;  /* 10s TCP connection timeout */
     config->connection_timeout_sec = 30;  /* 30s idle timeout - resets on activity */
     config->max_connection_lifetime_sec = 300;  /* 5 minutes max total connection time */
-    config->max_metadata_size_mb = 100;
-    config->max_retry_attempts = 3;
-    config->retry_delay_sec = 120;
 
     /* Phase 5: Batch Writer defaults */
-    config->batch_writes_enabled = 1;
     config->batch_size = 1000;
     config->flush_interval = 60;
 
@@ -73,26 +59,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->rclone_remote[0]      = '\0';
     config->rclone_dest_path[0]   = '\0';
     strncpy(config->rclone_bookmark_path, "data/rclone_backup_ids.txt", sizeof(config->rclone_bookmark_path) - 1);
-
-    /* wbpxre-dht defaults */
-    config->wbpxre_ping_workers = 10;
-    config->wbpxre_find_node_workers = 20;
-    config->wbpxre_sample_infohashes_workers = 50;
-    config->wbpxre_get_peers_workers = 100;
-    config->wbpxre_query_timeout = 5;
-    config->max_routing_table_nodes = 10000;  /* Default: 10000 nodes */
-
-    /* Peer discovery retry defaults */
-    config->peer_retry_enabled = 1;
-    config->peer_retry_max_attempts = 3;
-    config->peer_retry_min_threshold = 10;
-    config->peer_retry_delay_ms = 500;
-    config->peer_retry_cleanup_interval_sec = 10;
-    config->peer_retry_max_entries = 50000;
-
-    /* Triple routing table defaults */
-    config->triple_routing_threshold = 1500;        /* Rotate when filling table reaches this count */
-    config->triple_routing_rotation_time = 60;      /* Minimum time between rotations (seconds) */
 
     /* Pornography content filter defaults */
     config->porn_filter_enabled = 0;                /* Disabled by default */
@@ -231,10 +197,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* Parse settings */
         if (strcmp(key, "dht_port") == 0) {
             config->dht_port = atoi(value);
-        } else if (strcmp(key, "targeted_search_percentage") == 0) {
-            config->targeted_search_percentage = atoi(value);
-        } else if (strcmp(key, "http_port") == 0) {
-            config->http_port = atoi(value);
         } else if (strcmp(key, "db_path") == 0) {
             strncpy(config->db_path, value, sizeof(config->db_path) - 1);
         } else if (strcmp(key, "log_level") == 0) {
@@ -262,16 +224,8 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "bloom_path") == 0) {
             strncpy(config->bloom_path, value, sizeof(config->bloom_path) - 1);
         }
-        /* Phase 4: Worker Pool settings */
-        else if (strcmp(key, "scaling_factor") == 0) {
-            config->scaling_factor = atoi(value);
-        } else if (strcmp(key, "metadata_workers") == 0) {
-            config->metadata_workers = atoi(value);
-        }
         /* Phase 5: Batch Writer settings */
-        else if (strcmp(key, "batch_writes_enabled") == 0) {
-            config->batch_writes_enabled = atoi(value);
-        } else if (strcmp(key, "batch_size") == 0) {
+        else if (strcmp(key, "batch_size") == 0) {
             config->batch_size = atoi(value);
         } else if (strcmp(key, "flush_interval") == 0) {
             config->flush_interval = atoi(value);
@@ -309,53 +263,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->connection_timeout_sec = atoi(value);
         } else if (strcmp(key, "max_connection_lifetime_sec") == 0) {
             config->max_connection_lifetime_sec = atoi(value);
-        } else if (strcmp(key, "max_metadata_size_mb") == 0) {
-            config->max_metadata_size_mb = atoi(value);
-        } else if (strcmp(key, "max_retry_attempts") == 0) {
-            config->max_retry_attempts = atoi(value);
-        } else if (strcmp(key, "retry_delay_sec") == 0) {
-            config->retry_delay_sec = atoi(value);
-        }
-        /* wbpxre-dht settings */
-        else if (strcmp(key, "wbpxre_ping_workers") == 0) {
-            config->wbpxre_ping_workers = atoi(value);
-        } else if (strcmp(key, "wbpxre_find_node_workers") == 0) {
-            config->wbpxre_find_node_workers = atoi(value);
-        } else if (strcmp(key, "wbpxre_sample_infohashes_workers") == 0) {
-            config->wbpxre_sample_infohashes_workers = atoi(value);
-        } else if (strcmp(key, "wbpxre_get_peers_workers") == 0) {
-            config->wbpxre_get_peers_workers = atoi(value);
-        } else if (strcmp(key, "wbpxre_query_timeout") == 0) {
-            config->wbpxre_query_timeout = atoi(value);
-        } else if (strcmp(key, "max_routing_table_nodes") == 0) {
-            config->max_routing_table_nodes = atoi(value);
-        }
-        /* Peer discovery retry settings */
-        else if (strcmp(key, "peer_retry_enabled") == 0) {
-            config->peer_retry_enabled = atoi(value);
-        } else if (strcmp(key, "peer_retry_max_attempts") == 0) {
-            config->peer_retry_max_attempts = atoi(value);
-        } else if (strcmp(key, "peer_retry_min_threshold") == 0) {
-            config->peer_retry_min_threshold = atoi(value);
-        } else if (strcmp(key, "peer_retry_delay_ms") == 0) {
-            config->peer_retry_delay_ms = atoi(value);
-        } else if (strcmp(key, "peer_retry_cleanup_interval_sec") == 0) {
-            config->peer_retry_cleanup_interval_sec = atoi(value);
-            if (config->peer_retry_cleanup_interval_sec < 1) config->peer_retry_cleanup_interval_sec = 1;
-        } else if (strcmp(key, "peer_retry_max_entries") == 0) {
-            config->peer_retry_max_entries = atoi(value);
-            if (config->peer_retry_max_entries < 1000) config->peer_retry_max_entries = 1000;
-        }
-        /* Triple routing table settings */
-        else if (strcmp(key, "triple_routing_threshold") == 0) {
-            config->triple_routing_threshold = (uint32_t)atoi(value);
-            /* Minimum threshold of 100 nodes */
-            if (config->triple_routing_threshold < 100) config->triple_routing_threshold = 100;
-        }
-        else if (strcmp(key, "triple_routing_rotation_time") == 0) {
-            config->triple_routing_rotation_time = atoi(value);
-            /* Minimum rotation time of 10 seconds */
-            if (config->triple_routing_rotation_time < 10) config->triple_routing_rotation_time = 10;
         }
         /* Pornography content filter settings */
         else if (strcmp(key, "porn_filter_enabled") == 0) {
@@ -565,11 +472,9 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
 
     static struct option long_options[] = {
         {"port",        required_argument, 0, 'p'},
-        {"http-port",   required_argument, 0, 'h'},
         {"db-path",     required_argument, 0, 'd'},
         {"log-level",   required_argument, 0, 'l'},
         {"config",      required_argument, 0, 'c'},
-        {"aggressive",  no_argument,       0, 'a'},
         {"help",        no_argument,       0, '?'},
         {0, 0, 0, 0}
     };
@@ -577,13 +482,10 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:h:d:l:c:a?", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:l:c?", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 config->dht_port = atoi(optarg);
-                break;
-            case 'h':
-                config->http_port = atoi(optarg);
                 break;
             case 'd':
                 strncpy(config->db_path, optarg, sizeof(config->db_path) - 1);
@@ -604,20 +506,14 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
             case 'c':
                 /* Config file is loaded separately */
                 break;
-            case 'a':
-                /* Aggressive mode (placeholder - no longer used) */
-                log_msg(LOG_DEBUG, "Aggressive mode flag ignored (deprecated)");
-                break;
             case '?':
             default:
                 fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
                 fprintf(stderr, "Options:\n");
                 fprintf(stderr, "  -p, --port PORT          DHT port (default: 6881)\n");
-                fprintf(stderr, "  -h, --http-port PORT     HTTP API port (default: 8080)\n");
                 fprintf(stderr, "  -d, --db-path PATH       Database path (default: data/torrents.db)\n");
                 fprintf(stderr, "  -l, --log-level LEVEL    Log level: DEBUG|INFO|WARN|ERROR (default: INFO)\n");
                 fprintf(stderr, "  -c, --config FILE        Config file path (default: config.ini)\n");
-                fprintf(stderr, "  -a, --aggressive         Enable aggressive crawling mode\n");
                 fprintf(stderr, "  -?, --help               Show this help message\n");
                 return -1;
         }
@@ -637,10 +533,6 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
     log_msg(LOG_DEBUG, "DHT Settings:");
     log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
-    log_msg(LOG_DEBUG, "Discovery Settings:");
-    log_msg(LOG_DEBUG, "  Targeted Search Percentage: %d%%", config->targeted_search_percentage);
-    log_msg(LOG_DEBUG, "HTTP API Settings:");
-    log_msg(LOG_DEBUG, "  Port: %d", config->http_port);
     log_msg(LOG_DEBUG, "Database Settings:");
     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
     log_msg(LOG_DEBUG, "Logging:");

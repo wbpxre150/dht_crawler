@@ -5,21 +5,32 @@
 
 /* Configuration structure */
 typedef struct {
+    /*
+     * Live fields. The 22 dead fields removed in Stage 1 are documented in
+     * CONFIG_INI.md (one-pager post-Stage 6). When auditing this struct, the
+     * consumers are:
+     *   - main.c (dht_port, db_path, log_level, bloom_*, batch_size, backup_*,
+     *     ssh_*, rclone_*, porn_filter_*, language_filter_*)
+     *   - supervisor.c (dht_port, num_trees, tree_*, bep51_*, refresh_*,
+     *     respawn_*, min_metadata_rate, dynamic_rate_margin, etc.)
+     *   - tree_*.c (tree_* via supervisor config)
+     *   - tree_metadata.c (tree_tcp_connect_timeout_ms, tree_parallel_peers)
+     *   - batch_writer.c (batch_size, flush_interval, backup_path)
+     *   - refresh_thread.c (refresh_*)
+     *   - language_filter.c (language_filter_non_latin_threshold)
+     *   - porn_filter.c (porn_filter_enabled, porn_filter_keyword_file)
+     *   - failure_bloom filter (failure_bloom_capacity)
+     */
+
     /* DHT settings */
     int dht_port;
 
-    /* Discovery settings */
-    int targeted_search_percentage;  /* 0-100 */
-    
-    /* HTTP API settings */
-    int http_port;
-    
     /* Database settings */
     char db_path[512];
-    
+
     /* Logging */
     int log_level;  /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR */
-    
+
     /* Phase 2: Bloom Filter settings */
     int bloom_enabled;
     uint64_t bloom_capacity;
@@ -27,22 +38,14 @@ typedef struct {
     double bloom_error_rate;
     int bloom_persist;
     char bloom_path[512];
-    
-    /* Phase 4: Worker Pool settings */
-    int scaling_factor;
-    int metadata_workers;
 
     /* Metadata fetcher settings */
     int max_concurrent_connections;
     int tcp_connect_timeout_sec;        /* TCP connection establishment timeout */
     int connection_timeout_sec;         /* Idle timeout - resets on activity */
     int max_connection_lifetime_sec;    /* Max total connection time (0=unlimited) */
-    int max_metadata_size_mb;
-    int max_retry_attempts;
-    int retry_delay_sec;
 
     /* Phase 5: Batch Writer settings */
-    int batch_writes_enabled;
     int batch_size;
     int flush_interval;              /* seconds */
 
@@ -63,26 +66,6 @@ typedef struct {
     char rclone_remote[256];         /* rclone remote name, e.g. "r2" */
     char rclone_dest_path[1024];     /* bucket path, e.g. "dht-backup/dht_crawler_backup" */
     char rclone_bookmark_path[1024]; /* local bookmark file */
-
-    /* wbpxre-dht settings */
-    int wbpxre_ping_workers;
-    int wbpxre_find_node_workers;
-    int wbpxre_sample_infohashes_workers;
-    int wbpxre_get_peers_workers;
-    int wbpxre_query_timeout;
-    int max_routing_table_nodes;         /* Maximum nodes in routing table */
-
-    /* Peer discovery retry settings */
-    int peer_retry_enabled;              /* Enable multi-retry peer discovery */
-    int peer_retry_max_attempts;         /* Max get_peers retries (1-5, default: 3) */
-    int peer_retry_min_threshold;        /* Min peers before stopping retries (default: 10) */
-    int peer_retry_delay_ms;             /* Delay between retries in ms (default: 500) */
-    int peer_retry_cleanup_interval_sec; /* How often to cleanup old entries (default: 10) */
-    int peer_retry_max_entries;          /* Max entries in tracker before eviction (default: 50000) */
-
-    /* Triple routing table settings */
-    uint32_t triple_routing_threshold;    /* Node count to trigger rotation (default: 1500) */
-    int triple_routing_rotation_time;     /* Minimum time between rotations in seconds (default: 60) */
 
     /* Pornography content filter settings */
     int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */
@@ -140,7 +123,7 @@ typedef struct {
     int respawn_drain_timeout_sec;          /* Force destroy draining tree after this timeout (default: 120) */
     int max_draining_trees;                 /* Maximum trees allowed in draining state (default: 8) */
 
-    /* Thread tree mode toggle */
+    /* Thread tree mode toggle (kept for build compatibility; removed by main.c branch in Stage 3) */
     int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
 
     /* Keyspace partitioning settings */
