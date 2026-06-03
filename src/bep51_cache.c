@@ -445,6 +445,10 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path) {
         log_msg(LOG_DEBUG, "[bep51_cache] Loaded %d/%u nodes from cache", loaded, node_count);
 
         if (!has_checksum) {
+            if (node_count == 0) {
+                /* Empty cache file, no need to rewrite */
+                return 0;
+            }
             if (bep51_cache_save_to_file(cache, path) != 0) {
                 log_msg(LOG_WARN, "[bep51_cache] Failed to rewrite cache file in canonical format");
             }
@@ -460,7 +464,7 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path) {
     return -1;
 }
 
-static int write_record(FILE *fp, const bep51_cache_node_t *node) {
+static int write_record(FILE *fp, const bep51_cache_node_t *node, SHA256_CTX *sha) {
     uint8_t rec[BEP51_CACHE_RECORD_SIZE];
     memset(rec, 0, BEP51_CACHE_RECORD_SIZE);
 
@@ -488,6 +492,11 @@ static int write_record(FILE *fp, const bep51_cache_node_t *node) {
     if (fwrite(rec, 1, BEP51_CACHE_RECORD_SIZE, fp) != BEP51_CACHE_RECORD_SIZE) {
         return -1;
     }
+
+    if (sha) {
+        SHA256_Update(sha, rec, BEP51_CACHE_RECORD_SIZE);
+    }
+
     return 0;
 }
 
@@ -532,6 +541,11 @@ int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path) {
         unlink(temp_path);
         return -1;
     }
+    /* Initialize SHA-256 with the header bytes */
+    SHA256_CTX sha_ctx;
+    uint8_t checksum[BEP51_CACHE_CHECKSUM_SIZE];
+    SHA256_Init(&sha_ctx);
+    SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
 
     /* Iterate FIFO and write records */
     int written = 0;
@@ -542,7 +556,7 @@ int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path) {
         }
 
         /* Write record using helper */
-        if (write_record(fp, node) != 0) {
+        if (write_record(fp, node, &sha_ctx) != 0) {
             log_msg(LOG_ERROR, "[bep51_cache] Failed to write node record");
             fclose(fp);
             pthread_mutex_unlock(&cache->lock);
@@ -551,21 +565,6 @@ int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path) {
         }
 
         written++;
-    }
-
-    /* Compute SHA-256 checksum of header + records */
-    SHA256_CTX sha_ctx;
-    uint8_t checksum[BEP51_CACHE_CHECKSUM_SIZE];
-    SHA256_Init(&sha_ctx);
-    SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
-    fseek(fp, BEP51_CACHE_HEADER_SIZE, SEEK_SET);
-    /* Read and hash records */
-    uint8_t *rec_buf = malloc(BEP51_CACHE_RECORD_SIZE);
-    if (rec_buf) {
-        while (fread(rec_buf, 1, BEP51_CACHE_RECORD_SIZE, fp) == BEP51_CACHE_RECORD_SIZE) {
-            SHA256_Update(&sha_ctx, rec_buf, BEP51_CACHE_RECORD_SIZE);
-        }
-        free(rec_buf);
     }
     SHA256_Final(checksum, &sha_ctx);
 
