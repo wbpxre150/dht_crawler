@@ -66,8 +66,8 @@ void config_init_defaults(crawler_config_t *config) {
 
 
     /* Supervisor-level global bootstrap defaults */
-    config->global_bootstrap_target = 1000;
-    config->global_bootstrap_timeout_sec = 60;
+    config->global_bootstrap_target = 200;
+    config->global_bootstrap_timeout_sec = 600;
     config->global_bootstrap_workers = 20;
 
     /* Language filter defaults 

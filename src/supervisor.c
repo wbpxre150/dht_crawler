@@ -89,7 +89,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
 
     /* Supervisor-level global bootstrap settings */
-    sup->global_bootstrap_target = config->global_bootstrap_target > 0 ? config->global_bootstrap_target : 1000;
+    sup->global_bootstrap_target = config->global_bootstrap_target > 0 ? config->global_bootstrap_target : 200;
     sup->global_bootstrap_timeout_sec = config->global_bootstrap_timeout_sec > 0 ? config->global_bootstrap_timeout_sec : 60;
     sup->global_bootstrap_workers = config->global_bootstrap_workers > 0 ? config->global_bootstrap_workers : 20;
 
@@ -335,7 +335,7 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
 
 /* Main supervisor bootstrap function */
 int supervisor_bootstrap(supervisor_t *sup) {
-    int target = sup->global_bootstrap_target > 0 ? sup->global_bootstrap_target : 1000;
+    int target = sup->global_bootstrap_target > 0 ? sup->global_bootstrap_target : 200;
     int timeout_s = sup->global_bootstrap_timeout_sec > 0 ? sup->global_bootstrap_timeout_sec : 60;
     int nworkers = sup->global_bootstrap_workers > 0 ? sup->global_bootstrap_workers : 20;
     int required = sup->global_bootstrap_target;
@@ -401,9 +401,16 @@ int supervisor_bootstrap(supervisor_t *sup) {
         if (rc != 0) { tree_response_queue_destroy(ctx->queue); free(ctx); nworkers = i; break; }
     }
 
+    time_t last_log = start;
     while (time(NULL) < deadline) {
         int n = tree_routing_get_count(rt);
         if (n >= target) break;
+        time_t now = time(NULL);
+        if (now - last_log >= 20) {
+            log_msg(LOG_INFO, "[supervisor_bootstrap] %zd nodes in BEP51 cache, %d in RT, %lds elapsed",
+                    bep51_cache_get_count(sup->bep51_cache), n, (long)(now - start));
+            last_log = now;
+        }
         usleep(200000);
     }
 
