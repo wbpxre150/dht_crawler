@@ -6,33 +6,33 @@ A high-performance BitTorrent DHT crawler written in C that discovers and collec
 
 - **Multi-threaded architecture** with supervisor pattern managing multiple isolated crawler units
 - **Full BEP support**: BEP 5 (DHT), BEP 9 (ut_metadata), BEP 10 (Extension Protocol), BEP 51 (sample_infohashes)
+- **IPv4 and IPv6**: dual-stack UDP socket with IPv4-mapped address support
 - **High throughput**: 10-50 torrents/minute sustained with configurable parallelism
-- **Intelligent filtering**: Three-layer pornography filter with keyword, regex, and heuristic detection
-- **Efficient deduplication**: Bloom filters with 30M capacity and two-strike failure policy
+- **Intelligent filtering**: Three-layer pornography filter with keyword, regex, and heuristic detection; non-Latin language filter
+- **Efficient deduplication**: Two bloom filters — infohash dedup (30M capacity) and two-strike failure tracking
 - **Batched database writes**: 10-100x performance improvement via transaction batching
-- **Persistent bootstrap**: BEP51 node cache for instant startup after restarts
-- **HTTP API**: REST endpoints for statistics and on-demand infohash queries
+- **Persistent bootstrap**: BEP51 node cache for instant warm-restart (no cold-start penalty after first run)
+- **HTTP API + Web UI**: Search interface and REST endpoints for statistics and on-demand queries
+- **Backup support**: Daily file copy, SSH incremental export, and rclone (S3-compatible) incremental export
 - **Android optimized**: Thread limits and resource constraints handled gracefully
 
 ## Quick Start
 
 ### Dependencies
 
-Install required system packages:
-
 **Arch Linux:**
 ```bash
-sudo pacman -S base-devel libuv sqlite openssl userspace-rcu
+sudo pacman -S base-devel libuv sqlite openssl
 ```
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt install build-essential libuv1-dev libsqlite3-dev libssl-dev liburcu-dev
+sudo apt install build-essential libuv1-dev libsqlite3-dev libssl-dev
 ```
 
 **Termux (Android):**
 ```bash
-pkg install clang libuv sqlite openssl liburcu
+pkg install clang libuv sqlite openssl
 ```
 
 ### Build
@@ -50,9 +50,9 @@ make
 ```
 
 The first build automatically:
-- Applies patches to submodules (bencode-c)
-- Builds libbloom dependency
-- Creates data/ directory for database and caches
+- Applies patches to `lib/bencode-c` (capacity fix, zero-init fix) and `lib/civetweb` (atomic stop_flag fix)
+- Builds `lib/libbloom` as a static library
+- Creates `data/` directory for the database and caches
 
 ### Configuration
 
@@ -63,10 +63,10 @@ Edit `config.ini` to customize behavior. Key settings:
 num_trees = 32
 
 # Worker counts per tree (multiplied by num_trees)
-tree_find_node_workers = 5
+tree_find_node_workers = 3
 tree_bep51_workers = 10
-tree_get_peers_workers = 125
-tree_metadata_workers = 110
+tree_get_peers_workers = 50
+tree_metadata_workers = 75
 
 # Enable/disable porn filter
 porn_filter_enabled = 1
@@ -75,8 +75,7 @@ porn_filter_enabled = 1
 bloom_capacity = 30000000
 bloom_error_rate = 0.001
 
-# HTTP API port
-http_port = 8080
+# HTTP API port is hardcoded to 8080 (see include/http_api.h to change)
 ```
 
 ## Architecture Overview
@@ -96,12 +95,12 @@ Supervisor
 
 Shared Resources:
 ├── Batch Writer (SQLite transactions)
-├── Bloom Filters (deduplication + failure tracking)
+├── Bloom Filters (dedup + failure tracking)
 └── BEP51 Cache (persistent high-quality nodes)
 ```
 
 **Benefits:**
-- Scales to 10,000+ threads efficiently
+- Scales to thousands of threads efficiently
 - Isolated failures (one tree crash doesn't affect others)
 - Automatic respawning of underperforming trees
 - Comprehensive DHT keyspace coverage via partitioning
@@ -118,44 +117,66 @@ Each thread tree implements a concurrent pipeline:
 
 ## HTTP API
 
-Access crawler statistics and perform on-demand queries:
+The HTTP API listens on port 8080 and provides both a web UI and REST endpoints.
 
-### Get Statistics
+### Web Interface
+```
+http://localhost:8080/           # Google-style search home page
+http://localhost:8080/search?q=ubuntu   # Search results page
+http://localhost:8080/torrent?hash=...  # Torrent detail page
+```
+
+### REST Endpoints
 ```bash
+# Crawler statistics
 curl http://localhost:8080/stats
-```
 
-Returns JSON with:
-- Active trees and total metadata fetched
-- Hourly torrent discovery rate
-- Queue sizes and active connections
-- Bloom filter and failure tracking stats
+# Search torrents (JSON)
+curl "http://localhost:8080/search?q=ubuntu"
 
-### Refresh Infohash
-```bash
+# On-demand get_peers query for a specific infohash
 curl "http://localhost:8080/refresh?infohash=<40-char-hex>"
+
+# Random torrent discovery
+curl http://localhost:8080/random-tv
+curl http://localhost:8080/random-movies
+curl http://localhost:8080/random-music
 ```
 
-Performs on-demand get_peers query via dedicated refresh thread.
+`/stats` returns JSON with active trees, total metadata fetched, hourly discovery rate, queue sizes, and bloom filter stats.
 
 ## Database
 
-Torrents are stored in SQLite database (`data/torrents.db`):
+Torrents are stored in a SQLite database (`data/torrents.db`) with FTS5 full-text search:
 
 ```sql
 CREATE TABLE torrents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    info_hash TEXT UNIQUE NOT NULL,
-    name TEXT,
-    discovered_at INTEGER NOT NULL,
-    file_count INTEGER,
-    file_info TEXT  -- JSON array of files
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    info_hash        BLOB(20) NOT NULL UNIQUE,
+    name             TEXT NOT NULL,
+    size_bytes       INTEGER NOT NULL,
+    total_peers      INTEGER DEFAULT 0,
+    added_timestamp  INTEGER NOT NULL
+);
+
+CREATE TABLE torrent_files (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    torrent_id  INTEGER NOT NULL REFERENCES torrents(id) ON DELETE CASCADE,
+    prefix_id   INTEGER REFERENCES path_prefixes(id),
+    filename    TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    file_index  SMALLINT NOT NULL
+);
+
+CREATE TABLE path_prefixes (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    prefix  TEXT NOT NULL UNIQUE
 );
 ```
 
 Query discovered torrents:
 ```bash
-sqlite3 data/torrents.db "SELECT name, discovered_at FROM torrents ORDER BY id DESC LIMIT 10"
+sqlite3 data/torrents.db "SELECT name, added_timestamp FROM torrents ORDER BY id DESC LIMIT 10"
 ```
 
 ## Advanced Usage
@@ -167,12 +188,12 @@ make debug
 ./dht_crawler
 ```
 
-Enables `-g -DDEBUG` flags for debugging symbols.
+Enables `-g -DDEBUG` flags for debugging symbols and more verbose logging.
 
 ### Memory Safety Testing
 
 ```bash
-# AddressSanitizer (memory errors)
+# AddressSanitizer (memory errors + undefined behaviour)
 make asan
 ./dht_crawler
 
@@ -184,29 +205,61 @@ make tsan
 make valgrind
 ```
 
-### Tuning for Android/Termux
+### CLI Maintenance Flags
 
-Android has stricter thread limits (~10,000). The default config uses:
-- 32 trees × ~300 threads/tree = ~9,600 threads
-
-To reduce further:
-```ini
-num_trees = 16                    # Fewer trees
-tree_get_peers_workers = 100      # Fewer workers per tree
-tree_metadata_workers = 75
+```
+./dht_crawler --rebuild-bloom-filter   # Rebuild bloom.dat from the existing database
+./dht_crawler --porn-filter-update     # Re-scan database and remove porn-filtered entries
+./dht_crawler --compact                # VACUUM database into a fresh file and replace original
+./dht_crawler --check-database         # Run SQLite integrity_check and report errors
+./dht_crawler --recover-database       # Copy all readable rows to a new database; replace original
+./dht_crawler --dont-check-database    # Skip the automatic integrity check at startup
 ```
 
-### Disabling Porn Filter
+These modes exit after completing their task without starting the crawler.
 
-To collect all torrents without filtering:
+### Tuning for Android/Termux
+
+Android limits total threads to ~10,000. With default config: 32 trees × ~140 threads/tree ≈ 4,500 threads. To reduce further:
+
 ```ini
-porn_filter_enabled = 0
+num_trees = 16                    # Fewer trees
+tree_get_peers_workers = 30       # Fewer workers per tree
+tree_metadata_workers = 50
 ```
 
 ### Custom Bootstrap Nodes
 
-Bootstrap nodes are hardcoded in `src/thread_tree.c`. To add custom
-routers, edit the `TREE_BOOTSTRAP_HOSTS` array there.
+Bootstrap nodes are hardcoded in `src/supervisor.c` in the `BOOTSTRAP_HOSTS` array. Edit that array to add or replace DHT bootstrap routers.
+
+### Disabling Porn Filter
+
+```ini
+porn_filter_enabled = 0
+```
+
+### Backup Configuration
+
+Three backup mechanisms are available in `config.ini`:
+
+```ini
+# Daily file copy
+backup_enabled = 1
+backup_path = /path/to/backup.db
+
+# SSH incremental (exports new rows as compressed SQL daily)
+ssh_backup_enabled = 1
+ssh_host = your.server.com
+ssh_user = username
+ssh_dest_path = /home/username/backups/
+ssh_key_path = /path/to/key  # optional, leave "" for default
+
+# rclone incremental (S3-compatible, e.g. Cloudflare R2)
+rclone_backup_enabled = 1
+rclone_remote = r2
+rclone_dest_path = bucket-name/dht_crawler_backup
+```
+
 ## Monitoring
 
 ### Log Levels
@@ -234,22 +287,22 @@ Trees log statistics every 60 seconds:
 ### Bloom Filter Persistence
 
 Bloom filters are persisted to disk:
-- `data/bloom.dat` - Main infohash deduplication filter
-- `data/failure_bloom.dat` - Failure tracking filter (two-strike policy)
+- `data/bloom.dat` — main infohash deduplication filter
+- `data/failure_bloom.dat` — two-strike failure tracking filter
 
-Persisted every 60 seconds during batch flushes.
+Both are saved every `flush_interval` seconds during batch flushes and reloaded on startup.
 
 ## Performance Characteristics
 
-Typical performance on Android (32 trees, default config):
+Typical performance (32 trees, default config):
 - **Throughput**: 10-50 torrents/minute sustained
-- **Threads**: 6,000-9,000 total
-- **Connections**: Up to 5,000 concurrent TCP
-- **Memory**: ~500MB (dominated by bloom filters)
-- **Disk**: Minimal (batched writes every 60s)
+- **Threads**: ~4,500 total
+- **Connections**: Up to 3,000+ concurrent TCP
+- **Memory**: ~500MB (dominated by the two 30M-capacity bloom filters)
+- **Disk**: Minimal (batched writes every 300s by default)
 
 Bottlenecks:
-- Peer availability (many peers don't respond or support ut_metadata)
+- Peer availability (many peers don't respond or don't support ut_metadata)
 - TCP connection latency
 - Metadata fetch timeouts
 
@@ -258,24 +311,20 @@ Bottlenecks:
 ### Build Failures
 
 **Error**: `fatal error: uv.h: No such file or directory`
-- Install libuv-dev: `sudo apt install libuv1-dev`
-
-**Error**: `undefined reference to 'urcu_*'`
-- Install userspace-rcu: `sudo apt install liburcu-dev`
+- Install libuv: `sudo apt install libuv1-dev` / `sudo pacman -S libuv`
 
 **Error**: Bencode parsing crashes
-- The Makefile should auto-apply patches. Manually apply: `patch -p1 < patches/bencode-cap-fix.patch`
+- The Makefile auto-applies patches. Manually: `patch -p1 < patches/bencode-cap-fix.patch`
 
 ### Runtime Issues
 
 **No torrents being discovered:**
 - Check firewall allows UDP 6881
-- Verify bootstrap works: logs should show "Tree-native bootstrap complete"
+- Verify bootstrap works: logs should show nodes being discovered within ~30s of cold start
 
 **High CPU usage:**
-- Reduce worker counts in config.ini
+- Reduce worker counts in `config.ini`
 - Increase throttling thresholds to pause workers sooner
-- Enable `tree_require_empty_queue=1` to reduce respawning
 
 **Database locked errors:**
 - Increase `flush_interval` to reduce write frequency
@@ -290,24 +339,25 @@ Bottlenecks:
 ```
 dht_crawler/
 ├── src/              Implementation files
-│   ├── main.c        Entry point, signal handling
-│   ├── supervisor.c  Thread tree lifecycle management
-│   ├── thread_tree.c Thread tree implementation
-│   ├── tree_*.c      DHT protocol, routing, queues
-│   ├── batch_writer.c      Batched database writes
-│   ├── tree_metadata.c     BEP 9/10 metadata fetching
-│   ├── http_api.c          REST API endpoints
+│   ├── main.c        Entry point, signal handling, maintenance CLI modes
+│   ├── supervisor.c  Thread tree lifecycle, rate-based respawn, global bootstrap
+│   ├── thread_tree.c Single tree: phase transitions, worker spawning
+│   ├── tree_*.c      DHT protocol, routing, queues, metadata fetching
+│   ├── batch_writer.c      Batched SQLite writes, bloom/backup triggers
+│   ├── bep51_cache.c       Persistent BEP51 node cache
+│   ├── http_api.c          REST API + web search UI
+│   └── refresh_thread.c    Dedicated thread for /refresh endpoint
 ├── include/          Header files
-├── lib/              Third-party libraries (submodules)
-│   ├── bencode-c/    Bencode parser
+├── lib/              Third-party libraries (git submodules)
+│   ├── bencode-c/    Bencode parser (auto-patched)
 │   ├── cJSON/        JSON library
-│   ├── libbloom/     Bloom filter
+│   ├── libbloom/     Bloom filter (auto-built)
 │   ├── uthash/       Hash table macros
-│   └── civetweb/     HTTP server
-├── patches/          Submodule patches
+│   └── civetweb/     HTTP server (auto-patched)
+├── patches/          Patches applied to submodules during build
 ├── data/             Runtime data (created on first run)
 ├── Makefile          Build configuration
-└── config.ini        Runtime configuration
+└── config.ini        Runtime configuration (~130 keys)
 ```
 
 ## License
@@ -318,9 +368,7 @@ MIT License - see LICENSE file
 
 Contributions welcome! Areas for improvement:
 - Better DHT bootstrap strategies
-- IPv6 support
 - Magnet link generation
-- Web UI for browsing discovered torrents
 - Improved peer selection heuristics
 
 ## Acknowledgments
