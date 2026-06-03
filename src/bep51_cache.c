@@ -238,13 +238,6 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path) {
     memcpy(&version, header + 4, 4);
     version = ntohl(version);
 
-    if (version != BEP51_CACHE_VERSION) {
-        log_msg(LOG_ERROR, "[bep51_cache] Unsupported version: %u (expected %u)",
-                version, BEP51_CACHE_VERSION);
-        fclose(fp);
-        return -1;
-    }
-
     /* Parse node count */
     uint32_t node_count;
     memcpy(&node_count, header + 8, 4);
@@ -252,110 +245,219 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path) {
 
     log_msg(LOG_DEBUG, "[bep51_cache] Cache version %u, %u nodes", version, node_count);
 
-    /* Validate file size */
-    size_t expected_size = BEP51_CACHE_HEADER_SIZE +
-                          (node_count * BEP51_CACHE_RECORD_SIZE) +
-                          BEP51_CACHE_CHECKSUM_SIZE;
-
+    /* Get file size for validation */
     fseek(fp, 0, SEEK_END);
     long file_size = ftell(fp);
-    fseek(fp, BEP51_CACHE_HEADER_SIZE, SEEK_SET);
 
-    if (file_size != (long)expected_size) {
-        log_msg(LOG_ERROR, "[bep51_cache] File size mismatch: %ld bytes (expected %zu)",
-                file_size, expected_size);
-        fclose(fp);
-        return -1;
-    }
+    if (version == 1) {
+        /* --- v1 format: 26-byte records (IPv4 only), with 32-byte SHA-256 trailer --- */
+        size_t v1_record_size = 26;
+        size_t expected_size = BEP51_CACHE_HEADER_SIZE + (node_count * v1_record_size) + BEP51_CACHE_CHECKSUM_SIZE;
 
-    /* Allocate buffer for records */
-    size_t records_size = node_count * BEP51_CACHE_RECORD_SIZE;
-    uint8_t *records = malloc(records_size);
-    if (!records) {
-        log_msg(LOG_ERROR, "[bep51_cache] Failed to allocate buffer for %u records", node_count);
-        fclose(fp);
-        return -1;
-    }
-
-    /* Read all records */
-    if (fread(records, 1, records_size, fp) != records_size) {
-        log_msg(LOG_ERROR, "[bep51_cache] Failed to read records");
-        free(records);
-        fclose(fp);
-        return -1;
-    }
-
-    /* Read checksum */
-    uint8_t stored_checksum[BEP51_CACHE_CHECKSUM_SIZE];
-    if (fread(stored_checksum, 1, BEP51_CACHE_CHECKSUM_SIZE, fp) != BEP51_CACHE_CHECKSUM_SIZE) {
-        log_msg(LOG_ERROR, "[bep51_cache] Failed to read checksum");
-        free(records);
-        fclose(fp);
-        return -1;
-    }
-
-    fclose(fp);
-
-    /* Compute SHA-256 checksum of header + records */
-    SHA256_CTX sha_ctx;
-    uint8_t computed_checksum[BEP51_CACHE_CHECKSUM_SIZE];
-    SHA256_Init(&sha_ctx);
-    SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
-    SHA256_Update(&sha_ctx, records, records_size);
-    SHA256_Final(computed_checksum, &sha_ctx);
-
-    /* Verify checksum */
-    if (memcmp(stored_checksum, computed_checksum, BEP51_CACHE_CHECKSUM_SIZE) != 0) {
-        log_msg(LOG_ERROR, "[bep51_cache] Checksum verification failed");
-        free(records);
-        return -1;
-    }
-
-    log_msg(LOG_DEBUG, "[bep51_cache] Checksum verified");
-
-    /* Parse records and add to cache */
-    int loaded = 0;
-    for (uint32_t i = 0; i < node_count; i++) {
-        uint8_t *rec = records + (i * BEP51_CACHE_RECORD_SIZE);
-
-        uint8_t *node_id = rec;
-        uint8_t family = rec[20];
-        uint16_t port;
-        memcpy(&port, rec + 37, 2);
-        port = ntohs(port);
-
-        if (port == 0) {
-            continue;
+        if (file_size != (long)expected_size) {
+            log_msg(LOG_ERROR, "[bep51_cache] v1 file size mismatch: %ld bytes (expected %zu)",
+                    file_size, expected_size);
+            fclose(fp);
+            return -1;
         }
 
-        struct sockaddr_storage addr;
-        memset(&addr, 0, sizeof(addr));
+        size_t records_size = node_count * v1_record_size;
+        uint8_t *records = malloc(records_size);
+        if (!records) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to allocate buffer for %u v1 records", node_count);
+            fclose(fp);
+            return -1;
+        }
 
-        if (family == BEP51_CACHE_FAMILY_IPV4) {
+        fseek(fp, BEP51_CACHE_HEADER_SIZE, SEEK_SET);
+        if (fread(records, 1, records_size, fp) != records_size) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to read v1 records");
+            free(records);
+            fclose(fp);
+            return -1;
+        }
+
+        uint8_t stored_checksum[BEP51_CACHE_CHECKSUM_SIZE];
+        if (fread(stored_checksum, 1, BEP51_CACHE_CHECKSUM_SIZE, fp) != BEP51_CACHE_CHECKSUM_SIZE) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to read v1 checksum");
+            free(records);
+            fclose(fp);
+            return -1;
+        }
+        fclose(fp);
+
+        /* Verify SHA-256 over header + records */
+        SHA256_CTX sha_ctx;
+        uint8_t computed_checksum[BEP51_CACHE_CHECKSUM_SIZE];
+        SHA256_Init(&sha_ctx);
+        SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
+        SHA256_Update(&sha_ctx, records, records_size);
+        SHA256_Final(computed_checksum, &sha_ctx);
+
+        if (memcmp(stored_checksum, computed_checksum, BEP51_CACHE_CHECKSUM_SIZE) != 0) {
+            log_msg(LOG_ERROR, "[bep51_cache] v1 checksum verification failed");
+            free(records);
+            return -1;
+        }
+
+        /* Parse v1 records: 20 node_id + 4 IPv4 (network order) + 2 port (network order) */
+        int loaded = 0;
+        for (uint32_t i = 0; i < node_count; i++) {
+            uint8_t *rec = records + (i * v1_record_size);
+            uint8_t *node_id = rec;
+
+            uint32_t ip_raw;
+            memcpy(&ip_raw, rec + 20, 4);
+            uint32_t ip = ntohl(ip_raw);
+
+            uint16_t port_raw;
+            memcpy(&port_raw, rec + 24, 2);
+            uint16_t port = ntohs(port_raw);
+
+            if (ip == 0 || ip == 0xFFFFFFFF || port == 0) {
+                continue;
+            }
+
+            struct sockaddr_storage addr;
+            memset(&addr, 0, sizeof(addr));
             struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
             sin->sin_family = AF_INET;
-            uint32_t ip;
-            memcpy(&ip, rec + 21 + 12, 4);
-            sin->sin_addr.s_addr = ip;  /* already network byte order */
+            sin->sin_addr.s_addr = ip_raw;
             sin->sin_port = htons(port);
-        } else if (family == BEP51_CACHE_FAMILY_IPV6) {
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
-            sin6->sin6_family = AF_INET6;
-            memcpy(&sin6->sin6_addr, rec + 21, 16);
-            sin6->sin6_port = htons(port);
-        } else {
-            continue;
+
+            if (bep51_cache_add_node(cache, node_id, &addr) == 0) {
+                loaded++;
+            }
         }
 
-        /* Add to cache (bypasses mutex, we're in single-threaded init) */
-        if (bep51_cache_add_node(cache, node_id, &addr) == 0) {
-            loaded++;
+        free(records);
+        log_msg(LOG_INFO, "[bep51_cache] Loaded %d/%u nodes from v1 cache; rewriting in v2 format", loaded, node_count);
+
+        if (bep51_cache_save_to_file(cache, path) != 0) {
+            log_msg(LOG_WARN, "[bep51_cache] Failed to rewrite v1 cache to v2 format");
         }
+
+        return 0;
     }
 
-    free(records);
-    log_msg(LOG_DEBUG, "[bep51_cache] Loaded %d/%u nodes from cache", loaded, node_count);
-    return 0;
+    if (version == 2) {
+        /* --- v2 format: 39-byte records, with or without 32-byte SHA-256 trailer --- */
+        size_t expected_chk = BEP51_CACHE_HEADER_SIZE + (node_count * BEP51_CACHE_RECORD_SIZE) + BEP51_CACHE_CHECKSUM_SIZE;
+        size_t expected_nochk = BEP51_CACHE_HEADER_SIZE + (node_count * BEP51_CACHE_RECORD_SIZE);
+
+        int has_checksum;
+        if (file_size == (long)expected_chk) {
+            has_checksum = 1;
+        } else if (file_size == (long)expected_nochk) {
+            has_checksum = 0;
+            log_msg(LOG_WARN, "[bep51_cache] v2 cache file lacks trailing SHA-256; loading without verification and rewriting in canonical form");
+        } else {
+            log_msg(LOG_ERROR, "[bep51_cache] v2 file size mismatch: %ld bytes (expected %zu with checksum, %zu without)",
+                    file_size, expected_chk, expected_nochk);
+            fclose(fp);
+            return -1;
+        }
+
+        size_t records_size = node_count * BEP51_CACHE_RECORD_SIZE;
+        uint8_t *records = malloc(records_size);
+        if (!records) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to allocate buffer for %u records", node_count);
+            fclose(fp);
+            return -1;
+        }
+
+        fseek(fp, BEP51_CACHE_HEADER_SIZE, SEEK_SET);
+        if (fread(records, 1, records_size, fp) != records_size) {
+            log_msg(LOG_ERROR, "[bep51_cache] Failed to read records");
+            free(records);
+            fclose(fp);
+            return -1;
+        }
+
+        if (has_checksum) {
+            uint8_t stored_checksum[BEP51_CACHE_CHECKSUM_SIZE];
+            if (fread(stored_checksum, 1, BEP51_CACHE_CHECKSUM_SIZE, fp) != BEP51_CACHE_CHECKSUM_SIZE) {
+                log_msg(LOG_ERROR, "[bep51_cache] Failed to read checksum");
+                free(records);
+                fclose(fp);
+                return -1;
+            }
+            fclose(fp);
+
+            SHA256_CTX sha_ctx;
+            uint8_t computed_checksum[BEP51_CACHE_CHECKSUM_SIZE];
+            SHA256_Init(&sha_ctx);
+            SHA256_Update(&sha_ctx, header, BEP51_CACHE_HEADER_SIZE);
+            SHA256_Update(&sha_ctx, records, records_size);
+            SHA256_Final(computed_checksum, &sha_ctx);
+
+            if (memcmp(stored_checksum, computed_checksum, BEP51_CACHE_CHECKSUM_SIZE) != 0) {
+                log_msg(LOG_ERROR, "[bep51_cache] Checksum verification failed");
+                free(records);
+                return -1;
+            }
+
+            log_msg(LOG_DEBUG, "[bep51_cache] Checksum verified");
+        } else {
+            fclose(fp);
+        }
+
+        /* Parse v2 records */
+        int loaded = 0;
+        for (uint32_t i = 0; i < node_count; i++) {
+            uint8_t *rec = records + (i * BEP51_CACHE_RECORD_SIZE);
+
+            uint8_t *node_id = rec;
+            uint8_t family = rec[20];
+            uint16_t port;
+            memcpy(&port, rec + 37, 2);
+            port = ntohs(port);
+
+            if (port == 0) {
+                continue;
+            }
+
+            struct sockaddr_storage addr;
+            memset(&addr, 0, sizeof(addr));
+
+            if (family == BEP51_CACHE_FAMILY_IPV4) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
+                sin->sin_family = AF_INET;
+                uint32_t ip;
+                memcpy(&ip, rec + 21 + 12, 4);
+                sin->sin_addr.s_addr = ip;
+                sin->sin_port = htons(port);
+            } else if (family == BEP51_CACHE_FAMILY_IPV6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
+                sin6->sin6_family = AF_INET6;
+                memcpy(&sin6->sin6_addr, rec + 21, 16);
+                sin6->sin6_port = htons(port);
+            } else {
+                continue;
+            }
+
+            if (bep51_cache_add_node(cache, node_id, &addr) == 0) {
+                loaded++;
+            }
+        }
+
+        free(records);
+        log_msg(LOG_DEBUG, "[bep51_cache] Loaded %d/%u nodes from cache", loaded, node_count);
+
+        if (!has_checksum) {
+            if (bep51_cache_save_to_file(cache, path) != 0) {
+                log_msg(LOG_WARN, "[bep51_cache] Failed to rewrite cache file in canonical format");
+            }
+        }
+
+        return 0;
+    }
+
+    /* Unknown version */
+    log_msg(LOG_ERROR, "[bep51_cache] Unsupported version: %u (expected %u)",
+            version, BEP51_CACHE_VERSION);
+    fclose(fp);
+    return -1;
 }
 
 static int write_record(FILE *fp, const bep51_cache_node_t *node) {
