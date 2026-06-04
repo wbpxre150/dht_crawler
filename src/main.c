@@ -695,7 +695,7 @@ int main(int argc, char *argv[]) {
         .global_bootstrap_target = config.global_bootstrap_target,
         .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
         .global_bootstrap_workers = config.global_bootstrap_workers,
-        /* Porn filter settings 
+        /* Porn filter settings */
         .porn_filter_enabled = config.porn_filter_enabled,
         /* Adaptive keyspace partitioning */
         .dead_partition_threshold = config.dead_partition_threshold,
