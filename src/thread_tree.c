@@ -930,9 +930,6 @@ static void *bootstrap_thread_func(void *arg) {
         goto shutdown;
     }
 
-    int final_count = tree_routing_get_count(rt);
-    log_msg(LOG_INFO, "[tree %u] Bootstrap complete: %d nodes in routing table",
-            tree->tree_id, final_count);
 
     /* Start find_node workers to continuously discover new nodes */
     tree_start_find_node_workers(tree);
