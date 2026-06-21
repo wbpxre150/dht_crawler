@@ -35,6 +35,7 @@ typedef struct {
     int bloom_enabled;
     uint64_t bloom_capacity;
     uint64_t failure_bloom_capacity;  /* NEW: Capacity for failure bloom filter */
+    int failure_strike_count;         /* Failures before permanent block (1=immediate, 2=two-strike, default: 2) */
     double bloom_error_rate;
     int bloom_persist;
     char bloom_path[512];
@@ -134,6 +135,7 @@ typedef struct {
     int max_trees_per_partition;         /* Max trees allowed in one partition (default: 4) */
 
     /* Refresh thread settings (for /refresh HTTP endpoint) */
+    int refresh_retry_count;              /* Number of retries when /refresh returns 0 peers (default: 1) */
     int refresh_bootstrap_sample_size;   /* Nodes to sample from shared pool (default: 1000) */
     int refresh_routing_table_target;    /* Target routing table size (default: 500) */
     int refresh_ping_workers;            /* Ping workers (default: 1) */

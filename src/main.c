@@ -654,6 +654,7 @@ int main(int argc, char *argv[]) {
         .dht_port = config.dht_port,
         /* Bloom filter settings for failure tracking */
         .failure_bloom_capacity = config.failure_bloom_capacity,
+        .failure_strike_count = config.failure_strike_count,
         .bloom_error_rate = config.bloom_error_rate,
         .num_find_node_workers = config.tree_find_node_workers,
         .num_bep51_workers = config.tree_bep51_workers,
@@ -798,7 +799,10 @@ int main(int argc, char *argv[]) {
     
     /* Set refresh query store for /refresh endpoint */
     http_api_set_refresh_query_store(&g_http_api, g_refresh_query_store);
-    
+
+    /* Set retry count for /refresh endpoint */
+    g_http_api.refresh_retry_count = config.refresh_retry_count;
+
     /* Start HTTP API */
     log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
     rc = http_api_start(&g_http_api);

@@ -23,6 +23,7 @@ typedef struct {
     struct supervisor *supervisor;  /* Stage 6: Thread tree supervisor */
     struct refresh_thread *refresh_thread;  /* Refresh thread for /refresh endpoint */
     refresh_query_store_t *refresh_query_store;  /* Direct access for /refresh endpoint */
+    int refresh_retry_count;  /* Number of retries when /refresh returns 0 peers (default: 1) */
     int port;
     int running;
 } http_api_t;

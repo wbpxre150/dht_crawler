@@ -992,6 +992,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->bep51_node_cooldown_sec = config->bep51_node_cooldown_sec > 0 ? config->bep51_node_cooldown_sec : 30;
     tree->shared_bloom = config->bloom_filter;
     tree->failure_bloom = config->failure_bloom;
+    tree->failure_strike_count = (config->failure_strike_count >= 1 && config->failure_strike_count <= 2) ? config->failure_strike_count : 2;
 
     /* Stage 4 config */
     tree->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;

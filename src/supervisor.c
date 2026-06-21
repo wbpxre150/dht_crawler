@@ -79,6 +79,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Store bloom filter configuration */
     sup->failure_bloom_capacity = config->failure_bloom_capacity > 0 ? config->failure_bloom_capacity : 30000000;
+    sup->failure_strike_count = (config->failure_strike_count >= 1 && config->failure_strike_count <= 2) ? config->failure_strike_count : 2;
     sup->bloom_error_rate = config->bloom_error_rate > 0 ? config->bloom_error_rate : 0.001;
 
     /* Store worker counts */
@@ -500,6 +501,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,
         .failure_bloom = sup->failure_bloom,
+        .failure_strike_count = sup->failure_strike_count,
         .supervisor_ctx = sup,
         .on_shutdown = supervisor_on_tree_shutdown,
         /* Shared socket/dispatcher from supervisor (NULL = create private) */

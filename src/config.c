@@ -26,6 +26,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->bloom_enabled = 1;
     config->bloom_capacity = 10000000;
     config->failure_bloom_capacity = 30000000;  /* 30M entries (same as main bloom) */
+    config->failure_strike_count = 2;           /* Two-strike policy */
     config->bloom_error_rate = 0.001;
     config->bloom_persist = 1;
     strncpy(config->bloom_path, "data/bloom.dat", sizeof(config->bloom_path) - 1);
@@ -125,6 +126,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->max_trees_per_partition = 4;             /* Max 4 trees in one partition */
 
     /* Refresh thread defaults (for /refresh HTTP endpoint) */
+    config->refresh_retry_count = 1;               /* Retry once when /refresh returns 0 peers */
     config->refresh_bootstrap_sample_size = 1000;   /* Sample 1000 nodes from shared pool */
     config->refresh_routing_table_target = 500;     /* Target 500 nodes in routing table */
     config->refresh_ping_workers = 1;               /* 1 ping worker */
@@ -217,6 +219,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->bloom_capacity = strtoull(value, NULL, 10);
         } else if (strcmp(key, "failure_bloom_capacity") == 0) {
             config->failure_bloom_capacity = strtoull(value, NULL, 10);
+        } else if (strcmp(key, "failure_strike_count") == 0) {
+            config->failure_strike_count = atoi(value);
+            if (config->failure_strike_count < 1) config->failure_strike_count = 1;
+            if (config->failure_strike_count > 2) config->failure_strike_count = 2;
         } else if (strcmp(key, "bloom_error_rate") == 0) {
             config->bloom_error_rate = atof(value);
         } else if (strcmp(key, "bloom_persist") == 0) {
@@ -407,7 +413,11 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (config->max_trees_per_partition > 64) config->max_trees_per_partition = 64;
         }
         /* Refresh thread settings */
-        else if (strcmp(key, "refresh_bootstrap_sample_size") == 0) {
+        else if (strcmp(key, "refresh_retry_count") == 0) {
+            config->refresh_retry_count = atoi(value);
+            if (config->refresh_retry_count < 0) config->refresh_retry_count = 0;
+            if (config->refresh_retry_count > 5) config->refresh_retry_count = 5;
+        } else if (strcmp(key, "refresh_bootstrap_sample_size") == 0) {
             config->refresh_bootstrap_sample_size = atoi(value);
             if (config->refresh_bootstrap_sample_size < 100) config->refresh_bootstrap_sample_size = 100;
             if (config->refresh_bootstrap_sample_size > 10000) config->refresh_bootstrap_sample_size = 10000;

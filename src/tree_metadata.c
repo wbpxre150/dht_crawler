@@ -1280,10 +1280,20 @@ void *tree_metadata_worker_func(void *arg) {
             break;
         }
 
-        /* Handle failure with two-strike bloom filtering */
-        if (!metadata && tree->failure_bloom && tree->shared_bloom) {
-            /* All peers exhausted - apply two-strike logic */
-            if (bloom_filter_check(tree->failure_bloom, entry.infohash)) {
+        /* Handle failure with configurable strike bloom filtering */
+        if (!metadata && tree->shared_bloom) {
+            if (tree->failure_strike_count <= 1 || !tree->failure_bloom) {
+                /* Single-strike: permanently block on first failure */
+                bloom_filter_add(tree->shared_bloom, entry.infohash);
+                atomic_fetch_add(&tree->second_strike_failures, 1);
+
+                char hex[41];
+                for (int i = 0; i < 20; i++) {
+                    snprintf(hex + i * 2, 3, "%02x", entry.infohash[i]);
+                }
+                log_msg(LOG_DEBUG, "[tree %u] Failure for %s - permanently blocked (single-strike)",
+                        tree->tree_id, hex);
+            } else if (bloom_filter_check(tree->failure_bloom, entry.infohash)) {
                 /* Second strike - add to main bloom (permanent block) */
                 bloom_filter_add(tree->shared_bloom, entry.infohash);
                 atomic_fetch_add(&tree->second_strike_failures, 1);

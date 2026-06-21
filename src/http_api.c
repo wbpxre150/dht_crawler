@@ -720,21 +720,23 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
     int peer_count = refresh_query_wait(query, 8, &timed_out);
     int retry_attempted = 0;
 
-    /* Retry logic: If zero peers found, try one more time */
-    if (peer_count == 0 && !timed_out) {
-        log_msg(LOG_DEBUG, "First query returned 0 peers for %s, retrying...", hash_buf);
+    /* Retry logic: retry up to refresh_retry_count times when zero peers found */
+    int max_retries = api->refresh_retry_count > 0 ? api->refresh_retry_count : 1;
+    for (int retry = 0; retry < max_retries && peer_count == 0 && !timed_out; retry++) {
+        log_msg(LOG_DEBUG, "Query returned 0 peers for %s, retrying (%d/%d)...",
+                hash_buf, retry + 1, max_retries);
 
-        /* Submit retry */
         rc = refresh_thread_submit_request(api->refresh_thread, info_hash);
-        if (rc == 0) {
-            peer_count = refresh_query_wait(query, 8, &timed_out);
-            retry_attempted = 1;
+        if (rc != 0) break;
 
-            if (peer_count > 0) {
-                log_msg(LOG_DEBUG, "Retry successful: found %d peers for %s", peer_count, hash_buf);
-            } else {
-                log_msg(LOG_DEBUG, "Retry also returned 0 peers for %s", hash_buf);
-            }
+        peer_count = refresh_query_wait(query, 8, &timed_out);
+        retry_attempted = 1;
+
+        if (peer_count > 0) {
+            log_msg(LOG_DEBUG, "Retry %d successful: found %d peers for %s",
+                    retry + 1, peer_count, hash_buf);
+        } else {
+            log_msg(LOG_DEBUG, "Retry %d also returned 0 peers for %s", retry + 1, hash_buf);
         }
     }
 
@@ -752,8 +754,6 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata) {
 
     if (timed_out && peer_count == 0) {
         cJSON_AddStringToObject(root, "warning",
-            retry_attempted ?
-            "Both queries timed out with no peers - torrent may have no active peers" :
             "Query timed out with no peers - torrent may have no active peers");
     } else if (timed_out) {
         cJSON_AddStringToObject(root, "warning",

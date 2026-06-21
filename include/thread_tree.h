@@ -102,6 +102,7 @@ typedef struct tree_config {
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
     struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
+    int failure_strike_count;              /* Failures before permanent block (1 or 2, default: 2) */
 
     /* Supervisor callback context */
     void *supervisor_ctx;
@@ -131,6 +132,7 @@ typedef struct thread_tree {
     /* Shared resources (from supervisor) */
     struct bloom_filter *shared_bloom;     /* Stage 3: Shared bloom filter (thread-safe) */
     struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
+    int failure_strike_count;              /* Failures before permanent block (1 or 2, default: 2) */
 
 
     /* Stage 3 config */

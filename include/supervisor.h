@@ -58,6 +58,7 @@ typedef struct supervisor_config {
     int num_metadata_workers;
     /* Bloom filter configuration */
     uint64_t failure_bloom_capacity;
+    int failure_strike_count;            /* Failures before permanent block (1 or 2, default: 2) */
     double bloom_error_rate;
 
     /* BEP51 cache settings */
@@ -143,6 +144,7 @@ typedef struct supervisor {
 
     /* Bloom filter configuration */
     uint64_t failure_bloom_capacity;           /* Failure bloom filter capacity */
+    int failure_strike_count;                  /* Failures before permanent block (1 or 2, default: 2) */
     double bloom_error_rate;                   /* Error rate for bloom filters */
 
     /* Configuration */
