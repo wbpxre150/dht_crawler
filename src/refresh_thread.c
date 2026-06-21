@@ -338,50 +338,9 @@ static void *bootstrap_thread_func(void *arg) {
     tree_socket_t *sock = thread->socket;
     refresh_dispatcher_t *dispatcher = thread->dispatcher;
     log_msg(LOG_INFO, "Refresh thread bootstrap starting");
-    time_t deadline = time(NULL) + 60;  /* Extended from 30s for DNS resilience */
     int have_minimum = 0;
-    /* Phase A: URL bootstrap via find_node queries to known DHT routers.
-     * Each host is tried up to 2 times with 1.5s backoff between attempts
-     * to handle transient DNS failures. */
-    for (int pass = 0; pass < 2 && !have_minimum; pass++) {
-        for (int i = 0; REFRESH_BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
-        struct sockaddr_storage addr;
-        if (refresh_resolve_hostname(REFRESH_BOOTSTRAP_HOSTS[i],
-                                     REFRESH_BOOTSTRAP_PORTS[i], &addr) != 0) {
-            log_msg(LOG_WARN, "Refresh bootstrap: DNS failed for %s", REFRESH_BOOTSTRAP_HOSTS[i]);
-            continue;
-        }
-        uint8_t target[20];
-        for (int j = 0; j < 20; j++) target[j] = (uint8_t)(rand() % 256);
-        uint8_t tid[4];
-        int tid_len = tree_protocol_gen_tid(tid);
-        tree_response_queue_t *q = tree_response_queue_create(4);
-        refresh_dispatcher_register_tid(dispatcher, tid, tid_len, q);
-        refresh_send_find_node(thread->node_id, sock, tid, tid_len, target, &addr);
-        tree_response_t response_pkt;
-        if (tree_response_queue_pop(q, &response_pkt, 1000) == 0) {
-            refresh_find_node_response_t resp;
-            if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
-                                                 &response_pkt.from, &resp) == 0) {
-                for (int j = 0; j < resp.node_count; j++) {
-                    tree_routing_add_node(rt, resp.nodes[j], &resp.addrs[j]);
-                }
-                log_msg(LOG_DEBUG, "Refresh bootstrap: %d nodes from %s", resp.node_count, REFRESH_BOOTSTRAP_HOSTS[i]);
-            }
-        }
-        tree_response_queue_destroy(q);
-        refresh_dispatcher_unregister_tid(dispatcher, tid, tid_len);
-        int cur = tree_routing_get_count(rt);
-        if (cur >= 100) { have_minimum = 1; break; }
-        if (time(NULL) >= deadline) break;
-        }
-        /* Backoff between passes for DNS to recover */
-        if (!have_minimum && pass < 1) {
-            usleep(1500000);  /* 1.5s backoff */
-        }
-    }
-    /* Phase B: BEP51 cache fallback 
-    if (!have_minimum && thread->bep51_cache) {
+    /* Phase A: BEP51 cache (fast path — populated by running crawler) */
+    if (thread->bep51_cache) {
         bep51_cache_t *cache = thread->bep51_cache;
         size_t cc = bep51_cache_get_count(cache);
         if (cc >= 100) {
@@ -393,6 +352,46 @@ static void *bootstrap_thread_func(void *arg) {
                 }
                 free(warm);
                 if (tree_routing_get_count(rt) >= 100) have_minimum = 1;
+            }
+        }
+    }
+    /* Phase B: URL bootstrap (cold start fallback — BEP51 cache empty or insufficient) */
+    if (!have_minimum) {
+        time_t deadline = time(NULL) + 60;
+        for (int pass = 0; pass < 2 && !have_minimum; pass++) {
+            for (int i = 0; REFRESH_BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
+            struct sockaddr_storage addr;
+            if (refresh_resolve_hostname(REFRESH_BOOTSTRAP_HOSTS[i],
+                                         REFRESH_BOOTSTRAP_PORTS[i], &addr) != 0) {
+                log_msg(LOG_WARN, "Refresh bootstrap: DNS failed for %s", REFRESH_BOOTSTRAP_HOSTS[i]);
+                continue;
+            }
+            uint8_t target[20];
+            for (int j = 0; j < 20; j++) target[j] = (uint8_t)(rand() % 256);
+            uint8_t tid[4];
+            int tid_len = tree_protocol_gen_tid(tid);
+            tree_response_queue_t *q = tree_response_queue_create(4);
+            refresh_dispatcher_register_tid(dispatcher, tid, tid_len, q);
+            refresh_send_find_node(thread->node_id, sock, tid, tid_len, target, &addr);
+            tree_response_t response_pkt;
+            if (tree_response_queue_pop(q, &response_pkt, 1000) == 0) {
+                refresh_find_node_response_t resp;
+                if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
+                                                     &response_pkt.from, &resp) == 0) {
+                    for (int j = 0; j < resp.node_count; j++) {
+                        tree_routing_add_node(rt, resp.nodes[j], &resp.addrs[j]);
+                    }
+                    log_msg(LOG_DEBUG, "Refresh bootstrap: %d nodes from %s", resp.node_count, REFRESH_BOOTSTRAP_HOSTS[i]);
+                }
+            }
+            tree_response_queue_destroy(q);
+            refresh_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+            int cur = tree_routing_get_count(rt);
+            if (cur >= 100) { have_minimum = 1; break; }
+            if (time(NULL) >= deadline) break;
+            }
+            if (!have_minimum && pass < 1) {
+                usleep(1500000);
             }
         }
     }
