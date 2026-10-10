@@ -254,6 +254,13 @@ int main(int argc, char *argv[]) {
     } else {
         log_msg(LOG_WARN, "Could not load config.ini, using defaults");
     }
+    /* Apply the database path from config. config is stack-local and lives
+     * for the whole of main(), and cleanup_app_context() never frees
+     * db_path, so pointing at config.db_path is safe. When config.ini is
+     * missing or has no db_path key, config_init_defaults() leaves it at
+     * "data/torrents.db", preserving the previous default behaviour. */
+    g_app_ctx.db_path = config.db_path;
+    log_msg(LOG_DEBUG, "Using database path: %s", g_app_ctx.db_path);
 
     /* Apply the process nice level before any thread is spawned so that
      * every thread in the process inherits it. */
