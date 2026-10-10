@@ -74,7 +74,7 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
 
 /* Initialize HTTP API */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  struct batch_writer *batch_writer, int port) {
+                  struct batch_writer *batch_writer, int port, const char *bind) {
     if (!api || !app_ctx || !database) {
         return -1;
     }
@@ -83,8 +83,12 @@ int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
     api->database = database;
     api->batch_writer = batch_writer;
     api->port = port;
+    if (bind && bind[0]) {
+        strncpy(api->bind, bind, sizeof(api->bind) - 1);
+        api->bind[sizeof(api->bind) - 1] = '\0';
+    }
     api->running = 0;
-    log_msg(LOG_DEBUG, "HTTP API initialized on port %d", port);
+    log_msg(LOG_DEBUG, "HTTP API initialized (port %d, bind %s)", port, api->bind[0] ? api->bind : "0.0.0.0");
     return 0;
 }
 
@@ -94,9 +98,18 @@ int http_api_start(http_api_t *api) {
         return -1;
     }
 
+    /* Build the CivetWeb listening_ports value: "<bind>:<port>" when a specific
+     * bind address is configured, otherwise just "<port>" (bind all interfaces, as before). */
+    char listening_ports[80];
+    if (api->bind[0] != '\0' && strcmp(api->bind, "0.0.0.0") != 0) {
+        snprintf(listening_ports, sizeof(listening_ports), "%s:%d", api->bind, api->port);
+    } else {
+        snprintf(listening_ports, sizeof(listening_ports), "%d", api->port);
+    }
+
     /* CivetWeb options */
     const char *options[] = {
-        "listening_ports", "8080",
+        "listening_ports", listening_ports,
         "num_threads", "2",
         "request_timeout_ms", "15000",
         NULL
@@ -121,7 +134,7 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/torrent", http_torrent_page_handler, api);
 
     api->running = 1;
-    log_msg(LOG_DEBUG, "HTTP API server started on port %d", api->port);
+    log_msg(LOG_DEBUG, "HTTP API server started on %s", listening_ports);
     return 0;
 }
 

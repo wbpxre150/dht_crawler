@@ -31,6 +31,13 @@ typedef struct {
     /* Logging */
     int log_level;  /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR */
 
+    /* HTTP API settings */
+    int http_port;                 /* HTTP server port (default: 8080) */
+    char http_bind[64];            /* HTTP server bind address (default: "0.0.0.0") */
+
+    /* Process settings */
+    int nice_level;                /* setpriority(2) nice level applied at startup (default: 0, range -20..19) */
+
     /* Phase 2: Bloom Filter settings */
     int bloom_enabled;
     uint64_t bloom_capacity;

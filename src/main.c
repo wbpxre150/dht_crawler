@@ -255,6 +255,16 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_WARN, "Could not load config.ini, using defaults");
     }
 
+    /* Apply the process nice level before any thread is spawned so that
+     * every thread in the process inherits it. */
+    if (config.nice_level != 0) {
+        if (setpriority(PRIO_PROCESS, 0, config.nice_level) == 0) {
+            log_msg(LOG_INFO, "Process nice level set to %d", config.nice_level);
+        } else {
+            log_msg(LOG_WARN, "Failed to set nice level to %d: %s", config.nice_level, strerror(errno));
+        }
+    }
+
     /* Rebuild bloom filter from database if requested */
     if (rebuild_bloom) {
         if (!config.bloom_enabled) {
@@ -778,7 +788,8 @@ int main(int argc, char *argv[]) {
     
     /* Initialize HTTP API (minimal - no DHT manager in thread tree mode) */
     log_msg(LOG_DEBUG, "Initializing HTTP API for thread tree mode...");
-    rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, g_batch_writer, HTTP_API_PORT);
+    rc = http_api_init(&g_http_api, &g_app_ctx, &g_database, g_batch_writer,
+                       config.http_port, config.http_bind);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize HTTP API: %d", rc);
         refresh_thread_request_shutdown(g_refresh_thread);
@@ -804,7 +815,7 @@ int main(int argc, char *argv[]) {
     g_http_api.refresh_retry_count = config.refresh_retry_count;
 
     /* Start HTTP API */
-    log_msg(LOG_DEBUG, "Starting HTTP API server on port %d...", HTTP_API_PORT);
+    log_msg(LOG_DEBUG, "Starting HTTP API server (port %d, bind %s)...", config.http_port, config.http_bind);
     rc = http_api_start(&g_http_api);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to start HTTP API: %d", rc);
@@ -821,7 +832,7 @@ int main(int argc, char *argv[]) {
     log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
             config.num_trees, config.tree_bep51_workers,
             config.tree_get_peers_workers, config.tree_metadata_workers);
-    log_msg(LOG_DEBUG, "HTTP API available at http://localhost:%d/", HTTP_API_PORT);
+    log_msg(LOG_DEBUG, "HTTP API available at http://localhost:%d/", config.http_port);
     log_msg(LOG_DEBUG, "Press Ctrl+C to stop.");
     
     /* Wait for shutdown signal (blocking) */

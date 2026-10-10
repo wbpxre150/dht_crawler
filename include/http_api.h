@@ -25,6 +25,7 @@ typedef struct {
     refresh_query_store_t *refresh_query_store;  /* Direct access for /refresh endpoint */
     int refresh_retry_count;  /* Number of retries when /refresh returns 0 peers (default: 1) */
     int port;
+    char bind[64];  /* Bind address (default: "" = all interfaces); empty/"0.0.0.0" binds all interfaces */
     int running;
 } http_api_t;
 
@@ -42,7 +43,7 @@ typedef struct {
 
 /* Function declarations */
 int http_api_init(http_api_t *api, app_context_t *app_ctx, database_t *database,
-                  struct batch_writer *batch_writer, int port);
+                  struct batch_writer *batch_writer, int port, const char *bind);
 int http_api_start(http_api_t *api);
 void http_api_stop(http_api_t *api);
 void http_api_cleanup(http_api_t *api);

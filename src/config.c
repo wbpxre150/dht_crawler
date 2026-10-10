@@ -21,6 +21,13 @@ void config_init_defaults(crawler_config_t *config) {
     
     /* Logging defaults */
     config->log_level = 1;  /* INFO */
+
+    /* HTTP API defaults */
+    config->http_port = 8080;
+    strncpy(config->http_bind, "0.0.0.0", sizeof(config->http_bind) - 1);
+
+    /* Process defaults */
+    config->nice_level = 0;
     
     /* Phase 2: Bloom Filter defaults */
     config->bloom_enabled = 1;
@@ -211,6 +218,20 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             } else if (strcmp(value, "ERROR") == 0 || strcmp(value, "3") == 0) {
                 config->log_level = 3;
             }
+        }
+        /* HTTP API settings */
+        else if (strcmp(key, "http_port") == 0) {
+            config->http_port = atoi(value);
+            if (config->http_port < 1) config->http_port = 1;
+            if (config->http_port > 65535) config->http_port = 65535;
+        } else if (strcmp(key, "http_bind") == 0) {
+            strncpy(config->http_bind, value, sizeof(config->http_bind) - 1);
+        }
+        /* Process settings */
+        else if (strcmp(key, "nice_level") == 0) {
+            config->nice_level = atoi(value);
+            if (config->nice_level < -20) config->nice_level = -20;
+            if (config->nice_level > 19) config->nice_level = 19;
         }
         /* Phase 2: Bloom Filter settings */
         else if (strcmp(key, "bloom_enabled") == 0) {
