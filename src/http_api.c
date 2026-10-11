@@ -2400,12 +2400,6 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         char size_str[64];
         format_size(results[i].size_bytes, size_str, sizeof(size_str));
 
-        /* URL encode torrent name for magnet link */
-        char *encoded_name = url_encode(results[i].name);
-        if (!encoded_name) {
-            continue;  /* Skip this torrent if encoding fails */
-        }
-
         /* Determine peer count class */
         const char *peer_class = "low";
         if (results[i].total_peers > 100) peer_class = "";
@@ -2424,16 +2418,14 @@ static char* generate_search_results_html(search_result_t *results, int count, c
                "        <div class='torrent-meta'>\n"
                "          <span class='peer-count %s' id='peers-%s'>%d peer%s</span>\n"
                "          <button class='refresh-btn' onclick='refreshPeers(event, \"%s\")' title='Refresh peer count'>↻</button>\n"
-               "          <button class='copy-btn' onclick='copyMagnet(event, \"%s\", \"%s\")' title='Copy magnet link'>\xF0\x9F\xA7\xB2</button>\n"
+               "          <button class='copy-btn' onclick='addMagnet(event, \"%s\")' title='Add to Transmission'>\xE2\x9E\x95</button>\n"
                "          <span>%s</span>\n"
                "          <span>%d file%s</span>\n"
                "        </div>\n"
                "      </div>\n",
                peer_class, hex,
                results[i].total_peers, results[i].total_peers == 1 ? "" : "s",
-               hex, hex, encoded_name, size_str, results[i].num_files, results[i].num_files == 1 ? "" : "s");
-
-        free(encoded_name);
+               hex, hex, size_str, results[i].num_files, results[i].num_files == 1 ? "" : "s");
 
         /* File list */
         APPEND("      <div class='file-list' id='files-%s'>\n", hex);
@@ -2559,71 +2551,30 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "        });\n"
            "    }\n"
            "\n"
-           "    function copyMagnet(event, hash, encodedName) {\n"
+           "    function fmtGiB(b) {\n"
+           "      return (b / 1073741824).toFixed(2) + ' GiB';\n"
+           "    }\n"
+           "\n"
+           "    function addMessage(j) {\n"
+           "      if (!j) return 'Add failed: the proxy answered with an error. Log in on the control server (:8090) and retry.';\n"
+           "      if (j.ok) return j.duplicate ? 'Already in Transmission - nothing added.'\n"
+           "        : 'Added \"' + (j.name || '') + '\" to Transmission (normal priority, data directory root).';\n"
+           "      if (j.error === 'insufficient_space')\n"
+           "        return 'Not added - not enough space on the drive.\\nTorrent: ' + fmtGiB(j.sizeBytes) + '. Total free space: ' + fmtGiB(j.freeBytes) + '.';\n"
+           "      if (j.error === 'not_found') return 'Torrent not found in the crawler DB.';\n"
+           "      if (j.error === 'rpc_failed') return 'Transmission did not accept the torrent (daemon down or RPC error).';\n"
+           "      if (j.error === 'no_storage') return 'USB storage is not mounted.';\n"
+           "      if (j.error === 'db_unavailable') return 'The crawler database could not be read.';\n"
+           "      if (j.error === 'bad_hash') return 'Bad infohash.';\n"
+           "      return 'Add failed (' + (j.error || 'unknown') + '). Log in on the control server (:8090) and retry.';\n"
+           "    }\n"
+           "\n"
+           "    function addMagnet(event, hash) {\n"
            "      event.stopPropagation();\n"
-           "      \n"
-           "      const magnetLink = 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodedName;\n"
-           "      const btn = event.target;\n"
-           "      \n"
-           "      // Try modern Clipboard API first (works on localhost/HTTPS)\n"
-           "      if (navigator.clipboard && navigator.clipboard.writeText) {\n"
-           "        navigator.clipboard.writeText(magnetLink)\n"
-           "          .then(() => showCopySuccess(btn))\n"
-           "          .catch(() => fallbackCopy(magnetLink, btn));\n"
-           "      } else {\n"
-           "        // Primary method for HTTP local network\n"
-           "        fallbackCopy(magnetLink, btn);\n"
-           "      }\n"
-           "    }\n"
-           "\n"
-           "    function fallbackCopy(text, btn) {\n"
-           "      // Create temporary textarea for copy\n"
-           "      const textarea = document.createElement('textarea');\n"
-           "      textarea.value = text;\n"
-           "      textarea.style.position = 'fixed';\n"
-           "      textarea.style.left = '-9999px';\n"
-           "      textarea.style.top = '0';\n"
-           "      document.body.appendChild(textarea);\n"
-           "      \n"
-           "      // Select text\n"
-           "      textarea.focus();\n"
-           "      textarea.select();\n"
-           "      textarea.setSelectionRange(0, 99999);\n"
-           "      \n"
-           "      let success = false;\n"
-           "      try {\n"
-           "        success = document.execCommand('copy');\n"
-           "      } catch (err) {\n"
-           "        console.error('Copy failed:', err);\n"
-           "      }\n"
-           "      \n"
-           "      // Clean up\n"
-           "      document.body.removeChild(textarea);\n"
-           "      \n"
-           "      // Show result\n"
-           "      if (success) {\n"
-           "        showCopySuccess(btn);\n"
-           "      } else {\n"
-           "        // Last resort: show magnet link in alert for manual copy\n"
-           "        alert('Could not copy automatically. Magnet link:\\n\\n' + text);\n"
-           "      }\n"
-           "    }\n"
-           "\n"
-           "    function showCopySuccess(btn) {\n"
-           "      const originalContent = btn.textContent;\n"
-           "      const originalTitle = btn.title;\n"
-           "      \n"
-           "      // Visual feedback\n"
-           "      btn.textContent = '\\u2713';\n"
-           "      btn.title = 'Copied!';\n"
-           "      btn.classList.add('copied');\n"
-           "      \n"
-           "      // Restore after 2 seconds\n"
-           "      setTimeout(() => {\n"
-           "        btn.textContent = originalContent;\n"
-           "        btn.title = originalTitle;\n"
-           "        btn.classList.remove('copied');\n"
-           "      }, 2000);\n"
+           "      fetch('/api/transmission/add?hash=' + hash, { method: 'POST' })\n"
+           "        .then(function(r) { return r.json().catch(function() { return null; }); })\n"
+           "        .then(function(j) { alert(addMessage(j)); })\n"
+           "        .catch(function() { alert('Add failed: the app proxy did not answer.\\nAdd to Transmission is only available through the authenticated proxy (:8080).'); });\n"
            "    }\n"
            "  </script>\n");
 
