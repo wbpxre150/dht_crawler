@@ -213,7 +213,6 @@ make valgrind
 ./dht_crawler --compact                # VACUUM database into a fresh file and replace original
 ./dht_crawler --check-database         # Run SQLite integrity_check and report errors
 ./dht_crawler --recover-database       # Copy all readable rows to a new database; replace original
-./dht_crawler --dont-check-database    # Skip the automatic integrity check at startup
 ```
 
 These modes exit after completing their task without starting the crawler.

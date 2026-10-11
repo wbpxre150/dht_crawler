@@ -21,7 +21,7 @@ The first `make` automatically applies patches to `lib/bencode-c` and `lib/civet
 
 ```
 ./dht_crawler [--rebuild-bloom-filter] [--porn-filter-update] [--compact]
-              [--check-database] [--recover-database] [--dont-check-database]
+              [--check-database] [--recover-database]
 ```
 
 These are maintenance modes that exit after completing their task rather than running the crawler.
