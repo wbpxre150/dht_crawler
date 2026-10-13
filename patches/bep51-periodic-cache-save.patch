@@ -1,0 +1,51 @@
+--- a/src/supervisor.c
++++ b/src/supervisor.c
+@@ -18,6 +18,11 @@
+ #include <arpa/inet.h>
+ #include <unistd.h>
+ 
++/* Interval (seconds) between periodic BEP51 cache saves in the monitor thread */
++#ifndef BEP51_CACHE_SAVE_INTERVAL_SEC
++#define BEP51_CACHE_SAVE_INTERVAL_SEC 3600
++#endif
++
+ 
+ /* Forward declaration of internal helpers */
+ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_t *old_tree, uint32_t partition_index);
+@@ -1063,6 +1068,9 @@
+ 
+     log_msg(LOG_DEBUG, "[supervisor] Monitor thread started");
+ 
++    /* Periodic BEP51 cache save; zero-initialized to mark "not yet recorded" */
++    struct timespec last_save_ts = {0, 0};
++
+     while (atomic_load(&sup->monitor_running)) {
+         /* Sleep in small chunks (1 second) to be responsive to shutdown */
+         for (int i = 0; i < 10 && atomic_load(&sup->monitor_running); i++) {
+@@ -1283,6 +1291,26 @@
+ 
+         pthread_mutex_unlock(&sup->trees_lock);
+ 
++        /* Periodic BEP51 cache save. Intentionally outside trees_lock: the cache
++         * protects itself with its own mutex, which the monitor thread does not
++         * hold here. On failure, retry on the next monitor cycle. */
++        struct timespec now_ts;
++        clock_gettime(CLOCK_MONOTONIC, &now_ts);
++        if (last_save_ts.tv_sec == 0) {
++            last_save_ts = now_ts;
++        } else if ((now_ts.tv_sec - last_save_ts.tv_sec) >= BEP51_CACHE_SAVE_INTERVAL_SEC) {
++            if (sup->bep51_cache && sup->bep51_cache_path[0] != '\0') {
++                if (bep51_cache_save_to_file(sup->bep51_cache, sup->bep51_cache_path) == 0) {
++                    log_msg(LOG_INFO, "[supervisor] Periodic BEP51 cache save: %zu nodes to %s",
++                            bep51_cache_get_count(sup->bep51_cache), sup->bep51_cache_path);
++                    last_save_ts = now_ts;
++                } else {
++                    log_msg(LOG_WARN, "[supervisor] Periodic BEP51 cache save to %s failed",
++                            sup->bep51_cache_path);
++                }
++            }
++        }
++
+         /* Monitor and destroy draining trees */
+         monitor_draining_trees(sup);
+     }
