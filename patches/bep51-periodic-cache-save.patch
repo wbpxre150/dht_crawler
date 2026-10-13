@@ -22,13 +22,14 @@
      while (atomic_load(&sup->monitor_running)) {
          /* Sleep in small chunks (1 second) to be responsive to shutdown */
          for (int i = 0; i < 10 && atomic_load(&sup->monitor_running); i++) {
-@@ -1283,6 +1291,26 @@
+@@ -1283,6 +1291,27 @@
  
          pthread_mutex_unlock(&sup->trees_lock);
  
 +        /* Periodic BEP51 cache save. Intentionally outside trees_lock: the cache
 +         * protects itself with its own mutex, which the monitor thread does not
-+         * hold here. On failure, retry on the next monitor cycle. */
++         * hold here. On failure, last_save_ts is advanced too, so a failing save
++         * (e.g. ENOSPC) retries at most once per interval instead of every cycle. */
 +        struct timespec now_ts;
 +        clock_gettime(CLOCK_MONOTONIC, &now_ts);
 +        if (last_save_ts.tv_sec == 0) {
@@ -38,11 +39,11 @@
 +                if (bep51_cache_save_to_file(sup->bep51_cache, sup->bep51_cache_path) == 0) {
 +                    log_msg(LOG_INFO, "[supervisor] Periodic BEP51 cache save: %zu nodes to %s",
 +                            bep51_cache_get_count(sup->bep51_cache), sup->bep51_cache_path);
-+                    last_save_ts = now_ts;
 +                } else {
 +                    log_msg(LOG_WARN, "[supervisor] Periodic BEP51 cache save to %s failed",
 +                            sup->bep51_cache_path);
 +                }
++                last_save_ts = now_ts;
 +            }
 +        }
 +
