@@ -699,6 +699,23 @@ static void do_backup(batch_writer_t *writer) {
         "  file_index SMALLINT NOT NULL);"
         "CREATE INDEX IF NOT EXISTS idx_files_torrent"
         "  ON torrent_files(torrent_id);"
+        /* Stage 5 ingest-time classification: the same torrent_class shape as
+         * src/database.c, so a restored backup needs no rebuild step. */
+        "CREATE TABLE IF NOT EXISTS torrent_class ("
+        "  torrent_id INTEGER PRIMARY KEY REFERENCES torrents(id) ON DELETE CASCADE,"
+        "  category INTEGER NOT NULL,"
+        "  tv_kind INTEGER,"
+        "  adult INTEGER NOT NULL DEFAULT 0,"
+        "  adult_p REAL,"
+        "  season_lo INTEGER, season_hi INTEGER,"
+        "  episode_lo INTEGER, episode_hi INTEGER,"
+        "  resolution INTEGER,"
+        "  confidence REAL,"
+        "  clf_ver INTEGER NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS idx_class_cat"
+        "  ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
+        "CREATE INDEX IF NOT EXISTS idx_class_ver"
+        "  ON torrent_class(clf_ver);"
         "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_search USING fts5("
         "  name, tokenize='porter unicode61',"
         "  content='torrents', content_rowid='id');"
@@ -740,6 +757,11 @@ static void do_backup(batch_writer_t *writer) {
         "INSERT OR IGNORE INTO torrent_files"
         "  SELECT * FROM src.torrent_files"
         "  WHERE id > (SELECT COALESCE(MAX(id), 0) FROM torrent_files);"
+        /* The live DB carries torrent_class from database_create_schema() at
+         * startup; the id predicate matches the torrents copy above. */
+        "INSERT OR IGNORE INTO torrent_class"
+        "  SELECT * FROM src.torrent_class"
+        "  WHERE torrent_id > (SELECT COALESCE(MAX(torrent_id), 0) FROM torrent_class);"
         "COMMIT;",
         NULL, NULL, &err);
     if (rc != SQLITE_OK) {

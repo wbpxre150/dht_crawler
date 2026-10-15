@@ -10,6 +10,7 @@
 #include "database.h"
 #include "porn_filter.h"
 #include "language_filter.h"
+#include "classifier.h"
 #include "../lib/bencode-c/bencode.h"
 
 #include <openssl/sha.h>
@@ -1355,6 +1356,15 @@ void *tree_metadata_worker_func(void *arg) {
                     /* Free the metadata and skip database insertion */
                     free_database_metadata(&db_meta);
                 } else if (tree->shared_batch_writer) {
+                    /* Stage 5: tag-mode classification runs at the same point as
+                     * the filters, but only for survivors. The result travels in
+                     * db_meta (batch_writer_add deep-copies it) and is inserted as
+                     * one torrent_class row inside the same batch transaction.
+                     * A failure is not fatal: the torrent is stored without it. */
+                    if (classifier_classify(&db_meta, &db_meta.classification) == 0) {
+                        db_meta.has_classification = 1;
+                    }
+
                     /* Add to batch writer (batch_writer makes deep copy) */
                     rc = batch_writer_add(tree->shared_batch_writer, &db_meta);
                     if (rc != 0) {

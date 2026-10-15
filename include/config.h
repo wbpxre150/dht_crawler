@@ -19,6 +19,7 @@ typedef struct {
      *   - refresh_thread.c (refresh_*)
      *   - language_filter.c (language_filter_non_latin_threshold)
      *   - porn_filter.c (porn_filter_enabled, porn_filter_keyword_file)
+     *   - classifier.c (classifier_enabled, classifier_model_dir)
      *   - failure_bloom filter (failure_bloom_capacity)
      */
 
@@ -81,6 +82,10 @@ typedef struct {
 
     /* Language filter settings (independent of porn filter) */
     int language_filter_non_latin_threshold; /* Filter torrents where non-Latin chars exceed this % (0=disabled, default: 33) */
+
+    /* Ingest-time classifier settings (Stage 5, tag mode) */
+    int classifier_enabled;             /* Enable ingest-time classification (0=disabled, default: 1) */
+    char classifier_model_dir[512];     /* Directory with manifest.json + *.ftz (default: "models/v1") */
 
     /* Thread tree settings (Stage 1) */
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */

@@ -38,7 +38,30 @@ static const char *CREATE_TABLES_SQL =
     ");"
     ""
     "CREATE INDEX IF NOT EXISTS idx_files_torrent ON torrent_files(torrent_id);"
-    "CREATE INDEX IF NOT EXISTS idx_files_prefix ON torrent_files(prefix_id);";
+    "CREATE INDEX IF NOT EXISTS idx_files_prefix ON torrent_files(prefix_id);"
+    ""
+    /* Stage 5 ingest-time classification (classifier.md §7). A separate table
+     * leaves the torrents row and its FTS triggers untouched; torrent_id is the
+     * primary key, so there is at most one class row per torrent. */
+    "CREATE TABLE IF NOT EXISTS torrent_class ("
+    "    torrent_id INTEGER PRIMARY KEY REFERENCES torrents(id) ON DELETE CASCADE,"
+    "    category INTEGER NOT NULL,"
+    "    tv_kind INTEGER,"
+    "    adult INTEGER NOT NULL DEFAULT 0,"
+    "    adult_p REAL,"
+    "    season_lo INTEGER,"
+    "    season_hi INTEGER,"
+    "    episode_lo INTEGER,"
+    "    episode_hi INTEGER,"
+    "    resolution INTEGER,"
+    "    confidence REAL,"
+    "    clf_ver INTEGER NOT NULL"
+    ");"
+    ""
+    "CREATE INDEX IF NOT EXISTS idx_class_cat ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
+    "CREATE INDEX IF NOT EXISTS idx_class_ver ON torrent_class(clf_ver);"
+    ""
+    "CREATE TABLE IF NOT EXISTS classifier_meta (key TEXT PRIMARY KEY, value TEXT);";
 
 static const char *CREATE_FTS_SQL =
     "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_search USING fts5("
@@ -226,6 +249,22 @@ int database_create_schema(database_t *db) {
     rc = sqlite3_prepare_v2(db->db, check_exists_sql, -1, &db->check_exists_stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare check exists statement: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
+    /* Stage 5: one classification row per torrent, inserted by
+     * database_insert_torrent_unsafe() in the same transaction as the torrent.
+     * OR IGNORE guards the primary key when an INSERT OR REPLACE on torrents
+     * reuses a rowid that still carries an old class row. */
+    const char *insert_class_sql =
+        "INSERT OR IGNORE INTO torrent_class "
+        "(torrent_id, category, tv_kind, adult, adult_p, season_lo, season_hi, "
+        " episode_lo, episode_hi, resolution, confidence, clf_ver) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    rc = sqlite3_prepare_v2(db->db, insert_class_sql, -1, &db->insert_class_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare insert class statement: %s", sqlite3_errmsg(db->db));
         return -1;
     }
 
@@ -440,6 +479,38 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
     }
 
     int64_t torrent_id = sqlite3_last_insert_rowid(db->db);
+    /* Stage 5: the classification row rides in the caller's transaction (one
+     * BEGIN...COMMIT per batch flush), so it is never a second transaction.
+     * A failure here is logged but does not fail the torrent insert: the
+     * torrent itself is already written and a missing class row is what stage
+     * 8's backfill repairs (clf_ver < ver or no row). */
+    if (torrent->has_classification && db->insert_class_stmt) {
+        const classification_t *c = &torrent->classification;
+        sqlite3_reset(db->insert_class_stmt);
+        sqlite3_bind_int64(db->insert_class_stmt, 1, torrent_id);
+        sqlite3_bind_int(db->insert_class_stmt, 2, c->category);
+        if (c->tv_kind > 0) {
+            sqlite3_bind_int(db->insert_class_stmt, 3, c->tv_kind);
+        } else {
+            sqlite3_bind_null(db->insert_class_stmt, 3);  /* NULL unless tv/anime */
+        }
+        sqlite3_bind_int(db->insert_class_stmt, 4, c->adult);
+        sqlite3_bind_double(db->insert_class_stmt, 5, c->adult_p);
+        sqlite3_bind_int(db->insert_class_stmt, 6, c->season_lo);
+        sqlite3_bind_int(db->insert_class_stmt, 7, c->season_hi);
+        sqlite3_bind_int(db->insert_class_stmt, 8, c->episode_lo);
+        sqlite3_bind_int(db->insert_class_stmt, 9, c->episode_hi);
+        sqlite3_bind_int(db->insert_class_stmt, 10, c->resolution);
+        sqlite3_bind_double(db->insert_class_stmt, 11, c->confidence);
+        sqlite3_bind_int64(db->insert_class_stmt, 12, c->clf_ver);
+
+        rc = sqlite3_step(db->insert_class_stmt);
+        sqlite3_reset(db->insert_class_stmt);
+        if (rc != SQLITE_DONE) {
+            log_msg(LOG_WARN, "Failed to insert torrent_class for torrent_id %lld: %s",
+                   (long long)torrent_id, sqlite3_errmsg(db->db));
+        }
+    }
 
     /* Insert files with path normalization */
     for (int i = 0; i < num_files; i++) {
@@ -1010,6 +1081,11 @@ void database_cleanup(database_t *db) {
     if (db->insert_torrent_stmt) {
         sqlite3_finalize(db->insert_torrent_stmt);
         db->insert_torrent_stmt = NULL;
+    }
+
+    if (db->insert_class_stmt) {
+        sqlite3_finalize(db->insert_class_stmt);
+        db->insert_class_stmt = NULL;
     }
 
     if (db->insert_file_stmt) {

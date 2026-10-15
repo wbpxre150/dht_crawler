@@ -5,6 +5,7 @@
 #include "batch_writer.h"
 #include "porn_filter.h"
 #include "language_filter.h"
+#include "classifier.h"
 #include "torrent_search.h"
 #include "supervisor.h"
 #include "thread_tree.h"
@@ -442,6 +443,42 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(language_filter, "filter_rate_percent", filter_rate);
 
         cJSON_AddItemToObject(root, "language_filter", language_filter);
+    }
+
+    /* Stage 5: ingest-time classifier counters (present even at zero, so a
+     * dashboard can tell "no data yet" from "not built in"). */
+    {
+        classifier_stats_t clf_stats;
+        classifier_get_stats(&clf_stats);
+
+        cJSON *classifier = cJSON_CreateObject();
+        cJSON_AddBoolToObject(classifier, "enabled", clf_stats.enabled ? 1 : 0);
+        cJSON_AddNumberToObject(classifier, "total_classified", (double)clf_stats.total_classified);
+
+        double mean_us = 0.0;
+        if (clf_stats.total_classified > 0) {
+            mean_us = (double)clf_stats.total_us / (double)clf_stats.total_classified;
+        }
+        cJSON_AddNumberToObject(classifier, "mean_us_per_item", mean_us);
+        cJSON_AddNumberToObject(classifier, "adult_tagged", (double)clf_stats.adult_tagged);
+        cJSON_AddNumberToObject(classifier, "parser_only_fallback",
+                                (double)clf_stats.parser_only_fallback);
+        cJSON_AddNumberToObject(classifier, "model_load_failures",
+                                (double)clf_stats.model_load_failures);
+        cJSON_AddNumberToObject(classifier, "tv_kind_model_used",
+                                (double)clf_stats.tv_kind_model_used);
+
+        /* Only the categories that actually occurred, keyed by taxonomy name. */
+        cJSON *by_category = cJSON_CreateObject();
+        for (int i = 0; i < CLASSIFIER_NUM_CATEGORIES; i++) {
+            if (clf_stats.by_category[i] > 0) {
+                cJSON_AddNumberToObject(by_category, classifier_category_name(i),
+                                        (double)clf_stats.by_category[i]);
+            }
+        }
+        cJSON_AddItemToObject(classifier, "by_category", by_category);
+
+        cJSON_AddItemToObject(root, "classifier", classifier);
     }
 
     /* Stage 6: Add supervisor/thread tree statistics */

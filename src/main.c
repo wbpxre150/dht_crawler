@@ -5,6 +5,7 @@
 #include "porn_filter.h"
 #include "porn_filter_cleanup.h"
 #include "language_filter.h"
+#include "classifier.h"
 #include "torrent_search.h"
 #include "config.h"
 #include "supervisor.h"
@@ -459,6 +460,14 @@ int main(int argc, char *argv[]) {
     /* Initialize language filter (independent of porn filter) */
     language_filter_init(config.language_filter_non_latin_threshold);
 
+    /* Initialize ingest-time classifier (Stage 5, tag mode). Non-fatal: without
+     * a model directory it falls back to parser-only classification. */
+    if (config.classifier_enabled) {
+        classifier_init(config.classifier_model_dir);
+    } else {
+        log_msg(LOG_DEBUG, "Classifier disabled");
+    }
+
     /* Initialize torrent search module for title extraction */
     log_msg(LOG_DEBUG, "Initializing torrent search module...");
     rc = torrent_search_init("torrent_search_keywords.txt");
@@ -489,6 +498,11 @@ int main(int argc, char *argv[]) {
         bloom_filter_cleanup(g_bloom);
         return 1;
     }
+
+    /* Stage 5: the classifier was initialised before the database existed (it
+     * reads the model manifest, not the DB), so its provenance rows land here,
+     * right after classifier_meta is guaranteed to exist. */
+    classifier_write_meta(g_database.db);
 
     /* Connect bloom filter to database for write tracking (CRITICAL for correctness)
      * Bloom filter is updated ONLY after successful database writes, not at discovery time.

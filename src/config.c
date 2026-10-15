@@ -81,6 +81,10 @@ void config_init_defaults(crawler_config_t *config) {
     /* Language filter defaults 
     config->language_filter_non_latin_threshold = 33; /* Filter if >33% non-Latin characters */
 
+    /* Ingest-time classifier defaults (Stage 5, tag mode) */
+    config->classifier_enabled = 1;                 /* On by default; tag mode only */
+    strncpy(config->classifier_model_dir, "models/v1", sizeof(config->classifier_model_dir) - 1);
+
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
 
@@ -303,6 +307,12 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->language_filter_non_latin_threshold = atoi(value);
             if (config->language_filter_non_latin_threshold < 0) config->language_filter_non_latin_threshold = 0;
             if (config->language_filter_non_latin_threshold > 100) config->language_filter_non_latin_threshold = 100;
+        }
+        /* Ingest-time classifier settings (Stage 5, tag mode) */
+        else if (strcmp(key, "classifier_enabled") == 0) {
+            config->classifier_enabled = atoi(value);
+        } else if (strcmp(key, "classifier_model_dir") == 0) {
+            strncpy(config->classifier_model_dir, value, sizeof(config->classifier_model_dir) - 1);
         }
         /* Thread tree settings (Stage 1) */
         else if (strcmp(key, "num_trees") == 0) {

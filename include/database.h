@@ -13,6 +13,27 @@ typedef struct {
     int16_t file_index;  /* Changed to int16_t (SMALLINT) for space savings */
 } file_info_t;
 
+/*
+ * Stage 5 ingest-time classification (tag mode).
+ *
+ * Plain C values only: this struct is embedded in torrent_metadata_t, which
+ * batch_writer_add() deep-copies with a single memcpy (src/batch_writer.c), so
+ * extending it needs no copy-code changes.
+ *
+ * category/tv_kind hold tparse taxonomy codes (tp_category_t / tp_tv_kind_t);
+ * tv_kind 0 (TP_TV_NONE) is stored as SQL NULL in torrent_class.
+ */
+typedef struct {
+    int category;       /* tp_category_t */
+    int tv_kind;        /* tp_tv_kind_t, 0 = none */
+    int adult;          /* 1 when adult_p >= the manifest hide threshold */
+    double adult_p;     /* P(adult) from the adult model, 0.0 when unavailable */
+    int season_lo, season_hi, episode_lo, episode_hi;
+    int resolution;     /* 0, 480, 720, 1080, 2160 */
+    double confidence;  /* category model probability, 0.0 for parser-only */
+    long long clf_ver;  /* model version from the manifest, 0 when unknown */
+} classification_t;
+
 /* Torrent metadata structure */
 typedef struct {
     uint8_t info_hash[SHA1_DIGEST_LENGTH];
@@ -23,6 +44,10 @@ typedef struct {
     /* File information (for multi-file torrents) */
     file_info_t *files;
     int32_t num_files;
+    /* Stage 5 ingest-time classification (tag mode): set by tree_metadata.c
+     * after the filters pass; has_classification gates the torrent_class row. */
+    classification_t classification;
+    int has_classification;
 } torrent_metadata_t;
 
 /* Forward declaration */
@@ -32,6 +57,7 @@ struct bloom_filter;
 typedef struct {
     sqlite3 *db;
     sqlite3_stmt *insert_torrent_stmt;
+    sqlite3_stmt *insert_class_stmt;  /* Stage 5: torrent_class row */
     sqlite3_stmt *insert_file_stmt;
     sqlite3_stmt *insert_prefix_stmt;
     sqlite3_stmt *lookup_prefix_stmt;
