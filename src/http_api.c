@@ -109,6 +109,7 @@ static char* generate_search_results_html(search_result_t *results, int count, c
 static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
                                     int offset, search_result_t **results, int *count, int *total_count);
 static int browse_handler(struct mg_connection *conn, void *cbdata);
+static int sb_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...);
 
 typedef enum {
     VIDEO_FILTER_TV,      /* video torrent AND title has SxxExx */
@@ -232,28 +233,29 @@ static void format_class_filter_qs(const cls_filter_t *f, char *out, size_t out_
     out[0] = '\0';
     if (!f) return;
 
+    /* Every fragment goes through sb_append(), so a buffer too short for one
+     * stays NUL-terminated instead of letting the offset run past the end. */
     size_t pos = 0;
 
-    if (f->has_category && pos + 1 < out_len) {
-        pos += (size_t)snprintf(out + pos, out_len - pos, "%scategory=%s",
-                                pos ? "&" : "", classifier_category_name(f->category));
+    if (f->has_category) {
+        sb_append(out, out_len, &pos, "%scategory=%s",
+                  pos ? "&" : "", classifier_category_name(f->category));
     }
-    if (f->has_tv_kind && pos + 1 < out_len) {
+    if (f->has_tv_kind) {
         if (f->tv_kind > 0) {
-            pos += (size_t)snprintf(out + pos, out_len - pos, "%stv_kind=%s",
-                                    pos ? "&" : "", class_tv_kind_name(f->tv_kind));
+            sb_append(out, out_len, &pos, "%stv_kind=%s",
+                      pos ? "&" : "", class_tv_kind_name(f->tv_kind));
         } else {
-            pos += (size_t)snprintf(out + pos, out_len - pos, "%stv_kind=0",
-                                    pos ? "&" : "");
+            sb_append(out, out_len, &pos, "%stv_kind=0", pos ? "&" : "");
         }
     }
-    if (f->has_min_conf && pos + 1 < out_len) {
-        pos += (size_t)snprintf(out + pos, out_len - pos, "%smin_conf=%.3f",
-                                pos ? "&" : "", f->min_conf);
+    if (f->has_min_conf) {
+        sb_append(out, out_len, &pos, "%smin_conf=%.3f",
+                  pos ? "&" : "", f->min_conf);
     }
-    if (f->present && pos + 1 < out_len) {
-        pos += (size_t)snprintf(out + pos, out_len - pos, "%sadult=%s",
-                                pos ? "&" : "", class_adult_name(f->adult));
+    if (f->present) {
+        sb_append(out, out_len, &pos, "%sadult=%s",
+                  pos ? "&" : "", class_adult_name(f->adult));
     }
 }
 
@@ -390,42 +392,43 @@ static int class_filter_needs_join(const cls_filter_t *f) {
  * bind_class_filter(). */
 static int append_class_conditions(char *buf, size_t bufsize, int *pos,
                                    const cls_filter_t *f, int first_bind) {
-    int written;
+    if (!f || !pos || *pos < 0) return 0;
+
+    /* sb_append() bounds-checks every fragment and never advances the offset on
+     * a failed write, so the caller cannot end up with a negative remaining
+     * size for the fragment that follows. */
+    size_t sp = (size_t)*pos;
     int binds = 0;
+    int rc = 0;
 
     if (f->adult == CLS_ADULT_HIDE) {
-        written = snprintf(buf + *pos, bufsize - *pos, " AND c.adult = 0");
-        if (written > 0) *pos += written;
+        rc = sb_append(buf, bufsize, &sp, " AND c.adult = 0");
     } else if (f->adult == CLS_ADULT_ONLY) {
-        written = snprintf(buf + *pos, bufsize - *pos, " AND c.adult = 1");
-        if (written > 0) *pos += written;
+        rc = sb_append(buf, bufsize, &sp, " AND c.adult = 1");
     }
 
-    if (f->has_category) {
-        written = snprintf(buf + *pos, bufsize - *pos, " AND c.category = ?%d", first_bind + binds);
-        if (written > 0) *pos += written;
-        binds++;
+    if (rc == 0 && f->has_category) {
+        rc = sb_append(buf, bufsize, &sp, " AND c.category = ?%d", first_bind + binds);
+        if (rc == 0) binds++;
     }
 
-    if (f->has_tv_kind) {
+    if (rc == 0 && f->has_tv_kind) {
         if (f->tv_kind <= 0) {
             /* tp_tv_kind_t 0 (none) is stored as SQL NULL. */
-            written = snprintf(buf + *pos, bufsize - *pos, " AND c.tv_kind IS NULL");
-            if (written > 0) *pos += written;
+            rc = sb_append(buf, bufsize, &sp, " AND c.tv_kind IS NULL");
         } else {
-            written = snprintf(buf + *pos, bufsize - *pos, " AND c.tv_kind = ?%d", first_bind + binds);
-            if (written > 0) *pos += written;
-            binds++;
+            rc = sb_append(buf, bufsize, &sp, " AND c.tv_kind = ?%d", first_bind + binds);
+            if (rc == 0) binds++;
         }
     }
 
-    if (f->has_min_conf) {
-        written = snprintf(buf + *pos, bufsize - *pos, " AND c.confidence >= ?%d", first_bind + binds);
-        if (written > 0) *pos += written;
-        binds++;
+    if (rc == 0 && f->has_min_conf) {
+        rc = sb_append(buf, bufsize, &sp, " AND c.confidence >= ?%d", first_bind + binds);
+        if (rc == 0) binds++;
     }
 
-    return binds;
+    *pos = (int)sp;
+    return rc == 0 ? binds : 0;
 }
 
 /* Bind the parameters appended by append_class_conditions(), same order. */
@@ -1682,6 +1685,11 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
                     filter_qs[0] ? "&" : "", filter_qs);
                 free(encoded_query);
             } else {
+                /* The query is echoed back into the page, so it has to be
+                 * escaped like the results-page prefill: a crafted q must not
+                 * be able to inject markup. */
+                char query_html[2048]; /* q is <=255 bytes; worst case 6x when escaped */
+                html_escape(query_buf, query_html, sizeof(query_html));
                 snprintf(empty_html, sizeof(empty_html),
                     "<!DOCTYPE html>\n"
                     "<html>\n"
@@ -1700,7 +1708,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
                     "  <p class='message'>No torrents matched your query: \"%s\"</p>\n"
                     "  <a href='/'>Back to Search</a>\n"
                     "</body>\n"
-                    "</html>", query_buf);
+                    "</html>", query_html);
             }
 
             mg_printf(conn,
@@ -3150,6 +3158,10 @@ static char* generate_search_results_html(search_result_t *results, int count,
     } while(0)
 
     /* HTML header with CSS */
+    /* The query is echoed into <title> too, so it needs the same escaping as
+     * the prefill below: a crafted q must not be able to inject markup. */
+    char title_query_html[2048]; /* q is <=255 bytes; worst case 6x when escaped */
+    html_escape(query ? query : "", title_query_html, sizeof(title_query_html));
     APPEND("<!DOCTYPE html>\n"
            "<html>\n"
            "<head>\n"
@@ -3160,7 +3172,7 @@ static char* generate_search_results_html(search_result_t *results, int count,
            is_movie_mode ? "Random 100 Movies" :
            is_music_mode ? "Random 100 Music Torrents" :
            browse_mode   ? "Browse Torrents" :
-                           (query ? query : ""));
+                           title_query_html);
 
     APPEND(
            "  <style>\n"
@@ -3585,11 +3597,18 @@ static char* generate_search_results_html(search_result_t *results, int count,
                 char file_size_str[64];
                 format_size(results[i].file_sizes[j], file_size_str, sizeof(file_size_str));
 
+                /* Stored paths carry whatever the torrent metadata said, so
+                 * they get the same treatment as names. html_escape() cuts at
+                 * the last whole entity: an oversized path is shortened rather
+                 * than emitted half-escaped. */
+                char path_html[2048]; /* DB paths are far shorter; bounded anyway */
+                html_escape(results[i].file_paths[j], path_html, sizeof(path_html));
+
                 APPEND("          <li>\n"
                        "            <span class='file-path'>%s</span>\n"
                        "            <span class='file-size'>%s</span>\n"
                        "          </li>\n",
-                       results[i].file_paths[j], file_size_str);
+                       path_html, file_size_str);
             }
             if (results[i].num_files > 10) {
                 APPEND("          <li class='no-files'>...and %d more file%s</li>\n",
