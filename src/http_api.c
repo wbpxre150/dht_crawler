@@ -21,6 +21,7 @@ int tree_peers_queue_count(void *q);
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stdarg.h>
 
 /* ---------------------------------------------------------------------------
  * Stage 7: torrent_class-powered filters (/search, /browse, /random-*).
@@ -81,6 +82,9 @@ typedef struct {
     const char *extra_qs;        /* caller-built URL fragment, no leading '&',
                                   * e.g. "category=tv&tv_kind=season_pack" */
     int browse_mode;             /* render the q-less /browse listing */
+    const char *sort_qs;         /* caller-built "sort=<key>" fragment of a
+                                  * /browse page; the chips and the clear-all
+                                  * link keep it. NULL/"" when unsorted */
 } results_page_opts_t;
 
 /* Bind parameters a fully populated filter consumes; see
@@ -141,6 +145,41 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
     }
 
     snprintf(out, out_len, "%.2f %s", size, units[unit]);
+}
+
+/* Helper: escape &, <, >, " and ' so a value coming from the request or the
+ * database can be interpolated into HTML text or an attribute without changing
+ * the markup. Writes at most out_len-1 bytes plus the NUL terminator into the
+ * caller's buffer and never emits half an entity: when the escaped text does
+ * not fit, it is cut at the last whole character/entity that did. Returns the
+ * number of bytes written, so callers can tell truncated output apart. */
+static size_t html_escape(const char *in, char *out, size_t out_len) {
+    if (!out || out_len == 0) return 0;
+
+    size_t pos = 0;
+    if (in) {
+        for (const char *p = in; *p; p++) {
+            const char *entity;
+            switch (*p) {
+                case '&':  entity = "&amp;";  break;
+                case '<':  entity = "&lt;";   break;
+                case '>':  entity = "&gt;";   break;
+                case '"': entity = "&quot;"; break;
+                case '\'': entity = "&#39;";  break;
+                default:   entity = NULL;     break;
+            }
+            size_t need = entity ? strlen(entity) : 1;
+            if (pos + need + 1 > out_len) break; /* keep room for the NUL */
+            if (entity) {
+                memcpy(out + pos, entity, need);
+            } else {
+                out[pos] = *p;
+            }
+            pos += need;
+        }
+    }
+    out[pos] = '\0';
+    return pos;
 }
 
 /* --- Stage 7: torrent_class filter parsing and rendering helpers ---------- */
@@ -209,12 +248,28 @@ static void format_class_filter_qs(const cls_filter_t *f, char *out, size_t out_
         }
     }
     if (f->has_min_conf && pos + 1 < out_len) {
-        pos += (size_t)snprintf(out + pos, out_len - pos, "%smin_conf=%.2f",
+        pos += (size_t)snprintf(out + pos, out_len - pos, "%smin_conf=%.3f",
                                 pos ? "&" : "", f->min_conf);
     }
     if (f->present && pos + 1 < out_len) {
         pos += (size_t)snprintf(out + pos, out_len - pos, "%sadult=%s",
                                 pos ? "&" : "", class_adult_name(f->adult));
+    }
+}
+
+/* URL fragment of a chip link: the filter with one chip dropped, plus the sort
+ * key of a /browse page so dropping a filter does not reset the order. Like
+ * format_class_filter_qs it emits only fixed taxonomy names, parsed numbers and
+ * the whitelisted sort key, never user text, so it is URL-safe as-is. */
+static void format_chip_qs(const cls_filter_t *f, const char *sort_qs,
+                           char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    format_class_filter_qs(f, out, out_len);
+    if (!sort_qs || !sort_qs[0]) return;
+
+    size_t pos = strlen(out);
+    if (pos + 1 < out_len) {
+        snprintf(out + pos, out_len - pos, "%s%s", pos ? "&" : "", sort_qs);
     }
 }
 
@@ -1571,6 +1626,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     page_opts.filter = &class_filter;
     page_opts.extra_qs = filter_qs;
     page_opts.browse_mode = 0;
+    page_opts.sort_qs = NULL;
 
     char *query = url_decode(query_buf);
     log_msg(LOG_DEBUG, "Search query: %s (format: %s, page: %d)", query, want_html ? "html" : "json", page);
@@ -1787,15 +1843,38 @@ static int parse_search_query(const char *raw, parsed_query_t *pq) {
     return 0;
 }
 
+/* Bounded string append for the dynamically built SQL fragments. Unlike
+ * `pos += snprintf(...)`, which keeps counting the characters that were cut
+ * off, this never advances *pos on a failed write and reports it, so the caller
+ * can bail out instead of computing a negative remaining size and writing past
+ * the buffer. buf is always NUL-terminated. Returns 0 on success, -1 when fmt
+ * did not fit (or on an encoding error). */
+static int sb_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...) {
+    if (!buf || bufsize == 0 || !pos || *pos >= bufsize) return -1;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int written = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+
+    if (written < 0 || (size_t)written >= bufsize - *pos) {
+        buf[bufsize - 1] = '\0';
+        return -1;
+    }
+    *pos += (size_t)written;
+    return 0;
+}
+
 /*
  * Build a word-boundary SQL condition for a quoted term against a column.
- * Appends to buf. Uses GLOB patterns with [^a-zA-Z0-9] for boundaries.
- * bind_idx is the 1-based sqlite3_bind parameter index for the lowercase term.
- * Returns the number of bind parameters consumed (always 4).
+ * Appends to buf through sb_append, which bounds-checks the write. Uses GLOB
+ * patterns with [^a-zA-Z0-9] for boundaries. bind_idx is the 1-based
+ * sqlite3_bind parameter index for the lowercase term. Returns the number of
+ * bind parameters consumed (always 4), or -1 when the condition does not fit.
  */
-static int append_word_boundary_condition(char *buf, size_t bufsize, int *pos,
-                                           const char *column, int bind_idx) {
-    int written = snprintf(buf + *pos, bufsize - *pos,
+static int append_word_boundary_condition(char *buf, size_t bufsize, size_t *pos,
+                                          const char *column, int bind_idx) {
+    int rc = sb_append(buf, bufsize, pos,
         "(LOWER(%s) GLOB '*[^a-zA-Z0-9]' || ?%d || '[^a-zA-Z0-9]*'"
         " OR LOWER(%s) GLOB ?%d || '[^a-zA-Z0-9]*'"
         " OR LOWER(%s) GLOB '*[^a-zA-Z0-9]' || ?%d"
@@ -1804,8 +1883,34 @@ static int append_word_boundary_condition(char *buf, size_t bufsize, int *pos,
         column, bind_idx + 1,
         column, bind_idx + 2,
         column, bind_idx + 3);
-    if (written > 0) *pos += written;
+    if (rc != 0) return -1;
     return 4; /* number of bind params consumed */
+}
+
+/*
+ * Build the file_search half of the quoted-term query: the trigram FTS
+ * pre-filter (?2, all terms) followed by one word-boundary condition per quoted
+ * term. The fragment grows by ~200 bytes per term and q can carry
+ * MAX_QUERY_PARTS (16) of them, which overflows a fixed buffer, so every append
+ * is bounds-checked: returns 0 when the whole fragment fitted, -1 when it did
+ * not (out is then unusable and the caller has to fail the request instead of
+ * running a truncated query).
+ */
+static int build_quoted_file_subquery(const parsed_query_t *pq, char *out, size_t out_len) {
+    size_t pos = 0;
+    if (sb_append(out, out_len, &pos,
+                  "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+                  "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)") != 0) {
+        return -1;
+    }
+
+    for (int qi = 0; qi < pq->num_quoted; qi++) {
+        if (sb_append(out, out_len, &pos, " AND ") != 0) return -1;
+        if (append_word_boundary_condition(out, out_len, &pos, "tf.filename", 3 + qi * 4) != 4) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* Search torrents using FTS5, with support for quoted exact-word matching.
@@ -1911,28 +2016,28 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         /* Torrent search part: porter tokenizer handles quotes natively */
         /* File search part: word-boundary GLOB conditions for quoted terms */
 
-        /* Build file subquery portion */
+        /* Build file subquery portion. Every append is bounds-checked: the
+         * word-boundary fragment grows by ~200 bytes per quoted term and q can
+         * carry MAX_QUERY_PARTS (16) of them, so a query with 10+ quoted terms
+         * does not fit into this buffer any more. Failing the request is the
+         * graceful answer there — a truncated fragment would run a query that
+         * silently matched something else. */
         char file_subquery[2048];
-        int fpos = 0;
+        if (build_quoted_file_subquery(&pq, file_subquery, sizeof(file_subquery)) != 0) {
+            log_msg(LOG_ERROR, "Quoted search does not fit the SQL buffer (%d quoted terms)",
+                    pq.num_quoted);
+            database_read_unlock(db);
+            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+            free_parsed_query(&pq);
+            return -1;
+        }
 
         /* Bind indices: ?1 = torrent FTS query, ?2 = file FTS query (all terms for trigram pre-filter)
          * ?3... = quoted term GLOB binds (4 per quoted term)
-         * Then LIMIT and OFFSET at the end */
-        int bind_idx = 3; /* next available bind index */
-
-        /* Always use trigram FTS MATCH as pre-filter, then GLOB for word boundaries.
-         * file_fts_query contains ALL terms (quoted + unquoted) so trigram narrows
-         * candidates via its index before the GLOB conditions refine to exact words. */
-        fpos += snprintf(file_subquery + fpos, sizeof(file_subquery) - fpos,
-            "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-            "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)");
-
-        for (int qi = 0; qi < pq.num_quoted; qi++) {
-            fpos += snprintf(file_subquery + fpos, sizeof(file_subquery) - fpos, " AND ");
-            (void)append_word_boundary_condition(file_subquery, sizeof(file_subquery), &fpos,
-                "tf.filename", bind_idx);
-            bind_idx += 4;
-        }
+         * Then LIMIT and OFFSET at the end. The trigram FTS MATCH narrows the
+         * candidates through its index (file_fts_query holds ALL terms, quoted
+         * and unquoted), then the GLOB conditions refine them to exact words. */
+        int bind_idx = 3 + pq.num_quoted * 4; /* next available bind index */
 
         int limit_idx = bind_idx;
         int offset_idx = bind_idx + 1;
@@ -2325,11 +2430,17 @@ static int browse_handler(struct mg_connection *conn, void *cbdata) {
     char filter_qs[128];
     format_class_filter_qs(&filter, filter_qs, sizeof(filter_qs));
 
+    /* The chips rebuild the filter fragment themselves, so they need the sort
+     * key on its own: a browse page sorted by added/size must not flip back to
+     * the default when a chip drops a filter. */
+    char sort_qs[16];
+    snprintf(sort_qs, sizeof(sort_qs), "sort=%s", sort_name);
+
     char extra_qs[192];
     if (filter_qs[0]) {
-        snprintf(extra_qs, sizeof(extra_qs), "%s&sort=%s", filter_qs, sort_name);
+        snprintf(extra_qs, sizeof(extra_qs), "%s&%s", filter_qs, sort_qs);
     } else {
-        snprintf(extra_qs, sizeof(extra_qs), "sort=%s", sort_name);
+        snprintf(extra_qs, sizeof(extra_qs), "%s", sort_qs);
     }
 
     /* generate_search_results_html() answers NULL for an empty row set, so the
@@ -2374,6 +2485,7 @@ static int browse_handler(struct mg_connection *conn, void *cbdata) {
     page_opts.filter = &filter;
     page_opts.extra_qs = extra_qs;
     page_opts.browse_mode = 1;
+    page_opts.sort_qs = sort_qs;
 
     char *html = generate_search_results_html(results, count, NULL, page, total_count,
                                               &page_opts);
@@ -2602,6 +2714,7 @@ static int get_random_video_torrents_filtered(database_t *db,
     sqlite3_stmt *torrent_stmt;
     if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+        sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
     }
@@ -2611,6 +2724,7 @@ static int get_random_video_torrents_filtered(database_t *db,
     sqlite3_stmt *file_count_stmt;
     if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
         sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
     }
@@ -2620,6 +2734,7 @@ static int get_random_video_torrents_filtered(database_t *db,
     if (!res) {
         sqlite3_finalize(torrent_stmt);
         sqlite3_finalize(file_count_stmt);
+        sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
     }
@@ -2784,6 +2899,7 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
     sqlite3_stmt *torrent_stmt;
     if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+        sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
     }
@@ -2793,6 +2909,7 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
     sqlite3_stmt *file_count_stmt;
     if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
         sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
     }
@@ -2802,6 +2919,7 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
     if (!res) {
         sqlite3_finalize(torrent_stmt);
         sqlite3_finalize(file_count_stmt);
+        sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
     }
@@ -2964,6 +3082,8 @@ static char* url_encode(const char *str) {
  * and whether this is the q-less /browse listing, whose links cannot be built
  * from a q. opts->filter is never dereferenced for user text: only the parsed
  * enum values are printed.
+ * opts->sort_qs carries the caller-built "sort=<key>" fragment of a /browse
+ * page, which the chips and the clear-all link keep.
  *
  * Answers NULL when there is nothing to render: each caller owns its own empty
  * state, because they link back differently. */
@@ -2976,6 +3096,7 @@ static char* generate_search_results_html(search_result_t *results, int count,
 
     const int browse_mode = (opts != NULL && opts->browse_mode);
     const char *extra_qs = (opts != NULL && opts->extra_qs != NULL) ? opts->extra_qs : "";
+    const char *sort_qs = (opts != NULL && opts->sort_qs != NULL) ? opts->sort_qs : "";
     const cls_filter_t *filter = (opts != NULL) ? opts->filter : NULL;
 
     /* Determine random-mode category from sentinel query string */
@@ -3309,12 +3430,17 @@ static char* generate_search_results_html(search_result_t *results, int count,
                      kind_name ? kind_name : "0");
         }
 
+        /* The typed query is echoed back into an attribute, so it has to be
+         * escaped: a crafted q must not be able to break out of the value. */
+        char query_html[2048]; /* q is <=255 bytes; worst case 6x when escaped */
+        html_escape(query ? query : "", query_html, sizeof(query_html));
+
         APPEND("      <h1>%s</h1>\n"
                "      <form class='search-form' action='/search' method='get'>\n"
                "        <input type='text' name='q' placeholder='Search torrents... (use &quot;quotes&quot; for exact words)' value='%s'>\n"
                "        <input type='hidden' name='format' value='html'>\n",
                browse_mode ? "Browse Torrents" : "Search Results",
-               query ? query : "");
+               query_html);
 
         if (filter != NULL && filter->has_category) {
             APPEND("        <input type='hidden' name='category' value='%s'>\n",
@@ -3342,7 +3468,7 @@ static char* generate_search_results_html(search_result_t *results, int count,
      * path) and the remaining params come from the parse tree, never from the
      * raw query string. */
     if (show_chips && link_base[0]) {
-        char chip_qs[128];
+        char chip_qs[192];
         cls_filter_t sub;
 
         APPEND("    <div class='filter-chips'>\n");
@@ -3350,7 +3476,7 @@ static char* generate_search_results_html(search_result_t *results, int count,
         if (filter->has_category) {
             sub = *filter;
             sub.has_category = 0;
-            format_class_filter_qs(&sub, chip_qs, sizeof(chip_qs));
+            format_chip_qs(&sub, sort_qs, chip_qs, sizeof(chip_qs));
             APPEND("      <span class='chip'>Category: %s"
                    " <a href='%s%s%s' title='Clear category'>&times;</a></span>\n",
                    classifier_category_name(filter->category),
@@ -3362,7 +3488,7 @@ static char* generate_search_results_html(search_result_t *results, int count,
                                         ? class_tv_kind_name(filter->tv_kind) : NULL;
             sub = *filter;
             sub.has_tv_kind = 0;
-            format_class_filter_qs(&sub, chip_qs, sizeof(chip_qs));
+            format_chip_qs(&sub, sort_qs, chip_qs, sizeof(chip_qs));
             APPEND("      <span class='chip'>TV kind: %s"
                    " <a href='%s%s%s' title='Clear TV kind'>&times;</a></span>\n",
                    kind_name ? kind_name : "none",
@@ -3378,15 +3504,15 @@ static char* generate_search_results_html(search_result_t *results, int count,
         sub = *filter;
         sub.present = 1;
         sub.adult = (filter->adult == CLS_ADULT_SHOW) ? CLS_ADULT_HIDE : CLS_ADULT_SHOW;
-        format_class_filter_qs(&sub, chip_qs, sizeof(chip_qs));
+        format_chip_qs(&sub, sort_qs, chip_qs, sizeof(chip_qs));
         APPEND("      <span class='chip'>Adults: %s"
                " <a href='%s%s%s' title='Toggle adult content'>%s</a></span>\n",
                adult_label, link_base, chip_qs[0] ? "&" : "", chip_qs,
                (filter->adult == CLS_ADULT_SHOW) ? "hide" : "show");
 
         APPEND("      <span class='chip chip-clear'>"
-               "<a href='%s'>Clear all filters</a></span>\n"
-               "    </div>\n", link_base);
+               "<a href='%s%s%s'>Clear all filters</a></span>\n"
+               "    </div>\n", link_base, sort_qs[0] ? "&" : "", sort_qs);
     }
 
     /* Show results info with pagination context */
@@ -3430,8 +3556,12 @@ static char* generate_search_results_html(search_result_t *results, int count,
                hex);
 
         /* Link to per-torrent detail page (in-app navigation) */
+        char name_html[1024];
+        html_escape(results[i].name ? results[i].name : "",
+                    name_html, sizeof(name_html));
+
         APPEND("<a href='/torrent?hash=%s' onclick='event.stopPropagation()'>%s</a>",
-               hex, results[i].name);
+               hex, name_html);
 
         APPEND("</div>\n"
                "        <div class='torrent-meta'>\n"
