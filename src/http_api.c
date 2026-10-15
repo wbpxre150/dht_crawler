@@ -75,6 +75,14 @@ typedef struct {
     double min_conf;
 } cls_filter_t;
 
+/* Rendering options of one results page; see generate_search_results_html(). */
+typedef struct {
+    const cls_filter_t *filter;  /* active stage-7 filter, NULL when none */
+    const char *extra_qs;        /* caller-built URL fragment, no leading '&',
+                                  * e.g. "category=tv&tv_kind=season_pack" */
+    int browse_mode;             /* render the q-less /browse listing */
+} results_page_opts_t;
+
 /* Bind parameters a fully populated filter consumes; see
  * append_class_conditions() and bind_class_filter(). */
 #define CLS_FILTER_MAX_BINDS 3
@@ -91,7 +99,9 @@ static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
-static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
+static char* generate_search_results_html(search_result_t *results, int count, const char *query,
+                                          int page, int total_count,
+                                          const results_page_opts_t *opts);
 static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
                                     int offset, search_result_t **results, int *count, int *total_count);
 static int browse_handler(struct mg_connection *conn, void *cbdata);
@@ -158,6 +168,54 @@ static int class_tv_kind_from_name(const char *name) {
 static const char *class_tv_kind_name(int tv_kind) {
     if (tv_kind < 0 || tv_kind >= CLS_NUM_TV_KINDS) return NULL;
     return CLS_TV_KIND_NAMES[tv_kind];
+}
+
+/* Adult mode as the parameter value /search and /browse accept. */
+static const char *class_adult_name(cls_adult_mode_t mode) {
+    switch (mode) {
+        case CLS_ADULT_SHOW: return "show";
+        case CLS_ADULT_ONLY: return "only";
+        default:             return "hide";
+    }
+}
+
+/* Build the URL fragment that carries the active filters, e.g.
+ * "category=tv&tv_kind=season_pack&adult=show" (no leading and no trailing
+ * '&'), for every link that has to keep them: pagination, the filter chips and
+ * the "page beyond results" link. Only fixed taxonomy names and parsed numbers
+ * are emitted, never user-supplied text, so the fragment is URL-safe as-is and
+ * well under 64 bytes.
+ *
+ * tk_kind 0 (none) is stored as SQL NULL and has no name of its own, so only
+ * the integer form parses back. */
+static void format_class_filter_qs(const cls_filter_t *f, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!f) return;
+
+    size_t pos = 0;
+
+    if (f->has_category && pos + 1 < out_len) {
+        pos += (size_t)snprintf(out + pos, out_len - pos, "%scategory=%s",
+                                pos ? "&" : "", classifier_category_name(f->category));
+    }
+    if (f->has_tv_kind && pos + 1 < out_len) {
+        if (f->tv_kind > 0) {
+            pos += (size_t)snprintf(out + pos, out_len - pos, "%stv_kind=%s",
+                                    pos ? "&" : "", class_tv_kind_name(f->tv_kind));
+        } else {
+            pos += (size_t)snprintf(out + pos, out_len - pos, "%stv_kind=0",
+                                    pos ? "&" : "");
+        }
+    }
+    if (f->has_min_conf && pos + 1 < out_len) {
+        pos += (size_t)snprintf(out + pos, out_len - pos, "%smin_conf=%.2f",
+                                pos ? "&" : "", f->min_conf);
+    }
+    if (f->present && pos + 1 < out_len) {
+        pos += (size_t)snprintf(out + pos, out_len - pos, "%sadult=%s",
+                                pos ? "&" : "", class_adult_name(f->adult));
+    }
 }
 
 /* Strict integer parse: the whole string has to be one integer in [min, max].
@@ -659,8 +717,9 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
 
     snprintf(uptime_str, sizeof(uptime_str), "%d:%02d", uptime_hours, uptime_minutes);
 
-    /* Build HTML */
-    char html[4096];
+    /* Build HTML. The buffer is deliberately larger than the inline CSS plus
+     * the filter chips row: the original 4 KB truncated the page tail. */
+    char html[16384];
     snprintf(html, sizeof(html),
         "<!DOCTYPE html>\n"
         "<html>\n"
@@ -729,6 +788,36 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "    }\n"
         "    .btn:hover { background: #1557b0; }\n"
         "    .btn:active { transform: scale(0.98); }\n"
+        "    .chips {\n"
+        "      display: flex;\n"
+        "      flex-wrap: wrap;\n"
+        "      gap: 8px;\n"
+        "      justify-content: center;\n"
+        "      margin-bottom: 16px;\n"
+        "    }\n"
+        "    .chip {\n"
+        "      padding: 8px 16px;\n"
+        "      background: #e8f0fe;\n"
+        "      color: #1a73e8;\n"
+        "      border-radius: 16px;\n"
+        "      font-size: 14px;\n"
+        "      font-weight: 500;\n"
+        "      text-decoration: none;\n"
+        "      transition: background 0.2s;\n"
+        "    }\n"
+        "    .chip:hover { background: #d2e3fc; }\n"
+        "    .search-form select {\n"
+        "      padding: 14px 20px;\n"
+        "      border: 2px solid #ddd;\n"
+        "      border-radius: 24px;\n"
+        "      font-size: 16px;\n"
+        "      background: white;\n"
+        "      color: #333;\n"
+        "    }\n"
+        "    .search-form select:focus {\n"
+        "      outline: none;\n"
+        "      border-color: #1a73e8;\n"
+        "    }\n"
         "    .stats {\n"
         "      color: #5f6368;\n"
         "      font-size: 14px;\n"
@@ -749,8 +838,18 @@ static int root_handler(struct mg_connection *conn, void *cbdata) {
         "      <form class='search-form' action='/search' method='get'>\n"
         "        <input type='text' name='q' placeholder='Search torrents... (use &quot;quotes&quot; for exact words)' autofocus required>\n"
         "        <input type='hidden' name='format' value='html'>\n"
+        "        <select name='adult' title='Adult content filter'>\n"
+        "          <option value='hide' selected>Adults hidden</option>\n"
+        "          <option value='show'>Show adults</option>\n"
+        "          <option value='only'>Adults only</option>\n"
+        "        </select>\n"
         "        <button type='submit' class='btn'>Search</button>\n"
         "      </form>\n"
+        "      <div class='chips'>\n"
+        "        <a class='chip' href='/browse?format=html&category=tv&tv_kind=episode'>TV episodes</a>\n"
+        "        <a class='chip' href='/browse?format=html&category=tv&tv_kind=season_pack'>TV season packs</a>\n"
+        "        <a class='chip' href='/browse?format=html&category=tv&tv_kind=complete_series'>TV complete series</a>\n"
+        "      </div>\n"
         "      <div style='margin-top: 16px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;'>\n"
         "        <a href='/random-tv' class='btn' style='background: #34a853; text-decoration: none;'>\n"
         "          Random 100 TV Series\n"
@@ -1302,7 +1401,7 @@ static int random_video_handler_impl(struct mg_connection *conn,
     const char *sentinel = (filter == VIDEO_FILTER_TV)
                                ? RANDOM_TV_MODE_SENTINEL
                                : RANDOM_MOVIE_MODE_SENTINEL;
-    char *html = generate_search_results_html(results, count, sentinel, 1, count);
+    char *html = generate_search_results_html(results, count, sentinel, 1, count, NULL);
     if (!html) {
         const char *error = "{\"error\":\"Failed to generate HTML\"}";
         mg_printf(conn,
@@ -1389,7 +1488,7 @@ static int random_music_handler(struct mg_connection *conn, void *cbdata) {
         return 200;
     }
 
-    char *html = generate_search_results_html(results, count, RANDOM_MUSIC_MODE_SENTINEL, 1, count);
+    char *html = generate_search_results_html(results, count, RANDOM_MUSIC_MODE_SENTINEL, 1, count, NULL);
     if (!html) {
         const char *error = "{\"error\":\"Failed to generate HTML\"}";
         mg_printf(conn,
@@ -1462,6 +1561,17 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
         return send_json_error(conn, 400, error_msg);
     }
 
+    /* Stage 2: the filter params every result-page link has to keep, plus the
+     * rendering options built from them. filter_qs stays empty when none of the
+     * stage-7 params were supplied, which leaves the page as it was before. */
+    char filter_qs[128];
+    format_class_filter_qs(&class_filter, filter_qs, sizeof(filter_qs));
+
+    results_page_opts_t page_opts;
+    page_opts.filter = &class_filter;
+    page_opts.extra_qs = filter_qs;
+    page_opts.browse_mode = 0;
+
     char *query = url_decode(query_buf);
     log_msg(LOG_DEBUG, "Search query: %s (format: %s, page: %d)", query, want_html ? "html" : "json", page);
 
@@ -1510,9 +1620,10 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
                     "<body>\n"
                     "  <h1>No More Results</h1>\n"
                     "  <p class='message'>Page %d is beyond the available results (%d total)</p>\n"
-                    "  <a href='/search?q=%s&format=html&page=1'>Back to First Page</a>\n"
+                    "  <a href='/search?q=%s&format=html%s%s&page=1'>Back to First Page</a>\n"
                     "</body>\n"
-                    "</html>", page, total_count, encoded_query);
+                    "</html>", page, total_count, encoded_query,
+                    filter_qs[0] ? "&" : "", filter_qs);
                 free(encoded_query);
             } else {
                 snprintf(empty_html, sizeof(empty_html),
@@ -1548,7 +1659,8 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
             return 200;
         }
 
-        char *html = generate_search_results_html(results, count, query_buf, page, total_count);
+        char *html = generate_search_results_html(results, count, query_buf, page, total_count,
+                                                  &page_opts);
         if (!html) {
             const char *error = "{\"error\":\"Failed to generate HTML\"}";
             mg_printf(conn,
@@ -2143,14 +2255,20 @@ static int browse_torrents(database_t *db, const cls_filter_t *filter, const cha
 }
 
 /* /browse — no text query: the stage-7 filters (adult defaulting to hide), a
- * sort key and the page number. Always answers with the /search JSON envelope;
- * format=html is not implemented because the search results page renderer
- * pages back through /search?q=… (stage 2 owns the UI). */
+ * sort key and the page number. Answers with the /search JSON envelope by
+ * default; format=html renders the same results page as /search through the
+ * shared renderer, with every link pointing back at /browse because a text
+ * search link cannot be built without a q. */
 static int browse_handler(struct mg_connection *conn, void *cbdata) {
     http_api_t *api = (http_api_t *)cbdata;
     const struct mg_request_info *ri = mg_get_request_info(conn);
     const char *query_string = ri->query_string ? ri->query_string : "";
     size_t qs_len = strlen(query_string);
+
+    /* format: json (default) or html, parsed like /search does. */
+    char format_buf[16] = {0};
+    mg_get_var(query_string, qs_len, "format", format_buf, sizeof(format_buf));
+    int want_html = (strcmp(format_buf, "html") == 0);
 
     cls_filter_t filter;
     const char *bad_param = NULL;
@@ -2164,12 +2282,16 @@ static int browse_handler(struct mg_connection *conn, void *cbdata) {
     char sort_buf[16] = {0};
     mg_get_var(query_string, qs_len, "sort", sort_buf, sizeof(sort_buf));
     const char *order_by;
+    const char *sort_name; /* the same key, for the links of the HTML page */
     if (sort_buf[0] == '\0' || strcmp(sort_buf, "peers") == 0) {
         order_by = "t.total_peers DESC, t.added_timestamp DESC";
+        sort_name = "peers";
     } else if (strcmp(sort_buf, "added") == 0) {
         order_by = "t.added_timestamp DESC, t.id DESC";
+        sort_name = "added";
     } else if (strcmp(sort_buf, "size") == 0) {
         order_by = "t.size_bytes DESC, t.id DESC";
+        sort_name = "size";
     } else {
         return send_json_error(conn, 400, "Invalid value for 'sort'");
     }
@@ -2193,7 +2315,84 @@ static int browse_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     log_msg(LOG_DEBUG, "Browse page %d (%d results, %d total)", page, count, total_count);
-    return send_json_results(conn, results, count, total_count, page);
+
+    if (!want_html) {
+        return send_json_results(conn, results, count, total_count, page);
+    }
+
+    /* Stage 2: the HTML listing keeps the filters and the sort key in all of
+     * its links, so paging and the chips do not drop what the caller asked for. */
+    char filter_qs[128];
+    format_class_filter_qs(&filter, filter_qs, sizeof(filter_qs));
+
+    char extra_qs[192];
+    if (filter_qs[0]) {
+        snprintf(extra_qs, sizeof(extra_qs), "%s&sort=%s", filter_qs, sort_name);
+    } else {
+        snprintf(extra_qs, sizeof(extra_qs), "sort=%s", sort_name);
+    }
+
+    /* generate_search_results_html() answers NULL for an empty row set, so the
+     * no-results page is rendered here: the /search empty state is built around
+     * ?q= and would offer links this endpoint cannot serve. */
+    if (count == 0) {
+        char empty_html[1024];
+        snprintf(empty_html, sizeof(empty_html),
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>\n"
+            "  <meta charset='UTF-8'>\n"
+            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+            "  <title>No Results</title>\n"
+            "  <style>\n"
+            "    body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }\n"
+            "    .message { margin: 50px 0; color: #666; }\n"
+            "    a { color: #1a73e8; text-decoration: none; }\n"
+            "  </style>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <h1>No Results</h1>\n"
+            "  <p class='message'>No torrents matched these filters (page %d, %d total)</p>\n"
+            "  <p><a href='/browse?format=html'>Browse without filters</a></p>\n"
+            "  <p><a href='/'>Back to Search</a></p>\n"
+            "</body>\n"
+            "</html>", page, total_count);
+
+        mg_printf(conn,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html\r\n"
+                  "Content-Length: %d\r\n"
+                  "\r\n"
+                  "%s",
+                  (int)strlen(empty_html), empty_html);
+
+        free_search_results(results, count);
+        return 200;
+    }
+
+    results_page_opts_t page_opts;
+    page_opts.filter = &filter;
+    page_opts.extra_qs = extra_qs;
+    page_opts.browse_mode = 1;
+
+    char *html = generate_search_results_html(results, count, NULL, page, total_count,
+                                              &page_opts);
+    if (!html) {
+        free_search_results(results, count);
+        return send_json_error(conn, 500, "Failed to generate HTML");
+    }
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/html\r\n"
+              "Content-Length: %d\r\n"
+              "\r\n"
+              "%s",
+              (int)strlen(html), html);
+
+    free(html);
+    free_search_results(results, count);
+    return 200;
 }
 
 /* Check if a torrent is primarily video content by examining its files.
@@ -2756,11 +2955,28 @@ static char* url_encode(const char *str) {
     return encoded;
 }
 
-/* Generate HTML page for search results (or random video torrents when query is NULL) */
-static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count) {
+/* Generate the HTML page for one page of results.
+ *
+ * query is the search text, or one of the RANDOM_*_MODE_SENTINEL strings for the
+ * shuffle pages. opts is NULL for those (they carry no filter); otherwise it
+ * holds the active stage-7 filter — rendered as chips and preselected in the
+ * form — the URL fragment every link of the page has to keep (opts->extra_qs)
+ * and whether this is the q-less /browse listing, whose links cannot be built
+ * from a q. opts->filter is never dereferenced for user text: only the parsed
+ * enum values are printed.
+ *
+ * Answers NULL when there is nothing to render: each caller owns its own empty
+ * state, because they link back differently. */
+static char* generate_search_results_html(search_result_t *results, int count,
+                                          const char *query, int page, int total_count,
+                                          const results_page_opts_t *opts) {
     if (!results || count <= 0) {
         return NULL;
     }
+
+    const int browse_mode = (opts != NULL && opts->browse_mode);
+    const char *extra_qs = (opts != NULL && opts->extra_qs != NULL) ? opts->extra_qs : "";
+    const cls_filter_t *filter = (opts != NULL) ? opts->filter : NULL;
 
     /* Determine random-mode category from sentinel query string */
     int is_tv_mode    = (query != NULL && strcmp(query, RANDOM_TV_MODE_SENTINEL)    == 0);
@@ -2768,10 +2984,28 @@ static char* generate_search_results_html(search_result_t *results, int count, c
     int is_music_mode = (query != NULL && strcmp(query, RANDOM_MUSIC_MODE_SENTINEL) == 0);
     int is_random_mode = is_tv_mode || is_movie_mode || is_music_mode;
 
+    /* The chips also describe the default of a filtered page, which adult=hide
+     * is, so they are shown whenever any filter param was supplied at all. */
+    int show_chips = (filter != NULL) && (filter->present || browse_mode);
+
     /* Calculate pagination info (not used in random mode) */
     int total_pages = (total_count + HTTP_API_MAX_RESULTS - 1) / HTTP_API_MAX_RESULTS;
     int has_prev = page > 1;
     int has_next = page < total_pages;
+
+    /* Base of every link this page emits: a text search keeps its q, the browse
+     * listing has none. Empty on an allocation failure, in which case the page
+     * is rendered without links rather than with broken ones. */
+    char link_base[1024] = {0};
+    if (browse_mode) {
+        snprintf(link_base, sizeof(link_base), "/browse?format=html");
+    } else {
+        char *encoded_query = url_encode(query);
+        if (encoded_query) {
+            snprintf(link_base, sizeof(link_base), "/search?q=%s&format=html", encoded_query);
+            free(encoded_query);
+        }
+    }
 
     /* Build HTML dynamically */
     size_t capacity = 1024 * 100;  /* Start with 100KB */
@@ -2804,6 +3038,7 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            is_tv_mode    ? "Random 100 TV Series" :
            is_movie_mode ? "Random 100 Movies" :
            is_music_mode ? "Random 100 Music Torrents" :
+           browse_mode   ? "Browse Torrents" :
                            (query ? query : ""));
 
     APPEND(
@@ -2872,6 +3107,26 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "      border: 1px solid #ddd;\n"
            "    }\n"
            "    .btn-small:hover { background: #e8eaed; }\n"
+           "    .filter-chips {\n"
+           "      display: flex;\n"
+           "      flex-wrap: wrap;\n"
+           "      align-items: center;\n"
+           "      gap: 8px;\n"
+           "      margin-bottom: 16px;\n"
+           "    }\n"
+           "    .chip {\n"
+           "      display: inline-flex;\n"
+           "      align-items: center;\n"
+           "      gap: 6px;\n"
+           "      padding: 6px 14px;\n"
+           "      border-radius: 16px;\n"
+           "      background: #e8f0fe;\n"
+           "      color: #1a73e8;\n"
+           "      font-size: 14px;\n"
+           "    }\n"
+           "    .chip a { color: inherit; font-weight: 600; text-decoration: none; }\n"
+           "    .chip a:hover { text-decoration: underline; }\n"
+           "    .chip.chip-clear { background: #f1f3f4; color: #5f6368; }\n"
            "    .results-info {\n"
            "      margin-bottom: 16px;\n"
            "      color: #5f6368;\n"
@@ -3039,14 +3294,99 @@ static char* generate_search_results_html(search_result_t *results, int count, c
         APPEND("      <h1>Random 100 Music Torrents</h1>\n"
                "    </div>\n");
     } else {
-        APPEND("      <h1>Search Results</h1>\n"
+        /* The form preselects the filter the page was asked for; a page that
+         * arrived without one falls back to the default of the dashboard
+         * (adult=hide), so submitting the form keeps the view it came from. */
+        cls_adult_mode_t adult_mode = (filter != NULL && filter->present)
+                                          ? filter->adult
+                                          : CLS_ADULT_HIDE;
+        char tv_kind_value[24] = "";
+        if (filter != NULL && filter->has_tv_kind) {
+            const char *kind_name = (filter->tv_kind > 0)
+                                        ? class_tv_kind_name(filter->tv_kind) : NULL;
+            /* tv_kind "none" (0) has no name and only parses back as "0". */
+            snprintf(tv_kind_value, sizeof(tv_kind_value), "%s",
+                     kind_name ? kind_name : "0");
+        }
+
+        APPEND("      <h1>%s</h1>\n"
                "      <form class='search-form' action='/search' method='get'>\n"
                "        <input type='text' name='q' placeholder='Search torrents... (use &quot;quotes&quot; for exact words)' value='%s'>\n"
-               "        <input type='hidden' name='format' value='html'>\n"
+               "        <input type='hidden' name='format' value='html'>\n",
+               browse_mode ? "Browse Torrents" : "Search Results",
+               query ? query : "");
+
+        if (filter != NULL && filter->has_category) {
+            APPEND("        <input type='hidden' name='category' value='%s'>\n",
+                   classifier_category_name(filter->category));
+        }
+        if (filter != NULL && filter->has_tv_kind) {
+            APPEND("        <input type='hidden' name='tv_kind' value='%s'>\n", tv_kind_value);
+        }
+
+        APPEND("        <select name='adult' title='Adult content filter'>\n"
+               "          <option value='hide'%s>Adults hidden</option>\n"
+               "          <option value='show'%s>Show adults</option>\n"
+               "          <option value='only'%s>Adults only</option>\n"
+               "        </select>\n"
                "        <button type='submit' class='btn'>Search</button>\n"
                "      </form>\n"
                "    </div>\n",
-               query ? query : "");
+               adult_mode == CLS_ADULT_HIDE ? " selected" : "",
+               adult_mode == CLS_ADULT_SHOW ? " selected" : "",
+               adult_mode == CLS_ADULT_ONLY ? " selected" : "");
+    }
+
+    /* Stage 2: the active filters as chips, each one linking back to this page
+     * with that filter dropped. link_base carries the query (or the /browse
+     * path) and the remaining params come from the parse tree, never from the
+     * raw query string. */
+    if (show_chips && link_base[0]) {
+        char chip_qs[128];
+        cls_filter_t sub;
+
+        APPEND("    <div class='filter-chips'>\n");
+
+        if (filter->has_category) {
+            sub = *filter;
+            sub.has_category = 0;
+            format_class_filter_qs(&sub, chip_qs, sizeof(chip_qs));
+            APPEND("      <span class='chip'>Category: %s"
+                   " <a href='%s%s%s' title='Clear category'>&times;</a></span>\n",
+                   classifier_category_name(filter->category),
+                   link_base, chip_qs[0] ? "&" : "", chip_qs);
+        }
+
+        if (filter->has_tv_kind) {
+            const char *kind_name = (filter->tv_kind > 0)
+                                        ? class_tv_kind_name(filter->tv_kind) : NULL;
+            sub = *filter;
+            sub.has_tv_kind = 0;
+            format_class_filter_qs(&sub, chip_qs, sizeof(chip_qs));
+            APPEND("      <span class='chip'>TV kind: %s"
+                   " <a href='%s%s%s' title='Clear TV kind'>&times;</a></span>\n",
+                   kind_name ? kind_name : "none",
+                   link_base, chip_qs[0] ? "&" : "", chip_qs);
+        }
+
+        /* The adult chip flips the mode instead of clearing it: adult=hide is
+         * the default of /browse and of every filtered /search, so a link that
+         * only dropped the parameter would land back on the same rows. */
+        const char *adult_label = (filter->adult == CLS_ADULT_SHOW) ? "shown"
+                                : (filter->adult == CLS_ADULT_ONLY) ? "only"
+                                                                    : "hidden";
+        sub = *filter;
+        sub.present = 1;
+        sub.adult = (filter->adult == CLS_ADULT_SHOW) ? CLS_ADULT_HIDE : CLS_ADULT_SHOW;
+        format_class_filter_qs(&sub, chip_qs, sizeof(chip_qs));
+        APPEND("      <span class='chip'>Adults: %s"
+               " <a href='%s%s%s' title='Toggle adult content'>%s</a></span>\n",
+               adult_label, link_base, chip_qs[0] ? "&" : "", chip_qs,
+               (filter->adult == CLS_ADULT_SHOW) ? "hide" : "show");
+
+        APPEND("      <span class='chip chip-clear'>"
+               "<a href='%s'>Clear all filters</a></span>\n"
+               "    </div>\n", link_base);
     }
 
     /* Show results info with pagination context */
@@ -3257,34 +3597,34 @@ static char* generate_search_results_html(search_result_t *results, int count, c
            "    }\n"
            "  </script>\n");
 
-    /* Add pagination controls if needed (not for random mode) */
-    if (!is_random_mode && total_pages > 1) {
-        char *encoded_query = url_encode(query);
-        if (encoded_query) {
-            APPEND("  <div class='pagination'>\n");
+    /* Add pagination controls if needed (not for random mode). The links go
+     * back to link_base and carry extra_qs through, so the active filters (and
+     * the /browse sort key) survive a page step. */
+    if (!is_random_mode && total_pages > 1 && link_base[0]) {
+        const char *sep = extra_qs[0] ? "&" : "";
 
-            /* Previous button */
-            if (has_prev) {
-                APPEND("    <a href='/search?q=%s&format=html&page=%d'>Previous</a>\n",
-                       encoded_query, page - 1);
-            } else {
-                APPEND("    <span class='disabled'>Previous</span>\n");
-            }
+        APPEND("  <div class='pagination'>\n");
 
-            /* Page info */
-            APPEND("    <span class='page-info'>Page %d of %d</span>\n", page, total_pages);
-
-            /* Next button */
-            if (has_next) {
-                APPEND("    <a href='/search?q=%s&format=html&page=%d'>Next</a>\n",
-                       encoded_query, page + 1);
-            } else {
-                APPEND("    <span class='disabled'>Next</span>\n");
-            }
-
-            APPEND("  </div>\n");
-            free(encoded_query);
+        /* Previous button */
+        if (has_prev) {
+            APPEND("    <a href='%s%s%s&page=%d'>Previous</a>\n",
+                   link_base, sep, extra_qs, page - 1);
+        } else {
+            APPEND("    <span class='disabled'>Previous</span>\n");
         }
+
+        /* Page info */
+        APPEND("    <span class='page-info'>Page %d of %d</span>\n", page, total_pages);
+
+        /* Next button */
+        if (has_next) {
+            APPEND("    <a href='%s%s%s&page=%d'>Next</a>\n",
+                   link_base, sep, extra_qs, page + 1);
+        } else {
+            APPEND("    <span class='disabled'>Next</span>\n");
+        }
+
+        APPEND("  </div>\n");
     }
 
     /* Add shuffle/back buttons at bottom for random mode */
