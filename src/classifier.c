@@ -53,7 +53,8 @@ static struct {
     int enabled;                 /* set by classifier_init() */
     int manifest_ok;             /* manifest.json parsed */
     long long clf_ver;           /* model version string of the manifest */
-    double adult_hide_threshold; /* thresholds.adult_hide_threshold */
+    double adult_hide_threshold; /* effective tag threshold: config > manifest > default */
+    double cfg_hide_threshold;   /* config adult_hide_threshold; 0 = config supplied none */
     char model_dir[CLF_PATH_CAP];
     char adult_sha[CLF_SHA_HEX_LEN + 1];
     char category_sha[CLF_SHA_HEX_LEN + 1];
@@ -195,14 +196,30 @@ static void clf_load_manifest(void) {
         log_msg(LOG_WARN, "Classifier: manifest has no usable version; clf_ver stays 0");
     }
 
+    /* Effective adult hide threshold, most authoritative first: the config key
+     * (what the operator wrote in config.ini), then the manifest, then the
+     * built-in default. */
     const cJSON *thresholds = clf_json_object(root, "thresholds");
     const cJSON *hide = thresholds
                             ? cJSON_GetObjectItemCaseSensitive(thresholds, "adult_hide_threshold")
                             : NULL;
+    double manifest_hide = 0.0;
     if (cJSON_IsNumber(hide) && hide->valuedouble > 0.0 && hide->valuedouble <= 1.0) {
-        clf.adult_hide_threshold = hide->valuedouble;
+        manifest_hide = hide->valuedouble;
     } else {
-        log_msg(LOG_WARN, "Classifier: manifest threshold missing/invalid; adult hide threshold %.3f",
+        log_msg(LOG_WARN, "Classifier: manifest threshold missing/invalid");
+    }
+
+    if (clf.cfg_hide_threshold > 0.0) {
+        clf.adult_hide_threshold = clf.cfg_hide_threshold;
+        log_msg(LOG_INFO, "Classifier: adult hide threshold %.6f from config (manifest %.6f)",
+                clf.adult_hide_threshold, manifest_hide);
+    } else if (manifest_hide > 0.0) {
+        clf.adult_hide_threshold = manifest_hide;
+        log_msg(LOG_INFO, "Classifier: adult hide threshold %.6f from manifest", clf.adult_hide_threshold);
+    } else {
+        clf.adult_hide_threshold = CLF_ADULT_HIDE_DEFAULT;
+        log_msg(LOG_WARN, "Classifier: no usable adult hide threshold; using built-in %.3f",
                 clf.adult_hide_threshold);
     }
 
@@ -269,9 +286,19 @@ static void clf_tv_kind_load_once(void) {
 
 /* ---- public API -------------------------------------------------------- */
 
-void classifier_init(const char *model_dir) {
+void classifier_init(const char *model_dir, double adult_hide_threshold) {
     const char *dir = (model_dir && model_dir[0]) ? model_dir : CLF_MODEL_DIR_DEFAULT;
     snprintf(clf.model_dir, sizeof(clf.model_dir), "%s", dir);
+
+    /* Recorded before the manifest is read: clf_load_manifest() resolves the
+     * config > manifest > default precedence. */
+    clf.cfg_hide_threshold = (adult_hide_threshold > 0.0 && adult_hide_threshold <= 1.0)
+                                 ? adult_hide_threshold
+                                 : 0.0;
+    /* Provisional: the manifest may replace it, and it is what stands when the
+     * manifest never loads (a 0.0 threshold would tag every degraded item). */
+    clf.adult_hide_threshold = clf.cfg_hide_threshold > 0.0 ? clf.cfg_hide_threshold
+                                                            : CLF_ADULT_HIDE_DEFAULT;
 
     clf.enabled = 1;
     pthread_mutex_lock(&clf.stats_mutex);
@@ -413,7 +440,9 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     pthread_mutex_lock(&clf.stats_mutex);
     clf.stats.total_classified++;
     clf.stats.total_us += clf_elapsed_us(&t_start, &t_end);
-    clf.stats.adult_tagged += (uint64_t)(adult ? 1 : 0);
+    /* adult_tagged is NOT bumped here: only rows the caller actually stores
+     * with adult = 1 count (classifier_note_stored_adult()), so a dropped
+     * torrent never inflates it. */
     clf.stats.parser_only_fallback += (uint64_t)(degraded ? 1 : 0);
     clf.stats.tv_kind_model_used += (uint64_t)tv_kind_model_used;
     if (category >= 0 && category < CLASSIFIER_NUM_CATEGORIES) {
@@ -428,6 +457,32 @@ void classifier_get_stats(classifier_stats_t *out) {
     if (!out) return;
     pthread_mutex_lock(&clf.stats_mutex);
     *out = clf.stats;
+    pthread_mutex_unlock(&clf.stats_mutex);
+}
+
+int classifier_models_loaded(void) {
+    /* Read without the stats mutex: both fields are set once by
+     * classifier_init() before any worker thread exists, and only the adult
+     * model decides adult tagging (the caller uses this to demote the keyword
+     * porn filter). */
+    return (clf.enabled && clf.adult_model) ? 1 : 0;
+}
+
+void classifier_note_stored_adult(void) {
+    pthread_mutex_lock(&clf.stats_mutex);
+    clf.stats.adult_tagged++;
+    pthread_mutex_unlock(&clf.stats_mutex);
+}
+
+void classifier_note_adult_dropped(void) {
+    pthread_mutex_lock(&clf.stats_mutex);
+    clf.stats.adult_dropped++;
+    pthread_mutex_unlock(&clf.stats_mutex);
+}
+
+void classifier_note_hard_block_dropped(void) {
+    pthread_mutex_lock(&clf.stats_mutex);
+    clf.stats.hard_block_dropped++;
     pthread_mutex_unlock(&clf.stats_mutex);
 }
 
@@ -478,10 +533,21 @@ static struct {
     .stats_mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
-void classifier_init(const char *model_dir) {
+void classifier_init(const char *model_dir, double adult_hide_threshold) {
     (void)model_dir;
+    (void)adult_hide_threshold;
     log_msg(LOG_DEBUG, "Classifier: built without CLF_ENABLED; classification disabled");
 }
+
+/* No models exist in this flavour, so the keyword porn filter always stays
+ * active as the fallback and every ingest-outcome counter stays zero. */
+int classifier_models_loaded(void) {
+    return 0;
+}
+
+void classifier_note_stored_adult(void) {}
+void classifier_note_adult_dropped(void) {}
+void classifier_note_hard_block_dropped(void) {}
 
 int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     (void)meta;

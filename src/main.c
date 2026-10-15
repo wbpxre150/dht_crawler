@@ -6,6 +6,7 @@
 #include "porn_filter_cleanup.h"
 #include "language_filter.h"
 #include "classifier.h"
+#include "hard_block.h"
 #include "torrent_search.h"
 #include "config.h"
 #include "supervisor.h"
@@ -457,13 +458,17 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_DEBUG, "Porn filter disabled");
     }
 
+    /* Initialize the always-on hard block list (Stage 6). Non-fatal: a missing
+     * file only disables the list, and hard_block_init() logs the warning. */
+    hard_block_init(config.hard_block_file);
+
     /* Initialize language filter (independent of porn filter) */
     language_filter_init(config.language_filter_non_latin_threshold);
 
     /* Initialize ingest-time classifier (Stage 5, tag mode). Non-fatal: without
      * a model directory it falls back to parser-only classification. */
     if (config.classifier_enabled) {
-        classifier_init(config.classifier_model_dir);
+        classifier_init(config.classifier_model_dir, config.adult_hide_threshold);
     } else {
         log_msg(LOG_DEBUG, "Classifier disabled");
     }
@@ -485,6 +490,7 @@ int main(int argc, char *argv[]) {
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize database: %d", rc);
         porn_filter_cleanup();
+        hard_block_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
         return 1;
@@ -535,6 +541,7 @@ int main(int argc, char *argv[]) {
             database_cleanup(&g_database);
             torrent_search_cleanup();
             porn_filter_cleanup();
+            hard_block_cleanup();
             language_filter_cleanup();
             bloom_filter_cleanup(g_bloom);
             cleanup_app_context(&g_app_ctx);
@@ -553,6 +560,7 @@ int main(int argc, char *argv[]) {
             database_cleanup(&g_database);
             torrent_search_cleanup();
             porn_filter_cleanup();
+            hard_block_cleanup();
             language_filter_cleanup();
             bloom_filter_cleanup(g_bloom);
             cleanup_app_context(&g_app_ctx);
@@ -567,6 +575,7 @@ int main(int argc, char *argv[]) {
         database_cleanup(&g_database);
         torrent_search_cleanup();
         porn_filter_cleanup();
+        hard_block_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
 
@@ -680,12 +689,15 @@ int main(int argc, char *argv[]) {
         .global_bootstrap_workers = config.global_bootstrap_workers,
         /* Porn filter settings */
         .porn_filter_enabled = config.porn_filter_enabled,
+        /* Stage 6 adult handling (adult_mode is copied after the literal) */
+        .adult_drop_threshold = config.adult_drop_threshold,
         /* Adaptive keyspace partitioning */
         .dead_partition_threshold = config.dead_partition_threshold,
         .max_trees_per_partition = config.max_trees_per_partition
     };
     /* Copy BEP51 cache path (can't use string literal in struct initializer) */
     strncpy(sup_config.bep51_cache_path, config.bep51_cache_path, sizeof(sup_config.bep51_cache_path) - 1);
+    strncpy(sup_config.adult_mode, config.adult_mode, sizeof(sup_config.adult_mode) - 1);
     
     g_supervisor = supervisor_create(&sup_config);
     if (!g_supervisor) {
@@ -857,6 +869,7 @@ int main(int argc, char *argv[]) {
     database_cleanup(&g_database);
     torrent_search_cleanup();
     porn_filter_cleanup();
+    hard_block_cleanup();
     language_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
     

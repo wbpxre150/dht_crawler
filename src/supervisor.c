@@ -127,6 +127,10 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Porn filter settings */
     sup->porn_filter_enabled = config->porn_filter_enabled;
 
+    /* Stage 6 adult handling */
+    strncpy(sup->adult_mode, config->adult_mode, sizeof(sup->adult_mode) - 1);
+    sup->adult_drop_threshold = config->adult_drop_threshold;
+
     /* BEP51 cache settings */
     sup->bep51_cache_capacity = config->bep51_cache_capacity > 0 ? config->bep51_cache_capacity : 10000;
     sup->bep51_cache_submit_percent = config->bep51_cache_submit_percent > 0 ? config->bep51_cache_submit_percent : 5;
@@ -497,6 +501,8 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .ema_alpha = sup->rate_ema_alpha,
         /* Porn filter settings */
         .porn_filter_enabled = sup->porn_filter_enabled,
+        /* Stage 6 adult handling (adult_mode is copied after the literal below) */
+        .adult_drop_threshold = sup->adult_drop_threshold,
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,
@@ -508,6 +514,9 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .shared_socket = sup->shared_socket,
         .shared_dispatcher = sup->shared_dispatcher
     };
+    /* adult_mode is a char array and cannot be set from a non-literal in the
+     * designated initializer above. */
+    strncpy(config.adult_mode, sup->adult_mode, sizeof(config.adult_mode) - 1);
 
     uint32_t tree_id = sup->next_tree_id++;
     thread_tree_t *tree = thread_tree_create(tree_id, &config);

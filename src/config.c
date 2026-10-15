@@ -85,6 +85,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->classifier_enabled = 1;                 /* On by default; tag mode only */
     strncpy(config->classifier_model_dir, "models/v1", sizeof(config->classifier_model_dir) - 1);
 
+    /* Stage 6 adult handling defaults (calibrated values from models/v1/manifest.json) */
+    strncpy(config->adult_mode, "tag", sizeof(config->adult_mode) - 1);
+    config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
+    config->adult_drop_threshold = 0.995516;        /* only used by adult_mode=drop */
+    strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
+
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
 
@@ -313,6 +319,27 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->classifier_enabled = atoi(value);
         } else if (strcmp(key, "classifier_model_dir") == 0) {
             strncpy(config->classifier_model_dir, value, sizeof(config->classifier_model_dir) - 1);
+        }
+        /* Stage 6 adult handling settings */
+        else if (strcmp(key, "adult_mode") == 0) {
+            if (strcmp(value, "tag") == 0 || strcmp(value, "drop") == 0) {
+                strncpy(config->adult_mode, value, sizeof(config->adult_mode) - 1);
+            } else {
+                log_msg(LOG_WARN, "Invalid adult_mode '%s' (expected tag|drop); keeping '%s'",
+                        value, config->adult_mode);
+            }
+        } else if (strcmp(key, "adult_hide_threshold") == 0) {
+            double threshold = strtod(value, NULL);
+            if (threshold < 0.0) threshold = 0.0;
+            if (threshold > 1.0) threshold = 1.0;
+            config->adult_hide_threshold = threshold;
+        } else if (strcmp(key, "adult_drop_threshold") == 0) {
+            double threshold = strtod(value, NULL);
+            if (threshold < 0.0) threshold = 0.0;
+            if (threshold > 1.0) threshold = 1.0;
+            config->adult_drop_threshold = threshold;
+        } else if (strcmp(key, "hard_block_file") == 0) {
+            strncpy(config->hard_block_file, value, sizeof(config->hard_block_file) - 1);
         }
         /* Thread tree settings (Stage 1) */
         else if (strcmp(key, "num_trees") == 0) {

@@ -7,10 +7,13 @@
 /*
  * Ingest-time classification (Stage 5, tag mode).
  *
- * Every torrent that survives porn_filter_check()/language_filter_check() in
- * tree_metadata.c gets a classification_t. The value rides inside
- * torrent_metadata_t through batch_writer_add() and is written as one
- * torrent_class row, in the same transaction as the torrent itself.
+ * Every torrent that survives the ingest filters in tree_metadata.c (the
+ * always-on hard block list, the keyword porn filter while it is still in
+ * charge, and the language filter) gets a classification_t. The value rides
+ * inside torrent_metadata_t through batch_writer_add() and is written as one
+ * torrent_class row, in the same transaction as the torrent itself. In
+ * adult_mode=drop the same verdict is also the drop decision: items at or
+ * above the drop threshold are never stored at all.
  *
  * Decision path (classifier.md §4):
  *   - tparse always runs (release name + file list) and supplies the season /
@@ -44,7 +47,10 @@ typedef struct {
     uint64_t parser_only_fallback; /* items with a model missing/unusable */
     uint64_t model_load_failures;  /* unusable manifest (counted once) plus each
                                     * model that failed to load or verify */
-    uint64_t adult_tagged;         /* items with adult = 1 */
+    uint64_t adult_tagged;         /* stored rows with adult = 1 (reported by the
+                                    * ingest call site, not by classify()) */
+    uint64_t adult_dropped;        /* adult_mode=drop rows dropped on P(adult) */
+    uint64_t hard_block_dropped;   /* rows dropped by the hard block list */
     uint64_t tv_kind_model_used;   /* items where the tv_kind student was consulted */
     uint64_t by_category[CLASSIFIER_NUM_CATEGORIES]; /* per category, all items */
 } classifier_stats_t;
@@ -59,8 +65,12 @@ typedef struct {
  * @param model_dir directory holding manifest.json and {adult,category,tv_kind}.ftz
  *                  (NULL/empty falls back to "models/v1", cwd-relative like the
  *                  keyword files).
+ * @param adult_hide_threshold config adult_hide_threshold; > 0 is authoritative
+ *                  (it is what the operator wrote in config.ini), <= 0 means
+ *                  "config supplied none" and the manifest value is used, with
+ *                  the built-in default as the last resort.
  */
-void classifier_init(const char *model_dir);
+void classifier_init(const char *model_dir, double adult_hide_threshold);
 
 /*
  * Classify one torrent. Thread-safe: many tree metadata workers call this
@@ -75,6 +85,24 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out);
 
 /* Copy the current counters into *out (zeroed when classification is off). */
 void classifier_get_stats(classifier_stats_t *out);
+
+/*
+ * 1 when the adult model is loaded and usable, i.e. the classifier owns adult
+ * tagging. Callers use this to demote the keyword porn filter: when it returns
+ * 1 that filter must not run at all, and when the classifier is disabled (or
+ * built without CLF_ENABLED, or its models are missing) it returns 0 so the
+ * keyword fallback stays active.
+ */
+int classifier_models_loaded(void);
+
+/*
+ * Ingest-outcome counters. classifier_classify() cannot know whether its
+ * verdict was written or dropped, so the tree metadata worker reports the
+ * outcome here (each bumps exactly one counter under the stats mutex).
+ */
+void classifier_note_stored_adult(void); /* row stored with adult = 1 */
+void classifier_note_adult_dropped(void); /* row dropped: P(adult) >= adult_drop_threshold */
+void classifier_note_hard_block_dropped(void); /* row dropped by the hard block list */
 
 /* Display name for a tp_category_t value, for the /stats JSON keys. */
 const char *classifier_category_name(int category);

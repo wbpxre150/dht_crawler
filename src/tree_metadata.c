@@ -9,6 +9,7 @@
 #include "dht_crawler.h"
 #include "database.h"
 #include "porn_filter.h"
+#include "hard_block.h"
 #include "language_filter.h"
 #include "classifier.h"
 #include "../lib/bencode-c/bencode.h"
@@ -1334,14 +1335,46 @@ void *tree_metadata_worker_func(void *arg) {
             int rc = tree_metadata_to_database_format(metadata, &db_meta, entry.peer_count);
 
             if (rc == 0) {
-                /* Check porn filter and language filter */
+                /* Stage 6 filter order, most specific first: the always-on hard
+                 * block list, the keyword porn filter, the language filter, then
+                 * the classifier's adult verdict when adult_mode=drop. The porn
+                 * filter is a fallback: it only runs while the classifier cannot
+                 * decide (feature off, or its adult model missing/unusable). */
                 int filtered = 0;
-                if (tree->porn_filter_enabled && porn_filter_check(&db_meta)) {
+                if (hard_block_check(db_meta.name)) {
+                    filtered = 1;
+                    classifier_note_hard_block_dropped();
+                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (hard block): %s",
+                            tree->tree_id, metadata->name);
+                } else if (tree->porn_filter_enabled && !classifier_models_loaded() &&
+                           porn_filter_check(&db_meta)) {
                     filtered = 1;
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (porn): %s", tree->tree_id, metadata->name);
                 } else if (language_filter_check(&db_meta)) {
                     filtered = 1;
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (language): %s", tree->tree_id, metadata->name);
+                }
+
+                /* Classify survivors once, before the store/drop split: the
+                 * verdict feeds the torrent_class row (tag mode) and the adult
+                 * drop decision (drop mode). A failure is not fatal. */
+                if (!filtered && tree->shared_batch_writer) {
+                    if (classifier_classify(&db_meta, &db_meta.classification) == 0) {
+                        db_meta.has_classification = 1;
+                    }
+                }
+
+                /* adult_mode=drop takes the same path as any other filtered
+                 * item: filtered_count, bloom-add (no re-processing) and no DB
+                 * insert. With the models missing adult_p stays 0.0, so the
+                 * keyword fallback above keeps its old job. */
+                if (!filtered && db_meta.has_classification &&
+                    strcmp(tree->adult_mode, "drop") == 0 &&
+                    db_meta.classification.adult_p >= tree->adult_drop_threshold) {
+                    filtered = 1;
+                    classifier_note_adult_dropped();
+                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (adult %.3f): %s",
+                            tree->tree_id, db_meta.classification.adult_p, metadata->name);
                 }
 
                 if (filtered) {
@@ -1356,13 +1389,15 @@ void *tree_metadata_worker_func(void *arg) {
                     /* Free the metadata and skip database insertion */
                     free_database_metadata(&db_meta);
                 } else if (tree->shared_batch_writer) {
-                    /* Stage 5: tag-mode classification runs at the same point as
-                     * the filters, but only for survivors. The result travels in
-                     * db_meta (batch_writer_add deep-copies it) and is inserted as
-                     * one torrent_class row inside the same batch transaction.
-                     * A failure is not fatal: the torrent is stored without it. */
-                    if (classifier_classify(&db_meta, &db_meta.classification) == 0) {
-                        db_meta.has_classification = 1;
+                    /* The Stage 5 classification already ran above, at the same
+                     * point as the filters and only for survivors. The result
+                     * travels in db_meta (batch_writer_add deep-copies it) and is
+                     * inserted as one torrent_class row inside the same batch
+                     * transaction; a classification failure is not fatal. */
+                    if (db_meta.has_classification && db_meta.classification.adult) {
+                        /* Counted here, not in classifier_classify(): only rows
+                         * actually stored with adult=1 are "tagged". */
+                        classifier_note_stored_adult();
                     }
 
                     /* Add to batch writer (batch_writer makes deep copy) */

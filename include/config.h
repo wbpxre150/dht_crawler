@@ -19,7 +19,10 @@ typedef struct {
      *   - refresh_thread.c (refresh_*)
      *   - language_filter.c (language_filter_non_latin_threshold)
      *   - porn_filter.c (porn_filter_enabled, porn_filter_keyword_file)
-     *   - classifier.c (classifier_enabled, classifier_model_dir)
+     *   - classifier.c (classifier_enabled, classifier_model_dir,
+     *     adult_hide_threshold)
+     *   - tree_metadata.c (adult_mode, adult_drop_threshold), hard_block.c
+     *     (hard_block_file)
      *   - failure_bloom filter (failure_bloom_capacity)
      */
 
@@ -86,6 +89,12 @@ typedef struct {
     /* Ingest-time classifier settings (Stage 5, tag mode) */
     int classifier_enabled;             /* Enable ingest-time classification (0=disabled, default: 1) */
     char classifier_model_dir[512];     /* Directory with manifest.json + *.ftz (default: "models/v1") */
+
+    /* Stage 6 adult handling */
+    char adult_mode[8];                 /* "tag" (default) or "drop" at ingest */
+    double adult_hide_threshold;        /* Classifier adult tag threshold; 0 = take it from the manifest */
+    double adult_drop_threshold;        /* adult_mode=drop: drop when P(adult) >= this */
+    char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
 
     /* Thread tree settings (Stage 1) */
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */

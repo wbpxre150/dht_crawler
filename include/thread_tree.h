@@ -98,6 +98,10 @@ typedef struct tree_config {
     /* Porn filter settings */
     int porn_filter_enabled;            /* Enable porn filter (0=disabled, 1=enabled) */
 
+    /* Stage 6 adult handling */
+    char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
+    double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
+
     /* Shared resources from supervisor */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
@@ -211,6 +215,10 @@ typedef struct thread_tree {
 
     /* Porn filter settings */
     int porn_filter_enabled;                /* Enable porn filter (0=disabled, 1=enabled) */
+
+    /* Stage 6 adult handling */
+    char adult_mode[8];                  /* "tag": store the verdict, "drop": discard */
+    double adult_drop_threshold;         /* Drop when P(adult) >= this (adult_mode=drop) */
 
     /* Lifecycle tracking */
     time_t creation_time;           /* When tree was created */

@@ -461,6 +461,10 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         }
         cJSON_AddNumberToObject(classifier, "mean_us_per_item", mean_us);
         cJSON_AddNumberToObject(classifier, "adult_tagged", (double)clf_stats.adult_tagged);
+
+        cJSON_AddNumberToObject(classifier, "adult_dropped", (double)clf_stats.adult_dropped);
+        cJSON_AddNumberToObject(classifier, "hard_block_dropped",
+                                (double)clf_stats.hard_block_dropped);
         cJSON_AddNumberToObject(classifier, "parser_only_fallback",
                                 (double)clf_stats.parser_only_fallback);
         cJSON_AddNumberToObject(classifier, "model_load_failures",

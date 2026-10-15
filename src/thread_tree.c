@@ -1072,6 +1072,10 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     /* Porn filter configuration */
     tree->porn_filter_enabled = config->porn_filter_enabled;
 
+    /* Stage 6 adult handling (the drop decision is made in tree_metadata.c) */
+    strncpy(tree->adult_mode, config->adult_mode, sizeof(tree->adult_mode) - 1);
+    tree->adult_drop_threshold = config->adult_drop_threshold;
+
     /* Initialize lifecycle tracking */
     tree->creation_time = time(NULL);
 

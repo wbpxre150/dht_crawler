@@ -1,0 +1,23 @@
+# Hard Block List
+# Format: one lowercase term per line
+# Lines starting with # are comments; blank lines are ignored
+#
+# These terms are ALWAYS dropped at ingest, in both adult modes (tag and drop)
+# and whether or not the classifier is running: unlike the keyword porn filter
+# this list is not a fallback and is not demoted when the classifier models are
+# loaded. A match on the torrent NAME (case-insensitive substring) means the
+# row is never stored, and the infohash is bloom-added like any other filtered
+# item so it is not fetched again.
+#
+# Rules for this file:
+#   - reviewed, high-precision terms only: a false positive here silently
+#     discards a legitimate torrent, and there is no way to train around it;
+#   - one term per line, lowercase, no punctuation beyond what is in the term;
+#   - nothing generic ("child", "cp", "model", ...) - those belong in the
+#     keyword filter where a reviewer can widen them safely.
+#
+pthc
+ptsc
+r@ygold
+hcorecp
+child porn

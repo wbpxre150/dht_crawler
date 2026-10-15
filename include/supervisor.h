@@ -99,6 +99,10 @@ typedef struct supervisor_config {
     /* Porn filter settings */
     bool porn_filter_enabled;
 
+    /* Stage 6 adult handling */
+    char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
+    double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
+
     /* Tree bootstrap settings */
 
     /* Keyspace partitioning */
@@ -190,6 +194,10 @@ typedef struct supervisor {
 
     /* Porn filter settings */
     bool porn_filter_enabled;
+
+    /* Stage 6 adult handling */
+    char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
+    double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
 
     /* Tree bootstrap settings */
 
