@@ -39,6 +39,18 @@ typedef struct {
     int num_files;
     char **file_paths;
     int64_t *file_sizes;
+    /* Stage 7: torrent_class columns of this torrent, when it has a class row.
+     * has_class 0 means the row is unclassified (pre-classifier database, or
+     * the classifier was off at ingest) and the remaining fields carry no
+     * meaning. tv_kind 0 is stored as SQL NULL in torrent_class (see
+     * database.h), hence has_tv_kind. */
+    int has_class;
+    int category;       /* tp_category_t */
+    int has_tv_kind;
+    int tv_kind;        /* tp_tv_kind_t, 1..6 */
+    int adult;
+    int has_confidence;
+    double confidence;
 } search_result_t;
 
 /* Function declarations */

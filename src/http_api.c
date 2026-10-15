@@ -22,6 +22,63 @@ int tree_peers_queue_count(void *q);
 #include <stdlib.h>
 #include <time.h>
 
+/* ---------------------------------------------------------------------------
+ * Stage 7: torrent_class-powered filters (/search, /browse, /random-*).
+ *
+ * The classifier (stage 5) writes one torrent_class row per classified
+ * torrent, whose codes are the tparse taxonomy (tp_category_t / tp_tv_kind_t
+ * in dht_crawler-android/tparse/taxonomy.h). That header only exists on the
+ * Android wrapper's include path while this file also compiles for the
+ * crawler's own host `make`, so the values are mirrored here. They are frozen
+ * by the data already on the phone; the category *names* come from
+ * classifier_category_name(), so the JSON keys keep matching /stats.
+ * ------------------------------------------------------------------------ */
+typedef enum {
+    CLS_CAT_UNKNOWN = 0,
+    CLS_CAT_MOVIE,
+    CLS_CAT_TV,
+    CLS_CAT_ANIME,
+    CLS_CAT_MUSIC,
+    CLS_CAT_AUDIOBOOK,
+    CLS_CAT_EBOOK,
+    CLS_CAT_COMIC,
+    CLS_CAT_SOFTWARE,
+    CLS_CAT_GAME,
+    CLS_CAT_IMAGE,
+    CLS_CAT_OTHER,
+    CLS_NUM_CATEGORIES
+} cls_category_t;
+
+/* tp_tv_kind_t display names; 0 (none) is stored as SQL NULL in torrent_class
+ * (see database.h) and therefore has no filter name of its own. */
+static const char *const CLS_TV_KIND_NAMES[] = {
+    "none", "episode", "multi_episode", "season_pack", "multi_season",
+    "complete_series", "daily"
+};
+#define CLS_NUM_TV_KINDS ((int)(sizeof(CLS_TV_KIND_NAMES) / sizeof(CLS_TV_KIND_NAMES[0])))
+
+typedef enum {
+    CLS_ADULT_HIDE,  /* classified non-adult rows only: c.adult = 0 */
+    CLS_ADULT_SHOW,  /* no adult condition at all */
+    CLS_ADULT_ONLY   /* classified adult rows only: c.adult = 1 */
+} cls_adult_mode_t;
+
+/* torrent_class filter parsed from a query string. */
+typedef struct {
+    int present;            /* at least one stage-7 param was supplied */
+    cls_adult_mode_t adult; /* CLS_ADULT_HIDE unless the caller says otherwise */
+    int has_category;
+    int category;           /* tp_category_t */
+    int has_tv_kind;
+    int tv_kind;            /* tp_tv_kind_t */
+    int has_min_conf;
+    double min_conf;
+} cls_filter_t;
+
+/* Bind parameters a fully populated filter consumes; see
+ * append_class_conditions() and bind_class_filter(). */
+#define CLS_FILTER_MAX_BINDS 3
+
 /* Forward declarations */
 static int search_handler(struct mg_connection *conn, void *cbdata);
 static int stats_handler(struct mg_connection *conn, void *cbdata);
@@ -35,6 +92,9 @@ static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
 static char* url_encode(const char *str);
 static char* generate_search_results_html(search_result_t *results, int count, const char *query, int page, int total_count);
+static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
+                                    int offset, search_result_t **results, int *count, int *total_count);
+static int browse_handler(struct mg_connection *conn, void *cbdata);
 
 typedef enum {
     VIDEO_FILTER_TV,      /* video torrent AND title has SxxExx */
@@ -71,6 +131,352 @@ static void format_size(int64_t bytes, char *out, size_t out_len) {
     }
 
     snprintf(out, out_len, "%.2f %s", size, units[unit]);
+}
+
+/* --- Stage 7: torrent_class filter parsing and rendering helpers ---------- */
+
+/* tp_category_t value for a taxonomy name, or -1 when it is not one of them.
+ * The names are the /stats by_category keys, so the two cannot drift. */
+static int class_category_from_name(const char *name) {
+    for (int i = 0; i < CLASSIFIER_NUM_CATEGORIES; i++) {
+        if (strcmp(name, classifier_category_name(i)) == 0) return i;
+    }
+    return -1;
+}
+
+/* tp_tv_kind_t value for a name, or -1 when it is not one of them. The names
+ * start at 1: "none" (0) is stored as SQL NULL and is only reachable through
+ * the integer form, which matches the stage-7 parameter list. */
+static int class_tv_kind_from_name(const char *name) {
+    for (int i = 1; i < CLS_NUM_TV_KINDS; i++) {
+        if (strcmp(name, CLS_TV_KIND_NAMES[i]) == 0) return i;
+    }
+    return -1;
+}
+
+/* Display name for a stored tv_kind, or NULL when out of range. */
+static const char *class_tv_kind_name(int tv_kind) {
+    if (tv_kind < 0 || tv_kind >= CLS_NUM_TV_KINDS) return NULL;
+    return CLS_TV_KIND_NAMES[tv_kind];
+}
+
+/* Strict integer parse: the whole string has to be one integer in [min, max].
+ * Overflow saturates to LONG_MAX/LONG_MIN and is rejected by the range check,
+ * so errno does not have to be consulted. */
+static int parse_long_param(const char *s, long min, long max, long *out) {
+    if (!s || !*s) return -1;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < min || v > max) return -1;
+    *out = v;
+    return 0;
+}
+
+/* Strict float parse: whole string, finite, in [min, max]. */
+static int parse_double_param(const char *s, double min, double max, double *out) {
+    if (!s || !*s) return -1;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || !(v >= min && v <= max)) return -1;
+    *out = v;
+    return 0;
+}
+
+/* Parse the four stage-7 query parameters shared by /search and /browse:
+ *   category=<0-11|name>  tv_kind=<0-6|name>  adult=hide|show|only  min_conf=<0..1>
+ * All four are optional and case-sensitive. Only parsed numbers and taxonomy
+ * codes leave this function: the names are mapped to their enum value and
+ * bound as ints, and no user-supplied text ever reaches the SQL.
+ *
+ * A malformed value returns -1 and points *bad_param at the offending
+ * parameter name (a static string). On success out->present is 1 only when at
+ * least one of the four was supplied, which is what turns the adult=hide
+ * default on; /search keeps its pre-stage-7 behaviour when none of them is
+ * present (see search_handler). */
+static int parse_class_filter(const char *query_string, cls_filter_t *out, const char **bad_param) {
+    memset(out, 0, sizeof(*out));
+    out->adult = CLS_ADULT_HIDE;
+    if (bad_param) *bad_param = NULL;
+
+    const char *qs = query_string ? query_string : "";
+    size_t qs_len = strlen(qs);
+    char buf[64];
+    int n;
+    long value;
+
+    n = mg_get_var(qs, qs_len, "adult", buf, sizeof(buf));
+    if (n >= 0) {
+        out->present = 1;
+        if (strcmp(buf, "hide") == 0) {
+            out->adult = CLS_ADULT_HIDE;
+        } else if (strcmp(buf, "show") == 0) {
+            out->adult = CLS_ADULT_SHOW;
+        } else if (strcmp(buf, "only") == 0) {
+            out->adult = CLS_ADULT_ONLY;
+        } else {
+            if (bad_param) *bad_param = "adult";
+            return -1;
+        }
+    }
+
+    n = mg_get_var(qs, qs_len, "category", buf, sizeof(buf));
+    if (n >= 0) {
+        out->present = 1;
+        if (parse_long_param(buf, 0, CLS_NUM_CATEGORIES - 1, &value) != 0) {
+            value = class_category_from_name(buf);
+            if (value < 0) {
+                if (bad_param) *bad_param = "category";
+                return -1;
+            }
+        }
+        out->has_category = 1;
+        out->category = (int)value;
+    }
+
+    n = mg_get_var(qs, qs_len, "tv_kind", buf, sizeof(buf));
+    if (n >= 0) {
+        out->present = 1;
+        if (parse_long_param(buf, 0, CLS_NUM_TV_KINDS - 1, &value) != 0) {
+            value = class_tv_kind_from_name(buf);
+            if (value < 0) {
+                if (bad_param) *bad_param = "tv_kind";
+                return -1;
+            }
+        }
+        out->has_tv_kind = 1;
+        out->tv_kind = (int)value;
+    }
+
+    n = mg_get_var(qs, qs_len, "min_conf", buf, sizeof(buf));
+    if (n >= 0) {
+        out->present = 1;
+        if (parse_double_param(buf, 0.0, 1.0, &out->min_conf) != 0) {
+            if (bad_param) *bad_param = "min_conf";
+            return -1;
+        }
+        out->has_min_conf = 1;
+    }
+
+    return 0;
+}
+
+/* 1 when the filter actually restricts the row set, i.e. when the caller has to
+ * join torrent_class. A NULL filter, and adult=show without any column
+ * condition, leave the legacy behaviour (unclassified rows included) alone. */
+static int class_filter_needs_join(const cls_filter_t *f) {
+    if (!f) return 0;
+    return f->adult != CLS_ADULT_SHOW || f->has_category || f->has_tv_kind || f->has_min_conf;
+}
+
+/* Append the conditions of *f* as " AND ..." fragments, numbering bind
+ * parameters from first_bind on, and return how many were used. The caller
+ * supplies what the first fragment attaches to: "JOIN torrent_class c ON
+ * c.torrent_id = t.id" (SQLite can then drive the join off the partial index
+ * idx_class_cat when the filter names a category) or "WHERE 1" for a
+ * torrent_class-driven query. The condition order must stay in sync with
+ * bind_class_filter(). */
+static int append_class_conditions(char *buf, size_t bufsize, int *pos,
+                                   const cls_filter_t *f, int first_bind) {
+    int written;
+    int binds = 0;
+
+    if (f->adult == CLS_ADULT_HIDE) {
+        written = snprintf(buf + *pos, bufsize - *pos, " AND c.adult = 0");
+        if (written > 0) *pos += written;
+    } else if (f->adult == CLS_ADULT_ONLY) {
+        written = snprintf(buf + *pos, bufsize - *pos, " AND c.adult = 1");
+        if (written > 0) *pos += written;
+    }
+
+    if (f->has_category) {
+        written = snprintf(buf + *pos, bufsize - *pos, " AND c.category = ?%d", first_bind + binds);
+        if (written > 0) *pos += written;
+        binds++;
+    }
+
+    if (f->has_tv_kind) {
+        if (f->tv_kind <= 0) {
+            /* tp_tv_kind_t 0 (none) is stored as SQL NULL. */
+            written = snprintf(buf + *pos, bufsize - *pos, " AND c.tv_kind IS NULL");
+            if (written > 0) *pos += written;
+        } else {
+            written = snprintf(buf + *pos, bufsize - *pos, " AND c.tv_kind = ?%d", first_bind + binds);
+            if (written > 0) *pos += written;
+            binds++;
+        }
+    }
+
+    if (f->has_min_conf) {
+        written = snprintf(buf + *pos, bufsize - *pos, " AND c.confidence >= ?%d", first_bind + binds);
+        if (written > 0) *pos += written;
+        binds++;
+    }
+
+    return binds;
+}
+
+/* Bind the parameters appended by append_class_conditions(), same order. */
+static void bind_class_filter(sqlite3_stmt *stmt, int first_bind, const cls_filter_t *f) {
+    int idx = first_bind;
+
+    if (f->has_category) {
+        sqlite3_bind_int(stmt, idx++, f->category);
+    }
+    if (f->has_tv_kind && f->tv_kind > 0) {
+        sqlite3_bind_int(stmt, idx++, f->tv_kind);
+    }
+    if (f->has_min_conf) {
+        sqlite3_bind_double(stmt, idx++, f->min_conf);
+    }
+}
+
+/* Write a {"error":"..."} response with the given HTTP status. */
+static int send_json_error(struct mg_connection *conn, int status, const char *message) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "error", message);
+    char *json = cJSON_Print(root);
+    cJSON_Delete(root);
+
+    if (!json) return 500;
+
+    mg_printf(conn,
+              "HTTP/1.1 %d %s\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %d\r\n"
+              "\r\n"
+              "%s",
+              status, status == 400 ? "Bad Request" : "Internal Server Error",
+              (int)strlen(json), json);
+    free(json);
+    return status;
+}
+
+/* Add the stage-7 torrent_class fields to one result object; absent entirely
+ * when the torrent has no class row. */
+static void add_class_fields_json(cJSON *item, const search_result_t *r) {
+    if (!r->has_class) return;
+
+    cJSON_AddStringToObject(item, "category", classifier_category_name(r->category));
+
+    const char *tv_kind = r->has_tv_kind ? class_tv_kind_name(r->tv_kind) : NULL;
+    if (tv_kind) {
+        cJSON_AddStringToObject(item, "tv_kind", tv_kind);
+    } else {
+        cJSON_AddNullToObject(item, "tv_kind");
+    }
+
+    cJSON_AddNumberToObject(item, "adult", r->adult);
+
+    if (r->has_confidence) {
+        cJSON_AddNumberToObject(item, "confidence", r->confidence);
+    } else {
+        cJSON_AddNullToObject(item, "confidence");
+    }
+}
+
+/* Load up to 10 file rows (prefix-qualified path + size) for one result. Only
+ * called when the result has files, like the inline version it replaces. */
+static void fetch_result_files(database_t *db, search_result_t *r) {
+    const char *files_sql =
+        "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
+        "       tf.size_bytes "
+        "FROM torrent_files tf "
+        "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+        "WHERE tf.torrent_id = (SELECT id FROM torrents WHERE info_hash = ?) "
+        "ORDER BY tf.file_index LIMIT 10";
+
+    sqlite3_stmt *files_stmt;
+    if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_blob(files_stmt, 1, r->info_hash, 20, SQLITE_STATIC);
+
+    int file_count = 0;
+    r->file_paths = (char **)calloc(10, sizeof(char *));
+    r->file_sizes = (int64_t *)calloc(10, sizeof(int64_t));
+
+    while (sqlite3_step(files_stmt) == SQLITE_ROW && file_count < 10) {
+        r->file_paths[file_count] = strdup((const char *)sqlite3_column_text(files_stmt, 0));
+        r->file_sizes[file_count] = sqlite3_column_int64(files_stmt, 1);
+        file_count++;
+    }
+
+    sqlite3_finalize(files_stmt);
+}
+
+/* Serialize the /search and /browse result envelope and write the 200
+ * response; frees results. */
+static int send_json_results(struct mg_connection *conn, search_result_t *results,
+                             int count, int total_count, int page) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "count", count);
+    cJSON_AddNumberToObject(root, "total_count", total_count);
+    cJSON_AddNumberToObject(root, "page", page);
+    cJSON_AddNumberToObject(root, "limit", HTTP_API_MAX_RESULTS);
+    cJSON_AddBoolToObject(root, "has_more", (page - 1) * HTTP_API_MAX_RESULTS + count < total_count);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    cJSON *results_array = cJSON_CreateArray();
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_CreateObject();
+
+        char hex[41];
+        format_hex(results[i].info_hash, 20, hex);
+        cJSON_AddStringToObject(item, "info_hash", hex);
+        cJSON_AddStringToObject(item, "name", results[i].name);
+
+        char size_str[64];
+        format_size(results[i].size_bytes, size_str, sizeof(size_str));
+        cJSON_AddStringToObject(item, "size", size_str);
+        cJSON_AddNumberToObject(item, "size_bytes", results[i].size_bytes);
+        cJSON_AddNumberToObject(item, "total_peers", results[i].total_peers);
+        cJSON_AddNumberToObject(item, "added", results[i].added_timestamp);
+        cJSON_AddNumberToObject(item, "num_files", results[i].num_files);
+
+        /* Stage 7: torrent_class fields, when the torrent has a class row. */
+        add_class_fields_json(item, &results[i]);
+
+        /* Add files array */
+        if (results[i].num_files > 0 && results[i].file_paths) {
+            cJSON *files_array = cJSON_CreateArray();
+            for (int j = 0; j < results[i].num_files && j < 10; j++) {  /* Limit to 10 files */
+                cJSON *file = cJSON_CreateObject();
+                cJSON_AddStringToObject(file, "path", results[i].file_paths[j]);
+
+                char file_size_str[64];
+                format_size(results[i].file_sizes[j], file_size_str, sizeof(file_size_str));
+                cJSON_AddStringToObject(file, "size", file_size_str);
+                cJSON_AddNumberToObject(file, "size_bytes", results[i].file_sizes[j]);
+
+                cJSON_AddItemToArray(files_array, file);
+            }
+            cJSON_AddItemToObject(item, "files", files_array);
+        }
+
+        cJSON_AddItemToArray(results_array, item);
+    }
+    cJSON_AddItemToObject(root, "results", results_array);
+
+    char *json = cJSON_Print(root);
+    cJSON_Delete(root);
+
+    if (!json) {
+        free_search_results(results, count);
+        return 500;
+    }
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %d\r\n"
+              "Access-Control-Allow-Origin: *\r\n"
+              "\r\n"
+              "%s",
+              (int)strlen(json), json);
+
+    free(json);
+    free_search_results(results, count);
+    return 200;
 }
 
 /* Initialize HTTP API */
@@ -126,6 +532,7 @@ int http_api_start(http_api_t *api) {
     /* Register handlers */
     mg_set_request_handler(api->mg_ctx, "/", root_handler, api);
     mg_set_request_handler(api->mg_ctx, "/search", search_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/browse", browse_handler, api);
     mg_set_request_handler(api->mg_ctx, "/stats", stats_handler, api);
     mg_set_request_handler(api->mg_ctx, "/refresh", refresh_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random-tv", random_tv_handler, api);
@@ -1040,15 +1447,19 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     int offset = (page - 1) * HTTP_API_MAX_RESULTS;
 
     if (query_len <= 0 || strlen(query_buf) == 0) {
-        const char *error = "{\"error\":\"Missing query parameter 'q'\"}";
-        mg_printf(conn,
-                  "HTTP/1.1 400 Bad Request\r\n"
-                  "Content-Type: application/json\r\n"
-                  "Content-Length: %d\r\n"
-                  "\r\n"
-                  "%s",
-                  (int)strlen(error), error);
-        return 400;
+        return send_json_error(conn, 400, "Missing query parameter 'q'");
+    }
+
+    /* Stage 7 filter parameters. All four are optional; a malformed value is a
+     * 400. The adult=hide default only turns on when at least one of them is
+     * supplied, so a plain /search?q= keeps the pre-stage-7 behaviour (adult
+     * rows still visible, no class join) — see parse_class_filter(). */
+    cls_filter_t class_filter;
+    const char *bad_param = NULL;
+    if (parse_class_filter(ri->query_string, &class_filter, &bad_param) != 0) {
+        char error_msg[96];
+        snprintf(error_msg, sizeof(error_msg), "Invalid value for '%s'", bad_param);
+        return send_json_error(conn, 400, error_msg);
     }
 
     char *query = url_decode(query_buf);
@@ -1058,7 +1469,9 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     search_result_t *results = NULL;
     int count = 0;
     int total_count = 0;
-    int rc = search_torrents(api->database, query, offset, &results, &count, &total_count);
+    int rc = search_torrents_filtered(api->database, query,
+                                      class_filter.present ? &class_filter : NULL,
+                                      offset, &results, &count, &total_count);
     free(query);
 
     if (rc != 0) {
@@ -1162,69 +1575,8 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
         return 200;
     }
 
-    /* Build JSON response */
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "count", count);
-    cJSON_AddNumberToObject(root, "total_count", total_count);
-    cJSON_AddNumberToObject(root, "page", page);
-    cJSON_AddNumberToObject(root, "limit", HTTP_API_MAX_RESULTS);
-    cJSON_AddBoolToObject(root, "has_more", (offset + count) < total_count);
-    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
-
-    cJSON *results_array = cJSON_CreateArray();
-    for (int i = 0; i < count; i++) {
-        cJSON *item = cJSON_CreateObject();
-
-        char hex[41];
-        format_hex(results[i].info_hash, 20, hex);
-        cJSON_AddStringToObject(item, "info_hash", hex);
-        cJSON_AddStringToObject(item, "name", results[i].name);
-
-        char size_str[64];
-        format_size(results[i].size_bytes, size_str, sizeof(size_str));
-        cJSON_AddStringToObject(item, "size", size_str);
-        cJSON_AddNumberToObject(item, "size_bytes", results[i].size_bytes);
-        cJSON_AddNumberToObject(item, "total_peers", results[i].total_peers);
-        cJSON_AddNumberToObject(item, "added", results[i].added_timestamp);
-        cJSON_AddNumberToObject(item, "num_files", results[i].num_files);
-
-        /* Add files array */
-        if (results[i].num_files > 0 && results[i].file_paths) {
-            cJSON *files_array = cJSON_CreateArray();
-            for (int j = 0; j < results[i].num_files && j < 10; j++) {  /* Limit to 10 files */
-                cJSON *file = cJSON_CreateObject();
-                cJSON_AddStringToObject(file, "path", results[i].file_paths[j]);
-
-                char file_size_str[64];
-                format_size(results[i].file_sizes[j], file_size_str, sizeof(file_size_str));
-                cJSON_AddStringToObject(file, "size", file_size_str);
-                cJSON_AddNumberToObject(file, "size_bytes", results[i].file_sizes[j]);
-
-                cJSON_AddItemToArray(files_array, file);
-            }
-            cJSON_AddItemToObject(item, "files", files_array);
-        }
-
-        cJSON_AddItemToArray(results_array, item);
-    }
-    cJSON_AddItemToObject(root, "results", results_array);
-
-    char *json = cJSON_Print(root);
-    cJSON_Delete(root);
-
-    mg_printf(conn,
-              "HTTP/1.1 200 OK\r\n"
-              "Content-Type: application/json\r\n"
-              "Content-Length: %d\r\n"
-              "Access-Control-Allow-Origin: *\r\n"
-              "\r\n"
-              "%s",
-              (int)strlen(json), json);
-
-    free(json);
-    free_search_results(results, count);
-
-    return 200;
+    /* Build JSON response (shared with /browse) */
+    return send_json_results(conn, results, count, total_count, page);
 }
 
 /* --- Quoted search query parsing --- */
@@ -1344,8 +1696,12 @@ static int append_word_boundary_condition(char *buf, size_t bufsize, int *pos,
     return 4; /* number of bind params consumed */
 }
 
-/* Search torrents using FTS5, with support for quoted exact-word matching */
-int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {
+/* Search torrents using FTS5, with support for quoted exact-word matching.
+ * The optional stage-7 class filter rides along on the FTS rowid set: it only
+ * adds the torrent_class join when it actually restricts rows, so a plain
+ * search keeps its previous SQL and result set (see search_handler). */
+static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
+                                    int offset, search_result_t **results, int *count, int *total_count) {
     if (!db || !query || !results || !count || !total_count) {
         return -1;
     }
@@ -1374,6 +1730,14 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     char count_sql[4096];
     char main_sql[4096];
 
+    /* Stage 7: the class join goes into the count query only when the filter
+     * restricts rows, so a plain /search?q= keeps the legacy count query. The
+     * main query always joins the class row, because the JSON envelope reports
+     * its columns whenever the torrent has one. */
+    int class_join = class_filter_needs_join(filter);
+    char class_count_join[512];
+    char class_main_join[512];
+
     /* Lowercase versions of quoted terms for binding */
     char *quoted_lower[MAX_QUERY_PARTS];
     for (int qi = 0; qi < pq.num_quoted; qi++) {
@@ -1384,22 +1748,42 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     }
 
     if (!has_quoted) {
-        /* No quoted terms — original queries */
+        /* No quoted terms — original queries, plus the stage-7 class join.
+         * Bind indices: ?1 = torrent FTS, ?2 = file FTS, ?3/?4 = LIMIT/OFFSET,
+         * ?5... = class filter. */
+        class_count_join[0] = '\0';
+        int cpos = 0;
+        if (class_join) {
+            cpos = snprintf(class_count_join, sizeof(class_count_join),
+                            " JOIN torrent_class c ON c.torrent_id = t.id");
+            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 3);
+        }
+
+        cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
+                        class_join
+                            ? "JOIN torrent_class c ON c.torrent_id = t.id"
+                            : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
+        if (class_join) {
+            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 5);
+        }
+
         (void)snprintf(count_sql, sizeof(count_sql),
             "SELECT COUNT(DISTINCT t.id) "
-            "FROM torrents t "
+            "FROM torrents t%s "
             "WHERE t.id IN ("
             "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
             "    UNION"
             "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
             "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
-            ")");
+            ")", class_count_join);
 
         (void)snprintf(main_sql, sizeof(main_sql),
             "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-            "       t.added_timestamp, COUNT(f.id) as file_count "
+            "       t.added_timestamp, COUNT(f.id) as file_count, "
+            "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
             "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
+            "%s "
             "WHERE t.id IN ("
             "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
             "    UNION"
@@ -1408,7 +1792,7 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
             ") "
             "GROUP BY t.id "
             "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?3 OFFSET ?4");
+            "LIMIT ?3 OFFSET ?4", class_main_join);
     } else {
         /* Has quoted terms — build dynamic file_search subquery with word-boundary checks */
 
@@ -1441,20 +1825,42 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
         int limit_idx = bind_idx;
         int offset_idx = bind_idx + 1;
 
+        /* Stage 7: the class join binds after the quoted-term GLOB binds, so
+         * the count query numbers them from bind_idx and the main query from
+         * offset_idx + 1. SQLite binds by explicit index, so placeholders that
+         * do not appear in textual order are fine. */
+        class_count_join[0] = '\0';
+        int cpos = 0;
+        if (class_join) {
+            cpos = snprintf(class_count_join, sizeof(class_count_join),
+                            " JOIN torrent_class c ON c.torrent_id = t.id");
+            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, bind_idx);
+        }
+
+        cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
+                        class_join
+                            ? "JOIN torrent_class c ON c.torrent_id = t.id"
+                            : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
+        if (class_join) {
+            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, offset_idx + 1);
+        }
+
         (void)snprintf(count_sql, sizeof(count_sql),
             "SELECT COUNT(DISTINCT t.id) "
-            "FROM torrents t "
+            "FROM torrents t%s "
             "WHERE t.id IN ("
             "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
             "    UNION "
             "    %s"
-            ")", file_subquery);
+            ")", class_count_join, file_subquery);
 
         (void)snprintf(main_sql, sizeof(main_sql),
             "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-            "       t.added_timestamp, COUNT(f.id) as file_count "
+            "       t.added_timestamp, COUNT(f.id) as file_count, "
+            "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
             "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
+            "%s "
             "WHERE t.id IN ("
             "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
             "    UNION "
@@ -1462,7 +1868,7 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
             ") "
             "GROUP BY t.id "
             "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?%d OFFSET ?%d", file_subquery, limit_idx, offset_idx);
+            "LIMIT ?%d OFFSET ?%d", class_main_join, file_subquery, limit_idx, offset_idx);
     }
 
     /* Helper macro: bind quoted term GLOB params starting at bind_idx */
@@ -1493,6 +1899,9 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
     if (has_quoted) {
         BIND_QUOTED_GLOB_PARAMS(count_stmt, 3, pq, quoted_lower);
     }
+    if (class_join) {
+        bind_class_filter(count_stmt, has_quoted ? 3 + pq.num_quoted * 4 : 3, filter);
+    }
 
     if (sqlite3_step(count_stmt) == SQLITE_ROW) {
         *total_count = sqlite3_column_int(count_stmt, 0);
@@ -1512,6 +1921,7 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
 
     sqlite3_bind_text(stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, has_quoted ? pq.file_fts_query : query, -1, SQLITE_STATIC);
+    int class_main_bind = 5;  /* unquoted: ?3/?4 are LIMIT/OFFSET */
     if (!has_quoted) {
         sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
         sqlite3_bind_int(stmt, 4, offset);
@@ -1521,6 +1931,11 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
         int offset_idx = limit_idx + 1;
         sqlite3_bind_int(stmt, limit_idx, HTTP_API_MAX_RESULTS);
         sqlite3_bind_int(stmt, offset_idx, offset);
+        class_main_bind = offset_idx + 1;
+    }
+
+    if (class_join) {
+        bind_class_filter(stmt, class_main_bind, filter);
     }
 
     #undef BIND_QUOTED_GLOB_PARAMS
@@ -1545,32 +1960,26 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
         res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
         res[i].num_files = sqlite3_column_int(stmt, 5);
 
+        /* Stage 7: torrent_class columns 6..9, filled when the torrent has a
+         * class row. c.category is NOT NULL in the table, so it doubles as the
+         * "has a class row" flag; tv_kind and confidence are nullable. */
+        if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+            res[i].has_class = 1;
+            res[i].category = sqlite3_column_int(stmt, 6);
+            if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+                res[i].has_tv_kind = 1;
+                res[i].tv_kind = sqlite3_column_int(stmt, 7);
+            }
+            res[i].adult = sqlite3_column_int(stmt, 8);
+            if (sqlite3_column_type(stmt, 9) != SQLITE_NULL) {
+                res[i].has_confidence = 1;
+                res[i].confidence = sqlite3_column_double(stmt, 9);
+            }
+        }
+
         /* Get file listings for this torrent - reconstruct paths from prefix + filename */
         if (res[i].num_files > 0) {
-            const char *files_sql =
-                "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
-                "       tf.size_bytes "
-                "FROM torrent_files tf "
-                "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
-                "WHERE tf.torrent_id = (SELECT id FROM torrents WHERE info_hash = ?) "
-                "ORDER BY tf.file_index LIMIT 10";
-
-            sqlite3_stmt *files_stmt;
-            if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) == SQLITE_OK) {
-                sqlite3_bind_blob(files_stmt, 1, res[i].info_hash, 20, SQLITE_STATIC);
-
-                int file_count = 0;
-                res[i].file_paths = (char **)calloc(10, sizeof(char *));
-                res[i].file_sizes = (int64_t *)calloc(10, sizeof(int64_t));
-
-                while (sqlite3_step(files_stmt) == SQLITE_ROW && file_count < 10) {
-                    res[i].file_paths[file_count] = strdup((const char *)sqlite3_column_text(files_stmt, 0));
-                    res[i].file_sizes[file_count] = sqlite3_column_int64(files_stmt, 1);
-                    file_count++;
-                }
-
-                sqlite3_finalize(files_stmt);
-            }
+            fetch_result_files(db, &res[i]);
         }
 
         i++;
@@ -1588,6 +1997,11 @@ int search_torrents(database_t *db, const char *query, int offset, search_result
 
     log_msg(LOG_DEBUG, "Search found %d results (offset %d, total %d) for query: %s", i, offset, *total_count, query);
     return 0;
+}
+
+/* Legacy entry point without a class filter (see search_torrents_filtered). */
+int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {
+    return search_torrents_filtered(db, query, NULL, offset, results, count, total_count);
 }
 
 /* Free search results */
@@ -1616,6 +2030,170 @@ void free_search_results(search_result_t *results, int count) {
     }
 
     free(results);
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage 7: /browse — torrent_class-driven listing, no text query.
+ * ------------------------------------------------------------------------ */
+
+/* Run the /browse query. The row set is driven by torrent_class, so the common
+ * adult=hide + category (+ tv_kind) case is served by the partial index
+ * idx_class_cat instead of scanning torrents; each torrent row is then reached
+ * by its primary key. order_by is one of the fixed fragments chosen by
+ * browse_handler(). */
+static int browse_torrents(database_t *db, const cls_filter_t *filter, const char *order_by,
+                           int offset, search_result_t **results, int *count, int *total_count) {
+    if (!db || !filter || !order_by || !results || !count || !total_count) {
+        return -1;
+    }
+
+    *results = NULL;
+    *count = 0;
+    *total_count = 0;
+
+    /* "WHERE 1" plus the filter's " AND ..." fragments; the class binds come
+     * first, so LIMIT/OFFSET follow them. */
+    char count_sql[512];
+    char main_sql[1024];
+    int pos = snprintf(count_sql, sizeof(count_sql),
+                       "SELECT COUNT(*) FROM torrent_class c WHERE 1");
+    append_class_conditions(count_sql, sizeof(count_sql), &pos, filter, 1);
+
+    pos = snprintf(main_sql, sizeof(main_sql),
+        "SELECT t.info_hash, t.name, t.size_bytes, t.total_peers, t.added_timestamp, "
+        "       (SELECT COUNT(*) FROM torrent_files f WHERE f.torrent_id = t.id), "
+        "       c.category, c.tv_kind, c.adult, c.confidence "
+        "FROM torrent_class c "
+        "JOIN torrents t ON t.id = c.torrent_id "
+        "WHERE 1");
+    append_class_conditions(main_sql, sizeof(main_sql), &pos, filter, 1);
+    (void)snprintf(main_sql + pos, sizeof(main_sql) - pos,
+                   " ORDER BY %s LIMIT ?%d OFFSET ?%d",
+                   order_by, CLS_FILTER_MAX_BINDS + 1, CLS_FILTER_MAX_BINDS + 2);
+
+    database_read_lock(db);
+
+    sqlite3_stmt *count_stmt;
+    if (sqlite3_prepare_v2(db->db, count_sql, -1, &count_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare browse count query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
+        return -1;
+    }
+    bind_class_filter(count_stmt, 1, filter);
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+        *total_count = sqlite3_column_int(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, main_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare browse query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
+        return -1;
+    }
+    bind_class_filter(stmt, 1, filter);
+    sqlite3_bind_int(stmt, CLS_FILTER_MAX_BINDS + 1, HTTP_API_MAX_RESULTS);
+    sqlite3_bind_int(stmt, CLS_FILTER_MAX_BINDS + 2, offset);
+
+    search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
+    if (!res) {
+        sqlite3_finalize(stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    int i = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && i < HTTP_API_MAX_RESULTS) {
+        memcpy(res[i].info_hash, sqlite3_column_blob(stmt, 0), 20);
+        res[i].name = strdup((const char *)sqlite3_column_text(stmt, 1));
+        res[i].size_bytes = sqlite3_column_int64(stmt, 2);
+        res[i].total_peers = sqlite3_column_int(stmt, 3);
+        res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
+        res[i].num_files = sqlite3_column_int(stmt, 5);
+
+        /* Every row comes from torrent_class, so the class fields are always
+         * present here (tv_kind and confidence can still be NULL). */
+        res[i].has_class = 1;
+        res[i].category = sqlite3_column_int(stmt, 6);
+        if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+            res[i].has_tv_kind = 1;
+            res[i].tv_kind = sqlite3_column_int(stmt, 7);
+        }
+        res[i].adult = sqlite3_column_int(stmt, 8);
+        if (sqlite3_column_type(stmt, 9) != SQLITE_NULL) {
+            res[i].has_confidence = 1;
+            res[i].confidence = sqlite3_column_double(stmt, 9);
+        }
+
+        if (res[i].num_files > 0) {
+            fetch_result_files(db, &res[i]);
+        }
+
+        i++;
+    }
+
+    sqlite3_finalize(stmt);
+    database_read_unlock(db);
+
+    *results = res;
+    *count = i;
+
+    log_msg(LOG_DEBUG, "Browse returned %d results (offset %d, total %d)", i, offset, *total_count);
+    return 0;
+}
+
+/* /browse — no text query: the stage-7 filters (adult defaulting to hide), a
+ * sort key and the page number. Always answers with the /search JSON envelope;
+ * format=html is not implemented because the search results page renderer
+ * pages back through /search?q=… (stage 2 owns the UI). */
+static int browse_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+    const char *query_string = ri->query_string ? ri->query_string : "";
+    size_t qs_len = strlen(query_string);
+
+    cls_filter_t filter;
+    const char *bad_param = NULL;
+    if (parse_class_filter(query_string, &filter, &bad_param) != 0) {
+        char error_msg[96];
+        snprintf(error_msg, sizeof(error_msg), "Invalid value for '%s'", bad_param);
+        return send_json_error(conn, 400, error_msg);
+    }
+
+    /* sort: whitelisted to fixed ORDER BY fragments — no input is interpolated. */
+    char sort_buf[16] = {0};
+    mg_get_var(query_string, qs_len, "sort", sort_buf, sizeof(sort_buf));
+    const char *order_by;
+    if (sort_buf[0] == '\0' || strcmp(sort_buf, "peers") == 0) {
+        order_by = "t.total_peers DESC, t.added_timestamp DESC";
+    } else if (strcmp(sort_buf, "added") == 0) {
+        order_by = "t.added_timestamp DESC, t.id DESC";
+    } else if (strcmp(sort_buf, "size") == 0) {
+        order_by = "t.size_bytes DESC, t.id DESC";
+    } else {
+        return send_json_error(conn, 400, "Invalid value for 'sort'");
+    }
+
+    /* Page number (1-indexed, default 1), parsed like /search does. */
+    char page_buf[16] = {0};
+    mg_get_var(query_string, qs_len, "page", page_buf, sizeof(page_buf));
+    int page = 1;
+    if (strlen(page_buf) > 0) {
+        page = atoi(page_buf);
+        if (page < 1) page = 1;
+    }
+    int offset = (page - 1) * HTTP_API_MAX_RESULTS;
+
+    search_result_t *results = NULL;
+    int count = 0;
+    int total_count = 0;
+    if (browse_torrents(api->database, &filter, order_by, offset,
+                        &results, &count, &total_count) != 0) {
+        return send_json_error(conn, 500, "Database query failed");
+    }
+
+    log_msg(LOG_DEBUG, "Browse page %d (%d results, %d total)", page, count, total_count);
+    return send_json_results(conn, results, count, total_count, page);
 }
 
 /* Check if a torrent is primarily video content by examining its files.
@@ -1727,6 +2305,50 @@ static int has_tv_episode_pattern(const char *name) {
     return 0;
 }
 
+/* Stage 7: torrent_class probe for the random-* candidate loops. */
+#define RANDOM_CLASS_SQL "SELECT category, adult FROM torrent_class WHERE torrent_id = ?"
+
+/* Class-first candidate test for /random-tv, /random-movies and /random-music.
+ *
+ * A torrent that has a torrent_class row is judged by that row alone: adult
+ * rows are never eligible and the category has to be want_category. A torrent
+ * with no class row falls back to the pre-classifier heuristics (file-extension
+ * majority plus the SxxExx title pattern), so the endpoints keep serving a
+ * database the classifier never touched, and keep working while a backfill is
+ * only part-way through.
+ *
+ * class_stmt is RANDOM_CLASS_SQL, prepared once by the caller.
+ * CALLER must hold database_read_lock. */
+static int random_candidate_eligible(database_t *db, sqlite3_stmt *class_stmt,
+                                     int64_t torrent_id, const char *name,
+                                     int want_category) {
+    sqlite3_bind_int64(class_stmt, 1, torrent_id);
+
+    int classified = 0;
+    int category = 0;
+    int adult = 0;
+    if (sqlite3_step(class_stmt) == SQLITE_ROW) {
+        classified = 1;
+        category = sqlite3_column_int(class_stmt, 0);
+        adult = sqlite3_column_int(class_stmt, 1);
+    }
+    sqlite3_reset(class_stmt);
+
+    if (classified) {
+        return !adult && category == want_category;
+    }
+
+    /* No class row: legacy heuristics. */
+    if (want_category == CLS_CAT_MUSIC) {
+        return is_music_torrent(db, torrent_id);
+    }
+    if (!is_video_torrent(db, torrent_id)) {
+        return 0;
+    }
+    int is_tv = has_tv_episode_pattern(name);
+    return (want_category == CLS_CAT_TV) ? is_tv : !is_tv;
+}
+
 /* Get 100 random video torrents with exactly 50 peers, filtered to either TV
  * series (title has SxxExx) or movies (title does not). Uses random ID
  * sampling. */
@@ -1764,6 +2386,14 @@ static int get_random_video_torrents_filtered(database_t *db,
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (uintptr_t)&seed);
     srand(seed);
+
+    /* Stage 7: prepared once, probed per candidate by random_candidate_eligible(). */
+    sqlite3_stmt *class_stmt;
+    if (sqlite3_prepare_v2(db->db, RANDOM_CLASS_SQL, -1, &class_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare random class query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
+        return -1;
+    }
 
     /* Prepare statement to fetch torrent by ID with 50 peers */
     const char *torrent_sql =
@@ -1825,13 +2455,10 @@ static int get_random_video_torrents_filtered(database_t *db,
             }
 
             int passes_filter = 0;
-            if (!is_duplicate && is_video_torrent(db, torrent_id)) {
-                int is_tv = has_tv_episode_pattern(name);
-                if (filter == VIDEO_FILTER_TV) {
-                    passes_filter = is_tv;
-                } else {
-                    passes_filter = !is_tv;
-                }
+            if (!is_duplicate) {
+                passes_filter = random_candidate_eligible(
+                    db, class_stmt, torrent_id, name,
+                    filter == VIDEO_FILTER_TV ? CLS_CAT_TV : CLS_CAT_MOVIE);
             }
 
             if (passes_filter) {
@@ -1889,6 +2516,7 @@ static int get_random_video_torrents_filtered(database_t *db,
 
     sqlite3_finalize(torrent_stmt);
     sqlite3_finalize(file_count_stmt);
+    sqlite3_finalize(class_stmt);
 
     database_read_unlock(db);
 
@@ -1940,6 +2568,14 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (uintptr_t)&seed);
     srand(seed);
+
+    /* Stage 7: prepared once, probed per candidate by random_candidate_eligible(). */
+    sqlite3_stmt *class_stmt;
+    if (sqlite3_prepare_v2(db->db, RANDOM_CLASS_SQL, -1, &class_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare random class query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
+        return -1;
+    }
 
     /* Prepare statement to fetch torrent by ID with 50 peers */
     const char *torrent_sql =
@@ -1997,11 +2633,12 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
                 }
             }
 
-            if (!is_duplicate && is_music_torrent(db, torrent_id)) {
+            const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
+            if (!is_duplicate &&
+                random_candidate_eligible(db, class_stmt, torrent_id, name, CLS_CAT_MUSIC)) {
                 memcpy(res[found].info_hash, info_hash_blob, 20);
                 memcpy(found_hashes[found], info_hash_blob, 20);
 
-                const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
                 res[found].name = name ? strdup(name) : strdup("Unknown");
                 res[found].size_bytes = sqlite3_column_int64(torrent_stmt, 3);
                 res[found].total_peers = sqlite3_column_int(torrent_stmt, 4);
@@ -2052,6 +2689,7 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
 
     sqlite3_finalize(torrent_stmt);
     sqlite3_finalize(file_count_stmt);
+    sqlite3_finalize(class_stmt);
 
     database_read_unlock(db);
 
