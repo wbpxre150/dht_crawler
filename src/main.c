@@ -6,6 +6,7 @@
 #include "porn_filter_cleanup.h"
 #include "language_filter.h"
 #include "classifier.h"
+#include "classifier_backfill.h"
 #include "hard_block.h"
 #include "torrent_search.h"
 #include "config.h"
@@ -598,6 +599,13 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    /* Stage 8: the resumable backfill / re-classify job. Always on and ungated
+     * by config (it only ever repairs rows the ingest path left unlabelled or
+     * stale), low priority, and independent of the batch writer. A failed spawn
+     * is not fatal: the daemon keeps crawling and only logs. */
+    if (classifier_backfill_start(&g_database) != 0) {
+        log_msg(LOG_WARN, "Classifier backfill job not started");
+    }
     log_msg(LOG_DEBUG, "=== Starting Thread Tree Architecture ===");
     
     /* Create shared batch writer for all trees */
@@ -833,7 +841,10 @@ int main(int argc, char *argv[]) {
     batch_writer_inhibit_backup(g_batch_writer);
     supervisor_stop(g_supervisor);
     
-    log_msg(LOG_DEBUG, "Step 4: Flushing batch writer...");
+    log_msg(LOG_DEBUG, "Step 4: Stopping classifier backfill job...");
+    classifier_backfill_stop();
+
+    log_msg(LOG_DEBUG, "Step 5: Flushing batch writer...");
     batch_writer_flush(g_batch_writer);
     
     log_msg(LOG_DEBUG, "=== Thread tree shutdown complete, beginning cleanup ===");

@@ -468,6 +468,17 @@ int classifier_models_loaded(void) {
     return (clf.enabled && clf.adult_model) ? 1 : 0;
 }
 
+/* Set once by classifier_init() before any other thread exists, so it is read
+ * without the stats mutex like the fields classifier_models_loaded() uses. */
+int classifier_enabled(void) {
+    return clf.enabled ? 1 : 0;
+}
+
+/* clf.clf_ver is fixed once clf_load_manifest() ran (once, from init). */
+long long classifier_current_version(void) {
+    return clf.clf_ver;
+}
+
 void classifier_note_stored_adult(void) {
     pthread_mutex_lock(&clf.stats_mutex);
     clf.stats.adult_tagged++;
@@ -542,6 +553,16 @@ void classifier_init(const char *model_dir, double adult_hide_threshold) {
 /* No models exist in this flavour, so the keyword porn filter always stays
  * active as the fallback and every ingest-outcome counter stays zero. */
 int classifier_models_loaded(void) {
+    return 0;
+}
+
+/* This flavour never classifies: the backfill job reports available=false and
+ * stays idle. */
+int classifier_enabled(void) {
+    return 0;
+}
+
+long long classifier_current_version(void) {
     return 0;
 }
 

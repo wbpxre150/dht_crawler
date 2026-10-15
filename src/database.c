@@ -163,6 +163,23 @@ void database_read_unlock(database_t *db) {
     if (db) pthread_rwlock_unlock(&db->checkpoint_rwlock);
 }
 
+/*
+ * The connection's write mutex: one writer at a time on the shared sqlite3
+ * handle. database_insert_batch() and database_wal_checkpoint() take it
+ * internally, so a caller that opens its own BEGIN..COMMIT (stage 8's
+ * backfill) must hold it for the whole transaction - and must not call
+ * database_wal_checkpoint() before releasing it (that would self-deadlock on
+ * the non-recursive mutex).
+ */
+void database_write_lock(database_t *db) {
+    if (db) uv_mutex_lock(&db->mutex);
+}
+
+/* Release the connection write mutex */
+void database_write_unlock(database_t *db) {
+    if (db) uv_mutex_unlock(&db->mutex);
+}
+
 /* Set bloom filter for tracking successful writes */
 void database_set_bloom(database_t *db, bloom_filter_t *bloom) {
     if (!db) {
