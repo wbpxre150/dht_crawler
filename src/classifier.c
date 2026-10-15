@@ -224,27 +224,38 @@ static ftc_model_t *clf_load_model(const char *name, const char *expected_sha) {
 
     if (!clf.manifest_ok || expected_sha[0] == '\0') {
         log_msg(LOG_WARN, "Classifier: %s not loaded (no verified manifest entry); parser-only", path);
+        /* Counted under the stats mutex like every other stats mutation: the
+         * lazy tv_kind load below runs clf_load_model() on a tree-worker thread
+         * while other workers are updating clf.stats concurrently. */
+        pthread_mutex_lock(&clf.stats_mutex);
         clf.stats.model_load_failures++;
+        pthread_mutex_unlock(&clf.stats_mutex);
         return NULL;
     }
 
     char actual_sha[CLF_SHA_HEX_LEN + 1];
     if (clf_sha256_file(path, actual_sha) != 0) {
         log_msg(LOG_WARN, "Classifier: %s unreadable; parser-only for it", path);
+        pthread_mutex_lock(&clf.stats_mutex);
         clf.stats.model_load_failures++;
+        pthread_mutex_unlock(&clf.stats_mutex);
         return NULL;
     }
     if (strcmp(actual_sha, expected_sha) != 0) {
         log_msg(LOG_WARN, "Classifier: %s sha256 mismatch (manifest %.16s.., file %.16s..); not loading",
                 path, expected_sha, actual_sha);
+        pthread_mutex_lock(&clf.stats_mutex);
         clf.stats.model_load_failures++;
+        pthread_mutex_unlock(&clf.stats_mutex);
         return NULL;
     }
 
     ftc_model_t *model = ftc_load(path);
     if (!model) {
         log_msg(LOG_WARN, "Classifier: %s failed to load; parser-only for it", path);
+        pthread_mutex_lock(&clf.stats_mutex);
         clf.stats.model_load_failures++;
+        pthread_mutex_unlock(&clf.stats_mutex);
         return NULL;
     }
 

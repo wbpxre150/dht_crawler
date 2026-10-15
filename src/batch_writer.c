@@ -716,6 +716,12 @@ static void do_backup(batch_writer_t *writer) {
         "  ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
         "CREATE INDEX IF NOT EXISTS idx_class_ver"
         "  ON torrent_class(clf_ver);"
+        /* classifier_meta carries the ~5 provenance rows (clf_ver, the three
+         * model sha256s, the hide threshold) that say which classifier produced
+         * the torrent_class rows above; a restored backup without them can no
+         * longer be told apart from a parser-only run. */
+        "CREATE TABLE IF NOT EXISTS classifier_meta ("
+        "  key TEXT PRIMARY KEY, value TEXT);"
         "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_search USING fts5("
         "  name, tokenize='porter unicode61',"
         "  content='torrents', content_rowid='id');"
@@ -762,6 +768,10 @@ static void do_backup(batch_writer_t *writer) {
         "INSERT OR IGNORE INTO torrent_class"
         "  SELECT * FROM src.torrent_class"
         "  WHERE torrent_id > (SELECT COALESCE(MAX(torrent_id), 0) FROM torrent_class);"
+        /* classifier_meta is tiny and keyed by name, and classifier_write_meta()
+         * rewrites its rows in place, so it has no row-id watermark: REPLACE the
+         * whole (5-row) table to keep the backup's provenance current. */
+        "INSERT OR REPLACE INTO classifier_meta SELECT * FROM src.classifier_meta;"
         "COMMIT;",
         NULL, NULL, &err);
     if (rc != SQLITE_OK) {
