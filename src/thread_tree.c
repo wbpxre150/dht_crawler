@@ -1023,15 +1023,18 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->discovery_paused, false);
     pthread_mutex_init(&tree->throttle_lock, NULL);
     pthread_cond_init(&tree->throttle_resume, NULL);
-    tree->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
-    tree->infohash_resume_threshold = config->infohash_resume_threshold > 0 ? config->infohash_resume_threshold : 1000;
+    /* Throttle thresholds are derived from queue capacity:
+     * pause discovery at 90% of the infohash queue, resume at 33%. */
+    tree->infohash_pause_threshold = (tree->infohash_queue_capacity * 90) / 100;
+    tree->infohash_resume_threshold = (tree->infohash_queue_capacity * 33) / 100;
 
     /* Initialize get_peers throttling */
     atomic_store(&tree->get_peers_paused, false);
     pthread_mutex_init(&tree->get_peers_throttle_lock, NULL);
     pthread_cond_init(&tree->get_peers_throttle_resume, NULL);
-    tree->peers_pause_threshold = config->peers_pause_threshold > 0 ? config->peers_pause_threshold : 2000;
-    tree->peers_resume_threshold = config->peers_resume_threshold > 0 ? config->peers_resume_threshold : 1000;
+    /* Pause get_peers at 90% of the peers queue, resume at 33%. */
+    tree->peers_pause_threshold = (tree->peers_queue_capacity * 90) / 100;
+    tree->peers_resume_threshold = (tree->peers_queue_capacity * 33) / 100;
 
     /* Initialize statistics */
     atomic_store(&tree->metadata_count, 0);

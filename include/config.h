@@ -119,15 +119,6 @@ typedef struct {
     int tree_get_peers_workers;          /* get_peers workers per tree (default: 500) */
     int tree_peers_queue_capacity;       /* Peers queue size per tree (default: 2000) */
     int tree_get_peers_timeout_ms;       /* get_peers response timeout (default: 3000) */
-
-    /* Find_node throttling settings */
-    int tree_infohash_pause_threshold;   /* Queue size to pause find_node workers (default: 2000) */
-    int tree_infohash_resume_threshold;  /* Queue size to resume find_node workers (default: 1000) */
-
-    /* Get_peers throttling settings */
-    int tree_peers_pause_threshold;      /* Peers queue size to pause get_peers workers (default: 2000) */
-    int tree_peers_resume_threshold;     /* Peers queue size to resume get_peers workers (default: 1000) */
-
     /* Thread tree Stage 5 settings (metadata) */
     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */

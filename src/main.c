@@ -662,12 +662,6 @@ int main(int argc, char *argv[]) {
         /* Stage 4 settings (get_peers) */
         .peers_queue_capacity = config.tree_peers_queue_capacity,
         .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,
-        /* Find_node throttling settings */
-        .infohash_pause_threshold = config.tree_infohash_pause_threshold,
-        .infohash_resume_threshold = config.tree_infohash_resume_threshold,
-        /* Get_peers throttling settings */
-        .peers_pause_threshold = config.tree_peers_pause_threshold,
-        .peers_resume_threshold = config.tree_peers_resume_threshold,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
         .parallel_peers = config.tree_parallel_peers,

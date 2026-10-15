@@ -74,15 +74,6 @@ typedef struct supervisor_config {
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
     int get_peers_timeout_ms;       /* get_peers timeout (default: 3000) */
-
-    /* Find_node throttling settings */
-    int infohash_pause_threshold;   /* Queue size to pause find_node (default: 2000) */
-    int infohash_resume_threshold;  /* Queue size to resume find_node (default: 1000) */
-
-    /* Get_peers throttling settings */
-    int peers_pause_threshold;      /* Peers queue size to pause get_peers (default: 2000) */
-    int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
-
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;
@@ -170,15 +161,6 @@ typedef struct supervisor {
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;
     int get_peers_timeout_ms;
-
-    /* Find_node throttling settings */
-    int infohash_pause_threshold;
-    int infohash_resume_threshold;
-
-    /* Get_peers throttling settings */
-    int peers_pause_threshold;
-    int peers_resume_threshold;
-
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;

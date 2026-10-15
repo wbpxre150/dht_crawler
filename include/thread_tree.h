@@ -75,14 +75,6 @@ typedef struct tree_config {
     int peers_queue_capacity;       /* Peers queue size (default: 2000) */
     int get_peers_timeout_ms;       /* Get_peers response timeout (default: 3000) */
 
-    /* Find_node throttling settings */
-    int infohash_pause_threshold;   /* Queue size to pause find_node (default: 2000) */
-    int infohash_resume_threshold;  /* Queue size to resume find_node (default: 1000) */
-
-    /* Get_peers throttling settings */
-    int peers_pause_threshold;      /* Peers queue size to pause get_peers (default: 2000) */
-    int peers_resume_threshold;     /* Peers queue size to resume get_peers (default: 1000) */
-
     /* Stage 5: Metadata fetcher settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
     int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
@@ -166,15 +158,15 @@ typedef struct thread_tree {
     atomic_bool discovery_paused;           /* Signal to pause discovery workers (find_node + BEP51) */
     pthread_mutex_t throttle_lock;          /* Protects throttle state changes */
     pthread_cond_t throttle_resume;         /* Condition variable for resuming workers */
-    int infohash_pause_threshold;           /* Queue size to pause (default: 2000) */
-    int infohash_resume_threshold;          /* Queue size to resume (default: 1000) */
+    int infohash_pause_threshold;           /* Derived: pause discovery at 90% of infohash_queue_capacity */
+    int infohash_resume_threshold;          /* Derived: resume discovery at 33% of infohash_queue_capacity */
 
     /* Get_peers throttling state (separate from discovery throttling) */
     atomic_bool get_peers_paused;           /* Signal to pause get_peers workers */
     pthread_mutex_t get_peers_throttle_lock;/* Protects get_peers throttle state */
     pthread_cond_t get_peers_throttle_resume; /* Condition variable for resuming get_peers */
-    int peers_pause_threshold;              /* Peers queue size to pause (default: 2000) */
-    int peers_resume_threshold;             /* Peers queue size to resume (default: 1000) */
+    int peers_pause_threshold;              /* Derived: pause get_peers at 90% of peers_queue_capacity */
+    int peers_resume_threshold;             /* Derived: resume get_peers at 33% of peers_queue_capacity */
 
     /* Thread handles */
     pthread_t bootstrap_thread;

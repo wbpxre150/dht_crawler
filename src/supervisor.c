@@ -102,15 +102,6 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Stage 4 settings (get_peers) */
     sup->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
     sup->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 3000;
-
-    /* Find_node throttling settings */
-    sup->infohash_pause_threshold = config->infohash_pause_threshold > 0 ? config->infohash_pause_threshold : 2000;
-    sup->infohash_resume_threshold = config->infohash_resume_threshold > 0 ? config->infohash_resume_threshold : 1000;
-
-    /* Get_peers throttling settings */
-    sup->peers_pause_threshold = config->peers_pause_threshold > 0 ? config->peers_pause_threshold : 2000;
-    sup->peers_resume_threshold = config->peers_resume_threshold > 0 ? config->peers_resume_threshold : 1000;
-
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
@@ -483,12 +474,6 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Stage 4 settings */
         .peers_queue_capacity = sup->peers_queue_capacity,
         .get_peers_timeout_ms = sup->get_peers_timeout_ms,
-        /* Find_node throttling settings */
-        .infohash_pause_threshold = sup->infohash_pause_threshold,
-        .infohash_resume_threshold = sup->infohash_resume_threshold,
-        /* Get_peers throttling settings */
-        .peers_pause_threshold = sup->peers_pause_threshold,
-        .peers_resume_threshold = sup->peers_resume_threshold,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
         .parallel_peers = sup->parallel_peers,
