@@ -15,7 +15,7 @@ void config_init_defaults(crawler_config_t *config) {
     
     /* DHT defaults */
     config->dht_port = 6881;
-    config->udp_rate_limit_pps = 1500;              /* Outbound DHT UDP packets/sec (0=disabled) */
+    config->udp_rate_limit_pps = 2500;              /* Outbound DHT UDP packets/sec (0=disabled) */
 
     /* Database defaults */
     strncpy(config->db_path, "data/torrents.db", sizeof(config->db_path) - 1);

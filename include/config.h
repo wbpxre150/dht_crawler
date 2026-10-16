@@ -30,7 +30,7 @@ typedef struct {
     int dht_port;
 
     /* Process-wide UDP send rate limiting (Stage 2) */
-    int udp_rate_limit_pps;  /* Outbound DHT UDP packets/sec (0=disabled, else 100-20000; default: 1500) */
+    int udp_rate_limit_pps;  /* Outbound DHT UDP packets/sec (0=disabled, else 100-20000; default: 2500) */
 
     /* Database settings */
     char db_path[512];
