@@ -680,9 +680,9 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
             /* Send get_peers query */
             tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
 
-            /* Wait for response on personal queue (500ms timeout, increased from 100ms) */
+            /* Wait for response on personal queue (config: tree_get_peers_timeout_ms, default 1500ms) */
             tree_response_t response_pkt;
-            int pop_result = tree_response_queue_pop(rsp_queue, &response_pkt, 500);
+            int pop_result = tree_response_queue_pop(rsp_queue, &response_pkt, tree->get_peers_timeout_ms);
 
             /* Unregister TID immediately after receiving (or timeout) */
             tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
@@ -1014,7 +1014,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Stage 4 config */
     tree->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
-    tree->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 3000;
+    tree->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 1500;
 
     /* Stage 5 config */
     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;

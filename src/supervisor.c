@@ -101,7 +101,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Stage 4 settings (get_peers) */
     sup->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
-    sup->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 3000;
+    sup->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 1500;
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;

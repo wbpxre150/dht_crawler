@@ -106,7 +106,7 @@ void config_init_defaults(crawler_config_t *config) {
     /* Thread tree Stage 4 defaults (get_peers) */
     config->tree_get_peers_workers = 8;             /* 8 get_peers workers per tree */
     config->tree_peers_queue_capacity = 2000;       /* 2000 peers queue capacity */
-    config->tree_get_peers_timeout_ms = 3000;       /* 3 second get_peers timeout */
+    config->tree_get_peers_timeout_ms = 1500;       /* 1.5s get_peers timeout */
 
     /* Thread tree Stage 5 defaults (metadata) */
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */

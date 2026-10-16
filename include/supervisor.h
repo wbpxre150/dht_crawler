@@ -73,7 +73,7 @@ typedef struct supervisor_config {
 
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
-    int get_peers_timeout_ms;       /* get_peers timeout (default: 3000) */
+    int get_peers_timeout_ms;       /* get_peers timeout (default: 1500) */
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;
