@@ -15,6 +15,7 @@ void config_init_defaults(crawler_config_t *config) {
     
     /* DHT defaults */
     config->dht_port = 6881;
+    config->udp_rate_limit_pps = 1500;              /* Outbound DHT UDP packets/sec (0=disabled) */
 
     /* Database defaults */
     strncpy(config->db_path, "data/torrents.db", sizeof(config->db_path) - 1);
@@ -103,7 +104,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_bep51_query_interval_ms = 10;      /* 10ms between BEP51 queries */
 
     /* Thread tree Stage 4 defaults (get_peers) */
-    config->tree_get_peers_workers = 500;           /* 500 get_peers workers per tree */
+    config->tree_get_peers_workers = 8;             /* 8 get_peers workers per tree */
     config->tree_peers_queue_capacity = 2000;       /* 2000 peers queue capacity */
     config->tree_get_peers_timeout_ms = 3000;       /* 3 second get_peers timeout */
 
@@ -234,6 +235,14 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->nice_level = atoi(value);
             if (config->nice_level < -20) config->nice_level = -20;
             if (config->nice_level > 19) config->nice_level = 19;
+        }
+        /* UDP send rate limiting (Stage 2) */
+        else if (strcmp(key, "udp_rate_limit_pps") == 0) {
+            config->udp_rate_limit_pps = atoi(value);
+            if (config->udp_rate_limit_pps != 0) {
+                if (config->udp_rate_limit_pps < 100) config->udp_rate_limit_pps = 100;
+                if (config->udp_rate_limit_pps > 20000) config->udp_rate_limit_pps = 20000;
+            }
         }
         /* Phase 2: Bloom Filter settings */
         else if (strcmp(key, "bloom_enabled") == 0) {

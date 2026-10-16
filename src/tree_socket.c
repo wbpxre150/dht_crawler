@@ -1,5 +1,6 @@
 #include "tree_socket.h"
 #include "dht_crawler.h"
+#include "udp_rate_limit.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -152,6 +153,9 @@ int tree_socket_send(tree_socket_t *sock, const void *data, size_t len,
                 (void*)sock, data, (void*)dest);
         return -1;
     }
+    /* Process-wide UDP send rate limit. Must run BEFORE taking send_lock:
+     * acquire() may block, and send_lock is a non-recursive mutex. */
+    udp_rate_limit_acquire();
 
     pthread_mutex_lock(&sock->send_lock);
 

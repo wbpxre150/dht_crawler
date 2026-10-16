@@ -9,6 +9,7 @@
 #include "classifier_backfill.h"
 #include "torrent_search.h"
 #include "supervisor.h"
+#include "udp_rate_limit.h"
 #include "thread_tree.h"
 #include "bep51_cache.h"
 #include "http_torrent_page.h"
@@ -966,6 +967,10 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     cJSON_AddNumberToObject(root, "files_indexed", file_count);
     cJSON_AddNumberToObject(root, "torrents_last_hour", (double)hourly_count);
     cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+    /* Outbound UDP rate limiting (Stage 2) */
+    cJSON_AddNumberToObject(root, "udp_rate_limit_pps", (double)udp_rate_limit_pps());
+    cJSON_AddNumberToObject(root, "udp_sends_total", (double)udp_rate_limit_sends_total());
+    cJSON_AddNumberToObject(root, "udp_throttled_sends_total", (double)udp_rate_limit_throttled_total());
 
     /* Calculate and format uptime */
     time_t uptime_seconds = time(NULL) - api->app_ctx->start_time;

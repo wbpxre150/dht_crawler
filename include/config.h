@@ -29,6 +29,9 @@ typedef struct {
     /* DHT settings */
     int dht_port;
 
+    /* Process-wide UDP send rate limiting (Stage 2) */
+    int udp_rate_limit_pps;  /* Outbound DHT UDP packets/sec (0=disabled, else 100-20000; default: 1500) */
+
     /* Database settings */
     char db_path[512];
 
@@ -116,7 +119,7 @@ typedef struct {
     int tree_bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 10) */
 
     /* Thread tree Stage 4 settings (get_peers) */
-    int tree_get_peers_workers;          /* get_peers workers per tree (default: 500) */
+    int tree_get_peers_workers;          /* get_peers workers per tree (default: 8) */
     int tree_peers_queue_capacity;       /* Peers queue size per tree (default: 2000) */
     int tree_get_peers_timeout_ms;       /* get_peers response timeout (default: 3000) */
     /* Thread tree Stage 5 settings (metadata) */

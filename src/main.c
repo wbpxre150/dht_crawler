@@ -10,6 +10,7 @@
 #include "hard_block.h"
 #include "torrent_search.h"
 #include "config.h"
+#include "udp_rate_limit.h"
 #include "supervisor.h"
 #include "batch_writer.h"
 #include "refresh_thread.h"
@@ -260,6 +261,9 @@ int main(int argc, char *argv[]) {
      * "data/torrents.db", preserving the previous default behaviour. */
     g_app_ctx.db_path = config.db_path;
     log_msg(LOG_DEBUG, "Using database path: %s", g_app_ctx.db_path);
+    /* Configure the process-wide UDP send rate limiter before any thread
+     * that sends DHT UDP packets (trees, refresh thread) is spawned. */
+    udp_rate_limit_init((uint32_t)config.udp_rate_limit_pps);
 
     /* Apply the process nice level before any thread is spawned so that
      * every thread in the process inherits it. */
@@ -828,6 +832,9 @@ int main(int argc, char *argv[]) {
     
     /* Graceful shutdown sequence for thread tree mode */
     log_msg(LOG_DEBUG, "=== Beginning thread tree shutdown sequence ===");
+    /* Release any thread blocked in udp_rate_limit_acquire() so shutdown
+     * cannot deadlock waiting for a token. */
+    udp_rate_limit_shutdown();
     
     log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
     http_api_stop(&g_http_api);
