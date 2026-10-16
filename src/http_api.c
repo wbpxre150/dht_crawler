@@ -112,6 +112,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata);
 static int stats_handler(struct mg_connection *conn, void *cbdata);
 static int refresh_handler(struct mg_connection *conn, void *cbdata);
 static int random_handler(struct mg_connection *conn, void *cbdata);
+static int random_sample_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
@@ -654,6 +655,7 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/stats", stats_handler, api);
     mg_set_request_handler(api->mg_ctx, "/refresh", refresh_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random",        random_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/random-sample", random_sample_handler, api);
     mg_set_request_handler(api->mg_ctx, "/torrent/files", http_torrent_files_handler, api);
     mg_set_request_handler(api->mg_ctx, "/torrent/info", http_torrent_info_handler, api);
 
@@ -3520,6 +3522,352 @@ static int get_random_torrents(database_t *db, const cls_filter_t *filter,
     *count = found;
 
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage 10: read-only /random-sample audit endpoint.
+ *
+ * Serves uniformly sampled torrents that carry a torrent_class row at the
+ * requested clf_ver, for a teacher-vs-student accuracy audit run off-box. It
+ * is strictly read-only (no bloom/DB writes) and dedups only within a single
+ * response; re-rolling across calls is the client's job.
+ *
+ * Unlike the /random-* endpoints above it has NO heuristic fallback: a
+ * candidate with no class row, or a row at a different clf_ver, is rejected.
+ * ------------------------------------------------------------------------ */
+
+/* One sampled torrent plus its student verdict and (up to) 20 file paths. */
+typedef struct {
+    int64_t id;
+    uint8_t info_hash[20];
+    char *name;
+    int category;
+    int has_tv_kind;
+    int tv_kind;
+    int adult;
+    int has_confidence;
+    double confidence;
+    char *files[20];
+    int file_count;
+} sample_item_t;
+
+static void free_sample_items(sample_item_t *items, int count) {
+    if (!items) return;
+    for (int i = 0; i < count; i++) {
+        free(items[i].name);
+        for (int j = 0; j < items[i].file_count; j++) {
+            free(items[i].files[j]);
+        }
+    }
+    free(items);
+}
+
+/* Resolve the "current" clf_ver grad: classifier_meta['clf_ver'] is what the
+ * classifier wrote when it produced the DB and is present in a classified DB
+ * copy even when this host has no model manifest loaded. Fall back to the
+ * in-memory manifest version, then to the newest version present in
+ * torrent_class. Returns 0 when the database has no classified data at all. */
+static long long resolve_current_clf_ver(database_t *db) {
+    long long ver = 0;
+
+    database_read_lock(db);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db->db, "SELECT value FROM classifier_meta WHERE key = 'clf_ver'",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *v = sqlite3_column_text(stmt, 0);
+            if (v) ver = atoll((const char *)v);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    if (ver <= 0) {
+        stmt = NULL;
+        if (sqlite3_prepare_v2(db->db, "SELECT MAX(clf_ver) FROM torrent_class",
+                               -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW &&
+                sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+                ver = sqlite3_column_int64(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    database_read_unlock(db);
+
+    if (ver <= 0) {
+        ver = classifier_current_version();
+    }
+    return ver;
+}
+
+/* Uniform random-rowid sampling, mirroring get_random_music_torrents() but
+ * requiring a torrent_class row at exactly want_ver. Allocates *out_items with
+ * room for count entries and sets *out_count to the number actually found
+ * (<= count). Returns 0 on success (including a short/empty sample), -1 on a
+ * database error. */
+static int get_random_sample(database_t *db, long long want_ver, int count,
+                             sample_item_t **out_items, int *out_count) {
+    *out_items = NULL;
+    *out_count = 0;
+
+    database_read_lock(db);
+
+    int64_t max_id = 0;
+    sqlite3_stmt *max_stmt = NULL;
+    if (sqlite3_prepare_v2(db->db, "SELECT MAX(id) FROM torrents", -1, &max_stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(max_stmt) == SQLITE_ROW) {
+            max_id = sqlite3_column_int64(max_stmt, 0);
+        }
+        sqlite3_finalize(max_stmt);
+    }
+
+    if (max_id == 0) {
+        log_msg(LOG_DEBUG, "Random sample query: no torrents in database");
+        database_read_unlock(db);
+        return 0;
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (uintptr_t)&seed);
+    srand(seed);
+
+    const char *torrent_sql = "SELECT id, info_hash, name FROM torrents WHERE id = ?";
+    const char *class_sql =
+        "SELECT category, tv_kind, adult, confidence, clf_ver FROM torrent_class WHERE torrent_id = ?";
+    const char *files_sql =
+        "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) "
+        "FROM torrent_files tf "
+        "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+        "WHERE tf.torrent_id = ? ORDER BY tf.file_index LIMIT 20";
+
+    sqlite3_stmt *torrent_stmt = NULL;
+    sqlite3_stmt *class_stmt = NULL;
+    sqlite3_stmt *files_stmt = NULL;
+    if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db->db, class_sql, -1, &class_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare random-sample queries: %s", sqlite3_errmsg(db->db));
+        if (torrent_stmt) sqlite3_finalize(torrent_stmt);
+        if (class_stmt) sqlite3_finalize(class_stmt);
+        if (files_stmt) sqlite3_finalize(files_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    sample_item_t *items = (sample_item_t *)calloc((size_t)count, sizeof(sample_item_t));
+    int64_t *found_ids = (int64_t *)calloc((size_t)count, sizeof(int64_t));
+    if (!items || !found_ids) {
+        free(items);
+        free(found_ids);
+        sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(class_stmt);
+        sqlite3_finalize(files_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    int found = 0;
+    int attempts = 0;
+    const int max_attempts = 50000; /* Safety limit, same bound as the /random-* endpoints. */
+
+    while (found < count && attempts < max_attempts) {
+        attempts++;
+
+        int64_t random_id = ((int64_t)rand() * rand()) % max_id + 1;
+
+        int is_duplicate = 0;
+        for (int j = 0; j < found; j++) {
+            if (found_ids[j] == random_id) {
+                is_duplicate = 1;
+                break;
+            }
+        }
+        if (is_duplicate) continue;
+
+        sqlite3_bind_int64(torrent_stmt, 1, random_id);
+        if (sqlite3_step(torrent_stmt) != SQLITE_ROW) {
+            sqlite3_reset(torrent_stmt);
+            continue;
+        }
+
+        int64_t torrent_id = sqlite3_column_int64(torrent_stmt, 0);
+        const void *info_hash_blob = sqlite3_column_blob(torrent_stmt, 1);
+        int info_hash_len = sqlite3_column_bytes(torrent_stmt, 1);
+        const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
+
+        /* Require a torrent_class row at exactly want_ver; no fallback. */
+        sqlite3_bind_int64(class_stmt, 1, torrent_id);
+        int ok = 0;
+        int category = 0, tv_kind = 0, has_tv_kind = 0, adult = 0, has_confidence = 0;
+        double confidence = 0.0;
+        if (sqlite3_step(class_stmt) == SQLITE_ROW) {
+            long long row_ver = sqlite3_column_int64(class_stmt, 4);
+            if (row_ver == want_ver) {
+                ok = 1;
+                category = sqlite3_column_int(class_stmt, 0);
+                if (sqlite3_column_type(class_stmt, 1) != SQLITE_NULL) {
+                    has_tv_kind = 1;
+                    tv_kind = sqlite3_column_int(class_stmt, 1);
+                }
+                adult = sqlite3_column_int(class_stmt, 2);
+                if (sqlite3_column_type(class_stmt, 3) != SQLITE_NULL) {
+                    has_confidence = 1;
+                    confidence = sqlite3_column_double(class_stmt, 3);
+                }
+            }
+        }
+        sqlite3_reset(class_stmt);
+
+        if (!ok || info_hash_len != 20 || !info_hash_blob) {
+            sqlite3_reset(torrent_stmt);
+            continue;
+        }
+
+        sample_item_t *it = &items[found];
+        it->id = torrent_id;
+        memcpy(it->info_hash, info_hash_blob, 20);
+        it->name = strdup(name ? name : "");
+        it->category = category;
+        it->has_tv_kind = has_tv_kind;
+        it->tv_kind = tv_kind;
+        it->adult = adult;
+        it->has_confidence = has_confidence;
+        it->confidence = confidence;
+
+        sqlite3_bind_int64(files_stmt, 1, torrent_id);
+        while (sqlite3_step(files_stmt) == SQLITE_ROW && it->file_count < 20) {
+            const unsigned char *path = sqlite3_column_text(files_stmt, 0);
+            it->files[it->file_count] = strdup(path ? (const char *)path : "");
+            it->file_count++;
+        }
+        sqlite3_reset(files_stmt);
+
+        found_ids[found] = random_id;
+        found++;
+        sqlite3_reset(torrent_stmt);
+    }
+
+    sqlite3_finalize(torrent_stmt);
+    sqlite3_finalize(class_stmt);
+    sqlite3_finalize(files_stmt);
+    free(found_ids);
+
+    database_read_unlock(db);
+
+    *out_items = items;
+    *out_count = found;
+
+    log_msg(LOG_DEBUG, "Random sample (clf_ver=%lld) returned %d results after %d attempts",
+            want_ver, found, attempts);
+    return 0;
+}
+
+/* GET /random-sample?count=N&clf_ver=V — read-only JSON audit sampler. */
+static int random_sample_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+    const char *qs = ri->query_string ? ri->query_string : "";
+
+    /* count: default 20, clamped to 1..500; a non-numeric value is a 400. */
+    char count_buf[32] = {0};
+    int count = 20;
+    if (mg_get_var(qs, strlen(qs), "count", count_buf, sizeof(count_buf)) > 0) {
+        char *end = NULL;
+        long v = strtol(count_buf, &end, 10);
+        if (end == count_buf || !end || *end != '\0') {
+            return send_json_error(conn, 400, "Invalid value for 'count'");
+        }
+        if (v < 1) v = 1;
+        if (v > 500) v = 500;
+        count = (int)v;
+    }
+
+    /* clf_ver: a positive integer, or omitted / "current" for the latest. */
+    char ver_buf[32] = {0};
+    long long clf_ver = 0;
+    int ver_supplied = mg_get_var(qs, strlen(qs), "clf_ver", ver_buf, sizeof(ver_buf)) > 0;
+    if (ver_supplied && strcmp(ver_buf, "current") != 0) {
+        char *end = NULL;
+        long long v = strtoll(ver_buf, &end, 10);
+        if (end == ver_buf || !end || *end != '\0' || v <= 0) {
+            return send_json_error(conn, 400, "Invalid value for 'clf_ver'");
+        }
+        clf_ver = v;
+    } else {
+        clf_ver = resolve_current_clf_ver(api->database);
+        if (clf_ver <= 0) {
+            return send_json_error(conn, 400, "No classified data available");
+        }
+    }
+
+    sample_item_t *items = NULL;
+    int found = 0;
+    if (get_random_sample(api->database, clf_ver, count, &items, &found) != 0) {
+        return send_json_error(conn, 500, "Database query failed");
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "clf_ver", (double)clf_ver);
+    cJSON_AddNumberToObject(root, "count", found);
+
+    cJSON *items_array = cJSON_CreateArray();
+    for (int i = 0; i < found; i++) {
+        sample_item_t *it = &items[i];
+        cJSON *item = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(item, "id", (double)it->id);
+
+        char hex[41];
+        format_hex(it->info_hash, 20, hex);
+        cJSON_AddStringToObject(item, "infohash", hex);
+        cJSON_AddStringToObject(item, "name", it->name ? it->name : "");
+
+        cJSON *files_array = cJSON_CreateArray();
+        for (int j = 0; j < it->file_count; j++) {
+            cJSON_AddItemToArray(files_array, cJSON_CreateString(it->files[j] ? it->files[j] : ""));
+        }
+        cJSON_AddItemToObject(item, "files", files_array);
+
+        cJSON *student = cJSON_CreateObject();
+        cJSON_AddStringToObject(student, "category", classifier_category_name(it->category));
+        cJSON_AddNumberToObject(student, "adult", it->adult);
+        const char *tv_kind = it->has_tv_kind ? class_tv_kind_name(it->tv_kind) : NULL;
+        if (tv_kind) {
+            cJSON_AddStringToObject(student, "tv_kind", tv_kind);
+        } else {
+            cJSON_AddNullToObject(student, "tv_kind");
+        }
+        if (it->has_confidence) {
+            cJSON_AddNumberToObject(student, "confidence", it->confidence);
+        } else {
+            cJSON_AddNullToObject(student, "confidence");
+        }
+        cJSON_AddItemToObject(item, "student", student);
+
+        cJSON_AddItemToArray(items_array, item);
+    }
+    cJSON_AddItemToObject(root, "items", items_array);
+
+    char *json = cJSON_Print(root);
+    cJSON_Delete(root);
+    free_sample_items(items, found);
+
+    if (!json) {
+        return send_json_error(conn, 500, "Failed to serialize response");
+    }
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %d\r\n"
+              "\r\n"
+              "%s",
+              (int)strlen(json), json);
+    free(json);
+    return 200;
 }
 
 /* URL decode helper */

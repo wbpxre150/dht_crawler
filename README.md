@@ -454,6 +454,72 @@ dht_crawler/
 └── config.ini        Runtime configuration (~130 keys)
 ```
 
+## Offline Classification Audit (`/random-sample`)
+
+The read-only `GET /random-sample` endpoint serves randomly sampled torrents
+that already carry a `torrent_class` row at a requested classifier version, so
+a teacher-vs-student accuracy audit can run against a classified database copy
+on a Linux host. The handler is stateless and never writes to the database;
+deduplicating across calls is the client's job.
+
+Build (the Makefile auto-applies the `lib/` submodule patches on the first run):
+
+```bash
+make                # produces ./dht_crawler
+```
+
+Create a sanitized `config.ini` beside the binary and point it at the
+classified copy:
+
+```ini
+db_path=/path/to/classified-copy.db
+http_bind=127.0.0.1
+http_port=8080
+# optional: keep the audit host responsive
+nice_level=10
+```
+
+Start the crawler and query the endpoint:
+
+```bash
+./dht_crawler
+curl "http://127.0.0.1:8080/random-sample?count=100&clf_ver=1"
+```
+
+Query parameters:
+
+- `count` — items wanted, clamped to 1..500 (default 20). Fewer may be returned
+  when the sample pool is small; the client re-rolls to accumulate more.
+- `clf_ver` — classifier version to sample; only rows with that `clf_ver` are
+  returned. Omit it (or pass `current`) to use the latest version recorded in
+  `classifier_meta`. A torrent with no `torrent_class` row, or a row at a
+  different version, is never returned.
+
+Response shape (one array element per sampled torrent):
+
+```json
+{
+  "clf_ver": 1,
+  "count": 100,
+  "items": [
+    {
+      "id": 25,
+      "infohash": "a44e96d30cfbff6d5a80a3608a2a68e64c977b63",
+      "name": "example release name",
+      "files": ["Season 1/episode-25.mkv", "sample-25.nfo"],
+      "student": {
+        "category": "tv",
+        "adult": 0,
+        "tv_kind": "multi_season",
+        "confidence": 0.91
+      }
+    }
+  ]
+}
+```
+
+`tv_kind` and `confidence` are `null` when the classifier stored no value.
+
 ## License
 
 MIT License - see LICENSE file
