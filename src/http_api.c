@@ -1079,9 +1079,11 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         uint64_t second_strike_failures = 0;
         uint64_t fresh_peer_relookups = 0;
         uint64_t fresh_peer_rescues = 0;
+        uint64_t metadata_piece_reasks = 0;
         supervisor_stats(api->supervisor, &active_trees, &total_metadata,
                         &first_strike_failures, &second_strike_failures,
-                        &fresh_peer_relookups, &fresh_peer_rescues);
+                        &fresh_peer_relookups, &fresh_peer_rescues,
+                        &metadata_piece_reasks);
 
         cJSON *supervisor_json = cJSON_CreateObject();
         cJSON_AddNumberToObject(supervisor_json, "active_trees", active_trees);
@@ -1092,6 +1094,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(supervisor_json, "second_strike_failures", (double)second_strike_failures);
         cJSON_AddNumberToObject(supervisor_json, "fresh_peer_relookups_total", (double)fresh_peer_relookups);
         cJSON_AddNumberToObject(supervisor_json, "fresh_peer_rescues_total", (double)fresh_peer_rescues);
+        cJSON_AddNumberToObject(supervisor_json, "metadata_piece_reasks_total", (double)metadata_piece_reasks);
 
         /* Add draining tree statistics */
         int draining_count = 0, draining_max = 0, draining_connections = 0;
@@ -1123,6 +1126,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
+                cJSON_AddNumberToObject(tree_json, "metadata_piece_reasks", (double)atomic_load(&tree->metadata_piece_reasks));
                 cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
                 cJSON_AddNumberToObject(tree_json, "active_connections", (int)atomic_load(&tree->active_connections));

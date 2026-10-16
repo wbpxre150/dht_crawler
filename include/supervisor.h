@@ -223,6 +223,7 @@ typedef struct supervisor {
     atomic_uint_fast64_t cumulative_first_strike_failures;
     atomic_uint_fast64_t cumulative_fresh_peer_relookups;
     atomic_uint_fast64_t cumulative_fresh_peer_rescues;
+    atomic_uint_fast64_t cumulative_metadata_piece_reasks;
     atomic_uint_fast64_t cumulative_second_strike_failures;
     atomic_uint_fast64_t cumulative_filtered_count;
     atomic_uint_fast64_t cumulative_metadata_attempts;
@@ -273,7 +274,8 @@ void supervisor_on_tree_shutdown(thread_tree_t *tree);
  */
 void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata,
                      uint64_t *out_first_strike, uint64_t *out_second_strike,
-                     uint64_t *out_fresh_relookups, uint64_t *out_fresh_rescues);
+                     uint64_t *out_fresh_relookups, uint64_t *out_fresh_rescues,
+                     uint64_t *out_metadata_piece_reasks);
 
 /**
  * Get total active connections across all trees

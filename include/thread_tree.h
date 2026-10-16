@@ -199,6 +199,7 @@ typedef struct thread_tree {
     atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
     atomic_uint_fast64_t fresh_peer_relookups;    /* Metadata failures that triggered a fresh-peer re-lookup */
     atomic_uint_fast64_t fresh_peer_rescues;      /* Re-lookups whose retry fetched metadata */
+    atomic_uint_fast64_t metadata_piece_reasks;   /* Pieces re-asked from another conn after the 3 s cooldown */
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */

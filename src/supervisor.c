@@ -134,6 +134,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_first_strike_failures, 0);
     atomic_init(&sup->cumulative_fresh_peer_relookups, 0);
     atomic_init(&sup->cumulative_fresh_peer_rescues, 0);
+    atomic_init(&sup->cumulative_metadata_piece_reasks, 0);
     atomic_init(&sup->cumulative_second_strike_failures, 0);
     atomic_init(&sup->cumulative_filtered_count, 0);
     atomic_init(&sup->cumulative_metadata_attempts, 0);
@@ -1159,6 +1160,7 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
                     uint64_t tree_fresh_relookups = atomic_load(&tree->fresh_peer_relookups);
                     uint64_t tree_fresh_rescues = atomic_load(&tree->fresh_peer_rescues);
+                    uint64_t tree_piece_reasks = atomic_load(&tree->metadata_piece_reasks);
 
                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
@@ -1167,6 +1169,7 @@ static void *monitor_thread_func(void *arg) {
                     atomic_fetch_add(&sup->cumulative_metadata_attempts, tree_attempts);
                     atomic_fetch_add(&sup->cumulative_fresh_peer_relookups, tree_fresh_relookups);
                     atomic_fetch_add(&sup->cumulative_fresh_peer_rescues, tree_fresh_rescues);
+                    atomic_fetch_add(&sup->cumulative_metadata_piece_reasks, tree_piece_reasks);
 
                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
@@ -1297,7 +1300,8 @@ static void *monitor_thread_func(void *arg) {
 
 void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata,
                      uint64_t *out_first_strike, uint64_t *out_second_strike,
-                     uint64_t *out_fresh_relookups, uint64_t *out_fresh_rescues) {
+                     uint64_t *out_fresh_relookups, uint64_t *out_fresh_rescues,
+                     uint64_t *out_metadata_piece_reasks) {
     if (!sup) {
         if (out_active_trees) *out_active_trees = 0;
         if (out_total_metadata) *out_total_metadata = 0;
@@ -1305,6 +1309,7 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
         if (out_second_strike) *out_second_strike = 0;
         if (out_fresh_relookups) *out_fresh_relookups = 0;
         if (out_fresh_rescues) *out_fresh_rescues = 0;
+        if (out_metadata_piece_reasks) *out_metadata_piece_reasks = 0;
         return;
     }
 
@@ -1314,6 +1319,7 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
     uint64_t cumulative_second_strike = atomic_load(&sup->cumulative_second_strike_failures);
     uint64_t cumulative_fresh_relookups = atomic_load(&sup->cumulative_fresh_peer_relookups);
     uint64_t cumulative_fresh_rescues = atomic_load(&sup->cumulative_fresh_peer_rescues);
+    uint64_t cumulative_metadata_piece_reasks = atomic_load(&sup->cumulative_metadata_piece_reasks);
 
     /* Add current active trees' counts */
     uint64_t active_metadata = 0;
@@ -1321,6 +1327,7 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
     uint64_t active_second_strike = 0;
     uint64_t active_fresh_relookups = 0;
     uint64_t active_fresh_rescues = 0;
+    uint64_t active_metadata_piece_reasks = 0;
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -1335,6 +1342,7 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
             active_second_strike += atomic_load(&sup->trees[i]->second_strike_failures);
             active_fresh_relookups += atomic_load(&sup->trees[i]->fresh_peer_relookups);
             active_fresh_rescues += atomic_load(&sup->trees[i]->fresh_peer_rescues);
+            active_metadata_piece_reasks += atomic_load(&sup->trees[i]->metadata_piece_reasks);
         }
     }
 
@@ -1355,6 +1363,9 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
     }
     if (out_fresh_rescues) {
         *out_fresh_rescues = cumulative_fresh_rescues + active_fresh_rescues;
+    }
+    if (out_metadata_piece_reasks) {
+        *out_metadata_piece_reasks = cumulative_metadata_piece_reasks + active_metadata_piece_reasks;
     }
 }
 
