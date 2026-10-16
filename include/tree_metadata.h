@@ -33,7 +33,7 @@ typedef struct tree_torrent_metadata {
  */
 typedef struct tree_metadata_config {
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 30000) */
+    int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 60000) */
     int max_metadata_size;          /* Max metadata size in bytes (default: 10MB) */
     int parallel_peers;             /* Number of peers to connect in parallel (default: 2) */
     struct thread_tree *tree;       /* Tree pointer for connection tracking (optional) */
@@ -57,8 +57,11 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
  * Fetch metadata using parallel peer connections
  *
  * Connects to multiple peers simultaneously using a sliding window.
- * Each connection independently fetches all metadata pieces.
- * First connection to complete wins; others are closed.
+ * All window connections share one metadata buffer, piece bitmap and
+ * outstanding-request table: each peer requests only missing pieces, at
+ * most METADATA_OUTSTANDING_PER_PEER (2) in flight, spread round-robin
+ * across the window. The SHA-1 check over the fully assembled metadata
+ * arbitrates between peers.
  *
  * @param infohash The infohash to fetch metadata for
  * @param peers Array of peer addresses

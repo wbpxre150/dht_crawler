@@ -754,20 +754,49 @@ tree_torrent_metadata_t *tree_fetch_metadata_from_peer(
 
 #define MAX_PARALLEL_PEERS 4
 
-/* Per-connection state for parallel fetching */
+/* Max metadata piece requests a single peer may have in flight at once
+ * (libtorrent parity: maybe_send_request keeps fewer than 2 outstanding). */
+#define METADATA_OUTSTANDING_PER_PEER 2
+
+/* Close a connection that has produced no readable data for this long. */
+#define CONN_SILENCE_CLOSE_MS 10000
+
+/* Per-connection state for parallel fetching. The metadata bytes live in the
+ * shared metadata_fetch_state_t, not here. */
 typedef struct {
     int fd;
     conn_state_t state;
     uint8_t recv_buf[65536];
     size_t recv_offset;
     uint8_t ut_metadata_id;
+    int metadata_size;              /* Peer-advertised size (consistency check) */
+    time_t connect_start;
+    time_t last_activity;           /* Last readable data (silence watchdog) */
+    int outstanding_count;          /* Currently in-flight piece requests */
+    int outstanding_pieces[METADATA_OUTSTANDING_PER_PEER];
+} parallel_conn_t;
+
+/* Shared piece-aggregation state for one parallel metadata fetch. Owned by
+ * tree_fetch_metadata_parallel on the worker's stack. No locking is needed:
+ * it is driven exclusively by that worker thread's single poll() loop. */
+typedef struct {
+    int initialized;                /* Set once a peer advertises metadata_size */
     int metadata_size;
     int total_pieces;
-    uint8_t *metadata_buffer;
-    uint8_t *pieces_bitmap;
+    uint8_t *metadata_buffer;       /* total_pieces * 16 KiB (last piece short) */
+    uint8_t *pieces_bitmap;         /* ceil(total_pieces / 8) */
+    uint8_t *outstanding;           /* 1 byte per piece: request in flight */
     int pieces_received;
-    time_t connect_start;
-} parallel_conn_t;
+    int reset_count;                /* SHA-1-mismatch resets performed (max 1) */
+    int cursor;                     /* Round-robin cursor over pieces */
+} metadata_fetch_state_t;
+
+/* One whole parallel fetch: shared state plus the window connection slots. */
+typedef struct {
+    parallel_conn_t conns[MAX_PARALLEL_PEERS];
+    int window_size;
+    metadata_fetch_state_t st;
+} parallel_fetch_t;
 
 /* Initialize a connection slot with a new peer */
 static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
@@ -815,27 +844,102 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
 
     conn->fd = fd;
     conn->connect_start = time(NULL);
+    conn->last_activity = conn->connect_start;
     return 0;
 }
 
-/* Close and cleanup a connection slot */
-static void parallel_conn_close(parallel_conn_t *conn, thread_tree_t *tree) {
+/* Drop one piece from a connection's in-flight list and clear its shared
+ * outstanding flag (a request is owned by at most one connection). */
+static void meta_conn_clear_outstanding(parallel_conn_t *conn,
+                                        metadata_fetch_state_t *st, int piece) {
+    for (int i = 0; i < conn->outstanding_count; i++) {
+        if (conn->outstanding_pieces[i] == piece) {
+            conn->outstanding_pieces[i] =
+                conn->outstanding_pieces[conn->outstanding_count - 1];
+            conn->outstanding_count--;
+            break;
+        }
+    }
+    if (piece >= 0 && piece < st->total_pieces) st->outstanding[piece] = 0;
+}
+
+/* Release every piece this connection still had in flight so other window
+ * peers can take them over. */
+static void meta_conn_release_outstanding(parallel_conn_t *conn,
+                                          metadata_fetch_state_t *st) {
+    for (int i = 0; i < conn->outstanding_count; i++) {
+        int piece = conn->outstanding_pieces[i];
+        if (piece >= 0 && piece < st->total_pieces) st->outstanding[piece] = 0;
+    }
+    conn->outstanding_count = 0;
+}
+
+/* One-shot bitfield reset after a SHA-1 mismatch: clear every received piece,
+ * in-flight flag and the per-conn lists, then let the scheduler re-request. */
+static void metadata_state_reset(parallel_fetch_t *fetch) {
+    metadata_fetch_state_t *st = &fetch->st;
+    if (!st->initialized) return;
+    memset(st->pieces_bitmap, 0, (st->total_pieces + 7) / 8);
+    memset(st->outstanding, 0, st->total_pieces);
+    st->pieces_received = 0;
+    st->cursor = 0;
+    st->reset_count++;
+    for (int i = 0; i < fetch->window_size; i++) {
+        fetch->conns[i].outstanding_count = 0;
+    }
+}
+
+/* Send up to METADATA_OUTSTANDING_PER_PEER requests to one connection, picking
+ * missing (bitmap clear) && not-outstanding pieces round-robin from the shared
+ * cursor so the window spreads the load. */
+static void metadata_schedule_conn(parallel_fetch_t *fetch, int ci) {
+    parallel_conn_t *conn = &fetch->conns[ci];
+    metadata_fetch_state_t *st = &fetch->st;
+    if (!st->initialized) return;
+    if (conn->state != CONN_STATE_REQUESTING_METADATA || conn->fd < 0) return;
+
+    int pieces = st->total_pieces;
+    while (pieces > 0 && conn->outstanding_count < METADATA_OUTSTANDING_PER_PEER) {
+        int found = -1;
+        for (int n = 0; n < pieces; n++) {
+            int p = (st->cursor + n) % pieces;
+            if (st->pieces_bitmap[p / 8] & (1 << (p % 8))) continue;  /* have it */
+            if (st->outstanding[p]) continue;                        /* in flight */
+            found = p;
+            st->cursor = (p + 1) % pieces;
+            break;
+        }
+        if (found < 0) break;  /* every remaining piece is in flight/received */
+
+        if (send_metadata_request(conn->fd, conn->ut_metadata_id, found) < 0) {
+            conn->state = CONN_STATE_ERROR;  /* caller closes + refills */
+            return;
+        }
+        st->outstanding[found] = 1;
+        conn->outstanding_pieces[conn->outstanding_count++] = found;
+    }
+}
+
+/* Close and cleanup a connection slot. The shared metadata buffer is owned by
+ * the fetch, not the connection, so only per-conn state is touched here. */
+static void parallel_conn_close(parallel_conn_t *conn, thread_tree_t *tree,
+                                metadata_fetch_state_t *st) {
     if (conn->fd >= 0) {
         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(conn->fd);
         conn->fd = -1;
     }
-    free(conn->metadata_buffer);
-    free(conn->pieces_bitmap);
-    conn->metadata_buffer = NULL;
-    conn->pieces_bitmap = NULL;
+    if (st) meta_conn_release_outstanding(conn, st);
+    conn->outstanding_count = 0;
     conn->state = CONN_STATE_ERROR;
 }
 
 /* Process data for a single parallel connection. Returns metadata on success, NULL otherwise. */
-static tree_torrent_metadata_t *parallel_conn_process(parallel_conn_t *conn,
+static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, int ci,
                                                        const uint8_t *infohash,
                                                        int max_metadata) {
+    parallel_conn_t *conn = &fetch->conns[ci];
+    metadata_fetch_state_t *st = &fetch->st;
     if (conn->state == CONN_STATE_HANDSHAKING) {
         if (conn->recv_offset >= BT_HANDSHAKE_SIZE) {
             if (conn->recv_buf[0] != BT_PROTOCOL_LEN ||
@@ -895,24 +999,36 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_conn_t *conn,
                 }
 
                 if (conn->metadata_size > max_metadata) {
+                    /* Advertised size exceeds our cap: drop this peer. */
                     conn->state = CONN_STATE_ERROR;
                     goto shift;
                 }
 
-                conn->total_pieces = (conn->metadata_size + BT_METADATA_PIECE_SIZE - 1) / BT_METADATA_PIECE_SIZE;
-                conn->metadata_buffer = calloc(1, conn->metadata_size);
-                conn->pieces_bitmap = calloc(1, (conn->total_pieces + 7) / 8);
-
-                if (!conn->metadata_buffer || !conn->pieces_bitmap) {
+                if (!st->initialized) {
+                    /* First peer to speak up defines the fetch's size/shape. */
+                    st->metadata_size = conn->metadata_size;
+                    st->total_pieces =
+                        (st->metadata_size + BT_METADATA_PIECE_SIZE - 1) / BT_METADATA_PIECE_SIZE;
+                    st->metadata_buffer = calloc(1, st->metadata_size);
+                    st->pieces_bitmap = calloc(1, (st->total_pieces + 7) / 8);
+                    st->outstanding = calloc(st->total_pieces, 1);
+                    if (!st->metadata_buffer || !st->pieces_bitmap || !st->outstanding) {
+                        free(st->metadata_buffer); st->metadata_buffer = NULL;
+                        free(st->pieces_bitmap); st->pieces_bitmap = NULL;
+                        free(st->outstanding); st->outstanding = NULL;
+                        conn->state = CONN_STATE_ERROR;
+                        goto shift;
+                    }
+                    st->initialized = 1;
+                } else if (conn->metadata_size != st->metadata_size) {
+                    /* Peers disagree on size; at most one is right and the final
+                     * SHA-1 arbitrates. Close this conn and refill its slot. */
                     conn->state = CONN_STATE_ERROR;
                     goto shift;
-                }
-
-                for (int i = 0; i < conn->total_pieces; i++) {
-                    send_metadata_request(conn->fd, conn->ut_metadata_id, i);
                 }
 
                 conn->state = CONN_STATE_REQUESTING_METADATA;
+                metadata_schedule_conn(fetch, ci);
 
             } else if (ext_id == OUR_UT_METADATA_ID && conn->state == CONN_STATE_REQUESTING_METADATA) {
                 int piece_msg_type, piece_index;
@@ -929,39 +1045,53 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_conn_t *conn,
                 }
 
                 if (piece_msg_type == UT_METADATA_DATA &&
-                    piece_index >= 0 && piece_index < conn->total_pieces) {
+                    piece_index >= 0 && piece_index < st->total_pieces) {
 
-                    size_t offset = piece_index * BT_METADATA_PIECE_SIZE;
+                    size_t offset = (size_t)piece_index * BT_METADATA_PIECE_SIZE;
                     size_t expected = BT_METADATA_PIECE_SIZE;
-                    if (offset + expected > (size_t)conn->metadata_size) {
-                        expected = conn->metadata_size - offset;
+                    if (offset + expected > (size_t)st->metadata_size) {
+                        expected = st->metadata_size - offset;
                     }
+
+                    /* Whatever happens this request is answered: release it so
+                     * another conn can take the piece over if needed. */
+                    meta_conn_clear_outstanding(conn, st, piece_index);
 
                     if (piece_len == expected) {
                         int byte_idx = piece_index / 8;
                         int bit_idx = piece_index % 8;
 
-                        if (!(conn->pieces_bitmap[byte_idx] & (1 << bit_idx))) {
-                            memcpy(conn->metadata_buffer + offset, piece_data, piece_len);
-                            conn->pieces_bitmap[byte_idx] |= (1 << bit_idx);
-                            conn->pieces_received++;
+                        if (!(st->pieces_bitmap[byte_idx] & (1 << bit_idx))) {
+                            memcpy(st->metadata_buffer + offset, piece_data, piece_len);
+                            st->pieces_bitmap[byte_idx] |= (1 << bit_idx);
+                            st->pieces_received++;
 
-                            if (conn->pieces_received >= conn->total_pieces) {
+                            if (st->pieces_received >= st->total_pieces) {
                                 uint8_t computed_hash[20];
-                                SHA1(conn->metadata_buffer, conn->metadata_size, computed_hash);
+                                SHA1(st->metadata_buffer, st->metadata_size, computed_hash);
 
                                 if (memcmp(computed_hash, infohash, 20) == 0) {
-                                    tree_torrent_metadata_t *result = parse_info_dict(
-                                        conn->metadata_buffer, conn->metadata_size, infohash);
+                                    tree_torrent_metadata_t *meta = parse_info_dict(
+                                        st->metadata_buffer, st->metadata_size, infohash);
                                     conn->state = CONN_STATE_COMPLETE;
-                                    return result;
+                                    return meta;
+                                } else if (st->reset_count == 0) {
+                                    /* Assembled bytes do not hash to the infohash:
+                                     * peers disagreed on content. Reset the piece
+                                     * bitfield once and re-request everything. */
+                                    metadata_state_reset(fetch);
                                 } else {
+                                    /* Wrong even after the one allowed reset: fail
+                                     * the entry so it falls to the normal path. */
                                     conn->state = CONN_STATE_ERROR;
                                     goto shift;
                                 }
                             }
                         }
                     }
+
+                    /* Keep this conn's request pipe full. */
+                    metadata_schedule_conn(fetch, ci);
                 }
             }
         }
@@ -995,12 +1125,12 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
     if (window_size > MAX_PARALLEL_PEERS) window_size = MAX_PARALLEL_PEERS;
     if (window_size > peer_count) window_size = peer_count;
 
-    parallel_conn_t conns[MAX_PARALLEL_PEERS];
+    parallel_fetch_t fetch;
+    memset(&fetch, 0, sizeof(fetch));
+    fetch.window_size = window_size;
     for (int i = 0; i < MAX_PARALLEL_PEERS; i++) {
-        conns[i].fd = -1;
-        conns[i].state = CONN_STATE_ERROR;
-        conns[i].metadata_buffer = NULL;
-        conns[i].pieces_bitmap = NULL;
+        fetch.conns[i].fd = -1;
+        fetch.conns[i].state = CONN_STATE_ERROR;
     }
 
     int next_peer = 0;  /* Next untried peer index */
@@ -1010,7 +1140,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
     /* Fill initial window */
     int active_count = 0;
     for (int i = 0; i < window_size && next_peer < peer_count; i++) {
-        if (parallel_conn_start(&conns[i], infohash, &peers[next_peer], tree) == 0) {
+        if (parallel_conn_start(&fetch.conns[i], infohash, &peers[next_peer], tree) == 0) {
             active_count++;
         }
         next_peer++;
@@ -1029,13 +1159,13 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
         int nfds = 0;
 
         for (int i = 0; i < window_size; i++) {
-            if (conns[i].fd < 0 || conns[i].state == CONN_STATE_ERROR ||
-                conns[i].state == CONN_STATE_COMPLETE) continue;
+            if (fetch.conns[i].fd < 0 || fetch.conns[i].state == CONN_STATE_ERROR ||
+                fetch.conns[i].state == CONN_STATE_COMPLETE) continue;
 
-            pfds[nfds].fd = conns[i].fd;
+            pfds[nfds].fd = fetch.conns[i].fd;
             pfds[nfds].revents = 0;
 
-            if (conns[i].state == CONN_STATE_CONNECTING) {
+            if (fetch.conns[i].state == CONN_STATE_CONNECTING) {
                 pfds[nfds].events = POLLOUT;
             } else {
                 pfds[nfds].events = POLLIN;
@@ -1056,20 +1186,20 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
         /* Process each ready connection */
         for (int p = 0; p < nfds && !result; p++) {
             int ci = pfd_to_conn[p];
-            parallel_conn_t *conn = &conns[ci];
+            parallel_conn_t *conn = &fetch.conns[ci];
 
             if (pfds[p].revents == 0) {
                 /* Check per-connection timeout for connecting state */
                 if (conn->state == CONN_STATE_CONNECTING &&
                     difftime(time(NULL), conn->connect_start) > tcp_timeout / 1000) {
-                    parallel_conn_close(conn, tree);
+                    parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                 }
                 continue;
             }
 
             if (pfds[p].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                parallel_conn_close(conn, tree);
+                parallel_conn_close(conn, tree, &fetch.st);
                 active_count--;
                 continue;
             }
@@ -1079,7 +1209,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 int error;
                 socklen_t len = sizeof(error);
                 if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
-                    parallel_conn_close(conn, tree);
+                    parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
                 }
@@ -1088,11 +1218,12 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 uint8_t peer_id[20];
                 generate_peer_id(peer_id);
                 if (send_handshake(conn->fd, infohash, peer_id) < 0) {
-                    parallel_conn_close(conn, tree);
+                    parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
                 }
                 conn->state = CONN_STATE_HANDSHAKING;
+                conn->last_activity = time(NULL);
                 continue;
             }
 
@@ -1100,16 +1231,41 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 ssize_t nread = read(conn->fd, conn->recv_buf + conn->recv_offset,
                                      sizeof(conn->recv_buf) - conn->recv_offset);
                 if (nread <= 0) {
-                    parallel_conn_close(conn, tree);
+                    parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
                 }
 
                 conn->recv_offset += nread;
-                result = parallel_conn_process(conn, infohash, max_metadata);
+                conn->last_activity = time(NULL);
+                result = parallel_conn_process(&fetch, ci, infohash, max_metadata);
 
                 if (conn->state == CONN_STATE_ERROR) {
-                    parallel_conn_close(conn, tree);
+                    parallel_conn_close(conn, tree, &fetch.st);
+                    active_count--;
+                }
+            }
+        }
+
+        /* Silence watchdog + refill every live conn's request pipe. Runs once
+         * per 500 ms tick, so it also covers conns poll() did not report on. */
+        if (!result) {
+            time_t now = time(NULL);
+            for (int i = 0; i < window_size; i++) {
+                parallel_conn_t *conn = &fetch.conns[i];
+                if (conn->fd < 0 || conn->state == CONN_STATE_ERROR ||
+                    conn->state == CONN_STATE_COMPLETE) continue;
+
+                if (conn->state != CONN_STATE_CONNECTING &&
+                    difftime(now, conn->last_activity) > CONN_SILENCE_CLOSE_MS / 1000) {
+                    parallel_conn_close(conn, tree, &fetch.st);
+                    active_count--;
+                    continue;
+                }
+
+                metadata_schedule_conn(&fetch, i);
+                if (conn->state == CONN_STATE_ERROR) {
+                    parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                 }
             }
@@ -1118,10 +1274,10 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
         /* Fill empty slots from remaining peers */
         if (!result) {
             for (int i = 0; i < window_size && next_peer < peer_count; i++) {
-                if (conns[i].fd >= 0) continue;  /* Slot still active */
-                if (conns[i].state != CONN_STATE_ERROR) continue;
+                if (fetch.conns[i].fd >= 0) continue;  /* Slot still active */
+                if (fetch.conns[i].state != CONN_STATE_ERROR) continue;
 
-                if (parallel_conn_start(&conns[i], infohash, &peers[next_peer], tree) == 0) {
+                if (parallel_conn_start(&fetch.conns[i], infohash, &peers[next_peer], tree) == 0) {
                     active_count++;
                 }
                 next_peer++;
@@ -1129,16 +1285,13 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
         }
     }
 
-    /* Cleanup all connections */
+    /* Close every slot, then free the shared buffers exactly once. */
     for (int i = 0; i < window_size; i++) {
-        if (conns[i].fd >= 0) {
-            parallel_conn_close(&conns[i], tree);
-        } else {
-            /* fd already closed but buffers may need freeing */
-            free(conns[i].metadata_buffer);
-            free(conns[i].pieces_bitmap);
-        }
+        parallel_conn_close(&fetch.conns[i], tree, &fetch.st);
     }
+    free(fetch.st.metadata_buffer);
+    free(fetch.st.pieces_bitmap);
+    free(fetch.st.outstanding);
 
     return result;
 }
