@@ -7,6 +7,9 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#include "tree_peers_queue.h"    /* peer_entry_t for tree_lookup_peers() */
+#include "tree_response_queue.h" /* tree_response_queue_t for tree_lookup_peers() */
+
 /* Forward declarations */
 struct batch_writer;
 struct bloom_filter;
@@ -78,6 +81,7 @@ typedef struct tree_config {
     /* Stage 5: Metadata fetcher settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
     int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
+    int fresh_peer_retries;         /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
@@ -143,6 +147,7 @@ typedef struct thread_tree {
     /* Stage 5 config */
     int tcp_connect_timeout_ms;
     int parallel_peers;
+    int fresh_peer_retries;         /* Fresh-peer re-lookups before a metadata failure strike (0-3) */
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;
@@ -190,6 +195,8 @@ typedef struct thread_tree {
     atomic_uint_fast64_t filtered_count;    /* Filtered by porn filter */
     atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
     atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
+    atomic_uint_fast64_t fresh_peer_relookups;    /* Metadata failures that triggered a fresh-peer re-lookup */
+    atomic_uint_fast64_t fresh_peer_rescues;      /* Re-lookups whose retry fetched metadata */
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */
@@ -254,5 +261,23 @@ void thread_tree_request_shutdown(thread_tree_t *tree, shutdown_reason_t reason)
  * @return Phase name string
  */
 const char *thread_tree_phase_name(tree_phase_t phase);
+
+/**
+ * Run an iterative get_peers lookup for infohash and collect discovered peers.
+ *
+ * Queries the closest routing-table nodes and, over at most 3 iterations,
+ * re-queries closer nodes learned from responses. Peers are written into
+ * out->peers and out->infohash is set to infohash. This helper performs no
+ * queue push and does not change the tree phase; callers decide what to do with
+ * the result.
+ *
+ * @param tree Thread tree (its routing table, socket and dispatcher are used)
+ * @param infohash Target infohash (20 bytes)
+ * @param rsp_queue Per-caller response queue used to receive replies
+ * @param out Peer entry to fill (zeroed, infohash set, peers collected)
+ * @return Number of peers found (out->peer_count); 0 if none
+ */
+int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
+                      tree_response_queue_t *rsp_queue, peer_entry_t *out);
 
 #endif /* THREAD_TREE_H */

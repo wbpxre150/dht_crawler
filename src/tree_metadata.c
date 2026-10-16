@@ -1282,6 +1282,26 @@ void *tree_metadata_worker_func(void *arg) {
             break;
         }
 
+        /* On failure, optionally re-run a get_peers lookup for this infohash to
+         * obtain fresh peers and retry the metadata fetch once, BEFORE the
+         * failure-bloom strike below is recorded. Gated by
+         * tree_metadata_fresh_peer_retries (0 = disabled). The retry is not
+         * counted as a separate metadata attempt. */
+        if (!metadata && tree->fresh_peer_retries > 0) {
+            tree_response_queue_t *relookup_queue = tree_response_queue_create(10);
+            if (relookup_queue) {
+                atomic_fetch_add(&tree->fresh_peer_relookups, 1);
+                peer_entry_t fresh = {0};
+                int fresh_count = tree_lookup_peers(tree, entry.infohash, relookup_queue, &fresh);
+                if (atomic_load(&tree->shutdown_reason) != SHUTDOWN_REASON_SUPERVISOR && fresh_count > 0) {
+                    metadata = tree_fetch_metadata_parallel(
+                        entry.infohash, fresh.peers, fresh_count, &config);
+                    if (metadata) atomic_fetch_add(&tree->fresh_peer_rescues, 1);
+                }
+                tree_response_queue_destroy(relookup_queue);
+            }
+        }
+
         /* Handle failure with configurable strike bloom filtering */
         if (!metadata && tree->shared_bloom) {
             if (tree->failure_strike_count <= 1 || !tree->failure_bloom) {

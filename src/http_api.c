@@ -18,7 +18,7 @@
 /* Forward declarations for tree queue functions to avoid type conflicts */
 int tree_routing_get_count(void *rt);
 int tree_infohash_queue_count(void *q);
-int tree_peers_queue_count(void *q);
+/* tree_peers_queue_count() now comes in via thread_tree.h -> tree_peers_queue.h */
 #include <cJSON.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1077,8 +1077,11 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         uint64_t total_metadata = 0;
         uint64_t first_strike_failures = 0;
         uint64_t second_strike_failures = 0;
+        uint64_t fresh_peer_relookups = 0;
+        uint64_t fresh_peer_rescues = 0;
         supervisor_stats(api->supervisor, &active_trees, &total_metadata,
-                        &first_strike_failures, &second_strike_failures);
+                        &first_strike_failures, &second_strike_failures,
+                        &fresh_peer_relookups, &fresh_peer_rescues);
 
         cJSON *supervisor_json = cJSON_CreateObject();
         cJSON_AddNumberToObject(supervisor_json, "active_trees", active_trees);
@@ -1087,6 +1090,8 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(supervisor_json, "total_metadata_fetched", (double)total_metadata);
         cJSON_AddNumberToObject(supervisor_json, "first_strike_failures", (double)first_strike_failures);
         cJSON_AddNumberToObject(supervisor_json, "second_strike_failures", (double)second_strike_failures);
+        cJSON_AddNumberToObject(supervisor_json, "fresh_peer_relookups_total", (double)fresh_peer_relookups);
+        cJSON_AddNumberToObject(supervisor_json, "fresh_peer_rescues_total", (double)fresh_peer_rescues);
 
         /* Add draining tree statistics */
         int draining_count = 0, draining_max = 0, draining_connections = 0;

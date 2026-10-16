@@ -105,6 +105,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
+    sup->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
 
     /* Metadata rate-based respawn settings */
     sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
@@ -130,6 +131,8 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Initialize cumulative statistics */
     atomic_init(&sup->cumulative_metadata_count, 0);
     atomic_init(&sup->cumulative_first_strike_failures, 0);
+    atomic_init(&sup->cumulative_fresh_peer_relookups, 0);
+    atomic_init(&sup->cumulative_fresh_peer_rescues, 0);
     atomic_init(&sup->cumulative_second_strike_failures, 0);
     atomic_init(&sup->cumulative_filtered_count, 0);
     atomic_init(&sup->cumulative_metadata_attempts, 0);
@@ -477,6 +480,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
         .parallel_peers = sup->parallel_peers,
+        .fresh_peer_retries = sup->fresh_peer_retries,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,
@@ -1151,12 +1155,16 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
                     uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
                     uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
+                    uint64_t tree_fresh_relookups = atomic_load(&tree->fresh_peer_relookups);
+                    uint64_t tree_fresh_rescues = atomic_load(&tree->fresh_peer_rescues);
 
                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
                     atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
                     atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
                     atomic_fetch_add(&sup->cumulative_metadata_attempts, tree_attempts);
+                    atomic_fetch_add(&sup->cumulative_fresh_peer_relookups, tree_fresh_relookups);
+                    atomic_fetch_add(&sup->cumulative_fresh_peer_rescues, tree_fresh_rescues);
 
                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
@@ -1286,12 +1294,15 @@ static void *monitor_thread_func(void *arg) {
 }
 
 void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_total_metadata,
-                     uint64_t *out_first_strike, uint64_t *out_second_strike) {
+                     uint64_t *out_first_strike, uint64_t *out_second_strike,
+                     uint64_t *out_fresh_relookups, uint64_t *out_fresh_rescues) {
     if (!sup) {
         if (out_active_trees) *out_active_trees = 0;
         if (out_total_metadata) *out_total_metadata = 0;
         if (out_first_strike) *out_first_strike = 0;
         if (out_second_strike) *out_second_strike = 0;
+        if (out_fresh_relookups) *out_fresh_relookups = 0;
+        if (out_fresh_rescues) *out_fresh_rescues = 0;
         return;
     }
 
@@ -1299,11 +1310,15 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
     uint64_t cumulative_metadata = atomic_load(&sup->cumulative_metadata_count);
     uint64_t cumulative_first_strike = atomic_load(&sup->cumulative_first_strike_failures);
     uint64_t cumulative_second_strike = atomic_load(&sup->cumulative_second_strike_failures);
+    uint64_t cumulative_fresh_relookups = atomic_load(&sup->cumulative_fresh_peer_relookups);
+    uint64_t cumulative_fresh_rescues = atomic_load(&sup->cumulative_fresh_peer_rescues);
 
     /* Add current active trees' counts */
     uint64_t active_metadata = 0;
     uint64_t active_first_strike = 0;
     uint64_t active_second_strike = 0;
+    uint64_t active_fresh_relookups = 0;
+    uint64_t active_fresh_rescues = 0;
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -1316,6 +1331,8 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
             active_metadata += atomic_load(&sup->trees[i]->metadata_count);
             active_first_strike += atomic_load(&sup->trees[i]->first_strike_failures);
             active_second_strike += atomic_load(&sup->trees[i]->second_strike_failures);
+            active_fresh_relookups += atomic_load(&sup->trees[i]->fresh_peer_relookups);
+            active_fresh_rescues += atomic_load(&sup->trees[i]->fresh_peer_rescues);
         }
     }
 
@@ -1330,6 +1347,12 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
     }
     if (out_second_strike) {
         *out_second_strike = cumulative_second_strike + active_second_strike;
+    }
+    if (out_fresh_relookups) {
+        *out_fresh_relookups = cumulative_fresh_relookups + active_fresh_relookups;
+    }
+    if (out_fresh_rescues) {
+        *out_fresh_rescues = cumulative_fresh_rescues + active_fresh_rescues;
     }
 }
 

@@ -631,6 +631,96 @@ typedef struct get_peers_worker_ctx {
     tree_response_queue_t *response_queue;  /* Per-worker response queue */
 } get_peers_worker_ctx_t;
 
+/* Iterative get_peers lookup.
+ *
+ * Queries the closest routing-table nodes for `infohash` and, over at most 3
+ * iterations, re-queries closer nodes learned from responses, collecting peers
+ * into `out`. This is the pure lookup extracted from get_peers_worker_func: it
+ * does NOT push to any peers queue and does NOT touch the tree phase — callers
+ * decide what to do with the result.
+ *
+ * Returns the number of peers found (out->peer_count); 0 when the routing table
+ * is empty or no node returned peers. */
+int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
+                      tree_response_queue_t *rsp_queue, peer_entry_t *out) {
+    if (!tree || !infohash || !rsp_queue || !out) {
+        return 0;
+    }
+
+    tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
+    tree_socket_t *sock = (tree_socket_t *)tree->socket;
+    tree_dispatcher_t *dispatcher = tree->dispatcher;
+
+    /* Initialize the result like get_peers_worker_func used to */
+    memset(out, 0, sizeof(*out));
+    memcpy(out->infohash, infohash, 20);
+
+    /* Get closest nodes from routing table */
+    tree_node_t closest[8];
+    int n = tree_routing_get_closest(rt, infohash, closest, 8);
+    if (n == 0) {
+        /* No nodes to query: no peers */
+        return 0;
+    }
+
+    /* Simple iterative lookup: query initial nodes, then closer nodes from responses */
+    int max_iterations = 3;
+    for (int iter = 0; iter < max_iterations && out->peer_count < MAX_PEERS_PER_ENTRY; iter++) {
+        int queries_this_round = (iter == 0) ? n : 0;
+
+        /* Query each node */
+        for (int i = 0; i < n && out->peer_count < MAX_PEERS_PER_ENTRY; i++) {
+            /* Generate TID for this query */
+            uint8_t tid[4];
+            int tid_len = tree_protocol_gen_tid(tid);
+
+            /* Register TID with dispatcher BEFORE sending */
+            tree_dispatcher_register_tid(dispatcher, tid, tid_len, rsp_queue);
+
+            /* Send get_peers query */
+            tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
+
+            /* Wait for response on personal queue (500ms timeout, increased from 100ms) */
+            tree_response_t response_pkt;
+            int pop_result = tree_response_queue_pop(rsp_queue, &response_pkt, 500);
+
+            /* Unregister TID immediately after receiving (or timeout) */
+            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+
+            if (pop_result == 0) {
+                /* Got a response! */
+                tree_get_peers_response_t response;
+                if (tree_handle_get_peers_response(tree, response_pkt.data, response_pkt.len,
+                                                   &response_pkt.from, &response) == 0) {
+                    /* Collect peers */
+                    for (int p = 0; p < response.peer_count && out->peer_count < MAX_PEERS_PER_ENTRY; p++) {
+                        memcpy(&out->peers[out->peer_count], &response.peers[p],
+                               sizeof(struct sockaddr_storage));
+                        out->peer_count++;
+                    }
+
+                    /* Add closer nodes for next iteration (refresh last_seen to keep good nodes) */
+                    for (int ni = 0; ni < response.node_count && queries_this_round < 8; ni++) {
+                        tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
+                        /* Could track these for next iteration, but keeping it simple */
+                    }
+                }
+            }
+        }
+
+        /* If we found peers, we're done */
+        if (out->peer_count > 0) {
+            break;
+        }
+
+        /* Get fresh closest nodes for next iteration */
+        n = tree_routing_get_closest(rt, infohash, closest, 8);
+        if (n == 0) break;
+    }
+
+    return out->peer_count;
+}
+
 /* Get_peers worker thread function (Stage 4) - NEW DISPATCHER PATTERN */
 static void *get_peers_worker_func(void *arg) {
     get_peers_worker_ctx_t *ctx = (get_peers_worker_ctx_t *)arg;
@@ -640,10 +730,7 @@ static void *get_peers_worker_func(void *arg) {
 
     log_msg(LOG_DEBUG, "[tree %u] get_peers worker %d started", tree->tree_id, worker_id);
 
-    tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
-    tree_socket_t *sock = (tree_socket_t *)tree->socket;
     tree_peers_queue_t *peers_queue = (tree_peers_queue_t *)tree->peers_queue;
-    tree_dispatcher_t *dispatcher = tree->dispatcher;
     bool first_peers_found = false;
 
     unsigned long queries_sent = 0;
@@ -681,78 +768,9 @@ static void *get_peers_worker_func(void *arg) {
             continue;
         }
 
-        /* 2. Get closest nodes from routing table */
-        tree_node_t closest[8];
-        int n = tree_routing_get_closest(rt, infohash, closest, 8);
-        if (n == 0) {
-            /* No nodes to query, skip this infohash */
-            continue;
-        }
-
-        /* 3. Query nodes for peers (iterative lookup) */
+        /* 2-3. Iterative get_peers lookup: query closest nodes for peers */
         peer_entry_t result = {0};
-        memcpy(result.infohash, infohash, 20);
-
-        /* Simple iterative lookup: query initial nodes, then closer nodes from responses */
-        int max_iterations = 3;
-        for (int iter = 0; iter < max_iterations && result.peer_count < MAX_PEERS_PER_ENTRY; iter++) {
-            int queries_this_round = (iter == 0) ? n : 0;
-
-            /* Query each node */
-            for (int i = 0; i < n && result.peer_count < MAX_PEERS_PER_ENTRY; i++) {
-                /* Generate TID for this query */
-                uint8_t tid[4];
-                int tid_len = tree_protocol_gen_tid(tid);
-
-                /* Register TID with dispatcher BEFORE sending */
-                tree_dispatcher_register_tid(dispatcher, tid, tid_len, my_queue);
-
-                /* Send get_peers query */
-                tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
-                queries_sent++;
-
-                /* Wait for response on personal queue (500ms timeout, increased from 100ms) */
-                tree_response_t response_pkt;
-                int pop_result = tree_response_queue_pop(my_queue, &response_pkt, 500);
-
-                /* Unregister TID immediately after receiving (or timeout) */
-                tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
-
-                if (pop_result == 0) {
-                    /* Got a response! */
-                    responses_received++;
-
-                    tree_get_peers_response_t response;
-                    if (tree_handle_get_peers_response(tree, response_pkt.data, response_pkt.len,
-                                                       &response_pkt.from, &response) == 0) {
-                        /* Collect peers */
-                        for (int p = 0; p < response.peer_count && result.peer_count < MAX_PEERS_PER_ENTRY; p++) {
-                            memcpy(&result.peers[result.peer_count], &response.peers[p],
-                                   sizeof(struct sockaddr_storage));
-                            result.peer_count++;
-                        }
-
-                        /* Add closer nodes for next iteration (refresh last_seen to keep good nodes) */
-                        for (int ni = 0; ni < response.node_count && queries_this_round < 8; ni++) {
-                            tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
-                            /* Could track these for next iteration, but keeping it simple */
-                        }
-                    }
-                } else {
-                    /* Timeout or error */
-                    timeouts++;
-                }
-            }
-
-            /* If we found peers, we're done */
-            if (result.peer_count > 0) {
-                break;
-            }
-
-            /* Get fresh closest nodes for next iteration */
-            n = tree_routing_get_closest(rt, infohash, closest, 8);
-            if (n == 0) break;
-        }
+        tree_lookup_peers(tree, infohash, my_queue, &result);
 
         /* 4. If peers found, push to peers queue */
         if (result.peer_count > 0) {
@@ -1001,6 +1019,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     /* Stage 5 config */
     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     tree->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
+    tree->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
