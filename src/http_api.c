@@ -101,6 +101,7 @@ static int refresh_handler(struct mg_connection *conn, void *cbdata);
 static int random_tv_handler(struct mg_connection *conn, void *cbdata);
 static int random_movie_handler(struct mg_connection *conn, void *cbdata);
 static int random_music_handler(struct mg_connection *conn, void *cbdata);
+static int random_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
@@ -122,6 +123,7 @@ static int get_random_video_torrents_filtered(database_t *db, search_result_t **
 static int get_random_tv_torrents(database_t *db, search_result_t **results, int *count);
 static int get_random_movie_torrents(database_t *db, search_result_t **results, int *count);
 static int get_random_music_torrents(database_t *db, search_result_t **results, int *count);
+static int get_random_torrents(database_t *db, const cls_filter_t *filter, long min_peers, search_result_t **results, int *count);
 
 /* Sentinel values to indicate random-mode categories in generate_search_results_html.
  * Compared by pointer identity, so real query strings cannot collide. */
@@ -656,6 +658,7 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/random-tv", random_tv_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random-movies", random_movie_handler, api);
     mg_set_request_handler(api->mg_ctx, "/random-music", random_music_handler, api);
+    mg_set_request_handler(api->mg_ctx, "/random",        random_handler, api);
     mg_set_request_handler(api->mg_ctx, "/torrent/files", http_torrent_files_handler, api);
     mg_set_request_handler(api->mg_ctx, "/torrent", http_torrent_page_handler, api);
 
@@ -1602,6 +1605,80 @@ static int random_music_handler(struct mg_connection *conn, void *cbdata) {
     free(html);
     free_search_results(results, count);
     return 200;
+}
+
+/* General-purpose JSON /random handler: up to 50 random torrents with
+ * total_peers >= min_peers, optionally filtered by category/tv_kind/adult.
+ * Same JSON envelope as /search and /browse. */
+static int random_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
+
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+    const char *qs = ri->query_string ? ri->query_string : "";
+    size_t qs_len = strlen(qs);
+
+    cls_filter_t filter;
+    memset(&filter, 0, sizeof(filter));
+    filter.adult = CLS_ADULT_HIDE;   /* default hide */
+
+    long min_peers = 10;
+    char buf[256];
+
+    if (mg_get_var(qs, qs_len, "category", buf, sizeof(buf)) > 0) {
+        long v;
+        if (parse_long_param(buf, 0, CLS_NUM_CATEGORIES - 1, &v) == 0) {
+            filter.category = (int)v;
+        } else {
+            int c = class_category_from_name(buf);
+            if (c < 0) {
+                return send_json_error(conn, 400, "Invalid value for 'category'");
+            }
+            filter.category = c;
+        }
+        filter.has_category = 1;
+    }
+
+    if (mg_get_var(qs, qs_len, "tv_kind", buf, sizeof(buf)) > 0) {
+        long v;
+        if (parse_long_param(buf, 0, CLS_NUM_TV_KINDS - 1, &v) == 0) {
+            filter.tv_kind = (int)v;
+        } else {
+            int t = class_tv_kind_from_name(buf);
+            if (t < 0) {
+                return send_json_error(conn, 400, "Invalid value for 'tv_kind'");
+            }
+            filter.tv_kind = t;
+        }
+        filter.has_tv_kind = 1;
+    }
+
+    if (mg_get_var(qs, qs_len, "adult", buf, sizeof(buf)) > 0) {
+        if (strcmp(buf, "hide") == 0) {
+            filter.adult = CLS_ADULT_HIDE;
+        } else if (strcmp(buf, "show") == 0) {
+            filter.adult = CLS_ADULT_SHOW;
+        } else if (strcmp(buf, "only") == 0) {
+            filter.adult = CLS_ADULT_ONLY;
+        } else {
+            return send_json_error(conn, 400, "Invalid value for 'adult'");
+        }
+    }
+
+    if (mg_get_var(qs, qs_len, "min_peers", buf, sizeof(buf)) > 0) {
+        long v;
+        if (parse_long_param(buf, 0, 100000, &v) != 0) {
+            return send_json_error(conn, 400, "Invalid value for 'min_peers'");
+        }
+        min_peers = v;
+    }
+
+    search_result_t *results = NULL;
+    int count = 0;
+    if (get_random_torrents(api->database, &filter, min_peers, &results, &count) != 0) {
+        return send_json_error(conn, 500, "Database query failed");
+    }
+
+    return send_json_results(conn, results, count, count, 1);
 }
 
 static int search_handler(struct mg_connection *conn, void *cbdata) {
@@ -3053,6 +3130,219 @@ static int get_random_music_torrents(database_t *db, search_result_t **results, 
     *count = found;
 
     log_msg(LOG_DEBUG, "Random music query returned %d results after %d attempts", found, attempts);
+    return 0;
+}
+
+/* Stage 7: torrent_class probe for the /random candidate loop. tv_kind is
+ * nullable (NULL when the torrent has no tv/anime kind). */
+#define RANDOM_CLASS_SQL_EX "SELECT category, tv_kind, adult FROM torrent_class WHERE torrent_id = ?"
+
+/* Class-first candidate test for /random. A torrent with a class row is judged
+ * by that row alone (adult per adult_mode, then category / tv_kind equality).
+ * A torrent with no class row is eligible only when the caller passed no real
+ * filter (adult=show, no category, no tv_kind); the legacy extension/title
+ * heuristics are intentionally not applied — the phone DB is fully classified.
+ *
+ * want_category == -1 => any; want_tv_kind == -1 => any (incl. NULL),
+ * 0 => require NULL, >0 => equality. The probed class row is written back via
+ * the out-params so the caller can populate the JSON class fields.
+ * CALLER must hold database_read_lock. */
+static int random_candidate_eligible_ex(database_t *db, sqlite3_stmt *class_stmt,
+                                        int64_t torrent_id, const char *name,
+                                        int want_category, int want_tv_kind,
+                                        int adult_mode,
+                                        int *has_class, int *category,
+                                        int *has_tv_kind, int *tv_kind,
+                                        int *adult) {
+    (void)db;
+    (void)name;
+
+    sqlite3_bind_int64(class_stmt, 1, torrent_id);
+
+    *has_class = 0;
+    *category = 0;
+    *has_tv_kind = 0;
+    *tv_kind = 0;
+    *adult = 0;
+
+    if (sqlite3_step(class_stmt) == SQLITE_ROW) {
+        *has_class = 1;
+        *category = sqlite3_column_int(class_stmt, 0);
+        if (sqlite3_column_type(class_stmt, 1) != SQLITE_NULL) {
+            *has_tv_kind = 1;
+            *tv_kind = sqlite3_column_int(class_stmt, 1);
+        }
+        *adult = sqlite3_column_int(class_stmt, 2);
+    }
+    sqlite3_reset(class_stmt);
+
+    if (*has_class) {
+        if (adult_mode == CLS_ADULT_HIDE && *adult != 0) return 0;
+        if (adult_mode == CLS_ADULT_ONLY && *adult != 1) return 0;
+
+        if (want_category != -1 && *category != want_category) return 0;
+
+        if (want_tv_kind == 0) {
+            if (*has_tv_kind) return 0;              /* require NULL */
+        } else if (want_tv_kind > 0) {
+            if (!*has_tv_kind || *tv_kind != want_tv_kind) return 0;
+        }
+
+        return 1;
+    }
+
+    return (adult_mode == CLS_ADULT_SHOW && want_category == -1 && want_tv_kind == -1);
+}
+
+/* Generic random sampler: up to HTTP_API_MAX_RESULTS torrents with
+ * total_peers >= min_peers, filtered via random_candidate_eligible_ex. */
+static int get_random_torrents(database_t *db, const cls_filter_t *filter,
+                               long min_peers, search_result_t **results,
+                               int *count) {
+    if (!db || !filter || !results || !count) {
+        return -1;
+    }
+
+    *results = NULL;
+    *count = 0;
+
+    int want_category = filter->has_category ? filter->category : -1;
+    int want_tv_kind = filter->has_tv_kind ? filter->tv_kind : -1;
+    int adult_mode = filter->adult;
+
+    database_read_lock(db);
+
+    int64_t max_id = 0;
+    sqlite3_stmt *max_stmt;
+    if (sqlite3_prepare_v2(db->db, "SELECT MAX(id) FROM torrents", -1, &max_stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(max_stmt) == SQLITE_ROW) {
+            max_id = sqlite3_column_int64(max_stmt, 0);
+        }
+        sqlite3_finalize(max_stmt);
+    }
+
+    if (max_id == 0) {
+        database_read_unlock(db);
+        return 0;
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (uintptr_t)&seed);
+    srand(seed);
+
+    sqlite3_stmt *class_stmt;
+    if (sqlite3_prepare_v2(db->db, RANDOM_CLASS_SQL_EX, -1, &class_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare random class query: %s", sqlite3_errmsg(db->db));
+        database_read_unlock(db);
+        return -1;
+    }
+
+    const char *torrent_sql =
+        "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp "
+        "FROM torrents WHERE id = ? AND total_peers >= ?";
+    sqlite3_stmt *torrent_stmt;
+    if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+        sqlite3_finalize(class_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    const char *file_count_sql = "SELECT COUNT(*) FROM torrent_files WHERE torrent_id = ?";
+    sqlite3_stmt *file_count_stmt;
+    if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(class_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    search_result_t *res = (search_result_t *)calloc(100, sizeof(search_result_t));
+    if (!res) {
+        sqlite3_finalize(torrent_stmt);
+        sqlite3_finalize(file_count_stmt);
+        sqlite3_finalize(class_stmt);
+        database_read_unlock(db);
+        return -1;
+    }
+
+    uint8_t found_hashes[100][20];
+    int found = 0;
+    int attempts = 0;
+    int max_attempts = 50000;
+
+    while (found < HTTP_API_MAX_RESULTS && attempts < max_attempts) {
+        attempts++;
+
+        int64_t random_id = ((int64_t)rand() * rand()) % max_id + 1;
+
+        sqlite3_bind_int64(torrent_stmt, 1, random_id);
+        sqlite3_bind_int64(torrent_stmt, 2, (int64_t)min_peers);
+
+        if (sqlite3_step(torrent_stmt) == SQLITE_ROW) {
+            int64_t torrent_id = sqlite3_column_int64(torrent_stmt, 0);
+            const void *info_hash_blob = sqlite3_column_blob(torrent_stmt, 1);
+            const char *name = (const char *)sqlite3_column_text(torrent_stmt, 2);
+
+            int is_duplicate = 0;
+            for (int j = 0; j < found; j++) {
+                if (memcmp(found_hashes[j], info_hash_blob, 20) == 0) {
+                    is_duplicate = 1;
+                    break;
+                }
+            }
+
+            int passes = 0;
+            int has_class = 0, category = 0, has_tv_kind = 0, tv_kind = 0, adult = 0;
+            if (!is_duplicate) {
+                passes = random_candidate_eligible_ex(
+                    db, class_stmt, torrent_id, name,
+                    want_category, want_tv_kind, adult_mode,
+                    &has_class, &category, &has_tv_kind, &tv_kind, &adult);
+            }
+
+            if (passes) {
+                memcpy(res[found].info_hash, info_hash_blob, 20);
+                memcpy(found_hashes[found], info_hash_blob, 20);
+                res[found].name = name ? strdup(name) : strdup("Unknown");
+                res[found].size_bytes = sqlite3_column_int64(torrent_stmt, 3);
+                res[found].total_peers = sqlite3_column_int(torrent_stmt, 4);
+                res[found].added_timestamp = sqlite3_column_int64(torrent_stmt, 5);
+
+                res[found].has_class = has_class;
+                res[found].category = category;
+                res[found].has_tv_kind = has_tv_kind;
+                res[found].tv_kind = tv_kind;
+                res[found].adult = adult;
+                /* has_confidence stays 0 => JSON "confidence": null */
+
+                sqlite3_bind_int64(file_count_stmt, 1, torrent_id);
+                if (sqlite3_step(file_count_stmt) == SQLITE_ROW) {
+                    res[found].num_files = sqlite3_column_int(file_count_stmt, 0);
+                }
+                sqlite3_reset(file_count_stmt);
+
+                if (res[found].num_files > 0) {
+                    fetch_result_files(db, &res[found]);
+                }
+
+                found++;
+            }
+        }
+
+        sqlite3_reset(torrent_stmt);
+    }
+
+    sqlite3_finalize(torrent_stmt);
+    sqlite3_finalize(file_count_stmt);
+    sqlite3_finalize(class_stmt);
+
+    database_read_unlock(db);
+
+    *results = res;
+    *count = found;
+
     return 0;
 }
 
