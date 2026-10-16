@@ -82,6 +82,7 @@ typedef struct tree_config {
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
     int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
     int fresh_peer_retries;         /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
+    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
@@ -148,6 +149,7 @@ typedef struct thread_tree {
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;         /* Fresh-peer re-lookups before a metadata failure strike (0-3) */
+    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;

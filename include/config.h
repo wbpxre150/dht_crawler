@@ -127,6 +127,7 @@ typedef struct {
     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
     int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
     int tree_metadata_fresh_peer_retries;/* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
+    int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
 
     /* Thread tree metadata rate-based respawn settings */
     double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */

@@ -78,6 +78,7 @@ typedef struct supervisor_config {
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;          /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
+    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */
@@ -166,6 +167,7 @@ typedef struct supervisor {
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;          /* Fresh-peer re-lookups before metadata failure strike (0-3) */
+    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */

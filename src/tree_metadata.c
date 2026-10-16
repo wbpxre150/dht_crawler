@@ -48,7 +48,7 @@
 
 /* Default config values */
 #define DEFAULT_TCP_TIMEOUT_MS 5000
-#define DEFAULT_METADATA_TIMEOUT_MS 30000
+#define DEFAULT_METADATA_TIMEOUT_MS 60000
 
 /* Connection states */
 typedef enum {
@@ -1251,7 +1251,7 @@ void *tree_metadata_worker_func(void *arg) {
     tree_peers_queue_t *peers_queue = (tree_peers_queue_t *)tree->peers_queue;
     tree_metadata_config_t config = {
         .tcp_connect_timeout_ms = tree->tcp_connect_timeout_ms,
-        .metadata_timeout_ms = 30000,
+        .metadata_timeout_ms = tree->metadata_timeout_ms > 0 ? tree->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS,
         .max_metadata_size = 10 * 1024 * 1024,
         .parallel_peers = tree->parallel_peers,
         .tree = tree

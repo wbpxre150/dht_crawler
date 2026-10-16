@@ -678,6 +678,7 @@ int main(int argc, char *argv[]) {
         .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
         .parallel_peers = config.tree_parallel_peers,
         .fresh_peer_retries = config.tree_metadata_fresh_peer_retries,
+        .metadata_timeout_ms = config.tree_metadata_timeout_ms,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = config.min_metadata_rate,
         .dynamic_rate_margin = config.dynamic_rate_margin,

@@ -106,6 +106,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
     sup->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
+    sup->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 60000;
 
     /* Metadata rate-based respawn settings */
     sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
@@ -481,6 +482,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
         .parallel_peers = sup->parallel_peers,
         .fresh_peer_retries = sup->fresh_peer_retries,
+        .metadata_timeout_ms = sup->metadata_timeout_ms,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,

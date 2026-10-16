@@ -1020,6 +1020,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     tree->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
     tree->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
+    tree->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 60000;
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
