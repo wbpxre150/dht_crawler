@@ -98,16 +98,15 @@ int classifier_models_loaded(void);
 /*
  * 1 when classifier_init() ran, i.e. when classifier_classify() can produce a
  * verdict (the host build without CLF_ENABLED and a config with
- * classifier_enabled=0 both answer 0). Stage 8's backfill job uses it to tell
- * "nothing needed classifying" apart from "nothing could be classified".
+ * classifier_enabled=0 both answer 0). It tells "nothing needed classifying"
+ * apart from "nothing could be classified".
  */
 int classifier_enabled(void);
 
 /*
  * Model version this build labels rows with, the same value
  * classifier_write_meta() stores as classifier_meta['clf_ver'] (0 when no
- * manifest was read). Stage 8's backfill compares a stored row's clf_ver
- * against it to decide whether the row needs re-classification.
+ * manifest was read). Core logic compares a stored row's clf_ver against it.
  */
 long long classifier_current_version(void);
 

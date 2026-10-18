@@ -75,7 +75,7 @@ void database_read_lock(database_t *db);
 void database_read_unlock(database_t *db);
 
 /* Acquire/release the connection write mutex, for a caller that runs its own
- * BEGIN..COMMIT on the shared connection (stage 8 backfill). Held for the
+ * BEGIN..COMMIT on the shared connection. Held for the
  * transaction only: database_wal_checkpoint() takes the same mutex. */
 void database_write_lock(database_t *db);
 void database_write_unlock(database_t *db);
