@@ -96,6 +96,7 @@ void classifier_get_stats(classifier_stats_t *out);
 int classifier_models_loaded(void);
 
 /*
+ * 1 when classifier_init() ran, i.e. when classifier_classify() can produce a
  * verdict (the host build without CLF_ENABLED and a config with
  * classifier_enabled=0 both answer 0).
  */
