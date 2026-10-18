@@ -8,7 +8,6 @@
 #include "bloom_filter.h"
 #include "dht_crawler.h"
 #include "database.h"
-#include "porn_filter.h"
 #include "hard_block.h"
 #include "language_filter.h"
 #include "classifier.h"
@@ -1547,20 +1546,14 @@ void *tree_metadata_worker_func(void *arg) {
 
             if (rc == 0) {
                 /* Stage 6 filter order, most specific first: the always-on hard
-                 * block list, the keyword porn filter, the language filter, then
-                 * the classifier's adult verdict when adult_mode=drop. The porn
-                 * filter is a fallback: it only runs while the classifier cannot
-                 * decide (feature off, or its adult model missing/unusable). */
+                 * block list, then the language filter, then the classifier's
+                 * adult verdict when adult_mode=drop. */
                 int filtered = 0;
                 if (hard_block_check(db_meta.name)) {
                     filtered = 1;
                     classifier_note_hard_block_dropped();
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (hard block): %s",
                             tree->tree_id, metadata->name);
-                } else if (tree->porn_filter_enabled && !classifier_models_loaded() &&
-                           porn_filter_check(&db_meta)) {
-                    filtered = 1;
-                    log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (porn): %s", tree->tree_id, metadata->name);
                 } else if (language_filter_check(&db_meta)) {
                     filtered = 1;
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (language): %s", tree->tree_id, metadata->name);
@@ -1577,8 +1570,8 @@ void *tree_metadata_worker_func(void *arg) {
 
                 /* adult_mode=drop takes the same path as any other filtered
                  * item: filtered_count, bloom-add (no re-processing) and no DB
-                 * insert. With the models missing adult_p stays 0.0, so the
-                 * keyword fallback above keeps its old job. */
+                 * insert. With the models missing adult_p stays 0.0, so nothing
+                 * is dropped on the adult verdict. */
                 if (!filtered && db_meta.has_classification &&
                     strcmp(tree->adult_mode, "drop") == 0 &&
                     db_meta.classification.adult_p >= tree->adult_drop_threshold) {

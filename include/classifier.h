@@ -8,8 +8,7 @@
  * Ingest-time classification (Stage 5, tag mode).
  *
  * Every torrent that survives the ingest filters in tree_metadata.c (the
- * always-on hard block list, the keyword porn filter while it is still in
- * charge, and the language filter) gets a classification_t. The value rides
+ * always-on hard block list and the language filter) gets a classification_t. The value rides
  * inside torrent_metadata_t through batch_writer_add() and is written as one
  * torrent_class row, in the same transaction as the torrent itself. In
  * adult_mode=drop the same verdict is also the drop decision: items at or
@@ -88,10 +87,8 @@ void classifier_get_stats(classifier_stats_t *out);
 
 /*
  * 1 when the adult model is loaded and usable, i.e. the classifier owns adult
- * tagging. Callers use this to demote the keyword porn filter: when it returns
- * 1 that filter must not run at all, and when the classifier is disabled (or
- * built without CLF_ENABLED, or its models are missing) it returns 0 so the
- * keyword fallback stays active.
+ * tagging. 0 when the classifier is disabled (feature off, built without
+ * CLF_ENABLED, or its models missing/unusable).
  */
 int classifier_models_loaded(void);
 

@@ -20,7 +20,7 @@ The first `make` automatically applies patches to `lib/bencode-c` and `lib/civet
 ### CLI Flags
 
 ```
-./dht_crawler [--rebuild-bloom-filter] [--porn-filter-update] [--compact]
+./dht_crawler [--rebuild-bloom-filter] [--compact]
               [--check-database] [--recover-database]
 ```
 
@@ -102,7 +102,7 @@ Both are persisted to disk on each batch flush and reloaded on startup.
 - `tree_*_workers` — worker counts per tree (total threads ≈ num_trees × ~140)
 - `bloom_capacity`, `failure_bloom_capacity` — filter sizes (~500 MB total at 30M)
 - `batch_size`, `flush_interval` — write batching
-- `porn_filter_enabled`, `language_filter_non_latin_threshold` — content filtering
+- `language_filter_non_latin_threshold`, `hard_block_file` — content filtering
 - `bep51_cache_*` — bootstrap cache settings
 - `min_metadata_rate`, `dynamic_rate_margin`, `rate_*` — respawn thresholds
 

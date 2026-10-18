@@ -6,9 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Same shape as the porn filter's keyword loader, minus the hash table and the
- * co-occurrence layers: the list is small, reviewed, and matched on every
- * ingest, so a plain array of strdup'ed terms is enough. */
+/* The list is small, reviewed, and matched on every ingest, so a plain array
+ * of strdup'ed terms is enough: no hash table, no co-occurrence layers. */
 #define HB_MAX_TERMS 1024
 #define HB_LINE_CAP 256
 #define HB_FILE_DEFAULT "hard_block.txt"

@@ -92,9 +92,6 @@ typedef struct tree_config {
     bool require_empty_queue;           /* Only respawn if queue empty (default: true) */
     double ema_alpha;                   /* EMA smoothing alpha for metadata rate (default: 0.3) */
 
-    /* Porn filter settings */
-    int porn_filter_enabled;            /* Enable porn filter (0=disabled, 1=enabled) */
-
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
     double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
@@ -194,7 +191,7 @@ typedef struct thread_tree {
     /* Statistics */
     atomic_uint_fast64_t metadata_count;
     atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
-    atomic_uint_fast64_t filtered_count;    /* Filtered by porn filter */
+    atomic_uint_fast64_t filtered_count;    /* Dropped by the ingest filters (hard block/language/adult) */
     atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
     atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
     atomic_uint_fast64_t fresh_peer_relookups;    /* Metadata failures that triggered a fresh-peer re-lookup */
@@ -214,9 +211,6 @@ typedef struct thread_tree {
     int min_lifetime_sec;                   /* Minimum lifetime before rate checks (default: 600s = 10min) */
     bool require_empty_queue;               /* Only respawn if infohash queue empty */
     double ema_alpha;                       /* EMA smoothing alpha for metadata rate */
-
-    /* Porn filter settings */
-    int porn_filter_enabled;                /* Enable porn filter (0=disabled, 1=enabled) */
 
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag": store the verdict, "drop": discard */

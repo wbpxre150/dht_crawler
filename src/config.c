@@ -69,11 +69,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->rclone_dest_path[0]   = '\0';
     strncpy(config->rclone_bookmark_path, "data/rclone_backup_ids.txt", sizeof(config->rclone_bookmark_path) - 1);
 
-    /* Pornography content filter defaults */
-    config->porn_filter_enabled = 0;                /* Disabled by default */
-    strncpy(config->porn_filter_keyword_file, "porn_filter_keywords.txt", sizeof(config->porn_filter_keyword_file) - 1);
-
-
     /* Supervisor-level global bootstrap defaults */
     config->global_bootstrap_target = 200;
     config->global_bootstrap_timeout_sec = 600;
@@ -303,12 +298,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->connection_timeout_sec = atoi(value);
         } else if (strcmp(key, "max_connection_lifetime_sec") == 0) {
             config->max_connection_lifetime_sec = atoi(value);
-        }
-        /* Pornography content filter settings */
-        else if (strcmp(key, "porn_filter_enabled") == 0) {
-            config->porn_filter_enabled = atoi(value);
-        } else if (strcmp(key, "porn_filter_keyword_file") == 0) {
-            strncpy(config->porn_filter_keyword_file, value, sizeof(config->porn_filter_keyword_file) - 1);
         }
         /* Language filter settings */
         else if (strcmp(key, "language_filter_non_latin_threshold") == 0 ||

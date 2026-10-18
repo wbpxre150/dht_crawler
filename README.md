@@ -8,7 +8,7 @@ A high-performance BitTorrent DHT crawler written in C that discovers and collec
 - **Full BEP support**: BEP 5 (DHT), BEP 9 (ut_metadata), BEP 10 (Extension Protocol), BEP 51 (sample_infohashes)
 - **IPv4 and IPv6**: dual-stack UDP socket with IPv4-mapped address support
 - **High throughput**: 10-50 torrents/minute sustained with configurable parallelism
-- **Intelligent filtering**: Three-layer pornography filter with keyword, regex, and heuristic detection; non-Latin language filter
+- **Intelligent filtering**: fastText adult/category classifier (`adult_mode = tag|drop`), an always-on hard-block list, and a non-Latin language filter
 - **Efficient deduplication**: Two bloom filters — infohash dedup (30M capacity) and two-strike failure tracking
 - **Batched database writes**: 10-100x performance improvement via transaction batching
 - **Persistent bootstrap**: BEP51 node cache for instant warm-restart (no cold-start penalty after first run)
@@ -67,9 +67,6 @@ tree_find_node_workers = 3
 tree_bep51_workers = 10
 tree_get_peers_workers = 50
 tree_metadata_workers = 75
-
-# Enable/disable porn filter
-porn_filter_enabled = 1
 
 # Bloom filter settings
 bloom_capacity = 30000000
@@ -209,7 +206,6 @@ make valgrind
 
 ```
 ./dht_crawler --rebuild-bloom-filter   # Rebuild bloom.dat from the existing database
-./dht_crawler --porn-filter-update     # Re-scan database and remove porn-filtered entries
 ./dht_crawler --compact                # VACUUM database into a fresh file and replace original
 ./dht_crawler --check-database         # Run SQLite integrity_check and report errors
 ./dht_crawler --recover-database       # Copy all readable rows to a new database; replace original
@@ -230,12 +226,6 @@ tree_metadata_workers = 50
 ### Custom Bootstrap Nodes
 
 Bootstrap nodes are hardcoded in `src/supervisor.c` in the `BOOTSTRAP_HOSTS` array. Edit that array to add or replace DHT bootstrap routers.
-
-### Disabling Porn Filter
-
-```ini
-porn_filter_enabled = 0
-```
 
 ### Backup Configuration
 

@@ -5,13 +5,13 @@
  * Always-on hard block list (Stage 6).
  *
  * A flat list of unambiguous terms that are dropped at ingest in BOTH adult
- * modes and whether or not the classifier is running: the keyword porn filter
- * is a fallback that can be disabled or demoted, this list is not. Terms are
+ * modes and whether or not the classifier is running: unlike the classifier's
+ * adult verdict, this list is never demoted. Terms are
  * matched as plain case-insensitive substrings of the torrent NAME (the file
  * list is not consulted in this stage) and are never stored, so a dropped
  * infohash is also bloom-added by the caller like any other filtered item.
  *
- * File format mirrors porn_filter_keywords.txt: one term per line, blank lines
+ * File format: one term per line, blank lines
  * and '#' comment lines ignored; terms are folded to lowercase on load. File
  * path is cwd-relative, like the other keyword files.
  */

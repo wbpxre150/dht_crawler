@@ -3,7 +3,6 @@
 #include "refresh_query.h"
 #include "refresh_thread.h"
 #include "batch_writer.h"
-#include "porn_filter.h"
 #include "language_filter.h"
 #include "classifier.h"
 #include "torrent_search.h"
@@ -610,26 +609,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     char uptime_str[32];
     snprintf(uptime_str, sizeof(uptime_str), "%d:%02d", uptime_hours, uptime_minutes);
     cJSON_AddStringToObject(root, "uptime", uptime_str);
-
-    /* Add porn filter statistics */
-    porn_filter_stats_t pf_stats;
-    porn_filter_get_stats(&pf_stats);
-    if (pf_stats.total_checked > 0) {
-        cJSON *porn_filter = cJSON_CreateObject();
-        cJSON_AddNumberToObject(porn_filter, "total_checked", (double)pf_stats.total_checked);
-        cJSON_AddNumberToObject(porn_filter, "total_filtered", (double)pf_stats.total_filtered);
-        cJSON_AddNumberToObject(porn_filter, "filtered_by_keyword", (double)pf_stats.filtered_by_keyword);
-        cJSON_AddNumberToObject(porn_filter, "filtered_by_file", (double)pf_stats.filtered_by_file);
-
-        /* Calculate filter rate */
-        double filter_rate = 0.0;
-        if (pf_stats.total_checked > 0) {
-            filter_rate = (pf_stats.total_filtered * 100.0) / pf_stats.total_checked;
-        }
-        cJSON_AddNumberToObject(porn_filter, "filter_rate_percent", filter_rate);
-
-        cJSON_AddItemToObject(root, "porn_filter", porn_filter);
-    }
 
     /* Add language filter statistics */
     language_filter_stats_t lf_stats;

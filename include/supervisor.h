@@ -89,9 +89,6 @@ typedef struct supervisor_config {
     bool require_empty_queue;
     double rate_ema_alpha;             /* EMA smoothing alpha (0.0-1.0) */
 
-    /* Porn filter settings */
-    bool porn_filter_enabled;
-
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
     double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
@@ -177,9 +174,6 @@ typedef struct supervisor {
     int min_lifetime_minutes;
     bool require_empty_queue;
     double rate_ema_alpha;
-
-    /* Porn filter settings */
-    bool porn_filter_enabled;
 
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */

@@ -463,8 +463,7 @@ void classifier_get_stats(classifier_stats_t *out) {
 int classifier_models_loaded(void) {
     /* Read without the stats mutex: both fields are set once by
      * classifier_init() before any worker thread exists, and only the adult
-     * model decides adult tagging (the caller uses this to demote the keyword
-     * porn filter). */
+     * model decides adult tagging. */
     return (clf.enabled && clf.adult_model) ? 1 : 0;
 }
 
@@ -550,8 +549,8 @@ void classifier_init(const char *model_dir, double adult_hide_threshold) {
     log_msg(LOG_DEBUG, "Classifier: built without CLF_ENABLED; classification disabled");
 }
 
-/* No models exist in this flavour, so the keyword porn filter always stays
- * active as the fallback and every ingest-outcome counter stays zero. */
+/* No models exist in this flavour, so no ingest-time classification happens and
+ * every ingest-outcome counter stays zero. */
 int classifier_models_loaded(void) {
     return 0;
 }

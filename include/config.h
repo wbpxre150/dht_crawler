@@ -10,7 +10,7 @@ typedef struct {
      * CONFIG_INI.md (one-pager post-Stage 6). When auditing this struct, the
      * consumers are:
      *   - main.c (dht_port, db_path, log_level, bloom_*, batch_size, backup_*,
-     *     ssh_*, rclone_*, porn_filter_*, language_filter_*)
+     *     ssh_*, rclone_*, language_filter_*)
      *   - supervisor.c (dht_port, num_trees, tree_*, bep51_*, refresh_*,
      *     respawn_*, min_metadata_rate, dynamic_rate_margin, etc.)
      *   - tree_*.c (tree_* via supervisor config)
@@ -18,7 +18,6 @@ typedef struct {
      *   - batch_writer.c (batch_size, flush_interval, backup_path)
      *   - refresh_thread.c (refresh_*)
      *   - language_filter.c (language_filter_non_latin_threshold)
-     *   - porn_filter.c (porn_filter_enabled, porn_filter_keyword_file)
      *   - classifier.c (classifier_enabled, classifier_model_dir,
      *     adult_hide_threshold)
      *   - tree_metadata.c (adult_mode, adult_drop_threshold), hard_block.c
@@ -82,11 +81,7 @@ typedef struct {
     char rclone_dest_path[1024];     /* bucket path, e.g. "dht-backup/dht_crawler_backup" */
     char rclone_bookmark_path[1024]; /* local bookmark file */
 
-    /* Pornography content filter settings */
-    int porn_filter_enabled;             /* Enable pornography content filter (0=disabled, 1=enabled) */
-    char porn_filter_keyword_file[512];  /* Path to keyword file */
-
-    /* Language filter settings (independent of porn filter) */
+    /* Language filter settings */
     int language_filter_non_latin_threshold; /* Filter torrents where non-Latin chars exceed this % (0=disabled, default: 33) */
 
     /* Ingest-time classifier settings (Stage 5, tag mode) */
