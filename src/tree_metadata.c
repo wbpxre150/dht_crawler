@@ -11,6 +11,7 @@
 #include "hard_block.h"
 #include "language_filter.h"
 #include "classifier.h"
+#include "category_filter_cleanup.h"
 #include "../lib/bencode-c/bencode.h"
 
 #include <openssl/sha.h>
@@ -1579,6 +1580,35 @@ void *tree_metadata_worker_func(void *arg) {
                     classifier_note_adult_dropped();
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (adult %.3f): %s",
                             tree->tree_id, db_meta.classification.adult_p, metadata->name);
+                }
+
+                /* "Categories to save": a survivor is dropped when its category
+                 * — or, inside the tv/anime categories, its tv_kind — is not in
+                 * save_categories/save_tv_kinds. An item the classifier could
+                 * not place carries category 0 (unknown) / tv_kind 0 (none),
+                 * which are ordinary taxonomy entries here. With the default
+                 * all-bits-set masks this branch is inert, so the hot path is
+                 * unchanged unless an operator narrowed the selection. */
+                if (!filtered &&
+                    (tree->save_category_mask != CATEGORY_FILTER_ALL_CATEGORIES ||
+                     tree->save_tv_kind_mask != CATEGORY_FILTER_ALL_TV_KINDS)) {
+                    int category = db_meta.has_classification ? db_meta.classification.category : 0;
+                    int tv_kind = db_meta.has_classification ? db_meta.classification.tv_kind : 0;
+
+                    int verdict = category_filter_should_drop(category, tv_kind,
+                                                              tree->save_category_mask,
+                                                              tree->save_tv_kind_mask);
+                    if (verdict == CATEGORY_FILTER_DROP_CATEGORY) {
+                        filtered = 1;
+                        category_filter_note_category_dropped();
+                        log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (category %d): %s",
+                                tree->tree_id, category, metadata->name);
+                    } else if (verdict == CATEGORY_FILTER_DROP_TV_KIND) {
+                        filtered = 1;
+                        category_filter_note_tv_kind_dropped();
+                        log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (tv_kind %d): %s",
+                                tree->tree_id, tv_kind, metadata->name);
+                    }
                 }
 
                 if (filtered) {

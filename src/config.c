@@ -1,10 +1,46 @@
 #include "config.h"
 #include "dht_crawler.h"
+#include "category_filter_cleanup.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
 
+/*
+ * Parse a comma-separated save_categories / save_tv_kinds list into a bitmask.
+ * Entries are taxonomy names (case-insensitive) or, as a convenience, decimal
+ * indices. Unknown entries are logged and ignored; an empty list — or one with
+ * no valid entry at all — means "save everything", i.e. every bit set, which
+ * is what keeps the filter backward compatible with old configs.
+ */
+static uint16_t parse_taxonomy_mask(const char *value, int count, uint16_t all,
+                                    int (*parse_one)(const char *),
+                                    const char *key_name) {
+    uint16_t mask = 0;
+    char buf[512];
+
+    snprintf(buf, sizeof(buf), "%s", value);
+
+    char *cursor = buf;
+    while (cursor && *cursor) {
+        char *comma = strchr(cursor, ',');
+        if (comma) *comma = '\0';
+
+        int index = parse_one(cursor);
+        if (index >= 0 && index < count) {
+            mask |= (uint16_t)(1u << index);
+        } else {
+            log_msg(LOG_WARN, "Unknown %s entry '%s' ignored", key_name, cursor);
+        }
+
+        cursor = comma ? comma + 1 : NULL;
+    }
+
+    if (mask == 0) {
+        return all;
+    }
+    return mask;
+}
 /* Initialize config with default values */
 void config_init_defaults(crawler_config_t *config) {
     if (!config) {
@@ -86,6 +122,11 @@ void config_init_defaults(crawler_config_t *config) {
     config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
     config->adult_drop_threshold = 0.995516;        /* only used by adult_mode=drop */
     strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
+
+    /* "Categories to save" defaults: every bit set, so nothing is filtered at
+     * ingest until save_categories / save_tv_kinds narrow the selection. */
+    config->save_category_mask = CATEGORY_FILTER_ALL_CATEGORIES;
+    config->save_tv_kind_mask = CATEGORY_FILTER_ALL_TV_KINDS;
 
     /* Thread tree defaults (Stage 1) */
     config->num_trees = 4;                          /* 4 concurrent thread trees */
@@ -332,6 +373,18 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->adult_drop_threshold = threshold;
         } else if (strcmp(key, "hard_block_file") == 0) {
             strncpy(config->hard_block_file, value, sizeof(config->hard_block_file) - 1);
+        /* "Categories to save": comma-separated taxonomy names/indices; an
+         * empty list means "save everything". */
+        } else if (strcmp(key, "save_categories") == 0) {
+            config->save_category_mask =
+                parse_taxonomy_mask(value, CATEGORY_FILTER_NUM_CATEGORIES,
+                                    CATEGORY_FILTER_ALL_CATEGORIES,
+                                    category_filter_category_parse, key);
+        } else if (strcmp(key, "save_tv_kinds") == 0) {
+            config->save_tv_kind_mask =
+                parse_taxonomy_mask(value, CATEGORY_FILTER_NUM_TV_KINDS,
+                                    CATEGORY_FILTER_ALL_TV_KINDS,
+                                    category_filter_tv_kind_parse, key);
         }
         /* Thread tree settings (Stage 1) */
         else if (strcmp(key, "num_trees") == 0) {

@@ -5,6 +5,7 @@
 #include "batch_writer.h"
 #include "language_filter.h"
 #include "classifier.h"
+#include "category_filter_cleanup.h"
 #include "torrent_search.h"
 #include "supervisor.h"
 #include "udp_rate_limit.h"
@@ -663,6 +664,25 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddItemToObject(classifier, "by_category", by_category);
 
         cJSON_AddItemToObject(root, "classifier", classifier);
+    }
+
+    /* "Categories to save": ingest drops caused by save_categories /
+     * save_tv_kinds. Only present once something has been dropped, so an
+     * unfiltered crawl reports exactly the /stats it always did. */
+    {
+        category_filter_stats_t cf_stats;
+        category_filter_get_stats(&cf_stats);
+
+        if (cf_stats.total_dropped > 0) {
+            cJSON *category_filter = cJSON_CreateObject();
+            cJSON_AddNumberToObject(category_filter, "total_dropped",
+                                    (double)cf_stats.total_dropped);
+            cJSON_AddNumberToObject(category_filter, "dropped_by_category",
+                                    (double)cf_stats.dropped_by_category);
+            cJSON_AddNumberToObject(category_filter, "dropped_by_tv_kind",
+                                    (double)cf_stats.dropped_by_tv_kind);
+            cJSON_AddItemToObject(root, "category_filter", category_filter);
+        }
     }
 
     /* Stage 6: Add supervisor/thread tree statistics */

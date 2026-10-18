@@ -94,6 +94,12 @@ typedef struct {
     double adult_drop_threshold;        /* adult_mode=drop: drop when P(adult) >= this */
     char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
 
+    /* "Categories to save" (see category_filter_cleanup.h). Both are bitmasks
+     * over the tparse taxonomy and default to every bit set, which means "save
+     * everything" — the filter is inert until an operator narrows it. */
+    uint16_t save_category_mask;        /* bit i = tp_category_t i (12 bits, 0 = unknown) */
+    uint16_t save_tv_kind_mask;         /* bit i = tp_tv_kind_t i (7 bits, 0 = none) */
+
     /* Thread tree settings (Stage 1) */
     int num_trees;                       /* Number of concurrent thread trees (default: 4) */
 

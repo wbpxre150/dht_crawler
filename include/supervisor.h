@@ -93,6 +93,10 @@ typedef struct supervisor_config {
     char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
     double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
 
+    /* "Categories to save" bitmasks (see category_filter_cleanup.h) */
+    uint16_t save_category_mask;         /* bit i = tp_category_t i saved; all bits = everything */
+    uint16_t save_tv_kind_mask;          /* bit i = tp_tv_kind_t i saved; all bits = everything */
+
     /* Tree bootstrap settings */
 
     /* Keyspace partitioning */
@@ -178,6 +182,10 @@ typedef struct supervisor {
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
     double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
+
+    /* "Categories to save" bitmasks, propagated into each tree's config */
+    uint16_t save_category_mask;
+    uint16_t save_tv_kind_mask;
 
     /* Tree bootstrap settings */
 

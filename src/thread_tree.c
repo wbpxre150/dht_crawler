@@ -1094,6 +1094,9 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     /* Stage 6 adult handling (the drop decision is made in tree_metadata.c) */
     strncpy(tree->adult_mode, config->adult_mode, sizeof(tree->adult_mode) - 1);
     tree->adult_drop_threshold = config->adult_drop_threshold;
+    /* "Categories to save" (the drop decision is made in tree_metadata.c) */
+    tree->save_category_mask = config->save_category_mask;
+    tree->save_tv_kind_mask = config->save_tv_kind_mask;
 
     /* Initialize lifecycle tracking */
     tree->creation_time = time(NULL);

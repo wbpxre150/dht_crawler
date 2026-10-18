@@ -209,15 +209,16 @@ static void free_metadata(torrent_metadata_t *m) {
 
 /* ---------- Main entry ---------- */
 
-int language_filter_cleanup_run(database_t *db_handle, const char *db_path) {
+int language_filter_cleanup_run(database_t *db_handle, const char *db_path, int allow_prompt) {
     if (!db_handle || !db_handle->db) {
         log_msg(LOG_ERROR, "language cleanup: invalid database handle");
         return 1;
     }
     sqlite3 *db = db_handle->db;
 
-    /* Backup prompt */
-    if (prompt_backup(db_path) != 0) {
+    /* Backup prompt, interactive use only: the app runs the maintenance pass
+     * with no TTY, so a stdin read here would abort the whole purge. */
+    if (allow_prompt && prompt_backup(db_path) != 0) {
         log_msg(LOG_ERROR, "language cleanup: aborted before any DB modification");
         return 1;
     }
