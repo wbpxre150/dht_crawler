@@ -96,17 +96,15 @@ void classifier_get_stats(classifier_stats_t *out);
 int classifier_models_loaded(void);
 
 /*
- * 1 when classifier_init() ran, i.e. when classifier_classify() can produce a
  * verdict (the host build without CLF_ENABLED and a config with
- * classifier_enabled=0 both answer 0). It tells "nothing needed classifying"
- * apart from "nothing could be classified".
+ * classifier_enabled=0 both answer 0).
  */
 int classifier_enabled(void);
 
 /*
  * Model version this build labels rows with, the same value
  * classifier_write_meta() stores as classifier_meta['clf_ver'] (0 when no
- * manifest was read). Core logic compares a stored row's clf_ver against it.
+ * manifest was read).
  */
 long long classifier_current_version(void);
 

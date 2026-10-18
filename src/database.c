@@ -163,23 +163,6 @@ void database_read_unlock(database_t *db) {
     if (db) pthread_rwlock_unlock(&db->checkpoint_rwlock);
 }
 
-/*
- * The connection's write mutex: one writer at a time on the shared sqlite3
- * handle. database_insert_batch() and database_wal_checkpoint() take it
- * internally, so a caller that opens its own BEGIN..COMMIT must hold it
- * for the whole transaction - and must not call
- * database_wal_checkpoint() before releasing it (that would self-deadlock on
- * the non-recursive mutex).
- */
-void database_write_lock(database_t *db) {
-    if (db) uv_mutex_lock(&db->mutex);
-}
-
-/* Release the connection write mutex */
-void database_write_unlock(database_t *db) {
-    if (db) uv_mutex_unlock(&db->mutex);
-}
-
 /* Set bloom filter for tracking successful writes */
 void database_set_bloom(database_t *db, bloom_filter_t *bloom) {
     if (!db) {
@@ -309,57 +292,6 @@ int database_check_exists(database_t *db, const uint8_t *info_hash) {
     uv_mutex_unlock(&db->mutex);
     pthread_rwlock_unlock(&db->checkpoint_rwlock);
     return exists;
-}
-
-/* Begin transaction */
-int database_begin_transaction(database_t *db) {
-    if (!db || !db->db) {
-        return -1;
-    }
-
-    char *err_msg = NULL;
-    int rc = sqlite3_exec(db->db, "BEGIN TRANSACTION;", NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to begin transaction: %s", err_msg);
-        sqlite3_free(err_msg);
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Commit transaction */
-int database_commit_transaction(database_t *db) {
-    if (!db || !db->db) {
-        return -1;
-    }
-
-    char *err_msg = NULL;
-    int rc = sqlite3_exec(db->db, "COMMIT;", NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to commit transaction: %s", err_msg);
-        sqlite3_free(err_msg);
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Rollback transaction */
-int database_rollback_transaction(database_t *db) {
-    if (!db || !db->db) {
-        return -1;
-    }
-
-    char *err_msg = NULL;
-    int rc = sqlite3_exec(db->db, "ROLLBACK;", NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to rollback transaction: %s", err_msg);
-        sqlite3_free(err_msg);
-        return -1;
-    }
-
-    return 0;
 }
 
 /* Check if info_hash exists (for bloom filter integration) */

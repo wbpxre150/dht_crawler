@@ -74,12 +74,6 @@ typedef struct {
 void database_read_lock(database_t *db);
 void database_read_unlock(database_t *db);
 
-/* Acquire/release the connection write mutex, for a caller that runs its own
- * BEGIN..COMMIT on the shared connection. Held for the
- * transaction only: database_wal_checkpoint() takes the same mutex. */
-void database_write_lock(database_t *db);
-void database_write_unlock(database_t *db);
-
 /* Function declarations */
 int database_init(database_t *db, const char *db_path, app_context_t *app_ctx);
 int database_create_schema(database_t *db);
@@ -89,9 +83,6 @@ int database_insert_torrent(database_t *db, const torrent_metadata_t *torrent,
 int database_insert_batch(database_t *db, torrent_metadata_t **batch, size_t count, size_t *out_written);
 int database_check_exists(database_t *db, const uint8_t *info_hash);
 int database_has_infohash(database_t *db, const unsigned char *hash);
-int database_begin_transaction(database_t *db);
-int database_commit_transaction(database_t *db);
-int database_rollback_transaction(database_t *db);
 void database_cleanup(database_t *db);
 
 /* Torrent summary (for detail page) */
