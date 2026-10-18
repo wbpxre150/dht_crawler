@@ -1445,7 +1445,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
             ") "
             "GROUP BY t.id "
-            "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
+            "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
+            "t.total_peers DESC, t.added_timestamp DESC "
             "LIMIT ?3 OFFSET ?4", class_main_join);
     } else {
         /* Has quoted terms — build dynamic file_search subquery with word-boundary checks */
@@ -1521,7 +1522,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             "    %s"
             ") "
             "GROUP BY t.id "
-            "ORDER BY t.total_peers DESC, t.added_timestamp DESC "
+            "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
+            "t.total_peers DESC, t.added_timestamp DESC "
             "LIMIT ?%d OFFSET ?%d", class_main_join, file_subquery, limit_idx, offset_idx);
     }
 
