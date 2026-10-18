@@ -166,8 +166,8 @@ void database_read_unlock(database_t *db) {
 /*
  * The connection's write mutex: one writer at a time on the shared sqlite3
  * handle. database_insert_batch() and database_wal_checkpoint() take it
- * internally, so a caller that opens its own BEGIN..COMMIT (stage 8's
- * backfill) must hold it for the whole transaction - and must not call
+ * internally, so a caller that opens its own BEGIN..COMMIT must hold it
+ * for the whole transaction - and must not call
  * database_wal_checkpoint() before releasing it (that would self-deadlock on
  * the non-recursive mutex).
  */
@@ -499,8 +499,8 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
     /* Stage 5: the classification row rides in the caller's transaction (one
      * BEGIN...COMMIT per batch flush), so it is never a second transaction.
      * A failure here is logged but does not fail the torrent insert: the
-     * torrent itself is already written and a missing class row is what stage
-     * 8's backfill repairs (clf_ver < ver or no row). */
+     * torrent itself is already written; a missing class row just leaves the
+     * torrent unlabelled. */
     if (torrent->has_classification && db->insert_class_stmt) {
         const classification_t *c = &torrent->classification;
         sqlite3_reset(db->insert_class_stmt);

@@ -6,7 +6,6 @@
 #include "porn_filter.h"
 #include "language_filter.h"
 #include "classifier.h"
-#include "classifier_backfill.h"
 #include "torrent_search.h"
 #include "supervisor.h"
 #include "udp_rate_limit.h"
@@ -684,22 +683,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         }
         cJSON_AddItemToObject(classifier, "by_category", by_category);
 
-        /* Stage 8: the backfill / re-classify job's progress. Nested in the
-         * classifier block because it is the same feature's work: state is
-         * idle/running/complete, ckpt is the id the sweep resumes at, and
-         * done/total count the sweep in progress (available=false on a build
-         * or config without the classifier). */
-        classifier_backfill_stats_t bf_stats;
-        classifier_backfill_get_stats(&bf_stats);
-        cJSON *backfill = cJSON_CreateObject();
-        cJSON_AddStringToObject(backfill, "state", classifier_backfill_state_name(bf_stats.state));
-        cJSON_AddBoolToObject(backfill, "available", bf_stats.available ? 1 : 0);
-        cJSON_AddNumberToObject(backfill, "done", (double)bf_stats.done);
-        cJSON_AddNumberToObject(backfill, "total", (double)bf_stats.total);
-        cJSON_AddNumberToObject(backfill, "rate_rows_s", bf_stats.rate_rows_s);
-        cJSON_AddNumberToObject(backfill, "ckpt", (double)bf_stats.ckpt);
-        cJSON_AddNumberToObject(backfill, "clf_ver", (double)bf_stats.clf_ver);
-        cJSON_AddItemToObject(classifier, "backfill", backfill);
         cJSON_AddItemToObject(root, "classifier", classifier);
     }
 

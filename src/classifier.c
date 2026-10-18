@@ -185,7 +185,7 @@ static void clf_load_manifest(void) {
     clf.manifest_ok = 1;
 
     /* `version` is the model version string ("v1"): take its digits as the
-     * per-row clf_ver the backfill compares against. */
+     * per-row clf_ver recorded on ingest. */
     const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "version");
     if (cJSON_IsString(version)) {
         const char *p = version->valuestring;
@@ -556,8 +556,7 @@ int classifier_models_loaded(void) {
     return 0;
 }
 
-/* This flavour never classifies: the backfill job reports available=false and
- * stays idle. */
+/* This flavour never classifies. */
 int classifier_enabled(void) {
     return 0;
 }
