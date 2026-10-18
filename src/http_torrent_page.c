@@ -195,6 +195,26 @@ static int sb_append(sbuf_t *s, const char *fmt, ...) {
     }
 }
 
+/* Append a JSON-escaped copy of p to s (mirrors the escaping loop used by
+ * http_torrent_files_handler). */
+static void tp_append_json_string(sbuf_t *s, const char *p) {
+    if (!p) return;
+    for (; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+            case '"':  sb_append(s, "\\\""); break;
+            case '\\': sb_append(s, "\\\\"); break;
+            case '\n': sb_append(s, "\\n"); break;
+            case '\r': sb_append(s, "\\r"); break;
+            case '\t': sb_append(s, "\\t"); break;
+            default:
+                if (c < 0x20) sb_append(s, "\\u%04x", c);
+                else { char tmp[2] = {(char)c, 0}; sb_append(s, "%s", tmp); }
+                break;
+        }
+    }
+}
+
 static void send_404(struct mg_connection *conn, const char *msg) {
     const char *body = msg ? msg : "Not found";
     mg_printf(conn,
@@ -208,6 +228,15 @@ static void send_400(struct mg_connection *conn, const char *msg) {
     const char *body = msg ? msg : "Bad request";
     mg_printf(conn,
               "HTTP/1.1 400 Bad Request\r\n"
+              "Content-Type: text/plain; charset=utf-8\r\n"
+              "Content-Length: %d\r\n\r\n%s",
+              (int)strlen(body), body);
+}
+
+static void send_500(struct mg_connection *conn, const char *msg) {
+    const char *body = msg ? msg : "Internal server error";
+    mg_printf(conn,
+              "HTTP/1.1 500 Internal Server Error\r\n"
               "Content-Type: text/plain; charset=utf-8\r\n"
               "Content-Length: %d\r\n\r\n%s",
               (int)strlen(body), body);
@@ -542,5 +571,57 @@ int http_torrent_files_handler(struct mg_connection *conn, void *cbdata) {
 
     free(s.buf);
     db_free_torrent_file_rows(rows, count);
+    return 200;
+}
+
+/* ----- /torrent/info?hash=<hex> ----- */
+int http_torrent_info_handler(struct mg_connection *conn, void *cbdata) {
+    http_api_t *api = (http_api_t *)cbdata;
+
+    char hash[41];
+    if (tp_get_hash_param(conn, hash) != 0) {
+        send_400(conn, "Missing or invalid hash parameter");
+        return 400;
+    }
+
+    torrent_summary_t ts;
+    if (db_get_torrent_by_hash(api->database, hash, &ts) != 0) {
+        send_404(conn, "{\"error\":\"not_found\"}");
+        return 404;
+    }
+
+    char *filtered = extract_media_title(ts.name);
+    if (!filtered) filtered = strdup(ts.name ? ts.name : "");
+
+    sbuf_t s = {0};
+    s.cap = 8192;
+    s.buf = (char *)malloc(s.cap);
+    if (!s.buf) {
+        free(filtered);
+        free(ts.name);
+        send_500(conn, "OOM");
+        return 500;
+    }
+    s.buf[0] = '\0';
+
+    sb_append(&s, "{\"info_hash\":\"%s\",\"name\":\"", ts.info_hash);
+    tp_append_json_string(&s, ts.name ? ts.name : "");
+    sb_append(&s, "\",\"filtered_name\":\"");
+    tp_append_json_string(&s, filtered ? filtered : "");
+    sb_append(&s,
+              "\",\"size_bytes\":%lld,\"total_peers\":%d,\"added\":%lld,\"file_count\":%d}",
+              (long long)ts.size_bytes, ts.total_peers,
+              (long long)ts.added_timestamp, ts.file_count);
+
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %d\r\n\r\n",
+              (int)s.len);
+    mg_write(conn, s.buf, s.len);
+
+    free(s.buf);
+    free(filtered);
+    free(ts.name);
     return 200;
 }
