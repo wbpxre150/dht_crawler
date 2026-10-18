@@ -523,7 +523,6 @@ int http_api_start(http_api_t *api) {
     mg_set_request_handler(api->mg_ctx, "/random",        random_handler, api);
     mg_set_request_handler(api->mg_ctx, "/torrent/files", http_torrent_files_handler, api);
     mg_set_request_handler(api->mg_ctx, "/torrent/info", http_torrent_info_handler, api);
-    mg_set_request_handler(api->mg_ctx, "/torrent", http_torrent_page_handler, api);
 
     api->running = 1;
     log_msg(LOG_DEBUG, "HTTP API server started on %s", listening_ports);
