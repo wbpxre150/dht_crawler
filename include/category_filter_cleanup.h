@@ -86,16 +86,21 @@ void category_filter_get_stats(category_filter_stats_t *out);
  *      clear (in batches; the FK cascade drops torrent_class/torrent_files and
  *      the FTS delete triggers clean the search index);
  *   2. the same for rows in the tv/anime categories whose tv_kind bit is clear;
- *   3. the db-wide language pass (language_filter_cleanup_run(), no prompt);
- *   4. PRAGMA wal_checkpoint(TRUNCATE).
+ *   3. the same for every adult-tagged row (torrent_class.adult = 1 — the
+ *      classifier's adult model tag), independent of both masks: the purge is
+ *      folded into the button and always runs;
+ *   4. the db-wide language pass (language_filter_cleanup_run(), no prompt);
+ *   5. PRAGMA wal_checkpoint(TRUNCATE).
  *
- * A full mask for both keys means "nothing to purge": steps 1-2 are skipped and
- * only the language pass runs. The caller does not compact afterwards:
- * --category-filter-update leaves the database in place and exits.
+ * A full mask for both keys means "nothing to purge" for steps 1-2 — only the
+ * adult and language passes do any work. The caller does not compact
+ * afterwards: --category-filter-update leaves the database in place and exits.
  *
- * Aborts — before deleting anything — when the selection would remove every
- * row in the database; the config parser cannot produce that state (an empty
- * list means all bits set) but the guard keeps a hand-edited mask harmless.
+ * Aborts — before deleting anything — when the union of the three rules would
+ * remove every row in the database; the config parser cannot produce that state
+ * for the masks (an empty list means all bits set) but the guard keeps a
+ * hand-edited mask harmless and stops the adult purge from emptying a database
+ * in which every row happens to be adult-tagged.
  *
  * Returns 0 on success, non-zero on failure (suitable for exit()).
  */

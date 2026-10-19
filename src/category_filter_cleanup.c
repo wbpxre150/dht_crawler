@@ -170,31 +170,37 @@ static int build_unselected_list(uint16_t mask, int count, char *out, size_t out
     return off > 0 ? 1 : 0;
 }
 
-/* Count the torrents the selection would delete (both rules, de-duplicated). */
+/* Count the torrents the selection would delete (every rule, de-duplicated). */
 static int64_t count_selection(sqlite3 *db, const char *category_where,
-                               const char *tv_kind_where) {
+                               const char *tv_kind_where, const char *adult_where) {
     char sql[2048];
-    int written;
-
-    if (category_where && tv_kind_where) {
-        written = snprintf(sql, sizeof(sql),
-            "SELECT COUNT(*) FROM torrents WHERE id IN ("
-            "SELECT torrent_id FROM torrent_class WHERE %s"
-            " UNION SELECT torrent_id FROM torrent_class WHERE %s);",
-            category_where, tv_kind_where);
-    } else if (category_where || tv_kind_where) {
-        written = snprintf(sql, sizeof(sql),
-            "SELECT COUNT(*) FROM torrents WHERE id IN ("
-            "SELECT torrent_id FROM torrent_class WHERE %s);",
-            category_where ? category_where : tv_kind_where);
-    } else {
-        return 0;
-    }
-
-    if (written < 0 || (size_t)written >= sizeof(sql)) {
+    size_t off = (size_t)snprintf(sql, sizeof(sql),
+                                  "SELECT COUNT(*) FROM torrents WHERE id IN (");
+    if (off >= sizeof(sql)) {
         log_msg(LOG_ERROR, "category filter: selection count SQL too long");
         return -1;
     }
+
+    /* One UNION arm per rule: overlapping ids are counted once, even though a
+     * row can be adult-tagged and unselected at the same time. */
+    const char *const wheres[3] = { category_where, tv_kind_where, adult_where };
+    int parts = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!wheres[i]) continue;
+        int written = snprintf(sql + off, sizeof(sql) - off,
+                               "%sSELECT torrent_id FROM torrent_class WHERE %s",
+                               parts > 0 ? " UNION " : "", wheres[i]);
+        if (written < 0 || (size_t)written >= sizeof(sql) - off) {
+            log_msg(LOG_ERROR, "category filter: selection count SQL too long");
+            return -1;
+        }
+        off += (size_t)written;
+        parts++;
+    }
+
+    if (parts == 0) return 0;  /* nothing selected */
+
+    snprintf(sql + off, sizeof(sql) - off, ");");
 
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
@@ -362,6 +368,10 @@ int category_filter_update_run(database_t *db_handle, const char *db_path,
         tv_kind_where_p = tv_kind_where;
     }
 
+    /* The adult purge is unconditional: it is folded into the button rather
+     * than driven by a mask, so it has no "skipped" branch. */
+    static const char ADULT_WHERE[] = "adult = 1";
+
     log_msg(LOG_INFO, "category filter: save_categories=0x%03x save_tv_kinds=0x%02x "
             "(unselected categories: %s; unselected tv kinds: %s)",
             (unsigned)category_mask, (unsigned)tv_kind_mask,
@@ -382,22 +392,25 @@ int category_filter_update_run(database_t *db_handle, const char *db_path,
     }
     log_msg(LOG_INFO, "category filter: torrents in DB = %lld", (long long)total);
 
-    /* Safety: never let the selection empty the database. Unreachable from the
-     * config parser (an empty list means "all bits set"), but a hand-edited or
-     * corrupted mask must not wipe the crawl. */
-    if (category_where_p || tv_kind_where_p) {
-        int64_t doomed = count_selection(db, category_where_p, tv_kind_where_p);
-        if (doomed < 0) {
-            return 1;
-        }
-        log_msg(LOG_INFO, "category filter: selection would delete %lld of %lld torrents",
+    /* Safety: never let the selection empty the database. The doomed set is the
+     * UNION of all three rules (category, tv_kind, adult), de-duplicated so a
+     * row counts once no matter how many rules hit it. The mask arms are
+     * unreachable from the config parser (an empty list means "all bits set"),
+     * but a hand-edited or corrupted mask must not wipe the crawl — and the
+     * same guard keeps the unconditional adult purge from doing it. */
+    int64_t doomed = count_selection(db, category_where_p, tv_kind_where_p,
+                                     ADULT_WHERE);
+    if (doomed < 0) {
+        return 1;
+    }
+    log_msg(LOG_INFO, "category filter: selection would delete %lld of %lld torrents",
+            (long long)doomed, (long long)total);
+    if (total > 0 && doomed >= total) {
+        log_msg(LOG_ERROR, "category filter: the selection covers every row in the "
+                "database (%lld/%lld) — refusing to empty it. Check save_categories/"
+                "save_tv_kinds (the adult purge counts towards this total too).",
                 (long long)doomed, (long long)total);
-        if (total > 0 && doomed >= total) {
-            log_msg(LOG_ERROR, "category filter: the selection covers every row in the "
-                    "database (%lld/%lld) — refusing to empty it. Check save_categories/"
-                    "save_tv_kinds.", (long long)doomed, (long long)total);
-            return 1;
-        }
+        return 1;
     }
 
     time_t started = time(NULL);
@@ -426,23 +439,36 @@ int category_filter_update_run(database_t *db_handle, const char *db_path,
         log_msg(LOG_INFO, "category filter: every tv_kind is selected, skipping the tv_kind pass");
     }
 
-    /* Step 3: the db-wide language pass (no backup prompt: no TTY). */
+    /* Step 3: every adult-tagged row, independent of the masks above. Rows an
+     * earlier pass already removed are gone, so this counts only what is left. */
+    int64_t deleted_by_adult = purge_batched(db, "category filter: adult pass",
+                                            ADULT_WHERE);
+    if (deleted_by_adult < 0) {
+        log_msg(LOG_ERROR, "category filter: adult pass failed");
+        return 1;
+    }
+
+    /* Step 4: the db-wide language pass (no backup prompt: no TTY). */
     int lrc = language_filter_cleanup_run(db_handle, db_path, 0);
     if (lrc != 0) {
         log_msg(LOG_ERROR, "category filter: language pass failed (%d)", lrc);
         return lrc;
     }
 
-    /* Step 4: fold the WAL back into the main file (hygiene; this is not a
+    /* Step 5: fold the WAL back into the main file (hygiene; this is not a
      * compaction — --category-filter-update no longer vacuums the database). */
 
     long elapsed = (long)(time(NULL) - started);
     log_msg(LOG_INFO, "category filter: purge done — deleted_by_category=%lld "
-            "deleted_by_tv_kind=%lld total=%lld elapsed=%lds",
+            "deleted_by_tv_kind=%lld deleted_by_adult=%lld total=%lld elapsed=%lds",
             (long long)deleted_by_category, (long long)deleted_by_tv_kind,
-            (long long)(deleted_by_category + deleted_by_tv_kind), elapsed);
-    printf("\nSummary: deleted_by_category=%lld deleted_by_tv_kind=%lld elapsed=%lds\n",
-           (long long)deleted_by_category, (long long)deleted_by_tv_kind, elapsed);
+            (long long)deleted_by_adult,
+            (long long)(deleted_by_category + deleted_by_tv_kind + deleted_by_adult),
+            elapsed);
+    printf("\nSummary: deleted_by_category=%lld deleted_by_tv_kind=%lld "
+           "deleted_by_adult=%lld elapsed=%lds\n",
+           (long long)deleted_by_category, (long long)deleted_by_tv_kind,
+           (long long)deleted_by_adult, elapsed);
 
     return 0;
 }

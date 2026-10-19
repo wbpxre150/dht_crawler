@@ -27,6 +27,9 @@ The first `make` automatically applies patches to `lib/bencode-c` and `lib/civet
 
 These are maintenance modes that exit after completing their task rather than running the crawler.
 
+`--category-filter-update` purges the rows outside `save_categories`/`save_tv_kinds`
+and every adult-tagged row (`torrent_class.adult = 1`), then runs the language pass.
+
 ## Architecture
 
 ### Supervisor Pattern
