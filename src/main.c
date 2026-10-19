@@ -477,6 +477,11 @@ int main(int argc, char *argv[]) {
         log_msg(LOG_DEBUG, "Classifier disabled");
     }
 
+    /* Publish the active adult mode for /stats, even when the classifier is off:
+     * it is what the operator wrote, and it decides whether an adult-tagged row
+     * is stored (tag) or discarded (drop). Set once, before any worker thread. */
+    classifier_set_adult_mode(config.adult_mode);
+
     /* Initialize torrent search module for title extraction */
     log_msg(LOG_DEBUG, "Initializing torrent search module...");
     rc = torrent_search_init("torrent_search_keywords.txt");
@@ -690,7 +695,6 @@ int main(int argc, char *argv[]) {
         /* Porn filter settings */
         .porn_filter_enabled = config.porn_filter_enabled,
         /* Stage 6 adult handling (adult_mode is copied after the literal) */
-        .adult_drop_threshold = config.adult_drop_threshold,
         /* Adaptive keyspace partitioning */
         .dead_partition_threshold = config.dead_partition_threshold,
         .max_trees_per_partition = config.max_trees_per_partition

@@ -1569,13 +1569,16 @@ void *tree_metadata_worker_func(void *arg) {
                     }
                 }
 
-                /* adult_mode=drop takes the same path as any other filtered
-                 * item: filtered_count, bloom-add (no re-processing) and no DB
-                 * insert. With the models missing adult_p stays 0.0, so nothing
-                 * is dropped on the adult verdict. */
+                /* adult_mode=drop discards exactly what tag mode would hide:
+                 * the classifier TAGS a row adult once adult_p reaches the
+                 * effective tag threshold (adult_hide_threshold, resolved in
+                 * classifier.c), so that tag — not a second, higher threshold —
+                 * is the drop boundary. A row in a band below the old value is
+                 * therefore dropped here instead of being stored with adult=1
+                 * while the operator believed drop mode was active. */
                 if (!filtered && db_meta.has_classification &&
                     strcmp(tree->adult_mode, "drop") == 0 &&
-                    db_meta.classification.adult_p >= tree->adult_drop_threshold) {
+                    db_meta.classification.adult == 1) {
                     filtered = 1;
                     classifier_note_adult_dropped();
                     log_msg(LOG_DEBUG, "[tree %u] Filtered torrent (adult %.3f): %s",

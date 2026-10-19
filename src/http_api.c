@@ -634,6 +634,14 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
 
         cJSON *classifier = cJSON_CreateObject();
         cJSON_AddBoolToObject(classifier, "enabled", clf_stats.enabled ? 1 : 0);
+        /* Active ingest adult mode and the boundary it is applied on: drop mode
+         * discards every adult-tagged row, i.e. every row with adult_p >= this
+         * threshold. Required to tell "drop mode is on" from "all rows happen
+         * to score below the tag boundary". */
+        cJSON_AddStringToObject(classifier, "adult_mode",
+                                clf_stats.adult_mode[0] ? clf_stats.adult_mode : "tag");
+        cJSON_AddNumberToObject(classifier, "adult_hide_threshold",
+                                clf_stats.adult_hide_threshold);
         cJSON_AddNumberToObject(classifier, "total_classified", (double)clf_stats.total_classified);
 
         double mean_us = 0.0;

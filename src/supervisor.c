@@ -122,7 +122,6 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
 
     /* Stage 6 adult handling */
     strncpy(sup->adult_mode, config->adult_mode, sizeof(sup->adult_mode) - 1);
-    sup->adult_drop_threshold = config->adult_drop_threshold;
 
     /* BEP51 cache settings */
     sup->bep51_cache_capacity = config->bep51_cache_capacity > 0 ? config->bep51_cache_capacity : 10000;
@@ -494,7 +493,6 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Porn filter settings */
         .porn_filter_enabled = sup->porn_filter_enabled,
         /* Stage 6 adult handling (adult_mode is copied after the literal below) */
-        .adult_drop_threshold = sup->adult_drop_threshold,
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,

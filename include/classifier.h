@@ -11,8 +11,10 @@
  * always-on hard block list and the language filter) gets a classification_t. The value rides
  * inside torrent_metadata_t through batch_writer_add() and is written as one
  * torrent_class row, in the same transaction as the torrent itself. In
- * adult_mode=drop the same verdict is also the drop decision: items at or
- * above the drop threshold are never stored at all.
+ * adult_mode=drop the same verdict is also the drop decision: every item the
+ * adult model TAGGED adult (adult_p >= the effective adult_hide_threshold) is
+ * never stored at all. The tag boundary — not a separate, higher value — is
+ * the drop boundary, so drop mode never stores what tag mode would hide.
  *
  * Decision path (classifier.md §4):
  *   - tparse always runs (release name + file list) and supplies the season /
@@ -41,6 +43,11 @@
 
 typedef struct {
     int enabled;                   /* 1 when classifier_init() ran (feature on) */
+    char adult_mode[8];            /* active ingest adult mode: "tag" or "drop" */
+    double adult_hide_threshold;   /* effective tag threshold in use (config >
+                                    * manifest > default); 0.0 when not
+                                    * initialised. It is also the drop boundary
+                                    * in adult_mode=drop. */
     uint64_t total_classified;     /* items that were classified */
     uint64_t total_us;             /* summed classify() wall time, microseconds */
     uint64_t parser_only_fallback; /* items with a model missing/unusable */
@@ -48,11 +55,21 @@ typedef struct {
                                     * model that failed to load or verify */
     uint64_t adult_tagged;         /* stored rows with adult = 1 (reported by the
                                     * ingest call site, not by classify()) */
-    uint64_t adult_dropped;        /* adult_mode=drop rows dropped on P(adult) */
+    uint64_t adult_dropped;        /* adult_mode=drop rows dropped for being
+                                    * adult-tagged */
     uint64_t hard_block_dropped;   /* rows dropped by the hard block list */
     uint64_t tv_kind_model_used;   /* items where the tv_kind student was consulted */
     uint64_t by_category[CLASSIFIER_NUM_CATEGORIES]; /* per category, all items */
 } classifier_stats_t;
+
+/*
+ * Publish the active ingest adult mode ("tag" or "drop"; anything else is
+ * treated as "tag", which is also the config default). Call once from main.c
+ * before the worker threads start — it is called even when the classifier is
+ * off, so /stats can always report the operator's mode — and then read it back
+ * through classifier_get_stats().
+ */
+void classifier_set_adult_mode(const char *adult_mode);
 
 /*
  * Initialise the classifier. Non-fatal by contract: a missing model directory,
@@ -67,7 +84,9 @@ typedef struct {
  * @param adult_hide_threshold config adult_hide_threshold; > 0 is authoritative
  *                  (it is what the operator wrote in config.ini), <= 0 means
  *                  "config supplied none" and the manifest value is used, with
- *                  the built-in default as the last resort.
+ *                  the built-in default as the last resort. The resolved value
+ *                  is the tag boundary, and therefore the adult_mode=drop
+ *                  boundary, and is reported by classifier_get_stats().
  */
 void classifier_init(const char *model_dir, double adult_hide_threshold);
 
@@ -112,7 +131,7 @@ long long classifier_current_version(void);
  * outcome here (each bumps exactly one counter under the stats mutex).
  */
 void classifier_note_stored_adult(void); /* row stored with adult = 1 */
-void classifier_note_adult_dropped(void); /* row dropped: P(adult) >= adult_drop_threshold */
+void classifier_note_adult_dropped(void); /* row dropped: adult-tagged (drop mode) */
 void classifier_note_hard_block_dropped(void); /* row dropped by the hard block list */
 
 /* Display name for a tp_category_t value, for the /stats JSON keys. */

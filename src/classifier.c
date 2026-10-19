@@ -27,6 +27,12 @@ const char *classifier_category_name(int category) {
     return CATEGORY_NAMES[category];
 }
 
+/* adult_mode is validated by config.c; anything unexpected folds to the default
+ * so /stats can never report an unusable mode. */
+static const char *clf_normalize_adult_mode(const char *adult_mode) {
+    return (adult_mode && strcmp(adult_mode, "drop") == 0) ? "drop" : "tag";
+}
+
 #ifdef CLF_ENABLED
 
 #include <cJSON.h>
@@ -70,6 +76,9 @@ static struct {
     .model_dir = CLF_MODEL_DIR_DEFAULT,
     .tv_kind_once = PTHREAD_ONCE_INIT,
     .stats_mutex = PTHREAD_MUTEX_INITIALIZER,
+    /* Overwritten by classifier_set_adult_mode(); "tag" is the config default
+     * and keeps /stats sane if it is somehow never called. */
+    .stats = { .adult_mode = "tag" },
 };
 
 /* ---- small helpers ----------------------------------------------------- */
@@ -303,11 +312,20 @@ void classifier_init(const char *model_dir, double adult_hide_threshold) {
     clf.enabled = 1;
     pthread_mutex_lock(&clf.stats_mutex);
     clf.stats.enabled = 1;
+    /* Provisional: clf_load_manifest() below may replace the threshold; the
+     * resolved value is republished as soon as it returns. */
+    clf.stats.adult_hide_threshold = clf.adult_hide_threshold;
     pthread_mutex_unlock(&clf.stats_mutex);
 
     log_msg(LOG_INFO, "Initializing classifier (model dir: %s)...", clf.model_dir);
 
     clf_load_manifest();
+    /* The manifest may have replaced the threshold (config > manifest >
+     * default), and that resolved value is the boundary adult_mode=drop drops
+     * on, so /stats has to publish it rather than the config literal. */
+    pthread_mutex_lock(&clf.stats_mutex);
+    clf.stats.adult_hide_threshold = clf.adult_hide_threshold;
+    pthread_mutex_unlock(&clf.stats_mutex);
     if (!clf.manifest_ok) {
         /* Counted once: without the manifest none of the three models can be
          * loaded or verified, and /stats must not report zero failures while
@@ -453,6 +471,16 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     return 0;
 }
 
+void classifier_set_adult_mode(const char *adult_mode) {
+    /* Race-free by contract: main.c calls this once, before any worker thread
+     * exists. The stats mutex keeps it on the same publish/copy path as every
+     * other field classifier_get_stats() hands out. */
+    pthread_mutex_lock(&clf.stats_mutex);
+    snprintf(clf.stats.adult_mode, sizeof(clf.stats.adult_mode), "%s",
+             clf_normalize_adult_mode(adult_mode));
+    pthread_mutex_unlock(&clf.stats_mutex);
+}
+
 void classifier_get_stats(classifier_stats_t *out) {
     if (!out) return;
     pthread_mutex_lock(&clf.stats_mutex);
@@ -541,6 +569,9 @@ static struct {
     classifier_stats_t stats;
 } clf = {
     .stats_mutex = PTHREAD_MUTEX_INITIALIZER,
+    /* Overwritten by classifier_set_adult_mode(); "tag" is the config default
+     * and keeps /stats sane if it is somehow never called. */
+    .stats = { .adult_mode = "tag" },
 };
 
 void classifier_init(const char *model_dir, double adult_hide_threshold) {
@@ -572,6 +603,16 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     (void)meta;
     (void)out;
     return 1;
+}
+
+void classifier_set_adult_mode(const char *adult_mode) {
+    /* Race-free by contract: main.c calls this once, before any worker thread
+     * exists. The stats mutex keeps it on the same publish/copy path as every
+     * other field classifier_get_stats() hands out. */
+    pthread_mutex_lock(&clf.stats_mutex);
+    snprintf(clf.stats.adult_mode, sizeof(clf.stats.adult_mode), "%s",
+             clf_normalize_adult_mode(adult_mode));
+    pthread_mutex_unlock(&clf.stats_mutex);
 }
 
 void classifier_get_stats(classifier_stats_t *out) {

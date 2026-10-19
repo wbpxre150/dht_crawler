@@ -94,7 +94,6 @@ typedef struct tree_config {
 
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag" (default) or "drop" at ingest */
-    double adult_drop_threshold;         /* adult_mode=drop: drop when P(adult) >= this */
 
     /* "Categories to save" bitmasks (see category_filter_cleanup.h) */
     uint16_t save_category_mask;         /* bit i = tp_category_t i saved */
@@ -218,7 +217,6 @@ typedef struct thread_tree {
 
     /* Stage 6 adult handling */
     char adult_mode[8];                  /* "tag": store the verdict, "drop": discard */
-    double adult_drop_threshold;         /* Drop when P(adult) >= this (adult_mode=drop) */
 
     /* "Categories to save": ingest drops items outside these bitmasks */
     uint16_t save_category_mask;         /* bit i = tp_category_t i saved */

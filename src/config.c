@@ -120,7 +120,6 @@ void config_init_defaults(crawler_config_t *config) {
     /* Stage 6 adult handling defaults (calibrated values from models/v1/manifest.json) */
     strncpy(config->adult_mode, "tag", sizeof(config->adult_mode) - 1);
     config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
-    config->adult_drop_threshold = 0.995516;        /* only used by adult_mode=drop */
     strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
 
     /* "Categories to save" defaults: every bit set, so nothing is filtered at
@@ -366,11 +365,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (threshold < 0.0) threshold = 0.0;
             if (threshold > 1.0) threshold = 1.0;
             config->adult_hide_threshold = threshold;
-        } else if (strcmp(key, "adult_drop_threshold") == 0) {
-            double threshold = strtod(value, NULL);
-            if (threshold < 0.0) threshold = 0.0;
-            if (threshold > 1.0) threshold = 1.0;
-            config->adult_drop_threshold = threshold;
         } else if (strcmp(key, "hard_block_file") == 0) {
             strncpy(config->hard_block_file, value, sizeof(config->hard_block_file) - 1);
         /* "Categories to save": comma-separated taxonomy names/indices; an

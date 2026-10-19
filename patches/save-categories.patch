@@ -66,10 +66,9 @@
       * --compact: write a fresh compacted copy, replace original, exit.
       *******************************************************************/
      if (compact_db) {
-@@ -723,6 +756,9 @@
+@@ -723,5 +756,8 @@
          .global_bootstrap_workers = config.global_bootstrap_workers,
          /* Stage 6 adult handling (adult_mode is copied after the literal) */
-         .adult_drop_threshold = config.adult_drop_threshold,
 +        /* "Categories to save" (Stage: save_categories/save_tv_kinds) */
 +        .save_category_mask = config.save_category_mask,
 +        .save_tv_kind_mask = config.save_tv_kind_mask,
@@ -78,9 +77,8 @@
          .max_trees_per_partition = config.max_trees_per_partition
 --- a/src/supervisor.c
 +++ b/src/supervisor.c
-@@ -126,6 +126,10 @@
+@@ -126,5 +126,9 @@
      strncpy(sup->adult_mode, config->adult_mode, sizeof(sup->adult_mode) - 1);
-     sup->adult_drop_threshold = config->adult_drop_threshold;
  
 +    /* "Categories to save" (ingest drop decision lives in tree_metadata.c) */
 +    sup->save_category_mask = config->save_category_mask;
@@ -89,10 +87,9 @@
      /* BEP51 cache settings */
      sup->bep51_cache_capacity = config->bep51_cache_capacity > 0 ? config->bep51_cache_capacity : 10000;
      sup->bep51_cache_submit_percent = config->bep51_cache_submit_percent > 0 ? config->bep51_cache_submit_percent : 5;
-@@ -495,6 +499,9 @@
+@@ -495,5 +499,8 @@
          .ema_alpha = sup->rate_ema_alpha,
          /* Stage 6 adult handling (adult_mode is copied after the literal below) */
-         .adult_drop_threshold = sup->adult_drop_threshold,
 +        /* "Categories to save" */
 +        .save_category_mask = sup->save_category_mask,
 +        .save_tv_kind_mask = sup->save_tv_kind_mask,
