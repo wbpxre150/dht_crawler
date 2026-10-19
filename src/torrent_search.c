@@ -282,17 +282,112 @@ static void process_parentheses(char *str) {
 /**
  * Truncate at season/episode markers
  * Patterns: S01, S01E01, Season 1, Episode 1, etc.
+ * Returns 1 if the string was cut, 0 otherwise.
  */
-static void truncate_at_season(char *str) {
-    if (!str || !search_state.season_regex_compiled) return;
+static int truncate_at_season(char *str) {
+    if (!str || !search_state.season_regex_compiled) return 0;
 
     regmatch_t match;
     if (regexec(&search_state.season_regex, str, 1, &match, 0) == 0) {
         // Found a match - truncate at the start of it
         if (match.rm_so > 0) {
             str[match.rm_so] = '\0';
+            return 1;
         }
     }
+
+    return 0;
+}
+
+/**
+ * Check if a token is a quality marker (480p, 720P, 1080p, 2160p, uhd, hdr, ...)
+ */
+static int is_quality_token(const char *tok, size_t len) {
+    // Resolution token: 3-4 digits followed by 'p'
+    if (len == 4 || len == 5) {
+        int all_digits = 1;
+        for (size_t i = 0; i + 1 < len; i++) {
+            if (!isdigit((unsigned char)tok[i])) {
+                all_digits = 0;
+                break;
+            }
+        }
+        if (all_digits && (tok[len - 1] == 'p' || tok[len - 1] == 'P')) {
+            return 1;
+        }
+    }
+
+    // Bare quality tags
+    static const char *const tags[] = {"uhd", "hdr", "hdr10", "4k", "fhd", "qhd"};
+    for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+        if (strlen(tags[i]) == len && strncasecmp(tok, tags[i], len) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Cut the processed name at the first scene-release pivot (grammar only).
+ *
+ * Pivot ladder over the space-split string, first hit wins:
+ *   1. Year pivot: cut inclusive after the first year token (1900-2099) at
+ *      index > 0. The index guard keeps year-shaped titles intact
+ *      ("1917.2019.1080p" -> "1917 2019"); a title word that also looks like
+ *      a year ("Blade.Runner.2049.2017") resolves to the FIRST such token.
+ *   2. Season pivot (only if no year token anywhere): cut at the
+ *      season/episode marker, exactly like the legacy path.
+ *   3. Quality pivot (no year, no season): cut exclusively before the first
+ *      quality token ("Some.Movie.1080p.BluRay" -> "Some Movie").
+ *
+ * Post-pivot junk (codec/source/release-group suffixes) therefore never
+ * survives. Returns 1 if a pivot cut the string, 0 otherwise.
+ */
+static int cut_at_release_pivot(char *str) {
+    if (!str || *str == '\0') return 0;
+
+    size_t index = 0;
+    char *p = str;
+
+    // Pass 1: year pivot
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+
+        char *tok = p;
+        while (*p && !isspace((unsigned char)*p)) p++;
+        size_t toklen = (size_t)(p - tok);
+
+        if (index > 0 && is_year(tok, toklen)) {
+            // Cut inclusive: the year is part of the title
+            *p = '\0';
+            return 1;
+        }
+        index++;
+    }
+
+    // Pass 2: season pivot
+    if (truncate_at_season(str)) return 1;
+
+    // Pass 3: quality pivot
+    p = str;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+
+        char *tok = p;
+        while (*p && !isspace((unsigned char)*p)) p++;
+        size_t toklen = (size_t)(p - tok);
+
+        if (is_quality_token(tok, toklen)) {
+            // Cut exclusive: the quality tag is not part of the title
+            *tok = '\0';
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 /**
@@ -439,8 +534,14 @@ void torrent_search_cleanup(void) {
  * 1. Replace dots and underscores with spaces
  * 2. Remove content in square brackets [...]
  * 3. Preserve years in parentheses (1900-2099), remove other tech info
- * 4. Truncate at season/episode markers (S01E02, Season 1, etc.)
- * 5. Strip all loaded keywords (case-insensitive)
+ * 4. Cut at the first scene-release pivot (release grammar only):
+ *      year pivot    "Some.Movie.2020.1080p..."  -> "Some Movie 2020"
+ *      season pivot  "Show.Name.S01E05.1080p..." -> "Show Name"
+ *      quality pivot "Some.Movie.1080p.BluRay..." -> "Some Movie"
+ *    On a pivot path no keyword deletion runs - the grammar alone decides
+ *    where the title ends.
+ * 5. Legacy path (no pivot): truncate at season/episode markers, then strip
+ *    all loaded keywords (case-insensitive)
  * 6. Collapse multiple spaces and trim
  *
  * @param torrent_name The raw torrent name
@@ -467,15 +568,23 @@ char* extract_media_title(const char *torrent_name) {
     // Step 3: Process parentheses (preserve years, remove tech info)
     process_parentheses(result);
 
-    // Step 4: Truncate at season/episode markers
-    truncate_at_season(result);
-
-    // Step 5: Strip all keywords
-    if (search_state.initialized) {
-        strip_keywords(result);
+    // Step 4: Cut at the first scene-release pivot (year -> season -> quality).
+    // Pivot paths trust the release grammar only: strip_keywords() must NOT run
+    // there, otherwise a keyword could delete part of the title itself.
+    // Accepted edges (deliberately not chased): language tags before the pivot
+    // survive ("Movie.Name.FRENCH.1080p" -> "Movie Name FRENCH") and source
+    // tags preceding a quality token survive ("...WEB-DL.1080p" -> "...WEB-DL");
+    // IMDb and the crawler FTS both tolerate one extra token. Junk after the
+    // pivot (codecs, sources, release-group suffixes) never survives.
+    if (!cut_at_release_pivot(result)) {
+        // Step 5 (legacy path): truncate at season/episode markers, strip keywords
+        (void)truncate_at_season(result);
+        if (search_state.initialized) {
+            strip_keywords(result);
+        }
     }
 
-    // Step 6: Clean up
+    // Step 6: Clean up (both paths)
     collapse_spaces(result);
     clean_trailing_separators(result);
     trim_whitespace(result);
