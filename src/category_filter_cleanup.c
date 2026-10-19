@@ -433,8 +433,8 @@ int category_filter_update_run(database_t *db_handle, const char *db_path,
         return lrc;
     }
 
-    /* Step 4: fold the WAL back into the main file before the caller compacts. */
-    sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
+    /* Step 4: fold the WAL back into the main file (hygiene; this is not a
+     * compaction — --category-filter-update no longer vacuums the database). */
 
     long elapsed = (long)(time(NULL) - started);
     log_msg(LOG_INFO, "category filter: purge done — deleted_by_category=%lld "

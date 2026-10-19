@@ -90,8 +90,8 @@ void category_filter_get_stats(category_filter_stats_t *out);
  *   4. PRAGMA wal_checkpoint(TRUNCATE).
  *
  * A full mask for both keys means "nothing to purge": steps 1-2 are skipped and
- * only the language pass runs. The caller compacts the database afterwards
- * (--category-filter-update always compacts).
+ * only the language pass runs. The caller does not compact afterwards:
+ * --category-filter-update leaves the database in place and exits.
  *
  * Aborts — before deleting anything — when the selection would remove every
  * row in the database; the config parser cannot produce that state (an empty

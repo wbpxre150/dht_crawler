@@ -72,6 +72,10 @@ tree_metadata_workers = 75
 bloom_capacity = 30000000
 bloom_error_rate = 0.001
 
+# Categories to save (comma-separated taxonomy names; unset/empty = save everything)
+#   save_categories = unknown,movie,tv,anime,music,audiobook,ebook,comic,software,game,image,other
+#   save_tv_kinds = none,episode,multi_episode,season_pack,multi_season,complete_series,daily
+
 # HTTP API port is hardcoded to 8080 (see include/http_api.h to change)
 ```
 
@@ -209,6 +213,7 @@ make valgrind
 ./dht_crawler --compact                # VACUUM database into a fresh file and replace original
 ./dht_crawler --check-database         # Run SQLite integrity_check and report errors
 ./dht_crawler --recover-database       # Copy all readable rows to a new database; replace original
+./dht_crawler --category-filter-update  # Delete rows outside save_categories/save_tv_kinds, run the language pass
 ```
 
 These modes exit after completing their task without starting the crawler.

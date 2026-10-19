@@ -18,8 +18,8 @@
              printf("Usage: %s [OPTIONS]\n\n", argv[0]);
              printf("Options:\n");
              printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
-+            printf("  --category-filter-update Remove torrents outside save_categories/save_tv_kinds,\n");
-+            printf("                           run the language-filter pass, then compact the database\n");
++            printf("  --category-filter-update Remove torrents outside save_categories/save_tv_kinds\n");
++            printf("                           and run the language-filter pass\n");
              printf("  --compact                Compact the database by writing a fresh copy and replacing the original\n");
              printf("  --check-database         Run an integrity check on the database and report any errors\n");
              printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
@@ -32,39 +32,41 @@
          } else if (strcmp(argv[i], "--compact") == 0) {
              compact_db = true;
          } else if (strcmp(argv[i], "--check-database") == 0) {
-@@ -590,6 +596,31 @@
+@@ -590,6 +596,33 @@
      }
  
      /*******************************************************************
 +     * --category-filter-update: delete the rows the current
 +     * save_categories / save_tv_kinds selection rejects, run the db-wide
-+     * language pass, then fall through to --compact so the database is
-+     * compacted without any operator interaction. The flag never prompts:
-+     * the app runs it with no TTY.
++     * language pass, then exit. No compaction: a VACUUM INTO of a large
++     * database takes long enough that Android's lowmemorykiller reaps the
++     * app mid-run, and an explicit --compact is still available. The flag
++     * never prompts: the app runs it with no TTY.
 +     *******************************************************************/
 +    if (category_filter_update) {
 +        int cfrc = category_filter_update_run(&g_database, g_app_ctx.db_path,
 +                                             config.save_category_mask,
 +                                             config.save_tv_kind_mask);
++        database_cleanup(&g_database);
++        torrent_search_cleanup();
++        hard_block_cleanup();
++        language_filter_cleanup();
++        bloom_filter_cleanup(g_bloom);
 +        if (cfrc != 0) {
-+            log_msg(LOG_ERROR, "--category-filter-update failed (%d); original database kept", cfrc);
-+            database_cleanup(&g_database);
-+            torrent_search_cleanup();
-+            hard_block_cleanup();
-+            language_filter_cleanup();
-+            bloom_filter_cleanup(g_bloom);
++            log_msg(LOG_ERROR, "category filter update failed (%d); the database was left in place", cfrc);
 +            cleanup_app_context(&g_app_ctx);
-+            return cfrc;
++            return 1;
 +        }
-+        /* The purge is only half the job: always compact afterwards. */
-+        compact_db = true;
++        log_msg(LOG_INFO, "category filter update complete");
++        cleanup_app_context(&g_app_ctx);
++        return 0;
 +    }
 +
 +    /*******************************************************************
       * --compact: write a fresh compacted copy, replace original, exit.
       *******************************************************************/
      if (compact_db) {
-@@ -723,6 +754,9 @@
+@@ -723,6 +756,9 @@
          .global_bootstrap_workers = config.global_bootstrap_workers,
          /* Stage 6 adult handling (adult_mode is copied after the literal) */
          .adult_drop_threshold = config.adult_drop_threshold,
