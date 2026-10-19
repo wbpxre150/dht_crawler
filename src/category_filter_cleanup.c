@@ -1,5 +1,4 @@
 #include "category_filter_cleanup.h"
-#include "language_filter_cleanup.h"
 #include "dht_crawler.h"
 
 #include <pthread.h>
@@ -339,6 +338,10 @@ int category_filter_update_run(database_t *db_handle, const char *db_path,
     }
     sqlite3 *db = db_handle->db;
 
+    /* db_path is no longer read here: the purge itself is path-agnostic and the
+     * only former user was the db-wide language rescan. */
+    (void)db_path;
+
     char unselected_categories[64];
     char unselected_tv_kinds[32];
     int cat_rc = build_unselected_list(category_mask, CATEGORY_FILTER_NUM_CATEGORIES,
@@ -448,15 +451,9 @@ int category_filter_update_run(database_t *db_handle, const char *db_path,
         return 1;
     }
 
-    /* Step 4: the db-wide language pass (no backup prompt: no TTY). */
-    int lrc = language_filter_cleanup_run(db_handle, db_path, 0);
-    if (lrc != 0) {
-        log_msg(LOG_ERROR, "category filter: language pass failed (%d)", lrc);
-        return lrc;
-    }
-
-    /* Step 5: fold the WAL back into the main file (hygiene; this is not a
+    /* Step 4: fold the WAL back into the main file (hygiene; this is not a
      * compaction — --category-filter-update no longer vacuums the database). */
+    sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
 
     long elapsed = (long)(time(NULL) - started);
     log_msg(LOG_INFO, "category filter: purge done — deleted_by_category=%lld "

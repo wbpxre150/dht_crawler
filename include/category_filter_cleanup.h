@@ -89,12 +89,16 @@ void category_filter_get_stats(category_filter_stats_t *out);
  *   3. the same for every adult-tagged row (torrent_class.adult = 1 — the
  *      classifier's adult model tag), independent of both masks: the purge is
  *      folded into the button and always runs;
- *   4. the db-wide language pass (language_filter_cleanup_run(), no prompt);
- *   5. PRAGMA wal_checkpoint(TRUNCATE).
+ *   4. PRAGMA wal_checkpoint(TRUNCATE).
  *
  * A full mask for both keys means "nothing to purge" for steps 1-2 — only the
- * adult and language passes do any work. The caller does not compact
- * afterwards: --category-filter-update leaves the database in place and exits.
+ * adult pass does any work. The caller does not compact afterwards:
+ * --category-filter-update leaves the database in place and exits.
+ *
+ * The db-wide language rescan the pass used to run is gone: the ingest-time
+ * language filter is always on (language_filter.c + the
+ * language_filter_non_latin_threshold config key), so every stored row already
+ * passed it. The rescan deleted 0 rows and added hours to the run.
  *
  * Aborts — before deleting anything — when the union of the three rules would
  * remove every row in the database; the config parser cannot produce that state

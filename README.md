@@ -214,7 +214,7 @@ make valgrind
 ./dht_crawler --compact                # VACUUM database into a fresh file and replace original
 ./dht_crawler --check-database         # Run SQLite integrity_check and report errors
 ./dht_crawler --recover-database       # Copy all readable rows to a new database; replace original
-./dht_crawler --category-filter-update  # Delete rows outside save_categories/save_tv_kinds and adult-tagged rows, run the language pass
+./dht_crawler --category-filter-update  # Delete rows outside save_categories/save_tv_kinds and adult-tagged rows
 ```
 
 These modes exit after completing their task without starting the crawler.

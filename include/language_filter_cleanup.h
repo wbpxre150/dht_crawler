@@ -10,10 +10,9 @@
  * each one, and DELETEs matches in batches inside a single transaction. The
  * caller must have already called language_filter_init().
  *
- * Nothing calls this at startup: it is the language half of the
- * --category-filter-update maintenance pass (category_filter_cleanup.c), so a
- * db-wide language sweep stays available without the keyword machinery it used
- * to share a file with.
+ * Nothing calls this at startup: the pass is compiled and kept as the hook for
+ * a maintenance flag, so a db-wide language sweep stays available without the
+ * keyword machinery it used to share a file with.
  *
  * @param allow_prompt 1 to ask on stdin whether to back up first (interactive
  *                     use), 0 to run unattended — the app invokes this with no
