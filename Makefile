@@ -103,4 +103,20 @@ tsan:
 valgrind: debug
 	valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
 
-.PHONY: run debug asan tsan valgrind
+# Host unit tests for torrent_search (standalone: no dependency on all/$(TARGET),
+# no patch targets, no libbloom). Run from the repo root so the test binary finds
+# torrent_search_keywords.txt relative to cwd.
+TEST_SRCS = tests/test_torrent_search.c src/torrent_search.c tests/stub_log.c
+TEST_BIN = $(BUILD_DIR)/test_torrent_search
+TEST_CFLAGS =
+TEST_LDFLAGS =
+
+tests:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(TEST_SRCS) -o $(TEST_BIN) $(TEST_LDFLAGS)
+	./$(TEST_BIN)
+
+tests-asan:
+	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
+.PHONY: run debug asan tsan valgrind tests tests-asan

@@ -1,0 +1,129 @@
+/**
+ * Host unit tests for extract_media_title().
+ *
+ * Covers the scene-release pivot ladder (year -> season -> quality) plus the
+ * legacy keyword-stripping path, NULL and empty input.
+ *
+ * Standalone: no test framework, no dependency on the daemon build.
+ * Run from the repository root (the keyword file is opened relative to cwd):
+ *
+ *     make tests        # or: make tests-asan
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "torrent_search.h"
+#include "dht_crawler.h"
+
+typedef struct {
+    const char *input;
+    const char *expected;
+    const char *note;
+} title_case_t;
+
+/* Keyword file lives at the repo root; the test binary runs with cwd=repo root. */
+static const char *const KEYWORD_FILE = "torrent_search_keywords.txt";
+
+static const title_case_t CASES[] = {
+    /* 1. Year-shaped title survives: year pivot is inclusive. */
+    {"1917.2019.1080p.BluRay.x264-NOGRP", "1917 2019", "year-shaped title"},
+    /* 2. Plain year pivot. */
+    {"Some.Movie.2020.1080p.WEB-DL.x264-RARBG", "Some Movie 2020", "year pivot"},
+    /* 3. Title word that looks like a year -> FIRST hit wins. */
+    {"Blade.Runner.2049.2017.2160p.WEB-DL.x265-GROUP", "Blade Runner 2049", "year-shaped title word"},
+    /* 4. Title word "IT" collides with keyword-file entry "it": the pivot path
+     *    must not consult keywords, so the title survives intact. */
+    {"It.2017.1080p.BluRay.x264-GRP", "It 2017", "keyword collision on pivot path"},
+    /* 5. Season pivot. */
+    {"Show.Name.S01E05.1080p.x264-GRP", "Show Name", "season pivot"},
+    /* 6. Year beats season. */
+    {"Movie.Name.2019.Season.1.1080p", "Movie Name 2019", "year beats season"},
+    /* 7. Quality pivot, no year. */
+    {"Some.Movie.1080p.BluRay.x264", "Some Movie", "quality pivot"},
+    /* 8. Parenthesised year is kept (and stripped of parens) then pivots. */
+    {"Movie.Name.(2020).1080p", "Movie Name 2020", "parens year"},
+    /* 9. "Season N" marker with no year -> legacy truncation, no keywords left. */
+    {"Weeds Season 2 1080p", "Weeds", "season marker, no year"},
+    /* 10. Legacy path: no pivot at all (no year, no season, no quality tag), so
+     *     keyword stripping runs. "BluRay" is a whole-word keyword-file entry
+     *     (#32 "BluRay", stored lowercased); no other entry matches a token. */
+    {"My BluRay Adventure", "My Adventure", "legacy keyword strip"},
+};
+
+#define NUM_CASES (sizeof(CASES) / sizeof(CASES[0]))
+
+static int failures = 0;
+
+static void check_title(const title_case_t *tc) {
+    char *got = extract_media_title(tc->input);
+
+    if (got == NULL) {
+        fprintf(stderr, "FAIL [%s]: extract_media_title(\"%s\") returned NULL, expected \"%s\"\n",
+                tc->note, tc->input, tc->expected);
+        failures++;
+        return;
+    }
+
+    if (strcmp(got, tc->expected) != 0) {
+        fprintf(stderr, "FAIL [%s]: extract_media_title(\"%s\") = \"%s\", expected \"%s\"\n",
+                tc->note, tc->input, got, tc->expected);
+        failures++;
+        free(got);
+        return;
+    }
+
+    free(got);
+}
+
+int main(void) {
+    size_t total = 0;
+
+    if (torrent_search_init(KEYWORD_FILE) != 0) {
+        fprintf(stderr, "FAIL: torrent_search_init(\"%s\") != 0\n", KEYWORD_FILE);
+        return EXIT_FAILURE;
+    }
+
+    for (size_t i = 0; i < NUM_CASES; i++) {
+        check_title(&CASES[i]);
+        total++;
+    }
+
+    /* NULL input -> NULL. */
+    {
+        char *got = extract_media_title(NULL);
+        total++;
+        if (got != NULL) {
+            fprintf(stderr, "FAIL [null input]: expected NULL, got \"%s\"\n", got);
+            failures++;
+            free(got);
+        }
+    }
+
+    /* Empty string -> non-NULL empty string. */
+    {
+        char *got = extract_media_title("");
+        total++;
+        if (got == NULL) {
+            fprintf(stderr, "FAIL [empty input]: expected non-NULL empty string, got NULL\n");
+            failures++;
+        } else {
+            if (strcmp(got, "") != 0) {
+                fprintf(stderr, "FAIL [empty input]: expected \"\", got \"%s\"\n", got);
+                failures++;
+            }
+            free(got);
+        }
+    }
+
+    torrent_search_cleanup();
+
+    if (failures != 0) {
+        fprintf(stderr, "FAIL %d/%zu cases failed\n", failures, total);
+        return EXIT_FAILURE;
+    }
+
+    printf("PASS %zu/%zu cases\n", total, total);
+    return EXIT_SUCCESS;
+}
