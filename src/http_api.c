@@ -1212,11 +1212,51 @@ static void free_parsed_query(parsed_query_t *pq) {
     memset(pq, 0, sizeof(*pq));
 }
 
+/* Build the torrent_search FTS5 query string from the raw user query.
+ *
+ * FTS5 query syntax treats an unquoted '-' as an operator, so a plain title
+ * query such as `Spider-Man Into The Spider Verse 2018` is parsed as
+ * `Spider - Man ...` and the MATCH expression fails with "no such column:
+ * Man". The handler swallows the statement error and reports zero results.
+ * The index side has no such trouble: both the porter and the trigram
+ * tokenizer already treat '-' as a separator inside torrent names, so
+ * `spider man into ...` matches exactly the rows the hyphenated query should.
+ * Normalizing unquoted '-' to a space therefore aligns the query tokens with
+ * the tokens that were actually indexed.
+ *
+ * Quoted phrases are copied verbatim: quoting is how a user asks for an exact
+ * phrase and the porter tokenizer handles it natively, so a '-' inside quotes
+ * must stay untouched. Quote state is tracked with the same rule
+ * parse_search_query() applies below (a '"' toggles, there are no escapes).
+ * The mapping is 1:1 in length, so one strlen()+1 allocation is enough.
+ * Returns NULL on allocation failure; the caller treats that as a parse error. */
+static char *build_torrent_fts_query(const char *raw) {
+    size_t len = strlen(raw);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+
+    int in_quotes = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = raw[i];
+        if (c == '"') {
+            in_quotes = !in_quotes;
+            out[i] = c;
+        } else if (c == '-' && !in_quotes) {
+            out[i] = ' ';
+        } else {
+            out[i] = c;
+        }
+    }
+    out[len] = '\0';
+    return out;
+}
+
 static int parse_search_query(const char *raw, parsed_query_t *pq) {
     memset(pq, 0, sizeof(*pq));
 
-    /* Build torrent FTS query: preserve quotes as-is for porter tokenizer */
-    pq->torrent_fts_query = strdup(raw);
+    /* Build torrent FTS query: keep quotes (porter handles them natively) but
+     * normalize unquoted hyphens, see build_torrent_fts_query() */
+    pq->torrent_fts_query = build_torrent_fts_query(raw);
     if (!pq->torrent_fts_query) return -1;
 
     /* Parse quoted and unquoted segments */
@@ -1558,7 +1598,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     }
 
     sqlite3_bind_text(count_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(count_stmt, 2, has_quoted ? pq.file_fts_query : query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(count_stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
+                      -1, SQLITE_STATIC);
     if (has_quoted) {
         BIND_QUOTED_GLOB_PARAMS(count_stmt, 3, pq, quoted_lower);
     }
@@ -1583,7 +1624,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     }
 
     sqlite3_bind_text(stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, has_quoted ? pq.file_fts_query : query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
+                      -1, SQLITE_STATIC);
     int class_main_bind = 5;  /* unquoted: ?3/?4 are LIMIT/OFFSET */
     if (!has_quoted) {
         sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
