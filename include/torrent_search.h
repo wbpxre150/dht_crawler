@@ -26,12 +26,18 @@ void torrent_search_cleanup(void);
  * just the media title suitable for searching on IMDB or similar services.
  *
  * Processing steps:
- * - Replace dots and underscores with spaces
- * - Remove content in square brackets [...]
- * - Preserve years in parentheses (1900-2099), remove other tech info
- * - Truncate at season/episode markers (S01E02, Season 1, etc.)
- * - Strip all loaded keywords (case-insensitive)
- * - Collapse multiple spaces and trim
+ * 1. Replace dots and underscores with spaces
+ * 2. Remove content in square brackets [...]
+ * 3. Preserve years in parentheses (1900-2099), remove other tech info
+ * 4. Cut at the first scene-release pivot (release grammar only):
+ *      year pivot    "Some.Movie.2020.1080p..."  -> "Some Movie 2020"
+ *      season pivot  "Show.Name.S01E05.1080p..." -> "Show Name"
+ *      quality pivot "Some.Movie.1080p.BluRay..." -> "Some Movie"
+ *    Pivot paths do not strip keywords - the grammar alone decides where
+ *    the title ends.
+ * 5. Legacy path (no pivot): truncate at season/episode markers, then strip
+ *    all loaded keywords (case-insensitive)
+ * 6. Collapse multiple spaces and trim
  *
  * @param torrent_name The raw torrent name
  * @return Newly allocated string with extracted title (caller must free),

@@ -336,7 +336,7 @@ static int is_quality_token(const char *tok, size_t len) {
  *      index > 0. The index guard keeps year-shaped titles intact
  *      ("1917.2019.1080p" -> "1917 2019"); a title word that also looks like
  *      a year ("Blade.Runner.2049.2017") resolves to the FIRST such token.
- *   2. Season pivot (only if no year token anywhere): cut at the
+ *   2. Season pivot (only when no year token at index > 0 fired): cut at the
  *      season/episode marker, exactly like the legacy path.
  *   3. Quality pivot (no year, no season): cut exclusively before the first
  *      quality token ("Some.Movie.1080p.BluRay" -> "Some Movie").
