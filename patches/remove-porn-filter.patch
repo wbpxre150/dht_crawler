@@ -17,7 +17,7 @@
      bool compact_db = false;
      bool check_db = false;
      bool recover_db = false;
-@@ -201,9 +198,7 @@
+@@ -199,9 +196,7 @@
              printf("Usage: %s [OPTIONS]\n\n", argv[0]);
              printf("Options:\n");
              printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
@@ -27,7 +27,7 @@
              printf("  --check-database         Run an integrity check on the database and report any errors\n");
              printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
              printf("                           database, then replacing the original\n");
-@@ -214,8 +209,6 @@
+@@ -209,8 +204,6 @@
              return 0;
          } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
              rebuild_bloom = true;
@@ -36,7 +36,7 @@
          } else if (strcmp(argv[i], "--compact") == 0) {
              compact_db = true;
          } else if (strcmp(argv[i], "--check-database") == 0) {
-@@ -538,24 +531,11 @@
+@@ -449,24 +442,11 @@
          }
      }
  
@@ -62,7 +62,7 @@
      language_filter_init(config.language_filter_non_latin_threshold);
  
      /* Initialize ingest-time classifier (Stage 5, tag mode). Non-fatal: without
-@@ -582,7 +562,6 @@
+@@ -498,7 +478,6 @@
      rc = database_init(&g_database, g_app_ctx.db_path, &g_app_ctx);
      if (rc != 0) {
          log_msg(LOG_ERROR, "Failed to initialize database: %d", rc);
@@ -70,7 +70,7 @@
          hard_block_cleanup();
          language_filter_cleanup();
          bloom_filter_cleanup(g_bloom);
-@@ -611,38 +590,6 @@
+@@ -527,38 +506,6 @@
      }
  
      /*******************************************************************
@@ -109,7 +109,7 @@
       * --compact: write a fresh compacted copy, replace original, exit.
       *******************************************************************/
      if (compact_db) {
-@@ -652,7 +599,6 @@
+@@ -568,7 +515,6 @@
          if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
              database_cleanup(&g_database);
              torrent_search_cleanup();
@@ -117,7 +117,7 @@
              hard_block_cleanup();
              language_filter_cleanup();
              bloom_filter_cleanup(g_bloom);
-@@ -667,7 +613,6 @@
+@@ -583,7 +529,6 @@
  
          database_cleanup(&g_database);
          torrent_search_cleanup();
@@ -125,16 +125,16 @@
          hard_block_cleanup();
          language_filter_cleanup();
          bloom_filter_cleanup(g_bloom);
-@@ -776,8 +721,6 @@
+@@ -692,8 +637,6 @@
          .global_bootstrap_target = config.global_bootstrap_target,
          .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
          .global_bootstrap_workers = config.global_bootstrap_workers,
 -        /* Porn filter settings */
 -        .porn_filter_enabled = config.porn_filter_enabled,
          /* Stage 6 adult handling (adult_mode is copied after the literal) */
-         .adult_drop_threshold = config.adult_drop_threshold,
          /* Adaptive keyspace partitioning */
-@@ -960,7 +903,6 @@
+         .dead_partition_threshold = config.dead_partition_threshold,
+@@ -875,7 +818,6 @@
      }
      database_cleanup(&g_database);
      torrent_search_cleanup();
@@ -144,7 +144,7 @@
      bloom_filter_cleanup(g_bloom);
 --- a/src/supervisor.c
 +++ b/src/supervisor.c
-@@ -122,9 +122,6 @@
+@@ -117,9 +117,6 @@
      sup->require_empty_queue = config->require_empty_queue;
      sup->rate_ema_alpha = (config->rate_ema_alpha > 0.0 && config->rate_ema_alpha <= 1.0) ? config->rate_ema_alpha : 0.3;
  
@@ -153,13 +153,13 @@
 -
      /* Stage 6 adult handling */
      strncpy(sup->adult_mode, config->adult_mode, sizeof(sup->adult_mode) - 1);
-     sup->adult_drop_threshold = config->adult_drop_threshold;
-@@ -496,8 +493,6 @@
+ 
+@@ -490,8 +487,6 @@
          .min_lifetime_minutes = sup->min_lifetime_minutes,
          .require_empty_queue = sup->require_empty_queue,
          .ema_alpha = sup->rate_ema_alpha,
 -        /* Porn filter settings */
 -        .porn_filter_enabled = sup->porn_filter_enabled,
          /* Stage 6 adult handling (adult_mode is copied after the literal below) */
-         .adult_drop_threshold = sup->adult_drop_threshold,
          /* Shared resources */
+         .batch_writer = sup->batch_writer,
