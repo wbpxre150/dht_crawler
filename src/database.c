@@ -1160,18 +1160,40 @@ int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
     }
     if (torrent_id < 0) return -1;
 
+    /* Build a LIKE pattern matched against the FULL displayed path
+     * (prefix/filename) so a folder-name term matches too. Escape LIKE
+     * wildcards in the user term, then wrap in %term%. Unlike the old FTS5
+     * file_search MATCH, this stays scoped to one torrent via the
+     * idx_files_torrent index, so it is a fast per-torrent scan. */
+    char *like = NULL;
+    if (has_filter) {
+        size_t n = strlen(filter);
+        like = (char *)malloc(n * 2 + 3);   /* worst case: every byte escaped + %..% + NUL */
+        if (!like) return -1;
+        size_t j = 0;
+        like[j++] = '%';
+        for (size_t i = 0; i < n; i++) {
+            char c = filter[i];
+            if (c == '%' || c == '_' || c == '\\') like[j++] = '\\';
+            like[j++] = c;
+        }
+        like[j++] = '%';
+        like[j] = '\0';
+    }
+
     /* Total count */
     {
         sqlite3_stmt *st = NULL;
         const char *count_sql = has_filter
             ? "SELECT COUNT(*) FROM torrent_files tf "
-              "JOIN file_search fs ON fs.rowid = tf.id "
-              "WHERE tf.torrent_id = ? AND file_search MATCH ?"
+              "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
+              "WHERE tf.torrent_id = ? AND "
+              "COALESCE(pp.prefix || '/' || tf.filename, tf.filename) LIKE ? ESCAPE '\\'"
             : "SELECT COUNT(*) FROM torrent_files WHERE torrent_id = ?";
         database_read_lock(db);
         if (sqlite3_prepare_v2(db->db, count_sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, torrent_id);
-            if (has_filter) sqlite3_bind_text(st, 2, filter, -1, SQLITE_STATIC);
+            if (has_filter) sqlite3_bind_text(st, 2, like, -1, SQLITE_STATIC);
             if (sqlite3_step(st) == SQLITE_ROW && out_total) {
                 *out_total = sqlite3_column_int(st, 0);
             }
@@ -1185,9 +1207,9 @@ int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
         ? "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) AS path, "
           "       tf.size_bytes "
           "FROM torrent_files tf "
-          "JOIN file_search fs ON fs.rowid = tf.id "
           "LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
-          "WHERE tf.torrent_id = ? AND file_search MATCH ? "
+          "WHERE tf.torrent_id = ? AND "
+          "COALESCE(pp.prefix || '/' || tf.filename, tf.filename) LIKE ? ESCAPE '\\' "
           "ORDER BY tf.file_index LIMIT ? OFFSET ?"
         : "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) AS path, "
           "       tf.size_bytes "
@@ -1197,7 +1219,7 @@ int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
           "ORDER BY tf.file_index LIMIT ? OFFSET ?";
 
     torrent_file_row_t *rows = (torrent_file_row_t *)calloc(limit, sizeof(*rows));
-    if (!rows) return -1;
+    if (!rows) { free(like); return -1; }
     int n = 0;
 
     sqlite3_stmt *st = NULL;
@@ -1205,7 +1227,7 @@ int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
     if (sqlite3_prepare_v2(db->db, page_sql, -1, &st, NULL) == SQLITE_OK) {
         int idx = 1;
         sqlite3_bind_int64(st, idx++, torrent_id);
-        if (has_filter) sqlite3_bind_text(st, idx++, filter, -1, SQLITE_STATIC);
+        if (has_filter) sqlite3_bind_text(st, idx++, like, -1, SQLITE_STATIC);
         sqlite3_bind_int(st, idx++, limit);
         sqlite3_bind_int(st, idx++, offset);
 
@@ -1219,6 +1241,7 @@ int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
     }
     database_read_unlock(db);
 
+    free(like);
     *out_files = rows;
     *out_count = n;
     return 0;

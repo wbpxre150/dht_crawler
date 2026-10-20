@@ -160,28 +160,19 @@ int http_torrent_files_handler(struct mg_connection *conn, void *cbdata) {
     if (mg_get_var(qs, strlen(qs), "q", buf, sizeof(buf)) > 0) {
         filter = tp_url_decode(buf);
     }
-
-    /* If filter is too short for trigram FTS (<3 chars), drop it. */
-    char *fts_filter = NULL;
-    if (filter && strlen(filter) >= 3) {
-        /* Wrap in quotes to make a phrase match safe for FTS5. */
-        size_t fl = strlen(filter);
-        fts_filter = (char *)malloc(fl + 8);
-        if (fts_filter) {
-            /* Replace embedded double-quotes to avoid breaking the FTS literal. */
-            char *clean = strdup(filter);
-            for (char *p = clean; *p; p++) if (*p == '"') *p = ' ';
-            snprintf(fts_filter, fl + 8, "\"%s\"", clean);
-            free(clean);
-        }
+    /* Drop filters shorter than 3 chars (parity with the dashboard's
+     * FILES_MIN_FILTER_LEN). Longer filters are matched against the FULL
+     * displayed path (prefix/filename) by db_get_torrent_files_paginated. */
+    if (filter && strlen(filter) < 3) {
+        free(filter);
+        filter = NULL;
     }
 
     torrent_file_row_t *rows = NULL;
     int count = 0, total = 0;
     int rc = db_get_torrent_files_paginated(api->database, hash, offset, limit,
-                                            fts_filter, &rows, &count, &total);
+                                            filter, &rows, &count, &total);
     free(filter);
-    free(fts_filter);
 
     if (rc != 0) {
         send_404(conn, "{\"error\":\"not found\"}");
