@@ -193,6 +193,136 @@ static int load_strip_keywords(const char *file_path) {
  * Text Processing Functions
  * ============================================================================ */
 
+/* ============================================================================
+ * Tracker prefix stripping
+ * ============================================================================ */
+
+/*
+ * Rows scraped from tracker index pages often carry the site's hostname in front
+ * of the real release name, separated by a dash/pipe/colon:
+ *
+ *   "www.UIndex.org    -    Dune.Prophecy.S01E01..."  -> "Dune.Prophecy.S01E01..."
+ *   "www.Torrenting.com - The.Pitt.S01E05..."         -> "The.Pitt.S01E05..."
+ *   "rarbg.com - Some.Movie.2020..."                  -> "Some.Movie.2020..."
+ *
+ * Left in place those host tokens become part of the extracted title (they are
+ * before the release pivot, so the pivot path keeps them) and poison the IMDb /
+ * DHT query built from it.
+ */
+
+/* TLDs that tracker hostnames actually use. A bare (non-www) dotted prefix is
+ * only treated as a host when its last label is one of these, so ordinary
+ * dot-separated titles followed by a dash ("The.Hunger.Games - Mockingjay...")
+ * are never mistaken for a hostname. Deliberately absent: TLDs that are also
+ * common English words in this position (one, top, live, life, fun, pro) - they
+ * would turn "The.One - ..." into "...", and a wrong title is worse than a
+ * dirty one. */
+static const char *const TRACKER_TLDS[] = {
+    "com", "net", "org", "info", "biz", "tv", "cc", "io", "xyz", "ws",
+    "eu", "uk", "ru", "su", "nl", "br", "ch", "pl", "mx", "bz", "nz",
+    "hk", "kr", "jp", "cn", "tw", "vn", "sg", "dk", "fi", "cz", "sk",
+    "hu", "ro", "bg", "gr", "pt", "rs", "ba", "mk", "al", "tr", "il",
+    "ae", "sa", "ir", "pk", "bd", "lk", "np", "th", "kh", "mm", "mn",
+    "gg", "cd", "club", "site", "online", "link", "download", "stream",
+    "torrent", "torrents", "lol", "vip", "to", "re", "se",
+};
+
+/** True for a hostname label character (letters and digits). */
+static int is_host_label_char(char c) {
+    return isalnum((unsigned char)c) != 0;
+}
+
+/**
+ * Length of the hostname label at `p`, 0 when there is none.
+ *
+ * Labels may contain inner hyphens ("www.torrent-bay.org"), otherwise the
+ * parser would stop at the first hyphen and strip only half of the host. A
+ * trailing hyphen is not part of the label - it is the separator that follows
+ * the host ("www.site.org- Title").
+ */
+static size_t host_label_len(const char *p) {
+    size_t n = 0;
+    while (is_host_label_char(p[n]) || p[n] == '-') n++;
+
+    while (n > 0 && p[n - 1] == '-') n--;
+
+    for (size_t i = 0; i < n; i++) {
+        if (is_host_label_char(p[i])) return n;  /* reject an all-hyphen run */
+    }
+    return 0;
+}
+
+/** True when `label` is one of the tracker TLDs above. */
+static int is_tracker_tld(const char *label, size_t len) {
+    for (size_t i = 0; i < sizeof(TRACKER_TLDS) / sizeof(TRACKER_TLDS[0]); i++) {
+        if (strlen(TRACKER_TLDS[i]) == len &&
+            strncasecmp(label, TRACKER_TLDS[i], len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Match a leading tracker hostname prefix.
+ *
+ * Grammar: 2-6 dot-separated labels (letters, digits, inner hyphens), then
+ * optional blanks, then a separator ('-', '|' or ':'), then blanks. The host is
+ * accepted when either
+ *   - its first label is "www" (never a title word in this position), or
+ *   - its last label is a known tracker TLD.
+ * Any label that is itself a year (1900-2099) disqualifies the match: that is a
+ * title, not a hostname.
+ *
+ * @param str Raw torrent name
+ * @return Pointer to the first character after the prefix, or NULL when the
+ *         string does not start with a tracker hostname
+ */
+static const char *match_tracker_prefix(const char *str) {
+    if (!str) return NULL;
+
+    const char *p = str;
+    while (*p == ' ' || *p == '\t') p++;
+
+    const char *labels[6];
+    size_t lens[6];
+    size_t nlabels = 0;
+
+    while (nlabels < sizeof(labels) / sizeof(labels[0])) {
+        size_t n = host_label_len(p);
+        if (n == 0) break;
+
+        labels[nlabels] = p;
+        lens[nlabels] = n;
+        nlabels++;
+        p += n;
+
+        if (*p != '.') break;
+        p++;  /* consume the dot and try to read the next label */
+    }
+
+    if (nlabels < 2) return NULL;
+    if (p - str > 48) return NULL;  /* a hostname is short; a title is not */
+
+    for (size_t i = 0; i < nlabels; i++) {
+        if (is_year(labels[i], lens[i])) return NULL;
+    }
+
+    int is_www = lens[0] == 3 && strncasecmp(labels[0], "www", 3) == 0;
+    if (!is_www && !is_tracker_tld(labels[nlabels - 1], lens[nlabels - 1])) {
+        return NULL;
+    }
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '-' && *p != '|' && *p != ':') return NULL;
+    p++;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return NULL;  /* nothing left to keep */
+
+    return p;
+}
+
 /**
  * Replace dots and underscores with spaces
  */
@@ -463,6 +593,32 @@ static void clean_trailing_separators(char *str) {
     }
 }
 
+/**
+ * Remove leading separator runs left behind by a removed prefix.
+ *
+ * A bracketed tracker prefix is dropped by remove_brackets() but the separator
+ * that followed it stays:
+ *   "[ www.torrenting.com ] - Carlin.At.Carnegie..." -> "- Carlin At Carnegie..."
+ * Only separators that are followed by a blank are trimmed, so titles that
+ * legitimately start with one ("-30-") are left alone.
+ */
+static void clean_leading_separators(char *str) {
+    if (!str) return;
+
+    char *p = str;
+    while (*p == ' ' || *p == '\t') p++;
+
+    while ((*p == '-' || *p == '|' || *p == ':') &&
+           (p[1] == ' ' || p[1] == '\t')) {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+
+    if (p != str) {
+        memmove(str, p, strlen(p) + 1);
+    }
+}
+
 /* ============================================================================
  * Public API
  * ============================================================================ */
@@ -531,6 +687,8 @@ void torrent_search_cleanup(void) {
  * Extract the movie/TV show title from a torrent name.
  *
  * Processing steps:
+ * 0. Strip a leading tracker hostname prefix ("www.UIndex.org    -    ",
+ *    "rarbg.com - ") together with its separator
  * 1. Replace dots and underscores with spaces
  * 2. Remove content in square brackets [...]
  * 3. Preserve years in parentheses (1900-2099), remove other tech info
@@ -542,7 +700,7 @@ void torrent_search_cleanup(void) {
  *    where the title ends.
  * 5. Legacy path (no pivot): truncate at season/episode markers, then strip
  *    all loaded keywords (case-insensitive)
- * 6. Collapse multiple spaces and trim
+ * 6. Collapse multiple spaces, drop leading/trailing separators and trim
  *
  * @param torrent_name The raw torrent name
  * @return Newly allocated string with extracted title (caller must free),
@@ -557,6 +715,13 @@ char* extract_media_title(const char *torrent_name) {
     char *result = strdup(torrent_name);
     if (!result) {
         return NULL;
+    }
+
+    // Step 0: Strip a leading tracker hostname prefix. Runs before the
+    // separators are rewritten, while the dots that identify a host are intact.
+    const char *body = match_tracker_prefix(result);
+    if (body) {
+        memmove(result, body, strlen(body) + 1);
     }
 
     // Step 1: Replace dots and underscores with spaces
@@ -586,6 +751,7 @@ char* extract_media_title(const char *torrent_name) {
 
     // Step 6: Clean up (both paths)
     collapse_spaces(result);
+    clean_leading_separators(result);
     clean_trailing_separators(result);
     trim_whitespace(result);
 

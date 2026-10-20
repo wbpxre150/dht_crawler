@@ -50,6 +50,36 @@ static const title_case_t CASES[] = {
      *     keyword stripping runs. "BluRay" is a whole-word keyword-file entry
      *     (#32 "BluRay", stored lowercased); no other entry matches a token. */
     {"My BluRay Adventure", "My Adventure", "legacy keyword strip"},
+    /* 11. Tracker hostname prefix (www) with a dash separator is dropped, and
+     *     the year pivot then lands on the real release year. */
+    {"www.UIndex.org    -    Yellowstone.2018.S04E08.No.Kindness.1080p.BluRay.x264-OFT",
+     "Yellowstone 2018", "www tracker prefix"},
+    /* 12. Same prefix, season pivot. */
+    {"www.Torrenting.com - The.Pitt.S01E05.1080p.AMZN.WEB-DL.DDP5.1.H.264-FLUX",
+     "The Pitt", "www tracker prefix, season pivot"},
+    /* 13. Non-TLD host suffix ("ing") is fine for a www prefix; parens year. */
+    {"www.1TamilMV.ing - Kattalan (2026) Tamil HQ HDRip - 1080p - x265 - HEVC",
+     "Kattalan 2026", "www tracker prefix, parens year"},
+    /* 14. Bare tracker domain (no www) whose TLD is a known one. */
+    {"rarbg.com - Some.Movie.2020.1080p.WEB-DL.x264",
+     "Some Movie 2020", "bare tracker domain prefix"},
+    /* 15. Bracketed prefix: the host itself is removed by remove_brackets, the
+     *     leftover leading separator must not survive either. */
+    {"[ www.torrenting.com ] - Carlin.At.Carnegie.1983.iNTERNAL.DVDRip.x264-REGRET",
+     "Carlin At Carnegie 1983", "bracketed tracker prefix, leading dash"},
+    /* 16. Non-regression: dot-separated title words before a dash are a title,
+     *     not a hostname ("Games" is no tracker TLD), so nothing is stripped. */
+    {"The.Hunger.Games - Mockingjay.Part.1.2014.1080p",
+     "The Hunger Games - Mockingjay Part 1 2014", "title with dash, not a host"},
+    /* 17. Non-regression: a leading separator glued to the title ("-30-") is
+     *     part of the title and must not be trimmed. */
+    {"-30-.2011.1080p.BluRay.x264-GRP", "-30- 2011", "leading dash in title"},
+    /* 18. Bare tracker domain with a two-letter TLD (.re) and a pipe-free dash. */
+    {"eztv.re - Show.Name.S01E01.720p", "Show Name", "bare tracker domain (.re)"},
+    /* 19. Hyphenated host: the inner hyphen must not be taken for the separator
+     *     (a partial strip would leave "bay org - Some Movie 2020"). */
+    {"www.torrent-bay.org - Some.Movie.2020.1080p.WEB-DL",
+     "Some Movie 2020", "hyphenated tracker host"},
 };
 
 #define NUM_CASES (sizeof(CASES) / sizeof(CASES[0]))

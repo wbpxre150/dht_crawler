@@ -26,6 +26,8 @@ void torrent_search_cleanup(void);
  * just the media title suitable for searching on IMDB or similar services.
  *
  * Processing steps:
+ * 0. Strip a leading tracker hostname prefix ("www.UIndex.org    -    ",
+ *    "rarbg.com - ") together with its separator
  * 1. Replace dots and underscores with spaces
  * 2. Remove content in square brackets [...]
  * 3. Preserve years in parentheses (1900-2099), remove other tech info
@@ -37,7 +39,7 @@ void torrent_search_cleanup(void);
  *    the title ends.
  * 5. Legacy path (no pivot): truncate at season/episode markers, then strip
  *    all loaded keywords (case-insensitive)
- * 6. Collapse multiple spaces and trim
+ * 6. Collapse multiple spaces, drop leading/trailing separators and trim
  *
  * @param torrent_name The raw torrent name
  * @return Newly allocated string with extracted title (caller must free),
