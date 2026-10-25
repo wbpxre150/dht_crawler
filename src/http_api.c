@@ -1495,12 +1495,19 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
             ")", class_count_join);
 
+        /* No COUNT(f.id) in the SELECT list: aggregating the file count over
+         * the whole match set (~79.8k torrents x ~47 files ~= 3.75M index
+         * entries) was ~9 s of a 14.6 s query, only to print a per-row file
+         * count for the 50 rows on this page. The count is filled per returned
+         * row in the row loop instead (see page_files_count_sql below).
+         * GROUP BY t.id stays: it is what dedups the UNION row set, and the
+         * torrent_class join is on its torrent_id PK so it cannot multiply
+         * rows. */
         (void)snprintf(main_sql, sizeof(main_sql),
             "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-            "       t.added_timestamp, COUNT(f.id) as file_count, "
+            "       t.added_timestamp, "
             "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
-            "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
             "%s "
             "WHERE t.id IN ("
             "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
@@ -1573,12 +1580,15 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             "    %s"
             ")", class_count_join, file_subquery);
 
+        /* Same shape as the no-quoted branch: no COUNT(f.id) aggregate, the
+         * per-row file count is filled in the row loop. Bind indices are
+         * unchanged (?1 torrent FTS, ?2 file FTS, quoted GLOB binds, then
+         * LIMIT/OFFSET, then the class filter). */
         (void)snprintf(main_sql, sizeof(main_sql),
             "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-            "       t.added_timestamp, COUNT(f.id) as file_count, "
+            "       t.added_timestamp, "
             "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
-            "LEFT JOIN torrent_files f ON t.id = f.torrent_id "
             "%s "
             "WHERE t.id IN ("
             "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
@@ -1672,6 +1682,14 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         return -1;
     }
 
+    /* Per-page file count: identical subquery shape to fetch_result_files(),
+     * one idx_files_torrent range scan per returned row on this same read
+     * connection. This replaces the whole-match-set COUNT(f.id) aggregate the
+     * main query used to carry. */
+    const char *page_files_count_sql =
+        "SELECT COUNT(*) FROM torrent_files "
+        "WHERE torrent_id = (SELECT id FROM torrents WHERE info_hash = ?)";
+
     int i = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && i < HTTP_API_MAX_RESULTS) {
         /* Extract torrent data */
@@ -1680,23 +1698,34 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         res[i].size_bytes = sqlite3_column_int64(stmt, 2);
         res[i].total_peers = sqlite3_column_int(stmt, 3);
         res[i].added_timestamp = sqlite3_column_int64(stmt, 4);
-        res[i].num_files = sqlite3_column_int(stmt, 5);
 
-        /* Stage 7: torrent_class columns 6..9, filled when the torrent has a
+        /* Stage 7: torrent_class columns 5..8, filled when the torrent has a
          * class row. c.category is NOT NULL in the table, so it doubles as the
          * "has a class row" flag; tv_kind and confidence are nullable. */
-        if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+        if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
             res[i].has_class = 1;
-            res[i].category = sqlite3_column_int(stmt, 6);
-            if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+            res[i].category = sqlite3_column_int(stmt, 5);
+            if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
                 res[i].has_tv_kind = 1;
-                res[i].tv_kind = sqlite3_column_int(stmt, 7);
+                res[i].tv_kind = sqlite3_column_int(stmt, 6);
             }
-            res[i].adult = sqlite3_column_int(stmt, 8);
-            if (sqlite3_column_type(stmt, 9) != SQLITE_NULL) {
+            res[i].adult = sqlite3_column_int(stmt, 7);
+            if (sqlite3_column_type(stmt, 8) != SQLITE_NULL) {
                 res[i].has_confidence = 1;
-                res[i].confidence = sqlite3_column_double(stmt, 9);
+                res[i].confidence = sqlite3_column_double(stmt, 8);
             }
+        }
+
+        /* num_files for this row only. The statement is finalized on every
+         * path: an unfinalized statement pins a WAL snapshot and stalls the
+         * next CHECKPOINT_RESTART. */
+        sqlite3_stmt *files_count_stmt = NULL;
+        if (sqlite3_prepare_v2(conn, page_files_count_sql, -1, &files_count_stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_blob(files_count_stmt, 1, res[i].info_hash, 20, SQLITE_STATIC);
+            if (sqlite3_step(files_count_stmt) == SQLITE_ROW) {
+                res[i].num_files = sqlite3_column_int(files_count_stmt, 0);
+            }
+            sqlite3_finalize(files_count_stmt);
         }
 
         /* Get file listings for this torrent - reconstruct paths from prefix + filename */
