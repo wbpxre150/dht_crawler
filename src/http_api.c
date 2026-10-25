@@ -1280,9 +1280,10 @@ static char *build_torrent_fts_query(const char *raw) {
  * `best` (measured: the same 331,190-row set), so the file half of the match set
  * was dominated by torrents whose filenames contain neither `ac` nor `dc`.
  * The 3+-byte terms stay in the trigram MATCH string (?2); every short term is
- * refined with the same word-boundary GLOB the quoted path applies
- * (append_word_boundary_condition) instead of vanishing, so a term is never
- * silently dropped.
+ * refined with the same word-boundary GLOB tests the quoted path applies
+ * instead of vanishing, so a term is never silently dropped. (Stage 8 puts an
+ * instr() prefilter and pre-built patterns in front of those tests, see
+ * build_unquoted_file_subquery.)
  *
  * strlen() is the right test here: it counts bytes, which is the unit the
  * byte-level trigram tokenizer works in. A 2-character UTF-8 term is not a
@@ -1495,24 +1496,186 @@ static int build_quoted_file_subquery(const parsed_query_t *pq, char *out, size_
     return 0;
 }
 
+/* --- Stage 8: pre-built word-boundary patterns for sub-trigram terms -------
+ *
+ * The measured problem: the warm match-set build for q='best of ac dc' took
+ * 14.06 s while producing 13 match rows, and the same query built in ~3 s on
+ * the pre-stage-5 build over the identical 331,190-candidate scan. The delta
+ * is this branch's per-candidate machinery: up to 12 LOWER(tf.filename)
+ * evaluations, 12 SQL-side 'literal' || ? || 'literal' concatenations and 12
+ * GLOB matches per candidate row, all to confirm word boundaries for the terms
+ * the trigram index cannot serve.
+ *
+ * Stage 8 keeps the same four tests per term but (1) prefilters candidates with
+ * a plain substring probe, so a row that does not even contain the term is
+ * rejected by instr() before any GLOB runs, and (2) binds pre-built pattern
+ * strings, so the survivors pay four binds instead of twelve concatenations.
+ * ---------------------------------------------------------------------- */
+
+/* Patterns one sub-trigram term contributes, in bind order (see the tables
+ * below). */
+#define SHORT_TERM_PATTERNS 4
+/* Bound parameters one sub-trigram term contributes: the instr() prefilter
+ * needle plus its four patterns. */
+#define SHORT_TERM_BINDS (1 + SHORT_TERM_PATTERNS)
+
+/* Bind indices of one sub-trigram term's parameters in the file-half statement,
+ * where ?1 is the trigram terms string. Both the SQL builder and the binder go
+ * through these two, so the emitted placeholders and the binds cannot drift
+ * apart (the stage-5 arithmetic was duplicated in both places). */
+static int short_instr_bind(int si) {
+    return 2 + si * SHORT_TERM_BINDS;
+}
+
+static int short_pattern_bind(int si) {
+    return 3 + si * SHORT_TERM_BINDS;
+}
+
+/* "boundary before and after", "boundary after", "boundary before", and the
+ * bare term (bound to the '=' test). Concatenated around the term these are
+ * byte-identical to what the previous SQL-side '||' expression produced,
+ * including for a term that itself carries GLOB metacharacters: the term is
+ * pasted into the pattern, never escaped, which is the pre-existing accepted
+ * behaviour (review P2 #4). */
+static const char *const SHORT_PATTERN_PREFIX[SHORT_TERM_PATTERNS] = {
+    "*[^a-zA-Z0-9]", "", "*[^a-zA-Z0-9]", ""
+};
+static const char *const SHORT_PATTERN_SUFFIX[SHORT_TERM_PATTERNS] = {
+    "[^a-zA-Z0-9]*", "[^a-zA-Z0-9]*", "", ""
+};
+
+/* The needle the instr() prefilter binds for one sub-trigram term.
+ *
+ * For a term without GLOB metacharacters the literal bytes are a necessary
+ * condition of the term's word-boundary group: every pattern in that group can
+ * only match where the term occurs verbatim (a word-bounded occurrence is a
+ * substring occurrence), so a row that fails instr() would fail the group too
+ * and the prefilter can only remove work, never rows.
+ *
+ * A term that does carry metacharacters ('*', '?', '[') breaks that argument:
+ * those bytes act as wildcards inside the pattern, so the literal term is not
+ * implied by a match. Such a term binds an empty needle instead — instr(X, '')
+ * is 1 for every non-NULL X ("if Y is an empty string then instr() returns
+ * 1"), i.e. a tautology that leaves the GLOB group as the only decider, exactly
+ * as before stage 8. (A NULL filename yields NULL either way, which the WHERE
+ * clause rejects, so that case is unchanged as well.) */
+static const char *short_term_instr_needle(const char *term) {
+    if (strpbrk(term, "*?[") != NULL) return "";
+    return term;
+}
+
+/* One pattern string. The buffer is sized from its three pieces and written
+ * through sb_append, so nothing can be truncated; NULL on allocation failure. */
+static char *short_pattern_build(const char *prefix, const char *term, const char *suffix) {
+    size_t need = strlen(prefix) + strlen(term) + strlen(suffix) + 1;
+    char *pattern = (char *)malloc(need);
+    if (!pattern) return NULL;
+
+    size_t pos = 0;
+    if (sb_append(pattern, need, &pos, "%s%s%s", prefix, term, suffix) != 0) {
+        free(pattern);
+        return NULL;
+    }
+    return pattern;
+}
+
+/* Free a block from build_short_pattern_block(): num_short_glob terms times
+ * SHORT_TERM_PATTERNS strings. Tolerates NULL. */
+static void free_short_pattern_block(char **block, int num_short_glob) {
+    if (!block) return;
+    for (int i = 0; i < num_short_glob * SHORT_TERM_PATTERNS; i++) free(block[i]);
+    free(block);
+}
+
+/* Build every pattern the file half binds: one block of
+ * num_short_glob * SHORT_TERM_PATTERNS strings, term si's patterns at
+ * [si * SHORT_TERM_PATTERNS]. Built once per rebuild instead of concatenated
+ * per candidate row. NULL on allocation failure (or when there is nothing to
+ * build); the caller fails the request rather than running a partial set. */
+static char **build_short_pattern_block(const parsed_query_t *pq) {
+    if (pq->num_short_glob <= 0) return NULL;
+
+    size_t count = (size_t)pq->num_short_glob * SHORT_TERM_PATTERNS;
+    char **block = (char **)calloc(count, sizeof(*block));
+    if (!block) return NULL;
+
+    for (int si = 0; si < pq->num_short_glob; si++) {
+        for (int pi = 0; pi < SHORT_TERM_PATTERNS; pi++) {
+            char *pattern = short_pattern_build(SHORT_PATTERN_PREFIX[pi], pq->short_glob[si],
+                                                SHORT_PATTERN_SUFFIX[pi]);
+            if (!pattern) {
+                free_short_pattern_block(block, pq->num_short_glob);
+                return NULL;
+            }
+            block[si * SHORT_TERM_PATTERNS + pi] = pattern;
+        }
+    }
+    return block;
+}
+
 /*
- * Build the file_search half of the unquoted-term query: the trigram FTS
- * pre-filter (?2, the 3+-byte terms only) followed by one word-boundary GLOB
- * condition per sub-trigram term (4 binds each, starting at ?3). Same shape and
- * cost as the quoted variant above, and bounds-checked for the same reason:
- * every append can fail and the caller must then not run a truncated fragment.
+ * Build the word-boundary SQL condition for a sub-trigram term against a
+ * column, on pre-built patterns. The four tests are the ones
+ * append_word_boundary_condition() emits for a quoted term, but each GLOB takes
+ * one bound pattern instead of an SQL-side '||' concatenation (the '=' test
+ * still binds the bare term). bind_idx is the 1-based index of the term's first
+ * pattern; index+3 is the bare term. Returns the number of bind parameters
+ * consumed (always 4), or -1 when the condition does not fit.
+ */
+static int append_prebuilt_pattern_condition(char *buf, size_t bufsize, size_t *pos,
+                                             const char *column, int bind_idx) {
+    int rc = sb_append(buf, bufsize, pos,
+        "(LOWER(%s) GLOB ?%d"
+        " OR LOWER(%s) GLOB ?%d"
+        " OR LOWER(%s) GLOB ?%d"
+        " OR LOWER(%s) = ?%d)",
+        column, bind_idx,
+        column, bind_idx + 1,
+        column, bind_idx + 2,
+        column, bind_idx + 3);
+    if (rc != 0) return -1;
+    return 4; /* number of bind params consumed */
+}
+
+/*
+ * Build the file_search half of the unquoted-term query as a standalone
+ * statement body: the trigram FTS pre-filter (?1, the 3+-byte terms only), the
+ * instr() prefilter of every sub-trigram term, then one word-boundary GLOB
+ * condition per sub-trigram term.
+ *
+ * Bind layout: ?1 = the trigram terms, then five binds per sub-trigram term in
+ * emission order — the instr needle followed by the four patterns (see
+ * bind_unquoted_file_half, which must stay in step with this function).
+ *
+ * The instr predicates are hoisted ahead of every GLOB group. That is a pure
+ * AND reorder, so the intersection is unchanged, but it lets a candidate that
+ * lacks one of the terms exit after a couple of memmem-style probes instead of
+ * paying four GLOB matches per term; only substring-passing candidates reach
+ * the word-boundary confirmation.
+ *
+ * Bounds-checked for the same reason as the quoted variant: the fragment grows
+ * by ~200 bytes per term, so every append can fail and the caller must then not
+ * run a truncated fragment.
  */
 static int build_unquoted_file_subquery(const parsed_query_t *pq, char *out, size_t out_len) {
     size_t pos = 0;
     if (sb_append(out, out_len, &pos,
                   "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-                  "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)") != 0) {
+                  "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?1)") != 0) {
         return -1;
     }
 
     for (int si = 0; si < pq->num_short_glob; si++) {
+        if (sb_append(out, out_len, &pos, " AND instr(LOWER(tf.filename), ?%d) > 0",
+                      short_instr_bind(si)) != 0) {
+            return -1;
+        }
+    }
+
+    for (int si = 0; si < pq->num_short_glob; si++) {
         if (sb_append(out, out_len, &pos, " AND ") != 0) return -1;
-        if (append_word_boundary_condition(out, out_len, &pos, "tf.filename", 3 + si * 4) != 4) {
+        if (append_prebuilt_pattern_condition(out, out_len, &pos, "tf.filename",
+                                              short_pattern_bind(si)) != SHORT_TERM_PATTERNS) {
             return -1;
         }
     }
@@ -1520,31 +1683,60 @@ static int build_unquoted_file_subquery(const parsed_query_t *pq, char *out, siz
 }
 
 /*
- * Build the stage-3 match-set INSERT for a query without quoted terms.
+ * Bind the file-half statement built by build_unquoted_file_subquery().
  *
- * Bind layout: ?1 = the torrent (porter) FTS query, and when the file half is
- * included ?2 = the trigram-servable terms followed by 4 GLOB binds per short
- * term from ?3 on — exactly the order build_unquoted_file_subquery() emits them
- * in, so the binds are positional and no user input ever reaches the SQL text.
+ * ?1 is the trigram-servable terms string; every sub-trigram term then owns
+ * SHORT_TERM_BINDS consecutive parameters, starting at ?2 for the first term:
+ * the instr() needle, then the four patterns from the block. The bound text
+ * outlives the statement (SQLITE_STATIC), so both the parsed query and the
+ * pattern block must still be alive when this statement is finalized.
+ */
+static void bind_unquoted_file_half(sqlite3_stmt *stmt, const parsed_query_t *pq,
+                                    char *const *patterns) {
+    sqlite3_bind_text(stmt, 1, pq->file_fts_long, -1, SQLITE_STATIC);
+    for (int si = 0; si < pq->num_short_glob; si++) {
+        int bi = short_instr_bind(si);
+        sqlite3_bind_text(stmt, bi, short_term_instr_needle(pq->short_glob[si]), -1,
+                          SQLITE_STATIC);
+        for (int pi = 0; pi < SHORT_TERM_PATTERNS; pi++) {
+            sqlite3_bind_text(stmt, bi + 1 + pi, patterns[si * SHORT_TERM_PATTERNS + pi], -1,
+                              SQLITE_STATIC);
+        }
+    }
+}
+
+/*
+ * Build the match set for a query without quoted terms as *two* statements
+ * (stage 8): the name half into name_out and, when it can be built, the file
+ * half into file_out. Splitting them lets the timing line attribute the cost,
+ * and the resulting set is the one the single UNION statement produced — the
+ * name half is unique rowids, the file half keeps its SELECT DISTINCT, and
+ * OR IGNORE dedupes across the halves exactly as UNION did.
+ *
+ * Bind layout of the two statements, both numbered from ?1: the name half binds
+ * only ?1 = the torrent (porter) FTS query; the file half's layout is documented
+ * on build_unquoted_file_subquery(). No user input ever reaches the SQL text.
  *
  * The file half is left out in two cases, both of which only *narrow* the
  * result set and are logged by the caller:
  *   - no term is 3 bytes or longer (q=hd, q=3d, q=4k): the trigram index cannot
  *     serve the query at all, and a word-boundary GLOB scan over the whole
  *     torrent_files table (285M rows) is far worse than the answers it adds;
- *   - the GLOB fragment for this many short terms does not fit *out*: dropping
- *     the file half beats running a fragment that silently matched something
- *     else.
+ *   - the GLOB fragment for this many short terms does not fit *file_out*:
+ *     dropping the file half beats running a fragment that silently matched
+ *     something else.
  *
  * Returns 0 (also when the file half was skipped) and sets *file_side, or -1
  * when even the name-side-only statement did not fit.
  */
 static int build_unquoted_match_sql(const parsed_query_t *pq, const char *match_table,
-                                    char *out, size_t out_len, int *file_side) {
+                                    char *name_out, size_t name_len,
+                                    char *file_out, size_t file_len, int *file_side) {
     size_t pos = 0;
     *file_side = 0;
+    file_out[0] = '\0';
 
-    if (sb_append(out, out_len, &pos,
+    if (sb_append(name_out, name_len, &pos,
                   "INSERT OR IGNORE INTO %s "
                   "SELECT rowid FROM torrent_search WHERE name MATCH ?1",
                   match_table) != 0) {
@@ -1552,22 +1744,20 @@ static int build_unquoted_match_sql(const parsed_query_t *pq, const char *match_
     }
     if (pq->num_file_long == 0) return 0;
 
-    /* Remember where the name half ends *before* the " UNION " goes in: the
-     * fallback below cuts the statement back to exactly here, and a dangling
-     * UNION would be a prepare-time syntax error. */
-    size_t name_end = pos;
-    if (sb_append(out, out_len, &pos, " UNION ") != 0) return -1;
-    if (build_unquoted_file_subquery(pq, out + pos, out_len - pos) != 0) {
-        /* Not fatal: keep the name half (see above). sb_append always leaves the
-         * buffer NUL-terminated, so cutting back to name_end is well defined. */
-        out[name_end] = '\0';
-        log_msg(LOG_WARN,
-                "file search: GLOB fragment for %d short term(s) does not fit the SQL buffer, "
-                "using name matches only",
-                pq->num_short_glob);
+    pos = 0;
+    if (sb_append(file_out, file_len, &pos, "INSERT OR IGNORE INTO %s ", match_table) == 0 &&
+        build_unquoted_file_subquery(pq, file_out + pos, file_len - pos) == 0) {
+        *file_side = 1;
         return 0;
     }
-    *file_side = 1;
+
+    /* Not fatal: keep the name half (see above). sb_append leaves the buffer
+     * NUL-terminated, so dropping the partial file statement is well defined. */
+    file_out[0] = '\0';
+    log_msg(LOG_WARN,
+            "file search: GLOB fragment for %d short term(s) does not fit the SQL buffer, "
+            "using name matches only",
+            pq->num_short_glob);
     return 0;
 }
 
@@ -1816,12 +2006,17 @@ static void shared_conn_search_unlock(int degraded) {
  * attribute that time per request instead of guessing.
  *
  * Phases, all measured with CLOCK_MONOTONIC:
- *   conn  = database_read_db() (may open the per-thread connection)
- *   build = match-set rebuild: CREATE/DELETE reset through the INSERT finalize
- *   count = the count query (prepare, bind, step, finalize)
- *   page  = the page query (prepare, bind, step loop, finalize) minus rows
- *   rows  = the per-row num_files count + fetch_result_files() work
- *   total = function entry to just before database_read_unlock()
+ *   conn       = database_read_db() (may open the per-thread connection)
+ *   build      = match-set rebuild: CREATE/DELETE reset through the last
+ *                INSERT finalize
+ *   build_name = stage 8: the name-half INSERT of the match set (prepare, bind,
+ *                step, finalize); on the quoted branch, whose file half still
+ *                rides in the same statement, this is the whole build
+ *   build_file = stage 8: the file-half INSERT (unquoted branch only)
+ *   count      = the count query (prepare, bind, step, finalize)
+ *   page       = the page query (prepare, bind, step loop, finalize) minus rows
+ *   rows       = the per-row num_files count + fetch_result_files() work
+ *   total      = function entry to just before database_read_unlock()
  * A phase that did not run (a cache HIT skips build and count) stays -1 and is
  * printed as "-". No SQL, bind index, lock or control-flow change is involved:
  * the only added calls are clock reads plus the existing sqlite3_changes().
@@ -1829,8 +2024,10 @@ static void shared_conn_search_unlock(int degraded) {
  * because the device default log level is INFO (config.c).
  * ------------------------------------------------------------------------ */
 typedef struct {
-    double conn;    /* -1 = phase did not run */
+    double conn;        /* -1 = phase did not run */
     double build;
+    double build_name;  /* stage 8: name-half INSERT */
+    double build_file;  /* stage 8: file-half INSERT */
     double count;
     double page;
     double rows;
@@ -1864,10 +2061,13 @@ static const char *timing_count_str(char *buf, size_t len, int n) {
 /* One line per request, so `adb logcat -d | grep "search timing"` is enough. */
 static void search_timing_log(const char *query, const char *cache_state, int match_rows,
                               const search_timing_t *tm) {
-    char b_conn[24], b_build[24], b_count[24], b_page[24], b_rows[24], b_total[24];
+    char b_conn[24], b_build[24], b_build_name[24], b_build_file[24];
+    char b_count[24], b_page[24], b_rows[24], b_total[24];
     char b_match_rows[24];
     const char *conn = timing_ms_str(b_conn, sizeof(b_conn), tm->conn);
     const char *build = timing_ms_str(b_build, sizeof(b_build), tm->build);
+    const char *build_name = timing_ms_str(b_build_name, sizeof(b_build_name), tm->build_name);
+    const char *build_file = timing_ms_str(b_build_file, sizeof(b_build_file), tm->build_file);
     const char *count = timing_ms_str(b_count, sizeof(b_count), tm->count);
     const char *page = timing_ms_str(b_page, sizeof(b_page), tm->page);
     const char *rows = timing_ms_str(b_rows, sizeof(b_rows), tm->rows);
@@ -1875,15 +2075,17 @@ static void search_timing_log(const char *query, const char *cache_state, int ma
     const char *set_rows = timing_count_str(b_match_rows, sizeof(b_match_rows), match_rows);
 
     log_msg(LOG_DEBUG,
-            "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s count=%s "
-            "page=%s rows=%s total=%s",
-            query, cache_state, set_rows, conn, build, count, page, rows, total);
+            "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s build_name=%s "
+            "build_file=%s count=%s page=%s rows=%s total=%s",
+            query, cache_state, set_rows, conn, build, build_name, build_file, count, page, rows,
+            total);
     if (tm->total >= 1000.0) {
         /* Slow request: repeat at INFO so the device default level shows it. */
         log_msg(LOG_INFO,
-                "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s count=%s "
-                "page=%s rows=%s total=%s",
-                query, cache_state, set_rows, conn, build, count, page, rows, total);
+                "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s build_name=%s "
+                "build_file=%s count=%s page=%s rows=%s total=%s",
+                query, cache_state, set_rows, conn, build, build_name, build_file, count, page,
+                rows, total);
     }
 }
 
@@ -1896,7 +2098,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     /* Stage 7 timing: entry stamp for `total`, and one slot per phase (-1 =
      * phase did not run). Declared here so every unlock exit can print it. */
     double t_entry = now_ms();
-    search_timing_t tm = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0};
+    search_timing_t tm = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0};
     /* Stage 7: rows the match-set rebuild stored; -1 when this request reused a
      * cached set (no rebuild ran). */
     int match_rows = -1;
@@ -1981,17 +2183,20 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     /*
      * Build dynamic SQL for file_search subquery.
-     * - No quoted terms: trigram FTS MATCH on the 3+-byte terms, plus GLOB
-     *   word-boundary checks for the sub-trigram ones (stage 5).
+     * - No quoted terms: trigram FTS MATCH on the 3+-byte terms, an instr()
+     *   substring prefilter and GLOB word-boundary checks for the sub-trigram
+     *   ones (stage 5), built as two statements (stage 8).
      * - Has quoted terms + unquoted terms: FTS MATCH on unquoted, plus GLOB word-boundary checks.
      * - Only quoted terms: skip FTS, use GLOB word-boundary checks on torrent_files directly.
      */
     char match_sql[4096];
+    char file_sql[4096];
     char count_sql[4096];
     char main_sql[4096];
 
     /* Stage 5: set when the no-quoted branch kept the file_search half of the
-     * match set, i.e. when ?2 and the short-term GLOB binds exist. */
+     * match set, i.e. when ?1 = the trigram terms and the sub-trigram binds
+     * exist in file_sql. */
     int file_side = 0;
 
     /* Stage 7: the class join goes into the count query only when the filter
@@ -2013,14 +2218,15 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     if (!has_quoted) {
         /* No quoted terms — original queries, plus the stage-7 class join.
-         * Bind indices: the INSERT owns ?1 = torrent FTS, then ?2 = the
-         * trigram-servable file terms and ?3... = 4 GLOB binds per sub-trigram
-         * term (stage 5, see build_unquoted_match_sql); the count query only
-         * carries the class filter (from ?1); the page query keeps ?1 for the
-         * ORDER BY ranking MATCH, then ?2/?3 = LIMIT/OFFSET and ?4... = class
-         * filter. */
+         * Stage 8 bind indices, both statements numbered from ?1: the name-half
+         * INSERT owns only ?1 = torrent FTS; the file-half INSERT owns ?1 = the
+         * trigram-servable terms, then 5 binds per sub-trigram term (1 instr
+         * prefilter + 4 pre-built patterns, see bind_unquoted_file_half); the
+         * count query only carries the class filter (from ?1); the page query
+         * keeps ?1 for the ORDER BY ranking MATCH, then ?2/?3 = LIMIT/OFFSET and
+         * ?4... = class filter. */
         if (build_unquoted_match_sql(&pq, match_table, match_sql, sizeof(match_sql),
-                                     &file_side) != 0) {
+                                     file_sql, sizeof(file_sql), &file_side) != 0) {
             log_msg(LOG_ERROR, "Unquoted search does not fit the SQL buffer");
             SEARCH_TIMING_EMIT();
             database_read_unlock(db);
@@ -2218,10 +2424,19 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             return -1;
         }
 
+        /* Stage 8: the match set is built by two INSERTs — name half first,
+         * file half second — so the timing line can attribute the cost. The set
+         * is the one the single UNION statement produced: the name half is
+         * unique rowids, the file half keeps its SELECT DISTINCT, and OR IGNORE
+         * dedupes across the two halves exactly as UNION did. The quoted branch
+         * still builds its file half inside match_sql, so it runs one statement
+         * here and leaves build_file unset. */
+        double t_name = now_ms();
         sqlite3_stmt *match_stmt = NULL;
         rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
         if (rc != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
+            tm.build_name = now_ms() - t_name;
             tm.build = now_ms() - t_build;   /* Stage 7: partial build */
             SEARCH_TIMING_EMIT();
             database_read_unlock(db);
@@ -2236,19 +2451,6 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         if (has_quoted) {
             sqlite3_bind_text(match_stmt, 2, pq.file_fts_query, -1, SQLITE_STATIC);
             BIND_QUOTED_GLOB_PARAMS(match_stmt, 3, pq, quoted_lower);
-        } else if (file_side) {
-            /* ?2 = the 3+-byte terms the trigram index can serve, then 4
-             * word-boundary GLOB binds per sub-trigram term in the order
-             * build_unquoted_file_subquery() emitted them (stage 5). The terms
-             * outlive the statement (they are freed with pq after finalize). */
-            sqlite3_bind_text(match_stmt, 2, pq.file_fts_long, -1, SQLITE_STATIC);
-            for (int si = 0; si < pq.num_short_glob; si++) {
-                int bi = 3 + si * 4;
-                sqlite3_bind_text(match_stmt, bi, pq.short_glob[si], -1, SQLITE_STATIC);
-                sqlite3_bind_text(match_stmt, bi + 1, pq.short_glob[si], -1, SQLITE_STATIC);
-                sqlite3_bind_text(match_stmt, bi + 2, pq.short_glob[si], -1, SQLITE_STATIC);
-                sqlite3_bind_text(match_stmt, bi + 3, pq.short_glob[si], -1, SQLITE_STATIC);
-            }
         }
 
         int match_rc = sqlite3_step(match_stmt);
@@ -2257,16 +2459,67 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         match_rows = sqlite3_changes(conn);
         sqlite3_finalize(match_stmt);
         #undef BIND_QUOTED_GLOB_PARAMS
+        tm.build_name = now_ms() - t_name;
+        int build_failed = (match_rc != SQLITE_DONE);
+        if (build_failed) {
+            log_msg(LOG_DEBUG, "Search name match set failed for query '%s': %s",
+                    query, sqlite3_errmsg(conn));
+        }
+
+        if (file_side && !build_failed) {
+            /* File half: ?1 = the 3+-byte terms the trigram index can serve, then
+             * 5 binds per sub-trigram term (see bind_unquoted_file_half). The
+             * patterns and the terms outlive the statement: the binds are
+             * SQLITE_STATIC, so the block is freed only after finalize.
+             *
+             * Skipped when the name half already failed: the reset below wipes
+             * the set either way, so running the file scan would only spend the
+             * time the failure already made pointless. */
+            double t_file = now_ms();
+            char **patterns = build_short_pattern_block(&pq);
+            sqlite3_stmt *file_stmt = NULL;
+            rc = patterns ? sqlite3_prepare_v2(conn, file_sql, -1, &file_stmt, NULL)
+                          : SQLITE_NOMEM;
+            if (rc != SQLITE_OK) {
+                log_msg(LOG_ERROR, "Failed to prepare file match set query: %s",
+                        sqlite3_errmsg(conn));
+                tm.build_file = now_ms() - t_file;
+                tm.build = now_ms() - t_build;
+                free_short_pattern_block(patterns, pq.num_short_glob);
+                SEARCH_TIMING_EMIT();
+                database_read_unlock(db);
+                shared_conn_search_unlock(cache_degraded);
+                free(cache_key);
+                for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+                free_parsed_query(&pq);
+                return -1;
+            }
+
+            bind_unquoted_file_half(file_stmt, &pq, patterns);
+            int file_rc = sqlite3_step(file_stmt);
+            /* Only the rows this half added: OR IGNORE already dropped the ones
+             * the name half stored, so the two changes() values sum to the size
+             * of the match set. */
+            match_rows += sqlite3_changes(conn);
+            sqlite3_finalize(file_stmt);
+            free_short_pattern_block(patterns, pq.num_short_glob);
+            tm.build_file = now_ms() - t_file;
+            if (file_rc != SQLITE_DONE) {
+                log_msg(LOG_DEBUG, "Search file match set failed for query '%s': %s",
+                        query, sqlite3_errmsg(conn));
+                build_failed = 1;
+            }
+        }
         tm.build = now_ms() - t_build;   /* Stage 7: build phase done */
 
-        if (match_rc != SQLITE_DONE) {
+        if (build_failed) {
             /* An FTS syntax error (an unbalanced quote, say) only surfaces at step
              * time. /search has always reported zero results for those instead of
              * an error, so keep that contract: empty the match set and let the
              * count query below return 0, which short-circuits the page query.
-             * The empty set is then cached like any other: it is exact and cheap. */
-            log_msg(LOG_DEBUG, "Search match set failed for query '%s': %s",
-                    query, sqlite3_errmsg(conn));
+             * The empty set is then cached like any other: it is exact and cheap.
+             * A failure in either half empties the whole set — a half-built set
+             * must never be counted or cached as if it were complete. */
             (void)sqlite3_exec(conn, reset_sql, NULL, NULL, NULL);
             match_rows = 0;
         }
