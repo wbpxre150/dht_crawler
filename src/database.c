@@ -95,6 +95,11 @@ static const char *CREATE_TRIGGERS_SQL =
     "    INSERT INTO file_search(file_search, rowid, filename) VALUES('delete', old.id, old.filename);"
     "END;";
 
+/* pthread_key destructor for a thread's read connection (defined below
+ * database_read_unlock). Forward-declared because database_init() registers
+ * it before the definition. */
+static void read_conn_destructor(void *value);
+
 /* Initialize database */
 int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
     if (!db || !db_path || !app_ctx) {
@@ -104,11 +109,18 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
     memset(db, 0, sizeof(database_t));
     db->app_ctx = app_ctx;
     db->bloom = NULL;  /* Will be set via database_set_bloom() */
+    /* Keep the path: database_read_db() reopens it per thread. */
+    db->db_path = strdup(db_path);
+    if (!db->db_path) {
+        return -1;
+    }
 
     /* Open database */
     int rc = sqlite3_open(db_path, &db->db);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to open database: %s", sqlite3_errmsg(db->db));
+        free(db->db_path);
+        db->db_path = NULL;
         return -1;
     }
 
@@ -140,6 +152,8 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
     /* Initialize mutex */
     if (uv_mutex_init(&db->mutex) != 0) {
         sqlite3_close(db->db);
+        free(db->db_path);
+        db->db_path = NULL;
         return -1;
     }
 
@@ -147,8 +161,32 @@ int database_init(database_t *db, const char *db_path, app_context_t *app_ctx) {
     if (pthread_rwlock_init(&db->checkpoint_rwlock, NULL) != 0) {
         uv_mutex_destroy(&db->mutex);
         sqlite3_close(db->db);
+        free(db->db_path);
+        db->db_path = NULL;
         return -1;
     }
+
+    /* Per-thread read connections: the registry mutex plus the TLS slot whose
+     * destructor closes a thread's connection when it exits. */
+    if (pthread_mutex_init(&db->read_conn_mutex, NULL) != 0) {
+        pthread_rwlock_destroy(&db->checkpoint_rwlock);
+        uv_mutex_destroy(&db->mutex);
+        sqlite3_close(db->db);
+        free(db->db_path);
+        db->db_path = NULL;
+        return -1;
+    }
+    db->read_conns_count = 0;
+    if (pthread_key_create(&db->read_conn_key, read_conn_destructor) != 0) {
+        pthread_mutex_destroy(&db->read_conn_mutex);
+        pthread_rwlock_destroy(&db->checkpoint_rwlock);
+        uv_mutex_destroy(&db->mutex);
+        sqlite3_close(db->db);
+        free(db->db_path);
+        db->db_path = NULL;
+        return -1;
+    }
+    db->read_conn_key_valid = 1;
 
     return 0;
 }
@@ -161,6 +199,148 @@ void database_read_lock(database_t *db) {
 /* Release read lock */
 void database_read_unlock(database_t *db) {
     if (db) pthread_rwlock_unlock(&db->checkpoint_rwlock);
+}
+
+/* -------------------------------------------------------------------------
+ * Per-thread read connections
+ *
+ * The long read paths (/search, /browse, /random) used to run their
+ * statements on the process-wide db->db handle, so a single multi-second
+ * sqlite3_step() blocked every other DB user. They now run on a connection
+ * owned by the calling thread: database_read_db() opens it lazily and the
+ * pthread_key destructor closes it when the thread exits (civetweb worker
+ * threads are joined by mg_stop() before database_cleanup() runs).
+ *
+ * Isolation only: no SQL, no bind order and no result handling changes, and
+ * every reader still holds database_read_lock() so a RESTART checkpoint
+ * cannot run underneath it.
+ * ---------------------------------------------------------------------- */
+
+/* One thread's own read connection. Heap-allocated because the pthread_key
+ * destructor only receives the TLS value itself, and it needs both the handle
+ * to close and the database_t whose registry entry to drop. */
+struct database_read_conn {
+    sqlite3 *conn;
+    database_t *db;
+};
+
+/* Drop [rc] from the registry. Returns 1 when it was there (the caller then
+ * owns it and must close/free it), 0 when another owner already claimed it. */
+static int read_conn_unregister(database_t *db, struct database_read_conn *rc) {
+    int found = 0;
+    pthread_mutex_lock(&db->read_conn_mutex);
+    for (int i = 0; i < db->read_conns_count; i++) {
+        if (db->read_conns[i] == rc) {
+            db->read_conns[i] = db->read_conns[db->read_conns_count - 1];
+            db->read_conns[db->read_conns_count - 1] = NULL;
+            db->read_conns_count--;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&db->read_conn_mutex);
+    return found;
+}
+
+/* Runs when the owning thread exits (civetweb workers are joined by mg_stop(),
+ * so this normally happens long before database_cleanup()). Ownership is
+ * decided under the registry mutex by pointer identity: whoever claims the
+ * entry owns it, the other side finds nothing and touches nothing. */
+static void read_conn_destructor(void *value) {
+    struct database_read_conn *rc = (struct database_read_conn *)value;
+    if (!rc) {
+        return;
+    }
+
+    /* database_cleanup() took the whole registry over and freed the structs:
+     * touching rc here would be a use-after-free. */
+    database_t *db = rc->db;
+    if (!db || !db->read_conn_key_valid) {
+        return;
+    }
+
+    if (!read_conn_unregister(db, rc)) {
+        return;
+    }
+
+    /* close_v2: a stray unfinalized statement must not turn shutdown into a
+     * leaked connection (close_v2 zombies the handle instead of failing). */
+    if (rc->conn) {
+        sqlite3_close_v2(rc->conn);
+    }
+    free(rc);
+}
+
+/* Return this thread's read connection, opening it on first use.
+ *
+ * SQLITE_OPEN_READWRITE (not READONLY) on purpose: a WAL database needs a
+ * writable -shm wal-index file, which a read-only connection cannot map. The
+ * connection itself never writes anything -- see the literal-SQL rule on the
+ * prototype in database.h, which replaces PRAGMA query_only=ON because the
+ * bundled SQLite 3.49.1 rejects every write transaction under query_only,
+ * TEMP tables included.
+ *
+ * Any failure degrades to db->db, i.e. exactly today's behaviour. */
+sqlite3 *database_read_db(database_t *db) {
+    if (!db || !db->db) {
+        return NULL;
+    }
+    if (!db->read_conn_key_valid || !db->db_path) {
+        return db->db;
+    }
+
+    struct database_read_conn *rc =
+        (struct database_read_conn *)pthread_getspecific(db->read_conn_key);
+    if (rc && rc->conn) {
+        return rc->conn;
+    }
+
+    sqlite3 *conn = NULL;
+    if (sqlite3_open_v2(db->db_path, &conn, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+        log_msg(LOG_WARN, "Read connection: cannot open %s: %s (using shared connection)",
+                db->db_path, conn ? sqlite3_errmsg(conn) : "out of memory");
+        if (conn) sqlite3_close(conn);
+        return db->db;
+    }
+
+    /* Mirror the per-connection pragmas of database_init(). journal_mode,
+     * page_size and auto_vacuum are database properties, already set there. */
+    sqlite3_exec(conn, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
+    sqlite3_exec(conn, "PRAGMA mmap_size=268435456;", NULL, NULL, NULL);
+    sqlite3_busy_timeout(conn, 5000);
+
+    rc = (struct database_read_conn *)calloc(1, sizeof(*rc));
+    if (!rc) {
+        sqlite3_close(conn);
+        return db->db;
+    }
+    rc->conn = conn;
+    rc->db = db;
+
+    /* Register before publishing the TLS value: an unregistered connection
+     * would be invisible to the shutdown safety net, and a TLS value set
+     * before a failed registration would dangle into the destructor. */
+    pthread_mutex_lock(&db->read_conn_mutex);
+    if (db->read_conns_count >= DATABASE_READ_CONN_MAX) {
+        pthread_mutex_unlock(&db->read_conn_mutex);
+        log_msg(LOG_WARN, "Read connection registry full (%d), using shared connection",
+                DATABASE_READ_CONN_MAX);
+        sqlite3_close(conn);
+        free(rc);
+        return db->db;
+    }
+    db->read_conns[db->read_conns_count++] = rc;
+    pthread_mutex_unlock(&db->read_conn_mutex);
+
+    if (pthread_setspecific(db->read_conn_key, rc) != 0) {
+        read_conn_unregister(db, rc);
+        sqlite3_close(conn);
+        free(rc);
+        return db->db;
+    }
+
+    log_msg(LOG_DEBUG, "Read connection opened for thread %lu", (unsigned long)pthread_self());
+    return conn;
 }
 
 /* Set bloom filter for tracking successful writes */
@@ -1057,6 +1237,24 @@ void database_cleanup(database_t *db) {
         db->check_exists_stmt = NULL;
     }
 
+    /* Per-thread read connections. Normally the pthread_key destructor of each
+     * worker thread has already closed and unregistered its connection (mg_stop()
+     * joins the workers before cleanup), so this only sweeps a leaked entry.
+     * They are closed before the final checkpoint so no read connection can
+     * still hold the WAL open. */
+    db->read_conn_key_valid = 0;  /* ownership passes to this function */
+    pthread_mutex_lock(&db->read_conn_mutex);
+    for (int i = 0; i < db->read_conns_count; i++) {
+        struct database_read_conn *rc = db->read_conns[i];
+        db->read_conns[i] = NULL;
+        if (!rc) continue;
+        log_msg(LOG_WARN, "Read connection still registered at cleanup, closing it");
+        if (rc->conn) sqlite3_close_v2(rc->conn);
+        free(rc);
+    }
+    db->read_conns_count = 0;
+    pthread_mutex_unlock(&db->read_conn_mutex);
+
     if (db->db) {
         /* Final checkpoint: reset all statements, then truncate WAL.
          * No need for rwlock here since we're shutting down. */
@@ -1081,6 +1279,12 @@ void database_cleanup(database_t *db) {
 
     pthread_rwlock_destroy(&db->checkpoint_rwlock);
     uv_mutex_destroy(&db->mutex);
+    /* The TLS slot is dropped last: pthread_key_delete() does not run
+     * destructors, so no thread may still rely on it. */
+    pthread_key_delete(db->read_conn_key);
+    pthread_mutex_destroy(&db->read_conn_mutex);
+    free(db->db_path);
+    db->db_path = NULL;
 }
 
 static int hex_to_bin20(const char *hex, uint8_t *out) {

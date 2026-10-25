@@ -362,6 +362,14 @@ static void add_class_fields_json(cJSON *item, const search_result_t *r) {
 /* Load up to 10 file rows (prefix-qualified path + size) for one result. Only
  * called when the result has files, like the inline version it replaces. */
 static void fetch_result_files(database_t *db, search_result_t *r) {
+    /* Runs once per result row inside the long search/browse/random loops, so
+     * it must stay on the calling thread's own read connection (see
+     * database_read_db) instead of the process-wide db->db. */
+    sqlite3 *conn = database_read_db(db);
+    if (!conn) {
+        return;
+    }
+
     const char *files_sql =
         "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename) as path, "
         "       tf.size_bytes "
@@ -371,7 +379,7 @@ static void fetch_result_files(database_t *db, search_result_t *r) {
         "ORDER BY tf.file_index LIMIT 10";
 
     sqlite3_stmt *files_stmt;
-    if (sqlite3_prepare_v2(db->db, files_sql, -1, &files_stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(conn, files_sql, -1, &files_stmt, NULL) != SQLITE_OK) {
         return;
     }
     sqlite3_bind_blob(files_stmt, 1, r->info_hash, 20, SQLITE_STATIC);
@@ -1411,6 +1419,15 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     *count = 0;
     *total_count = 0;
 
+    /* Everything this function prepares runs on the calling thread's own read
+     * connection: an FTS search over the 78 GB database takes seconds and must
+     * not block the millisecond queries that stay on db->db. SQL is unchanged
+     * and every statement is finalized before database_read_unlock(). */
+    sqlite3 *conn = database_read_db(db);
+    if (!conn) {
+        return -1;
+    }
+
     /* Parse query for quoted terms */
     parsed_query_t pq;
     if (parse_search_query(query, &pq) != 0) {
@@ -1588,9 +1605,9 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     /* --- Execute count query --- */
     sqlite3_stmt *count_stmt;
-    int rc = sqlite3_prepare_v2(db->db, count_sql, -1, &count_stmt, NULL);
+    int rc = sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL);
     if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(db->db));
+        log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(conn));
         database_read_unlock(db);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
@@ -1614,9 +1631,9 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     /* --- Execute main query --- */
     sqlite3_stmt *stmt;
-    rc = sqlite3_prepare_v2(db->db, main_sql, -1, &stmt, NULL);
+    rc = sqlite3_prepare_v2(conn, main_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(db->db));
+        log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(conn));
         database_read_unlock(db);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
@@ -1756,6 +1773,13 @@ static int browse_torrents(database_t *db, const cls_filter_t *filter, const cha
     *count = 0;
     *total_count = 0;
 
+    /* Own read connection: see database_read_db (search/browse/random are the
+     * long read paths; the millisecond queries stay on db->db). */
+    sqlite3 *conn = database_read_db(db);
+    if (!conn) {
+        return -1;
+    }
+
     /* "WHERE 1" plus the filter's " AND ..." fragments; the class binds come
      * first, so LIMIT/OFFSET follow them. */
     char count_sql[512];
@@ -1779,8 +1803,8 @@ static int browse_torrents(database_t *db, const cls_filter_t *filter, const cha
     database_read_lock(db);
 
     sqlite3_stmt *count_stmt;
-    if (sqlite3_prepare_v2(db->db, count_sql, -1, &count_stmt, NULL) != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare browse count query: %s", sqlite3_errmsg(db->db));
+    if (sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare browse count query: %s", sqlite3_errmsg(conn));
         database_read_unlock(db);
         return -1;
     }
@@ -1791,8 +1815,8 @@ static int browse_torrents(database_t *db, const cls_filter_t *filter, const cha
     sqlite3_finalize(count_stmt);
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, main_sql, -1, &stmt, NULL) != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare browse query: %s", sqlite3_errmsg(db->db));
+    if (sqlite3_prepare_v2(conn, main_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare browse query: %s", sqlite3_errmsg(conn));
         database_read_unlock(db);
         return -1;
     }
@@ -1976,6 +2000,13 @@ static int get_random_torrents(database_t *db, const cls_filter_t *filter,
     *results = NULL;
     *count = 0;
 
+    /* Own read connection: see database_read_db (search/browse/random are the
+     * long read paths; the millisecond queries stay on db->db). */
+    sqlite3 *conn = database_read_db(db);
+    if (!conn) {
+        return -1;
+    }
+
     int want_category = filter->has_category ? filter->category : -1;
     int want_tv_kind = filter->has_tv_kind ? filter->tv_kind : -1;
     int adult_mode = filter->adult;
@@ -1984,7 +2015,7 @@ static int get_random_torrents(database_t *db, const cls_filter_t *filter,
 
     int64_t max_id = 0;
     sqlite3_stmt *max_stmt;
-    if (sqlite3_prepare_v2(db->db, "SELECT MAX(id) FROM torrents", -1, &max_stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(conn, "SELECT MAX(id) FROM torrents", -1, &max_stmt, NULL) == SQLITE_OK) {
         if (sqlite3_step(max_stmt) == SQLITE_ROW) {
             max_id = sqlite3_column_int64(max_stmt, 0);
         }
@@ -2002,8 +2033,8 @@ static int get_random_torrents(database_t *db, const cls_filter_t *filter,
     srand(seed);
 
     sqlite3_stmt *class_stmt;
-    if (sqlite3_prepare_v2(db->db, RANDOM_CLASS_SQL_EX, -1, &class_stmt, NULL) != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare random class query: %s", sqlite3_errmsg(db->db));
+    if (sqlite3_prepare_v2(conn, RANDOM_CLASS_SQL_EX, -1, &class_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare random class query: %s", sqlite3_errmsg(conn));
         database_read_unlock(db);
         return -1;
     }
@@ -2012,8 +2043,8 @@ static int get_random_torrents(database_t *db, const cls_filter_t *filter,
         "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp "
         "FROM torrents WHERE id = ? AND total_peers >= ?";
     sqlite3_stmt *torrent_stmt;
-    if (sqlite3_prepare_v2(db->db, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(db->db));
+    if (sqlite3_prepare_v2(conn, torrent_sql, -1, &torrent_stmt, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare torrent query: %s", sqlite3_errmsg(conn));
         sqlite3_finalize(class_stmt);
         database_read_unlock(db);
         return -1;
@@ -2021,7 +2052,7 @@ static int get_random_torrents(database_t *db, const cls_filter_t *filter,
 
     const char *file_count_sql = "SELECT COUNT(*) FROM torrent_files WHERE torrent_id = ?";
     sqlite3_stmt *file_count_stmt;
-    if (sqlite3_prepare_v2(db->db, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(conn, file_count_sql, -1, &file_count_stmt, NULL) != SQLITE_OK) {
         sqlite3_finalize(torrent_stmt);
         sqlite3_finalize(class_stmt);
         database_read_unlock(db);

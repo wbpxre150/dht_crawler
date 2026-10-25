@@ -53,6 +53,14 @@ typedef struct {
 /* Forward declaration */
 struct bloom_filter;
 
+/* Per-thread read connections registry size. The HTTP API runs two civetweb
+ * worker threads plus the refresh thread; 32 slots is far more than needed and
+ * still bounds the number of open connections if something leaks a thread. */
+#define DATABASE_READ_CONN_MAX 32
+
+/* One per-thread read connection (defined in database.c). */
+struct database_read_conn;
+
 /* Database manager */
 typedef struct {
     sqlite3 *db;
@@ -67,12 +75,41 @@ typedef struct {
     uv_mutex_t mutex;
     pthread_rwlock_t checkpoint_rwlock;  /* Coordinates readers vs WAL checkpoint */
     struct bloom_filter *bloom;  /* Bloom filter for marking successful writes */
+    /* --- Per-thread read connections (database_read_db) -------------------
+     * The long read paths (/search, /browse, /random) run their statements on
+     * a connection owned by the calling thread, so one multi-second
+     * sqlite3_step() cannot block the other DB users behind the process-wide
+     * `db`. The registry is only a shutdown safety net: each connection is
+     * normally closed by its thread's pthread_key destructor. */
+    char *db_path;                              /* strdup'd by database_init() */
+    pthread_key_t read_conn_key;                /* TLS slot -> struct database_read_conn */
+    int read_conn_key_valid;                    /* 0 after pthread_key_delete() */
+    pthread_mutex_t read_conn_mutex;            /* guards read_conns[]/read_conns_count */
+    struct database_read_conn *read_conns[DATABASE_READ_CONN_MAX];
+    int read_conns_count;
 } database_t;
 
 /* Acquire/release read lock for database queries (used by HTTP API etc.)
  * Prevents WAL checkpoint from running while readers are active. */
 void database_read_lock(database_t *db);
 void database_read_unlock(database_t *db);
+
+/* Return the calling thread's own read connection, opening it on first use.
+ *
+ * ONLY LITERAL SQL STRINGS MAY EVER BE PREPARED ON THE RETURNED CONNECTION.
+ * Every piece of user input must reach it as a bound parameter: a read
+ * connection is a private, long-lived handle whose statements are prepared
+ * outside the shared `db`, so any interpolated text would bypass the single
+ * place where this code base keeps SQL construction reviewable. The reason
+ * for the separate connection is isolation, not speed: a multi-second
+ * sqlite3_step() on it must never block the millisecond queries that stay on
+ * db->db.
+ *
+ * Falls back to db->db when the per-thread connection cannot be created, so
+ * callers degrade to the previous shared-connection behaviour instead of
+ * failing. The caller must still hold database_read_lock() and must finalize
+ * every statement it prepared here before database_read_unlock(). */
+sqlite3 *database_read_db(database_t *db);
 
 /* Function declarations */
 int database_init(database_t *db, const char *db_path, app_context_t *app_ctx);
