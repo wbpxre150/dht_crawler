@@ -1210,11 +1210,23 @@ typedef struct {
     int num_unquoted;
     char *torrent_fts_query;  /* full query with quotes (porter handles natively) */
     char *file_fts_query;     /* unquoted terms only (for trigram MATCH) */
+    /* Stage 5: the unquoted branch's file side, split by whether the trigram
+     * tokenizer can index the term (see split_file_terms). file_fts_long holds
+     * the 3+-byte terms joined for the trigram MATCH; short_glob holds the
+     * lowercased sub-trigram terms that are refined by word-boundary GLOB
+     * instead of being silently dropped by FTS5. */
+    char *file_fts_long;
+    int num_file_long;
+    char **short_glob;
+    int num_short_glob;
 } parsed_query_t;
 
 static void free_parsed_query(parsed_query_t *pq) {
     for (int i = 0; i < pq->num_quoted; i++) free(pq->quoted[i]);
     for (int i = 0; i < pq->num_unquoted; i++) free(pq->unquoted[i]);
+    for (int i = 0; i < pq->num_short_glob; i++) free(pq->short_glob[i]);
+    free(pq->short_glob);
+    free(pq->file_fts_long);
     free(pq->torrent_fts_query);
     free(pq->file_fts_query);
     memset(pq, 0, sizeof(*pq));
@@ -1257,6 +1269,74 @@ static char *build_torrent_fts_query(const char *raw) {
     }
     out[len] = '\0';
     return out;
+}
+
+/* Stage 5: split the file side of the query into terms the trigram index can
+ * serve and terms it cannot.
+ *
+ * file_search is an FTS5 trigram index, and a token shorter than 3 bytes yields
+ * no trigram at all: FTS5 drops such a token from the MATCH expression without
+ * an error. `best of ac dc` therefore constrained the file side exactly like
+ * `best` (measured: the same 331,190-row set), so the file half of the match set
+ * was dominated by torrents whose filenames contain neither `ac` nor `dc`.
+ * The 3+-byte terms stay in the trigram MATCH string (?2); every short term is
+ * refined with the same word-boundary GLOB the quoted path applies
+ * (append_word_boundary_condition) instead of vanishing, so a term is never
+ * silently dropped.
+ *
+ * strlen() is the right test here: it counts bytes, which is the unit the
+ * byte-level trigram tokenizer works in. A 2-character UTF-8 term is not a
+ * 3-byte trigram, so this must not be "fixed" to a character count.
+ *
+ * The input is the normalized torrent FTS string, so whenever every term is 3+
+ * bytes the long-term string is byte-identical to what the file side bound
+ * before this change (build_torrent_fts_query has already turned unquoted '-'
+ * into a separator, so hyphenated titles keep splitting the same way).
+ *
+ * Returns 0, or -1 on allocation failure (the caller fails the request). */
+static int split_file_terms(parsed_query_t *pq) {
+    const char *src = pq->torrent_fts_query;
+    if (!src) return -1;
+
+    pq->file_fts_long = (char *)malloc(strlen(src) + 1);
+    if (!pq->file_fts_long) return -1;
+    size_t long_len = 0;
+
+    const char *p = src;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        const char *start = p;
+        while (*p && *p != ' ') p++;
+        size_t len = (size_t)(p - start);
+
+        if (len >= 3) {
+            if (pq->num_file_long > 0) pq->file_fts_long[long_len++] = ' ';
+            memcpy(pq->file_fts_long + long_len, start, len);
+            long_len += len;
+            pq->num_file_long++;
+        } else {
+            char **grown = (char **)realloc(pq->short_glob,
+                                            sizeof(*pq->short_glob) *
+                                                (size_t)(pq->num_short_glob + 1));
+            if (!grown) return -1;
+            pq->short_glob = grown;
+
+            char *term = (char *)malloc(len + 1);
+            if (!term) return -1;
+            /* Lowercased exactly like the quoted path's quoted_lower: the GLOB
+             * patterns match LOWER(tf.filename) and GLOB is case-sensitive. */
+            for (size_t i = 0; i < len; i++) {
+                char c = start[i];
+                term[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+            }
+            term[len] = '\0';
+            pq->short_glob[pq->num_short_glob++] = term;
+        }
+    }
+    pq->file_fts_long[long_len] = '\0';
+    return 0;
 }
 
 static int parse_search_query(const char *raw, parsed_query_t *pq) {
@@ -1332,6 +1412,13 @@ static int parse_search_query(const char *raw, parsed_query_t *pq) {
     file_fts_buf[file_fts_len] = '\0';
     pq->file_fts_query = strdup(file_fts_buf);
 
+    /* Stage 5: the unquoted branch's file side needs its terms partitioned by
+     * whether the trigram tokenizer can index them; see split_file_terms(). */
+    if (split_file_terms(pq) != 0) {
+        free_parsed_query(pq);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1402,6 +1489,82 @@ static int build_quoted_file_subquery(const parsed_query_t *pq, char *out, size_
             return -1;
         }
     }
+    return 0;
+}
+
+/*
+ * Build the file_search half of the unquoted-term query: the trigram FTS
+ * pre-filter (?2, the 3+-byte terms only) followed by one word-boundary GLOB
+ * condition per sub-trigram term (4 binds each, starting at ?3). Same shape and
+ * cost as the quoted variant above, and bounds-checked for the same reason:
+ * every append can fail and the caller must then not run a truncated fragment.
+ */
+static int build_unquoted_file_subquery(const parsed_query_t *pq, char *out, size_t out_len) {
+    size_t pos = 0;
+    if (sb_append(out, out_len, &pos,
+                  "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+                  "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)") != 0) {
+        return -1;
+    }
+
+    for (int si = 0; si < pq->num_short_glob; si++) {
+        if (sb_append(out, out_len, &pos, " AND ") != 0) return -1;
+        if (append_word_boundary_condition(out, out_len, &pos, "tf.filename", 3 + si * 4) != 4) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Build the stage-3 match-set INSERT for a query without quoted terms.
+ *
+ * Bind layout: ?1 = the torrent (porter) FTS query, and when the file half is
+ * included ?2 = the trigram-servable terms followed by 4 GLOB binds per short
+ * term from ?3 on — exactly the order build_unquoted_file_subquery() emits them
+ * in, so the binds are positional and no user input ever reaches the SQL text.
+ *
+ * The file half is left out in two cases, both of which only *narrow* the
+ * result set and are logged by the caller:
+ *   - no term is 3 bytes or longer (q=hd, q=3d, q=4k): the trigram index cannot
+ *     serve the query at all, and a word-boundary GLOB scan over the whole
+ *     torrent_files table (285M rows) is far worse than the answers it adds;
+ *   - the GLOB fragment for this many short terms does not fit *out*: dropping
+ *     the file half beats running a fragment that silently matched something
+ *     else.
+ *
+ * Returns 0 (also when the file half was skipped) and sets *file_side, or -1
+ * when even the name-side-only statement did not fit.
+ */
+static int build_unquoted_match_sql(const parsed_query_t *pq, const char *match_table,
+                                    char *out, size_t out_len, int *file_side) {
+    size_t pos = 0;
+    *file_side = 0;
+
+    if (sb_append(out, out_len, &pos,
+                  "INSERT OR IGNORE INTO %s "
+                  "SELECT rowid FROM torrent_search WHERE name MATCH ?1",
+                  match_table) != 0) {
+        return -1;
+    }
+    if (pq->num_file_long == 0) return 0;
+
+    /* Remember where the name half ends *before* the " UNION " goes in: the
+     * fallback below cuts the statement back to exactly here, and a dangling
+     * UNION would be a prepare-time syntax error. */
+    size_t name_end = pos;
+    if (sb_append(out, out_len, &pos, " UNION ") != 0) return -1;
+    if (build_unquoted_file_subquery(pq, out + pos, out_len - pos) != 0) {
+        /* Not fatal: keep the name half (see above). sb_append always leaves the
+         * buffer NUL-terminated, so cutting back to name_end is well defined. */
+        out[name_end] = '\0';
+        log_msg(LOG_WARN,
+                "file search: GLOB fragment for %d short term(s) does not fit the SQL buffer, "
+                "using name matches only",
+                pq->num_short_glob);
+        return 0;
+    }
+    *file_side = 1;
     return 0;
 }
 
@@ -1673,13 +1836,18 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     /*
      * Build dynamic SQL for file_search subquery.
-     * - No quoted terms: use trigram FTS MATCH as before.
+     * - No quoted terms: trigram FTS MATCH on the 3+-byte terms, plus GLOB
+     *   word-boundary checks for the sub-trigram ones (stage 5).
      * - Has quoted terms + unquoted terms: FTS MATCH on unquoted, plus GLOB word-boundary checks.
      * - Only quoted terms: skip FTS, use GLOB word-boundary checks on torrent_files directly.
      */
     char match_sql[4096];
     char count_sql[4096];
     char main_sql[4096];
+
+    /* Stage 5: set when the no-quoted branch kept the file_search half of the
+     * match set, i.e. when ?2 and the short-term GLOB binds exist. */
+    int file_side = 0;
 
     /* Stage 7: the class join goes into the count query only when the filter
      * restricts rows, so a plain /search?q= keeps the legacy count query. The
@@ -1700,17 +1868,34 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     if (!has_quoted) {
         /* No quoted terms — original queries, plus the stage-7 class join.
-         * Bind indices: the INSERT owns ?1 = torrent FTS and ?2 = file FTS;
-         * the count query only carries the class filter (from ?1); the page
-         * query keeps ?1 for the ORDER BY ranking MATCH, then ?2/?3 =
-         * LIMIT/OFFSET and ?4... = class filter. */
-        (void)snprintf(match_sql, sizeof(match_sql),
-            "INSERT OR IGNORE INTO %s "
-            "SELECT rowid FROM torrent_search WHERE name MATCH ?1"
-            " UNION "
-            "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-            "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)",
-            match_table);
+         * Bind indices: the INSERT owns ?1 = torrent FTS, then ?2 = the
+         * trigram-servable file terms and ?3... = 4 GLOB binds per sub-trigram
+         * term (stage 5, see build_unquoted_match_sql); the count query only
+         * carries the class filter (from ?1); the page query keeps ?1 for the
+         * ORDER BY ranking MATCH, then ?2/?3 = LIMIT/OFFSET and ?4... = class
+         * filter. */
+        if (build_unquoted_match_sql(&pq, match_table, match_sql, sizeof(match_sql),
+                                     &file_side) != 0) {
+            log_msg(LOG_ERROR, "Unquoted search does not fit the SQL buffer");
+            database_read_unlock(db);
+            free(cache_key);
+            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+            free_parsed_query(&pq);
+            return -1;
+        }
+        if (pq.num_short_glob > 0) {
+            /* These terms are shorter than a trigram, so the FTS5 trigram index
+             * drops them from MATCH. They constrain the file side through
+             * word-boundary GLOB instead of vanishing (stage 5). */
+            log_msg(LOG_DEBUG,
+                    "file search: %d short term(s) constrained by GLOB, %d long term(s) in trigram match",
+                    pq.num_short_glob, pq.num_file_long);
+            if (!file_side && pq.num_file_long == 0) {
+                log_msg(LOG_DEBUG,
+                        "file search: no trigram-servable term for query '%s', using name matches only",
+                        query);
+            }
+        }
 
         class_count_join[0] = '\0';
         int cpos = 0;
@@ -1892,10 +2077,22 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         }
 
         sqlite3_bind_text(match_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-        sqlite3_bind_text(match_stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
-                          -1, SQLITE_STATIC);
         if (has_quoted) {
+            sqlite3_bind_text(match_stmt, 2, pq.file_fts_query, -1, SQLITE_STATIC);
             BIND_QUOTED_GLOB_PARAMS(match_stmt, 3, pq, quoted_lower);
+        } else if (file_side) {
+            /* ?2 = the 3+-byte terms the trigram index can serve, then 4
+             * word-boundary GLOB binds per sub-trigram term in the order
+             * build_unquoted_file_subquery() emitted them (stage 5). The terms
+             * outlive the statement (they are freed with pq after finalize). */
+            sqlite3_bind_text(match_stmt, 2, pq.file_fts_long, -1, SQLITE_STATIC);
+            for (int si = 0; si < pq.num_short_glob; si++) {
+                int bi = 3 + si * 4;
+                sqlite3_bind_text(match_stmt, bi, pq.short_glob[si], -1, SQLITE_STATIC);
+                sqlite3_bind_text(match_stmt, bi + 1, pq.short_glob[si], -1, SQLITE_STATIC);
+                sqlite3_bind_text(match_stmt, bi + 2, pq.short_glob[si], -1, SQLITE_STATIC);
+                sqlite3_bind_text(match_stmt, bi + 3, pq.short_glob[si], -1, SQLITE_STATIC);
+            }
         }
 
         int match_rc = sqlite3_step(match_stmt);
