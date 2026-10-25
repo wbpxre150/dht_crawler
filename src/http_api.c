@@ -1806,12 +1806,101 @@ static void shared_conn_search_unlock(int degraded) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Stage 7 diagnostics: per-phase /search timings (log only).
+ *
+ * The cold-search exit criterion failed at 31.64 s against a 16 s bar while the
+ * warm re-run of the same query took 0.063 s (total_count 11), so the cost sits
+ * in first-touch I/O over the 78 GB USB-backed database, not in the match-set
+ * build the earlier stages optimised. These timings exist so a tester can
+ * attribute that time per request instead of guessing.
+ *
+ * Phases, all measured with CLOCK_MONOTONIC:
+ *   conn  = database_read_db() (may open the per-thread connection)
+ *   build = match-set rebuild: CREATE/DELETE reset through the INSERT finalize
+ *   count = the count query (prepare, bind, step, finalize)
+ *   page  = the page query (prepare, bind, step loop, finalize) minus rows
+ *   rows  = the per-row num_files count + fetch_result_files() work
+ *   total = function entry to just before database_read_unlock()
+ * A phase that did not run (a cache HIT skips build and count) stays -1 and is
+ * printed as "-". No SQL, bind index, lock or control-flow change is involved:
+ * the only added calls are clock reads plus the existing sqlite3_changes().
+ * Emitted at DEBUG always and again at INFO when the request took >= 1 s,
+ * because the device default log level is INFO (config.c).
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    double conn;    /* -1 = phase did not run */
+    double build;
+    double count;
+    double page;
+    double rows;
+    double total;
+} search_timing_t;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+/* Duration for the timing line; a skipped phase prints as "-". */
+static const char *timing_ms_str(char *buf, size_t len, double ms) {
+    if (ms < 0.0) {
+        return "-";
+    }
+    snprintf(buf, len, "%.1f", ms);
+    return buf;
+}
+
+/* Match-set size for the timing line; -1 (no rebuild this request) prints "-". */
+static const char *timing_count_str(char *buf, size_t len, int n) {
+    if (n < 0) {
+        return "-";
+    }
+    snprintf(buf, len, "%d", n);
+    return buf;
+}
+
+/* One line per request, so `adb logcat -d | grep "search timing"` is enough. */
+static void search_timing_log(const char *query, const char *cache_state, int match_rows,
+                              const search_timing_t *tm) {
+    char b_conn[24], b_build[24], b_count[24], b_page[24], b_rows[24], b_total[24];
+    char b_match_rows[24];
+    const char *conn = timing_ms_str(b_conn, sizeof(b_conn), tm->conn);
+    const char *build = timing_ms_str(b_build, sizeof(b_build), tm->build);
+    const char *count = timing_ms_str(b_count, sizeof(b_count), tm->count);
+    const char *page = timing_ms_str(b_page, sizeof(b_page), tm->page);
+    const char *rows = timing_ms_str(b_rows, sizeof(b_rows), tm->rows);
+    const char *total = timing_ms_str(b_total, sizeof(b_total), tm->total);
+    const char *set_rows = timing_count_str(b_match_rows, sizeof(b_match_rows), match_rows);
+
+    log_msg(LOG_DEBUG,
+            "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s count=%s "
+            "page=%s rows=%s total=%s",
+            query, cache_state, set_rows, conn, build, count, page, rows, total);
+    if (tm->total >= 1000.0) {
+        /* Slow request: repeat at INFO so the device default level shows it. */
+        log_msg(LOG_INFO,
+                "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s count=%s "
+                "page=%s rows=%s total=%s",
+                query, cache_state, set_rows, conn, build, count, page, rows, total);
+    }
+}
+
 /* Search torrents using FTS5, with support for quoted exact-word matching.
  * The optional stage-7 class filter rides along on the FTS rowid set: it only
  * adds the torrent_class join when it actually restricts rows, so a plain
  * search keeps its previous SQL and result set (see search_handler). */
 static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
                                     int offset, search_result_t **results, int *count, int *total_count) {
+    /* Stage 7 timing: entry stamp for `total`, and one slot per phase (-1 =
+     * phase did not run). Declared here so every unlock exit can print it. */
+    double t_entry = now_ms();
+    search_timing_t tm = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0};
+    /* Stage 7: rows the match-set rebuild stored; -1 when this request reused a
+     * cached set (no rebuild ran). */
+    int match_rows = -1;
+
     if (!db || !query || !results || !count || !total_count) {
         return -1;
     }
@@ -1824,7 +1913,9 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
      * connection: an FTS search over the 78 GB database takes seconds and must
      * not block the millisecond queries that stay on db->db. SQL is unchanged
      * and every statement is finalized before database_read_unlock(). */
+    double t_conn = now_ms();
     sqlite3 *conn = database_read_db(db);
+    tm.conn = now_ms() - t_conn;
     if (!conn) {
         return -1;
     }
@@ -1866,6 +1957,22 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     } else {
         log_msg(LOG_DEBUG, "Search match cache: MISS slot %d for query: %s", slot_idx, query);
     }
+
+    /* Stage 7: the cache state for the timing line, taken from the same values
+     * the DEBUG lines above just printed (an EXPIRED slot is a MISS here; the
+     * lookup already logged the expiry). */
+    const char *cache_state = !cache            ? "OFF"
+                              : cache_degraded  ? "DEGRADED"
+                              : (hit_slot >= 0) ? "HIT"
+                                                : "MISS";
+
+    /* Stage 7: stamps `total` and prints the one-line summary. Called right
+     * before database_read_unlock() on every exit path, so no lock is held
+     * longer than before and the unlock order is untouched. */
+    #define SEARCH_TIMING_EMIT() do { \
+        tm.total = now_ms() - t_entry; \
+        search_timing_log(query, cache_state, match_rows, &tm); \
+    } while (0)
 
     /* Degraded mode: hold the shared connection for the whole rebuild/count/page
      * sequence (see shared_conn_search_mtx above). Healthy requests skip this. */
@@ -1915,6 +2022,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         if (build_unquoted_match_sql(&pq, match_table, match_sql, sizeof(match_sql),
                                      &file_side) != 0) {
             log_msg(LOG_ERROR, "Unquoted search does not fit the SQL buffer");
+            SEARCH_TIMING_EMIT();
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
@@ -1996,6 +2104,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         if (build_quoted_file_subquery(&pq, file_subquery, sizeof(file_subquery)) != 0) {
             log_msg(LOG_ERROR, "Quoted search does not fit the SQL buffer (%d quoted terms)",
                     pq.num_quoted);
+            SEARCH_TIMING_EMIT();
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
@@ -2087,6 +2196,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     int rc = SQLITE_OK;
 
     if (!cache_hit) {
+        double t_build = now_ms();   /* Stage 7: reset through INSERT finalize */
         char reset_sql[256];
         (void)snprintf(reset_sql, sizeof(reset_sql),
                        "CREATE TEMP TABLE IF NOT EXISTS %s(id INTEGER PRIMARY KEY);"
@@ -2098,6 +2208,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
         if (sqlite3_exec(conn, reset_sql, NULL, NULL, NULL) != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to reset the search match set: %s", sqlite3_errmsg(conn));
+            tm.build = now_ms() - t_build;   /* Stage 7: partial build */
+            SEARCH_TIMING_EMIT();
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
@@ -2110,6 +2222,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
         if (rc != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
+            tm.build = now_ms() - t_build;   /* Stage 7: partial build */
+            SEARCH_TIMING_EMIT();
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
@@ -2140,9 +2254,10 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         int match_rc = sqlite3_step(match_stmt);
         /* Rows the INSERT actually stored: an O(1) answer to "is this set
          * pathological?" that does not rescan a multi-million-row temp btree. */
-        int match_rows = sqlite3_changes(conn);
+        match_rows = sqlite3_changes(conn);
         sqlite3_finalize(match_stmt);
         #undef BIND_QUOTED_GLOB_PARAMS
+        tm.build = now_ms() - t_build;   /* Stage 7: build phase done */
 
         if (match_rc != SQLITE_DONE) {
             /* An FTS syntax error (an unbalanced quote, say) only surfaces at step
@@ -2157,10 +2272,13 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         }
 
         /* --- Execute count query (exact: same match set as the page query) --- */
+        double t_count = now_ms();   /* Stage 7: count phase */
         sqlite3_stmt *count_stmt;
         rc = sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL);
         if (rc != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(conn));
+            tm.count = now_ms() - t_count;   /* Stage 7: partial count */
+            SEARCH_TIMING_EMIT();
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
@@ -2177,6 +2295,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             *total_count = sqlite3_column_int(count_stmt, 0);
         }
         sqlite3_finalize(count_stmt);
+        tm.count = now_ms() - t_count;   /* Stage 7: count phase done */
 
         if (match_rows > SEARCH_MATCH_CACHE_MAX_ROWS) {
             /* One pathological query must not pin both slots of temp storage. */
@@ -2212,6 +2331,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         /* An over-cap set the class filter emptied still has to go: it was not
          * cached, so nothing else will ever reset this slot table. */
         if (drop_after_page) search_match_drop_table(conn, match_table);
+        SEARCH_TIMING_EMIT();
         database_read_unlock(db);
         shared_conn_search_unlock(cache_degraded);
         *results = NULL;  /* send_json_results handles a NULL array with count 0 */
@@ -2223,11 +2343,15 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     }
 
     /* --- Execute main query --- */
+    double t_page = now_ms();   /* Stage 7: page query + row loop */
+    double rows_ms = 0.0;       /* Stage 7: time spent in the row loop */
     sqlite3_stmt *stmt;
     rc = sqlite3_prepare_v2(conn, main_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(conn));
+        tm.page = now_ms() - t_page;   /* Stage 7: partial page query */
         if (drop_after_page) search_match_drop_table(conn, match_table);
+        SEARCH_TIMING_EMIT();
         database_read_unlock(db);
         shared_conn_search_unlock(cache_degraded);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
@@ -2246,7 +2370,9 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
     if (!res) {
         sqlite3_finalize(stmt);
+        tm.page = now_ms() - t_page;   /* Stage 7: page query never ran */
         if (drop_after_page) search_match_drop_table(conn, match_table);
+        SEARCH_TIMING_EMIT();
         database_read_unlock(db);
         shared_conn_search_unlock(cache_degraded);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
@@ -2264,6 +2390,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     int i = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && i < HTTP_API_MAX_RESULTS) {
+        double t_row = now_ms();   /* Stage 7: this row's file count + file list */
         /* Extract torrent data */
         memcpy(res[i].info_hash, sqlite3_column_blob(stmt, 0), 20);
         res[i].name = strdup((const char *)sqlite3_column_text(stmt, 1));
@@ -2306,14 +2433,20 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         }
 
         i++;
+        rows_ms += now_ms() - t_row;   /* Stage 7 */
     }
 
     sqlite3_finalize(stmt);
+    /* Stage 7: `page` is the query itself (prepare, step, finalize) and `rows`
+     * the per-row work inside its step loop, so the two do not double-count. */
+    tm.rows = rows_ms;
+    tm.page = now_ms() - t_page - rows_ms;
 
     /* Over-cap set: the page has been read, drop the temp table instead of
      * leaving it behind for the slot's next rebuild. */
     if (drop_after_page) search_match_drop_table(conn, match_table);
 
+    SEARCH_TIMING_EMIT();
     database_read_unlock(db);
     shared_conn_search_unlock(cache_degraded);
 
@@ -2326,6 +2459,8 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     log_msg(LOG_DEBUG, "Search found %d results (offset %d, total %d) for query: %s", i, offset, *total_count, query);
     return 0;
 }
+
+#undef SEARCH_TIMING_EMIT
 
 /* Legacy entry point without a class filter (see search_torrents_filtered). */
 int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {

@@ -1,6 +1,7 @@
 #include "database.h"
 #include "dht_crawler.h"
 #include "bloom_filter.h"
+#include <time.h>   /* Stage 7: CLOCK_MONOTONIC for the read-connection open timing */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -275,6 +276,14 @@ static void read_conn_destructor(void *value) {
     free(rc);
 }
 
+/* Stage 7 diagnostics: CLOCK_MONOTONIC milliseconds for the read-connection
+ * open. Log-only helper; the open path itself is unchanged. */
+static double read_open_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
 /* Return this thread's read connection, opening it on first use.
  *
  * SQLITE_OPEN_READWRITE (not READONLY) on purpose: a WAL database needs a
@@ -300,6 +309,7 @@ sqlite3 *database_read_db(database_t *db) {
     }
 
     sqlite3 *conn = NULL;
+    double t_open = read_open_now_ms();   /* Stage 7: open + pragmas timing */
     if (sqlite3_open_v2(db->db_path, &conn, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
         log_msg(LOG_WARN, "Read connection: cannot open %s: %s (using shared connection)",
                 db->db_path, conn ? sqlite3_errmsg(conn) : "out of memory");
@@ -312,6 +322,15 @@ sqlite3 *database_read_db(database_t *db) {
     sqlite3_exec(conn, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
     sqlite3_exec(conn, "PRAGMA mmap_size=268435456;", NULL, NULL, NULL);
     sqlite3_busy_timeout(conn, 5000);
+
+    /* Stage 7: a cold /search pays for this thread's first connection over the
+     * USB-backed database. Fires at most once per worker thread; INFO because
+     * that is the device default level (config.c), so it needs no config edit. */
+    double open_ms = read_open_now_ms() - t_open;
+    if (open_ms >= 1000.0) {
+        log_msg(LOG_INFO, "read connection: open+pragmas took %.1fms (first use on this thread)",
+                open_ms);
+    }
 
     rc = (struct database_read_conn *)calloc(1, sizeof(*rc));
     if (!rc) {
