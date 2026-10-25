@@ -1405,6 +1405,209 @@ static int build_quoted_file_subquery(const parsed_query_t *pq, char *out, size_
     return 0;
 }
 
+/* --- Stage 4: per-thread /search match-set cache ---------------------------
+ *
+ * Stage 3 builds the FTS match set once per request, but every /search page
+ * and every repeat of the same search still rebuilt it: an FTS scan over the
+ * whole corpus (seconds of random I/O on the phone's USB volume) for each of
+ * the 50-row pages. The match set is cached per thread instead. Each request
+ * thread owns one read connection (database_read_db, stage 1) and therefore
+ * its own TEMP schema, so a per-thread cache can never leak between concurrent
+ * searches.
+ *
+ * Two slots per thread: paging forward keeps page N-1's entry, and a second
+ * search interleaved with the first (a filter toggle, say) still hits on the
+ * way back. Eviction across the two slots is LRU. Entries expire after
+ * SEARCH_MATCH_CACHE_TTL_SECS; staleness is by design (the crawler only
+ * flushes new torrents every flush_interval=300 s, and the match set is a
+ * superset question — a missing brand-new torrent for a few minutes is the
+ * same window /stats already reports). There is no ingest invalidation.
+ *
+ * Everything below is metadata only: the SQL itself is unchanged stage-3 SQL
+ * with the slot's table name substituted, and the table name comes from a
+ * compile-time constant array, never from user input.
+ * ---------------------------------------------------------------------- */
+
+/* 300 s: matches the crawler's flush_interval, so an entry cannot outlive the
+ * window in which the index it was built from is known to be unchanged. */
+#define SEARCH_MATCH_CACHE_TTL_SECS 300
+
+/* Slots per thread (and therefore TEMP tables per read connection). */
+#define SEARCH_MATCH_CACHE_SLOTS 2
+
+/* A pathological query (a single common letter, say) matches most of the
+ * corpus. Serving it from the match set is fine, but pinning megabytes of
+ * temp storage in both slots for 5 minutes is not: above this many rows the
+ * set is used for this request and then dropped, never cached. */
+#define SEARCH_MATCH_CACHE_MAX_ROWS 2000000
+
+/* Temp table per slot. The names are compile-time constants: they are
+ * substituted into the SQL below, so no request data ever reaches the SQL
+ * text (see the literal-SQL rule in database.h). */
+static const char *const SEARCH_MATCH_TABLES[SEARCH_MATCH_CACHE_SLOTS] = {
+    "search_match_0",
+    "search_match_1"
+};
+
+typedef struct {
+    int used;                   /* slot holds a usable entry */
+    char *key;                  /* malloc'd cache key (NULL while unused) */
+    int total_count;            /* exact row count for that match set */
+    time_t built_at;            /* time(NULL) when the set was built */
+    unsigned long long last_used; /* LRU stamp (cache->tick value) */
+} search_match_slot_t;
+
+typedef struct {
+    search_match_slot_t slot[SEARCH_MATCH_CACHE_SLOTS];
+    unsigned long long tick;    /* monotonic LRU counter for this thread */
+} search_match_cache_t;
+
+/* TLS slot holding one search_match_cache_t per thread. Created once; the
+ * destructor only frees heap metadata and must NOT issue SQL: pthread
+ * destructor order across keys is unspecified, so the read connection (and
+ * with it the TEMP tables) may already be gone by the time this runs — the
+ * tables die with the connection either way (stage 1's destructor). */
+static pthread_key_t g_search_match_cache_key;
+static pthread_once_t g_search_match_cache_key_once = PTHREAD_ONCE_INIT;
+static int g_search_match_cache_key_valid = 0;
+
+static void search_match_cache_destructor(void *value) {
+    search_match_cache_t *cache = (search_match_cache_t *)value;
+    if (!cache) return;
+    for (int i = 0; i < SEARCH_MATCH_CACHE_SLOTS; i++) {
+        free(cache->slot[i].key);
+    }
+    free(cache);
+}
+
+static void search_match_cache_key_init(void) {
+    if (pthread_key_create(&g_search_match_cache_key, search_match_cache_destructor) == 0) {
+        g_search_match_cache_key_valid = 1;
+    } else {
+        /* Degrade to the stage-3 behaviour: rebuild per request. */
+        log_msg(LOG_WARN, "Search match cache: cannot create TLS key, caching disabled");
+    }
+}
+
+/* This thread's cache metadata, allocated on first use. NULL disables the
+ * cache for the caller (every request still works, it just rebuilds). */
+static search_match_cache_t *search_match_cache_get(void) {
+    pthread_once(&g_search_match_cache_key_once, search_match_cache_key_init);
+    if (!g_search_match_cache_key_valid) return NULL;
+
+    search_match_cache_t *cache =
+        (search_match_cache_t *)pthread_getspecific(g_search_match_cache_key);
+    if (cache) return cache;
+
+    cache = (search_match_cache_t *)calloc(1, sizeof(*cache));
+    if (!cache) return NULL;
+    if (pthread_setspecific(g_search_match_cache_key, cache) != 0) {
+        free(cache);
+        return NULL;
+    }
+    return cache;
+}
+
+/* The cache key: every input that determines the entry. The match set itself
+ * only depends on the query, but the cached total_count also depends on the
+ * class filter (the count query carries its conditions), so the whole filter
+ * rides along. Nothing is normalized or lowercased here — the key holds the
+ * same strings the SQL binds, and a forgotten component would silently serve
+ * another query's rows. */
+static char *search_match_cache_key_build(const char *query, const cls_filter_t *filter,
+                                          int has_quoted) {
+    size_t need = strlen(query) + 128;
+    char *key = (char *)malloc(need);
+    if (!key) return NULL;
+
+    if (filter) {
+        (void)snprintf(key, need, "%d|f|%d|%d|%d|%d|%d|%d|%.17g|%s",
+                       has_quoted, (int)filter->adult,
+                       filter->has_category, filter->category,
+                       filter->has_tv_kind, filter->tv_kind,
+                       filter->has_min_conf, filter->min_conf, query);
+    } else {
+        (void)snprintf(key, need, "%d|nofilter|%s", has_quoted, query);
+    }
+    return key;
+}
+
+/* Drop the metadata of one slot; the temp table content stays until the slot
+ * is rebuilt (that is what makes a hit cheap). */
+static void search_match_slot_clear(search_match_slot_t *slot) {
+    free(slot->key);
+    slot->key = NULL;
+    slot->used = 0;
+    slot->total_count = 0;
+    slot->built_at = 0;
+    slot->last_used = 0;
+}
+
+/* Slot holding *key* and younger than the TTL, or -1. A hit is stamped for
+ * LRU on the way out. */
+static int search_match_cache_lookup(search_match_cache_t *cache, const char *key) {
+    if (!cache || !key) return -1;
+
+    time_t now = time(NULL);
+    for (int i = 0; i < SEARCH_MATCH_CACHE_SLOTS; i++) {
+        search_match_slot_t *slot = &cache->slot[i];
+        if (!slot->used || !slot->key) continue;
+        if (strcmp(slot->key, key) != 0) continue;
+        if (now - slot->built_at >= SEARCH_MATCH_CACHE_TTL_SECS) {
+            /* Expired: report a miss so the tester can see the rebuild. */
+            log_msg(LOG_DEBUG, "Search match cache: EXPIRED slot %d (age %lds) for query: %s",
+                    i, (long)(now - slot->built_at), key);
+            search_match_slot_clear(slot);
+            return -1;
+        }
+        slot->last_used = ++cache->tick;
+        return i;
+    }
+    return -1;
+}
+
+/* Slot to rebuild into: a free one, else the least recently used. */
+static int search_match_cache_pick_slot(search_match_cache_t *cache) {
+    int victim = 0;
+    unsigned long long oldest = 0;
+    for (int i = 0; i < SEARCH_MATCH_CACHE_SLOTS; i++) {
+        if (!cache->slot[i].used) return i;
+        if (i == 0 || cache->slot[i].last_used < oldest) {
+            oldest = cache->slot[i].last_used;
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+/* Store a built entry. total_count is the exact count already computed for
+ * this set (an empty set is a valid, cheap entry). Takes ownership of *key*. */
+static void search_match_cache_store(search_match_cache_t *cache, int slot_idx, char *key,
+                                     int total_count) {
+    if (!cache || !key || slot_idx < 0 || slot_idx >= SEARCH_MATCH_CACHE_SLOTS) {
+        free(key);
+        return;
+    }
+    search_match_slot_t *slot = &cache->slot[slot_idx];
+    free(slot->key);
+    slot->key = key;
+    slot->used = 1;
+    slot->total_count = total_count;
+    slot->built_at = time(NULL);
+    slot->last_used = ++cache->tick;
+}
+
+/* Drop one slot table. Only used for a set that was built but deliberately not
+ * cached (see SEARCH_MATCH_CACHE_MAX_ROWS): it has been served, so the temp
+ * storage must go instead of waiting for the slot's next rebuild. */
+static void search_match_drop_table(sqlite3 *conn, const char *table) {
+    char drop_sql[128];
+    (void)snprintf(drop_sql, sizeof(drop_sql), "DROP TABLE IF EXISTS %s;", table);
+    if (sqlite3_exec(conn, drop_sql, NULL, NULL, NULL) != SQLITE_OK) {
+        log_msg(LOG_WARN, "Search match cache: cannot drop %s: %s", table, sqlite3_errmsg(conn));
+    }
+}
+
 /* Search torrents using FTS5, with support for quoted exact-word matching.
  * The optional stage-7 class filter rides along on the FTS rowid set: it only
  * adds the torrent_class join when it actually restricts rows, so a plain
@@ -1436,6 +1639,35 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     /* Fast path: no quoted terms — use original simple queries */
     int has_quoted = (pq.num_quoted > 0);
+
+    /* --- Stage 4: match-set cache lookup (metadata only: no SQL, no lock) --- */
+    search_match_cache_t *cache = search_match_cache_get();
+    char *cache_key = search_match_cache_key_build(query, filter, has_quoted);
+    /* Degraded mode: database_read_db() falls back to the process-wide handle
+     * when it cannot open a per-thread connection. The TEMP tables are then
+     * shared by every request thread, so a hit could serve another search's
+     * rows — bypass the cache there entirely and rebuild per request (exactly
+     * the stage-3 behaviour). sqlite3_open_v2() never hands out db->db, so this
+     * comparison is exact. */
+    int cache_degraded = (conn == db->db);
+    int hit_slot = cache_degraded ? -1 : search_match_cache_lookup(cache, cache_key);
+    /* The slot this request works with: the hit, or the one a miss rebuilds
+     * into (a free slot, else the least recently used). */
+    int slot_idx = (hit_slot >= 0) ? hit_slot
+                                   : (cache ? search_match_cache_pick_slot(cache) : 0);
+    const char *match_table = SEARCH_MATCH_TABLES[slot_idx];
+
+    if (!cache) {
+        log_msg(LOG_DEBUG, "Search match cache: DISABLED for query: %s", query);
+    } else if (cache_degraded) {
+        log_msg(LOG_DEBUG, "Search match cache: shared connection, bypassing for query: %s",
+                query);
+    } else if (hit_slot >= 0) {
+        log_msg(LOG_DEBUG, "Search match cache: HIT slot %d (total %d) for query: %s",
+                slot_idx, cache->slot[slot_idx].total_count, query);
+    } else {
+        log_msg(LOG_DEBUG, "Search match cache: MISS slot %d for query: %s", slot_idx, query);
+    }
 
     database_read_lock(db);
 
@@ -1473,11 +1705,12 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
          * query keeps ?1 for the ORDER BY ranking MATCH, then ?2/?3 =
          * LIMIT/OFFSET and ?4... = class filter. */
         (void)snprintf(match_sql, sizeof(match_sql),
-            "INSERT OR IGNORE INTO search_match "
+            "INSERT OR IGNORE INTO %s "
             "SELECT rowid FROM torrent_search WHERE name MATCH ?1"
             " UNION "
             "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-            "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)");
+            "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)",
+            match_table);
 
         class_count_join[0] = '\0';
         int cpos = 0;
@@ -1502,7 +1735,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         (void)snprintf(count_sql, sizeof(count_sql),
             "SELECT COUNT(*) "
             "FROM torrents t%s "
-            "WHERE t.id IN (SELECT id FROM search_match)", class_count_join);
+            "WHERE t.id IN (SELECT id FROM %s)", class_count_join, match_table);
 
         /* No COUNT(f.id) in the SELECT list: aggregating the file count over
          * the whole match set (~79.8k torrents x ~47 files ~= 3.75M index
@@ -1518,11 +1751,11 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
             "%s "
-            "WHERE t.id IN (SELECT id FROM search_match) "
+            "WHERE t.id IN (SELECT id FROM %s) "
             "GROUP BY t.id "
             "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
             "t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?2 OFFSET ?3", class_main_join);
+            "LIMIT ?2 OFFSET ?3", class_main_join, match_table);
     } else {
         /* Has quoted terms — build dynamic file_search subquery with word-boundary checks */
 
@@ -1540,6 +1773,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             log_msg(LOG_ERROR, "Quoted search does not fit the SQL buffer (%d quoted terms)",
                     pq.num_quoted);
             database_read_unlock(db);
+            free(cache_key);
             for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
             return -1;
@@ -1554,10 +1788,10 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
          * page query keeps ?1 for the ORDER BY ranking MATCH followed by ?2/?3
          * = LIMIT/OFFSET and ?4... = class filter. */
         (void)snprintf(match_sql, sizeof(match_sql),
-            "INSERT OR IGNORE INTO search_match "
+            "INSERT OR IGNORE INTO %s "
             "SELECT rowid FROM torrent_search WHERE name MATCH ?1"
             " UNION "
-            "%s", file_subquery);
+            "%s", match_table, file_subquery);
 
         /* Stage 7: the class join rides on the match set, so the count query
          * numbers its binds from ?1 and the main query from ?4. SQLite binds by
@@ -1582,7 +1816,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         (void)snprintf(count_sql, sizeof(count_sql),
             "SELECT COUNT(*) "
             "FROM torrents t%s "
-            "WHERE t.id IN (SELECT id FROM search_match)", class_count_join);
+            "WHERE t.id IN (SELECT id FROM %s)", class_count_join, match_table);
 
         /* Same shape as the no-quoted branch: no COUNT(f.id) aggregate, the
          * per-row file count is filled in the row loop, and the page query
@@ -1593,11 +1827,11 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
             "%s "
-            "WHERE t.id IN (SELECT id FROM search_match) "
+            "WHERE t.id IN (SELECT id FROM %s) "
             "GROUP BY t.id "
             "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
             "t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?2 OFFSET ?3", class_main_join);
+            "LIMIT ?2 OFFSET ?3", class_main_join, match_table);
     }
 
     /* Helper macro: bind quoted term GLOB params starting at start_idx */
@@ -1612,81 +1846,132 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         } \
     } while(0)
 
-    /* --- Build the match set once per request --- */
+    /* --- Build the match set (stage 3) or reuse the cached one (stage 4) --- */
     /* The FTS match over the whole corpus is the expensive part of /search: it
      * used to run once inside the count query and once inside the page query
      * (plus a third time in the ORDER BY ranking expression, which stays). Both
-     * now read this TEMP table instead. It is per-connection — stage 1 gives
+     * now read one TEMP table instead. It is per-connection — stage 1 gives
      * every request thread its own read connection, so the temp schema cannot
-     * leak between concurrent searches — and truncated at the start of each
-     * request. Only literal SQL is prepared here; all user input stays a bound
-     * parameter. */
-    if (sqlite3_exec(conn,
-                     "CREATE TEMP TABLE IF NOT EXISTS search_match(id INTEGER PRIMARY KEY);"
-                     "DELETE FROM search_match;",
-                     NULL, NULL, NULL) != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to reset the search match set: %s", sqlite3_errmsg(conn));
-        database_read_unlock(db);
-        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-        free_parsed_query(&pq);
-        return -1;
-    }
+     * leak between concurrent searches — and this request owns exactly one of
+     * the two slot tables, so the other slot keeps its rows for the next page
+     * or the next repeat search. Only literal SQL is prepared here: the slot
+     * table name is a compile-time constant and every piece of user input stays
+     * a bound parameter. */
+    int cache_hit = (hit_slot >= 0);
+    int drop_after_page = 0;   /* over-cap set: served once, then dropped */
+    int rc = SQLITE_OK;
 
-    sqlite3_stmt *match_stmt = NULL;
-    int rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
-    if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
-        database_read_unlock(db);
-        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-        free_parsed_query(&pq);
-        return -1;
-    }
+    if (!cache_hit) {
+        char reset_sql[256];
+        (void)snprintf(reset_sql, sizeof(reset_sql),
+                       "CREATE TEMP TABLE IF NOT EXISTS %s(id INTEGER PRIMARY KEY);"
+                       "DELETE FROM %s;", match_table, match_table);
 
-    sqlite3_bind_text(match_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(match_stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
-                      -1, SQLITE_STATIC);
-    if (has_quoted) {
-        BIND_QUOTED_GLOB_PARAMS(match_stmt, 3, pq, quoted_lower);
-    }
+        /* A rebuild replaces what the slot held: drop its metadata first, so a
+         * failure below cannot leave an entry pointing at rows it does not own. */
+        if (cache) search_match_slot_clear(&cache->slot[slot_idx]);
 
-    int match_rc = sqlite3_step(match_stmt);
-    sqlite3_finalize(match_stmt);
-    #undef BIND_QUOTED_GLOB_PARAMS
+        if (sqlite3_exec(conn, reset_sql, NULL, NULL, NULL) != SQLITE_OK) {
+            log_msg(LOG_ERROR, "Failed to reset the search match set: %s", sqlite3_errmsg(conn));
+            database_read_unlock(db);
+            free(cache_key);
+            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+            free_parsed_query(&pq);
+            return -1;
+        }
 
-    if (match_rc != SQLITE_DONE) {
-        /* An FTS syntax error (an unbalanced quote, say) only surfaces at step
-         * time. /search has always reported zero results for those instead of
-         * an error, so keep that contract: empty the match set and let the
-         * count query below return 0, which short-circuits the page query. */
-        log_msg(LOG_DEBUG, "Search match set failed for query '%s': %s",
-                query, sqlite3_errmsg(conn));
-        sqlite3_exec(conn, "DELETE FROM search_match;", NULL, NULL, NULL);
-    }
+        sqlite3_stmt *match_stmt = NULL;
+        rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
+        if (rc != SQLITE_OK) {
+            log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
+            database_read_unlock(db);
+            free(cache_key);
+            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+            free_parsed_query(&pq);
+            return -1;
+        }
 
-    /* --- Execute count query (exact: same match set as the page query) --- */
-    sqlite3_stmt *count_stmt;
-    rc = sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL);
-    if (rc != SQLITE_OK) {
-        log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(conn));
-        database_read_unlock(db);
-        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-        free_parsed_query(&pq);
-        return -1;
-    }
+        sqlite3_bind_text(match_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
+        sqlite3_bind_text(match_stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
+                          -1, SQLITE_STATIC);
+        if (has_quoted) {
+            BIND_QUOTED_GLOB_PARAMS(match_stmt, 3, pq, quoted_lower);
+        }
 
-    if (class_join) {
-        bind_class_filter(count_stmt, 1, filter);
-    }
+        int match_rc = sqlite3_step(match_stmt);
+        /* Rows the INSERT actually stored: an O(1) answer to "is this set
+         * pathological?" that does not rescan a multi-million-row temp btree. */
+        int match_rows = sqlite3_changes(conn);
+        sqlite3_finalize(match_stmt);
+        #undef BIND_QUOTED_GLOB_PARAMS
 
-    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
-        *total_count = sqlite3_column_int(count_stmt, 0);
+        if (match_rc != SQLITE_DONE) {
+            /* An FTS syntax error (an unbalanced quote, say) only surfaces at step
+             * time. /search has always reported zero results for those instead of
+             * an error, so keep that contract: empty the match set and let the
+             * count query below return 0, which short-circuits the page query.
+             * The empty set is then cached like any other: it is exact and cheap. */
+            log_msg(LOG_DEBUG, "Search match set failed for query '%s': %s",
+                    query, sqlite3_errmsg(conn));
+            (void)sqlite3_exec(conn, reset_sql, NULL, NULL, NULL);
+            match_rows = 0;
+        }
+
+        /* --- Execute count query (exact: same match set as the page query) --- */
+        sqlite3_stmt *count_stmt;
+        rc = sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL);
+        if (rc != SQLITE_OK) {
+            log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(conn));
+            database_read_unlock(db);
+            free(cache_key);
+            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+            free_parsed_query(&pq);
+            return -1;
+        }
+
+        if (class_join) {
+            bind_class_filter(count_stmt, 1, filter);
+        }
+
+        if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+            *total_count = sqlite3_column_int(count_stmt, 0);
+        }
+        sqlite3_finalize(count_stmt);
+
+        if (match_rows > SEARCH_MATCH_CACHE_MAX_ROWS) {
+            /* One pathological query must not pin both slots of temp storage. */
+            log_msg(LOG_DEBUG,
+                    "Search match cache: not caching %d-row set (slot %d) for query: %s",
+                    match_rows, slot_idx, query);
+            drop_after_page = 1;
+            free(cache_key);
+            cache_key = NULL;
+        } else if (cache_degraded) {
+            /* Shared connection: an entry could not be told apart from another
+             * thread's, so serve this set and let the next request rebuild. */
+            free(cache_key);
+            cache_key = NULL;
+        } else {
+            /* Empty sets included: exact and cheap. store() takes the key. */
+            search_match_cache_store(cache, slot_idx, cache_key, *total_count);
+            cache_key = NULL;
+        }
+    } else {
+        /* Hit: the slot's temp table still holds this query's match set, so
+         * neither the FTS build nor the count query runs — only the page query
+         * below does. total_count stays exact for the life of the entry. */
+        *total_count = cache->slot[slot_idx].total_count;
+        free(cache_key);
+        cache_key = NULL;
     }
-    sqlite3_finalize(count_stmt);
 
     /* Empty result set: the page query cannot return a row either (the class
      * filter already ran in the count query), so skip it — a search with no
      * hits must not pay for the ORDER BY ranking pass. */
     if (*total_count == 0) {
+        /* An over-cap set the class filter emptied still has to go: it was not
+         * cached, so nothing else will ever reset this slot table. */
+        if (drop_after_page) search_match_drop_table(conn, match_table);
         database_read_unlock(db);
         *results = NULL;  /* send_json_results handles a NULL array with count 0 */
         *count = 0;
@@ -1701,6 +1986,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     rc = sqlite3_prepare_v2(conn, main_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(conn));
+        if (drop_after_page) search_match_drop_table(conn, match_table);
         database_read_unlock(db);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
@@ -1718,6 +2004,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
     if (!res) {
         sqlite3_finalize(stmt);
+        if (drop_after_page) search_match_drop_table(conn, match_table);
         database_read_unlock(db);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
@@ -1779,6 +2066,10 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     }
 
     sqlite3_finalize(stmt);
+
+    /* Over-cap set: the page has been read, drop the temp table instead of
+     * leaving it behind for the slot's next rebuild. */
+    if (drop_after_page) search_match_drop_table(conn, match_table);
 
     database_read_unlock(db);
 
