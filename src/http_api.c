@@ -1289,9 +1289,12 @@ static char *build_torrent_fts_query(const char *raw) {
  * 3-byte trigram, so this must not be "fixed" to a character count.
  *
  * The input is the normalized torrent FTS string, so whenever every term is 3+
- * bytes the long-term string is byte-identical to what the file side bound
- * before this change (build_torrent_fts_query has already turned unquoted '-'
- * into a separator, so hyphenated titles keep splitting the same way).
+ * bytes the long-term string is trigram-equivalent to what the file side bound
+ * before this change: build_torrent_fts_query has already turned unquoted '-'
+ * into a separator, and the byte-level trigram tokenizer splits on it either
+ * way, so `spider-man` and `spider man` produce the same trigram postings even
+ * though the bound string itself is not byte-identical (the space replaces the
+ * hyphen).
  *
  * Returns 0, or -1 on allocation failure (the caller fails the request). */
 static int split_file_terms(parsed_query_t *pq) {
@@ -1771,6 +1774,38 @@ static void search_match_drop_table(sqlite3 *conn, const char *table) {
     }
 }
 
+/* --- Stage 6: degraded-mode serialization on the shared connection ---
+ *
+ * database_read_db() falls back to the process-wide db->db when it cannot open
+ * a per-thread read connection (see database.h). Every request that lands on
+ * that shared handle shares one TEMP schema, so two concurrent searches would
+ * rebuild the same slot table (both pick slot 0, since neither can look the
+ * cache up) while the other is still paging from it — silently serving the
+ * wrong rows and a wrong total_count.
+ *
+ * This mutex makes a degraded search hold the shared connection for its whole
+ * rebuild/count/page sequence, which is exactly the documented degrade contract
+ * in database.h: fall back to the pre-stage-1 shared-connection behaviour,
+ * correct but slow. Healthy requests never touch it: they own their connection
+ * and its TEMP schema, so they neither need nor contend for this lock.
+ *
+ * Lock order: this is a leaf, always taken *before* database_read_lock() and
+ * released *after* database_read_unlock(), and nothing else ever acquires it,
+ * so it cannot deadlock against the rwlock or any other lock. */
+static pthread_mutex_t shared_conn_search_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void shared_conn_search_lock(int degraded) {
+    if (degraded) {
+        pthread_mutex_lock(&shared_conn_search_mtx);
+    }
+}
+
+static void shared_conn_search_unlock(int degraded) {
+    if (degraded) {
+        pthread_mutex_unlock(&shared_conn_search_mtx);
+    }
+}
+
 /* Search torrents using FTS5, with support for quoted exact-word matching.
  * The optional stage-7 class filter rides along on the FTS rowid set: it only
  * adds the torrent_class join when it actually restricts rows, so a plain
@@ -1832,6 +1867,9 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         log_msg(LOG_DEBUG, "Search match cache: MISS slot %d for query: %s", slot_idx, query);
     }
 
+    /* Degraded mode: hold the shared connection for the whole rebuild/count/page
+     * sequence (see shared_conn_search_mtx above). Healthy requests skip this. */
+    shared_conn_search_lock(cache_degraded);
     database_read_lock(db);
 
     /*
@@ -1878,6 +1916,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
                                      &file_side) != 0) {
             log_msg(LOG_ERROR, "Unquoted search does not fit the SQL buffer");
             database_read_unlock(db);
+            shared_conn_search_unlock(cache_degraded);
             free(cache_key);
             for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
@@ -1958,6 +1997,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             log_msg(LOG_ERROR, "Quoted search does not fit the SQL buffer (%d quoted terms)",
                     pq.num_quoted);
             database_read_unlock(db);
+            shared_conn_search_unlock(cache_degraded);
             free(cache_key);
             for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
@@ -2059,6 +2099,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         if (sqlite3_exec(conn, reset_sql, NULL, NULL, NULL) != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to reset the search match set: %s", sqlite3_errmsg(conn));
             database_read_unlock(db);
+            shared_conn_search_unlock(cache_degraded);
             free(cache_key);
             for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
@@ -2070,6 +2111,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         if (rc != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
             database_read_unlock(db);
+            shared_conn_search_unlock(cache_degraded);
             free(cache_key);
             for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
@@ -2120,6 +2162,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         if (rc != SQLITE_OK) {
             log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(conn));
             database_read_unlock(db);
+            shared_conn_search_unlock(cache_degraded);
             free(cache_key);
             for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
@@ -2170,6 +2213,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
          * cached, so nothing else will ever reset this slot table. */
         if (drop_after_page) search_match_drop_table(conn, match_table);
         database_read_unlock(db);
+        shared_conn_search_unlock(cache_degraded);
         *results = NULL;  /* send_json_results handles a NULL array with count 0 */
         *count = 0;
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
@@ -2185,6 +2229,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         log_msg(LOG_ERROR, "Failed to prepare search query: %s", sqlite3_errmsg(conn));
         if (drop_after_page) search_match_drop_table(conn, match_table);
         database_read_unlock(db);
+        shared_conn_search_unlock(cache_degraded);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
         return -1;
@@ -2203,6 +2248,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         sqlite3_finalize(stmt);
         if (drop_after_page) search_match_drop_table(conn, match_table);
         database_read_unlock(db);
+        shared_conn_search_unlock(cache_degraded);
         for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
         return -1;
@@ -2269,6 +2315,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     if (drop_after_page) search_match_drop_table(conn, match_table);
 
     database_read_unlock(db);
+    shared_conn_search_unlock(cache_degraded);
 
     *results = res;
     *count = i;

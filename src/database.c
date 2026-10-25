@@ -252,8 +252,12 @@ static void read_conn_destructor(void *value) {
         return;
     }
 
-    /* database_cleanup() took the whole registry over and freed the structs:
-     * touching rc here would be a use-after-free. */
+    /* Safe even when this runs after database_cleanup(): cleanup drops the TLS
+     * key and clears read_conn_key_valid *before* it sweeps the registry, and
+     * it deliberately leaves the database_read_conn structs allocated (zombied)
+     * instead of freeing them, so this read of rc->db cannot be a use-after-free.
+     * The flag being 0 means we return without touching the registry or the
+     * connection cleanup already closed. */
     database_t *db = rc->db;
     if (!db || !db->read_conn_key_valid) {
         return;
@@ -1241,8 +1245,21 @@ void database_cleanup(database_t *db) {
      * worker thread has already closed and unregistered its connection (mg_stop()
      * joins the workers before cleanup), so this only sweeps a leaked entry.
      * They are closed before the final checkpoint so no read connection can
-     * still hold the WAL open. */
-    db->read_conn_key_valid = 0;  /* ownership passes to this function */
+     * still hold the WAL open.
+     *
+     * The TLS key is dropped and read_conn_key_valid cleared *before* the sweep,
+     * and the database_read_conn structs are deliberately left allocated
+     * (zombied) instead of being freed: a destructor still in flight — or one
+     * that runs after this returns — then reads live memory, observes
+     * read_conn_key_valid == 0 and returns without touching the registry or the
+     * connection closed below. That makes read_conn_destructor's guard hold by
+     * construction rather than by timing. The leak is bounded by
+     * DATABASE_READ_CONN_MAX structs, happens only at shutdown, and is reclaimed
+     * at process exit. */
+    if (db->read_conn_key_valid) {
+        db->read_conn_key_valid = 0;   /* no thread may use the key from here on */
+        pthread_key_delete(db->read_conn_key);
+    }
     pthread_mutex_lock(&db->read_conn_mutex);
     for (int i = 0; i < db->read_conns_count; i++) {
         struct database_read_conn *rc = db->read_conns[i];
@@ -1250,7 +1267,8 @@ void database_cleanup(database_t *db) {
         if (!rc) continue;
         log_msg(LOG_WARN, "Read connection still registered at cleanup, closing it");
         if (rc->conn) sqlite3_close_v2(rc->conn);
-        free(rc);
+        rc->conn = NULL;   /* a late destructor must never close it twice */
+        /* rc itself is intentionally not freed: see the comment above. */
     }
     db->read_conns_count = 0;
     pthread_mutex_unlock(&db->read_conn_mutex);
@@ -1279,9 +1297,6 @@ void database_cleanup(database_t *db) {
 
     pthread_rwlock_destroy(&db->checkpoint_rwlock);
     uv_mutex_destroy(&db->mutex);
-    /* The TLS slot is dropped last: pthread_key_delete() does not run
-     * destructors, so no thread may still rely on it. */
-    pthread_key_delete(db->read_conn_key);
     pthread_mutex_destroy(&db->read_conn_mutex);
     free(db->db_path);
     db->db_path = NULL;
