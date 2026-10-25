@@ -1445,6 +1445,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
      * - Has quoted terms + unquoted terms: FTS MATCH on unquoted, plus GLOB word-boundary checks.
      * - Only quoted terms: skip FTS, use GLOB word-boundary checks on torrent_files directly.
      */
+    char match_sql[4096];
     char count_sql[4096];
     char main_sql[4096];
 
@@ -1467,14 +1468,23 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
     if (!has_quoted) {
         /* No quoted terms — original queries, plus the stage-7 class join.
-         * Bind indices: ?1 = torrent FTS, ?2 = file FTS, ?3/?4 = LIMIT/OFFSET,
-         * ?5... = class filter. */
+         * Bind indices: the INSERT owns ?1 = torrent FTS and ?2 = file FTS;
+         * the count query only carries the class filter (from ?1); the page
+         * query keeps ?1 for the ORDER BY ranking MATCH, then ?2/?3 =
+         * LIMIT/OFFSET and ?4... = class filter. */
+        (void)snprintf(match_sql, sizeof(match_sql),
+            "INSERT OR IGNORE INTO search_match "
+            "SELECT rowid FROM torrent_search WHERE name MATCH ?1"
+            " UNION "
+            "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
+            "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)");
+
         class_count_join[0] = '\0';
         int cpos = 0;
         if (class_join) {
             cpos = snprintf(class_count_join, sizeof(class_count_join),
                             " JOIN torrent_class c ON c.torrent_id = t.id");
-            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 3);
+            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 1);
         }
 
         cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
@@ -1482,43 +1492,37 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
                             ? "JOIN torrent_class c ON c.torrent_id = t.id"
                             : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
         if (class_join) {
-            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 5);
+            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 4);
         }
 
+        /* Count from the materialized match set: same rows as before, but the
+         * FTS match is no longer evaluated a second time. The torrent_class
+         * join is on its torrent_id PK, so it cannot multiply rows and
+         * COUNT(*) equals the previous COUNT(DISTINCT t.id). */
         (void)snprintf(count_sql, sizeof(count_sql),
-            "SELECT COUNT(DISTINCT t.id) "
+            "SELECT COUNT(*) "
             "FROM torrents t%s "
-            "WHERE t.id IN ("
-            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
-            "    UNION"
-            "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-            "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
-            ")", class_count_join);
+            "WHERE t.id IN (SELECT id FROM search_match)", class_count_join);
 
         /* No COUNT(f.id) in the SELECT list: aggregating the file count over
          * the whole match set (~79.8k torrents x ~47 files ~= 3.75M index
          * entries) was ~9 s of a 14.6 s query, only to print a per-row file
          * count for the 50 rows on this page. The count is filled per returned
          * row in the row loop instead (see page_files_count_sql below).
-         * GROUP BY t.id stays: it is what dedups the UNION row set, and the
-         * torrent_class join is on its torrent_id PK so it cannot multiply
-         * rows. */
+         * GROUP BY t.id stays: the torrent_class join is on its torrent_id PK
+         * so it cannot multiply rows, and it keeps the page query's shape
+         * identical to the pre-stage-3 one. */
         (void)snprintf(main_sql, sizeof(main_sql),
             "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
             "       t.added_timestamp, "
             "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
             "%s "
-            "WHERE t.id IN ("
-            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
-            "    UNION"
-            "    SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-            "    WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)"
-            ") "
+            "WHERE t.id IN (SELECT id FROM search_match) "
             "GROUP BY t.id "
             "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
             "t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?3 OFFSET ?4", class_main_join);
+            "LIMIT ?2 OFFSET ?3", class_main_join);
     } else {
         /* Has quoted terms — build dynamic file_search subquery with word-boundary checks */
 
@@ -1541,26 +1545,30 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             return -1;
         }
 
-        /* Bind indices: ?1 = torrent FTS query, ?2 = file FTS query (all terms for trigram pre-filter)
-         * ?3... = quoted term GLOB binds (4 per quoted term)
-         * Then LIMIT and OFFSET at the end. The trigram FTS MATCH narrows the
+        /* Bind indices: the INSERT owns ?1 = torrent FTS query, ?2 = file FTS
+         * query (all terms for the trigram pre-filter) and ?3... = quoted term
+         * GLOB binds (4 per quoted term). The trigram FTS MATCH narrows the
          * candidates through its index (file_fts_query holds ALL terms, quoted
-         * and unquoted), then the GLOB conditions refine them to exact words. */
-        int bind_idx = 3 + pq.num_quoted * 4; /* next available bind index */
+         * and unquoted), then the GLOB conditions refine them to exact words.
+         * The count query then only carries the class filter (from ?1), and the
+         * page query keeps ?1 for the ORDER BY ranking MATCH followed by ?2/?3
+         * = LIMIT/OFFSET and ?4... = class filter. */
+        (void)snprintf(match_sql, sizeof(match_sql),
+            "INSERT OR IGNORE INTO search_match "
+            "SELECT rowid FROM torrent_search WHERE name MATCH ?1"
+            " UNION "
+            "%s", file_subquery);
 
-        int limit_idx = bind_idx;
-        int offset_idx = bind_idx + 1;
-
-        /* Stage 7: the class join binds after the quoted-term GLOB binds, so
-         * the count query numbers them from bind_idx and the main query from
-         * offset_idx + 1. SQLite binds by explicit index, so placeholders that
-         * do not appear in textual order are fine. */
+        /* Stage 7: the class join rides on the match set, so the count query
+         * numbers its binds from ?1 and the main query from ?4. SQLite binds by
+         * explicit index, so placeholders that do not appear in textual order
+         * are fine. */
         class_count_join[0] = '\0';
         int cpos = 0;
         if (class_join) {
             cpos = snprintf(class_count_join, sizeof(class_count_join),
                             " JOIN torrent_class c ON c.torrent_id = t.id");
-            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, bind_idx);
+            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 1);
         }
 
         cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
@@ -1568,40 +1576,31 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
                             ? "JOIN torrent_class c ON c.torrent_id = t.id"
                             : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
         if (class_join) {
-            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, offset_idx + 1);
+            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 4);
         }
 
         (void)snprintf(count_sql, sizeof(count_sql),
-            "SELECT COUNT(DISTINCT t.id) "
+            "SELECT COUNT(*) "
             "FROM torrents t%s "
-            "WHERE t.id IN ("
-            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
-            "    UNION "
-            "    %s"
-            ")", class_count_join, file_subquery);
+            "WHERE t.id IN (SELECT id FROM search_match)", class_count_join);
 
         /* Same shape as the no-quoted branch: no COUNT(f.id) aggregate, the
-         * per-row file count is filled in the row loop. Bind indices are
-         * unchanged (?1 torrent FTS, ?2 file FTS, quoted GLOB binds, then
-         * LIMIT/OFFSET, then the class filter). */
+         * per-row file count is filled in the row loop, and the page query
+         * reads the same materialized match set the count query used. */
         (void)snprintf(main_sql, sizeof(main_sql),
             "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
             "       t.added_timestamp, "
             "       c.category, c.tv_kind, c.adult, c.confidence "
             "FROM torrents t "
             "%s "
-            "WHERE t.id IN ("
-            "    SELECT rowid FROM torrent_search WHERE name MATCH ?1"
-            "    UNION "
-            "    %s"
-            ") "
+            "WHERE t.id IN (SELECT id FROM search_match) "
             "GROUP BY t.id "
             "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
             "t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?%d OFFSET ?%d", class_main_join, file_subquery, limit_idx, offset_idx);
+            "LIMIT ?2 OFFSET ?3", class_main_join);
     }
 
-    /* Helper macro: bind quoted term GLOB params starting at bind_idx */
+    /* Helper macro: bind quoted term GLOB params starting at start_idx */
     #define BIND_QUOTED_GLOB_PARAMS(stmt, start_idx, pq, quoted_lower) do { \
         int _bi = (start_idx); \
         for (int _qi = 0; _qi < (pq).num_quoted; _qi++) { \
@@ -1613,9 +1612,60 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         } \
     } while(0)
 
-    /* --- Execute count query --- */
+    /* --- Build the match set once per request --- */
+    /* The FTS match over the whole corpus is the expensive part of /search: it
+     * used to run once inside the count query and once inside the page query
+     * (plus a third time in the ORDER BY ranking expression, which stays). Both
+     * now read this TEMP table instead. It is per-connection — stage 1 gives
+     * every request thread its own read connection, so the temp schema cannot
+     * leak between concurrent searches — and truncated at the start of each
+     * request. Only literal SQL is prepared here; all user input stays a bound
+     * parameter. */
+    if (sqlite3_exec(conn,
+                     "CREATE TEMP TABLE IF NOT EXISTS search_match(id INTEGER PRIMARY KEY);"
+                     "DELETE FROM search_match;",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to reset the search match set: %s", sqlite3_errmsg(conn));
+        database_read_unlock(db);
+        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+        free_parsed_query(&pq);
+        return -1;
+    }
+
+    sqlite3_stmt *match_stmt = NULL;
+    int rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
+        database_read_unlock(db);
+        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+        free_parsed_query(&pq);
+        return -1;
+    }
+
+    sqlite3_bind_text(match_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
+    sqlite3_bind_text(match_stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
+                      -1, SQLITE_STATIC);
+    if (has_quoted) {
+        BIND_QUOTED_GLOB_PARAMS(match_stmt, 3, pq, quoted_lower);
+    }
+
+    int match_rc = sqlite3_step(match_stmt);
+    sqlite3_finalize(match_stmt);
+    #undef BIND_QUOTED_GLOB_PARAMS
+
+    if (match_rc != SQLITE_DONE) {
+        /* An FTS syntax error (an unbalanced quote, say) only surfaces at step
+         * time. /search has always reported zero results for those instead of
+         * an error, so keep that contract: empty the match set and let the
+         * count query below return 0, which short-circuits the page query. */
+        log_msg(LOG_DEBUG, "Search match set failed for query '%s': %s",
+                query, sqlite3_errmsg(conn));
+        sqlite3_exec(conn, "DELETE FROM search_match;", NULL, NULL, NULL);
+    }
+
+    /* --- Execute count query (exact: same match set as the page query) --- */
     sqlite3_stmt *count_stmt;
-    int rc = sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL);
+    rc = sqlite3_prepare_v2(conn, count_sql, -1, &count_stmt, NULL);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to prepare count query: %s", sqlite3_errmsg(conn));
         database_read_unlock(db);
@@ -1624,20 +1674,27 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         return -1;
     }
 
-    sqlite3_bind_text(count_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(count_stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
-                      -1, SQLITE_STATIC);
-    if (has_quoted) {
-        BIND_QUOTED_GLOB_PARAMS(count_stmt, 3, pq, quoted_lower);
-    }
     if (class_join) {
-        bind_class_filter(count_stmt, has_quoted ? 3 + pq.num_quoted * 4 : 3, filter);
+        bind_class_filter(count_stmt, 1, filter);
     }
 
     if (sqlite3_step(count_stmt) == SQLITE_ROW) {
         *total_count = sqlite3_column_int(count_stmt, 0);
     }
     sqlite3_finalize(count_stmt);
+
+    /* Empty result set: the page query cannot return a row either (the class
+     * filter already ran in the count query), so skip it — a search with no
+     * hits must not pay for the ORDER BY ranking pass. */
+    if (*total_count == 0) {
+        database_read_unlock(db);
+        *results = NULL;  /* send_json_results handles a NULL array with count 0 */
+        *count = 0;
+        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+        free_parsed_query(&pq);
+        log_msg(LOG_DEBUG, "Search found 0 results (offset %d) for query: %s", offset, query);
+        return 0;
+    }
 
     /* --- Execute main query --- */
     sqlite3_stmt *stmt;
@@ -1651,26 +1708,11 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
     }
 
     sqlite3_bind_text(stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, has_quoted ? pq.file_fts_query : pq.torrent_fts_query,
-                      -1, SQLITE_STATIC);
-    int class_main_bind = 5;  /* unquoted: ?3/?4 are LIMIT/OFFSET */
-    if (!has_quoted) {
-        sqlite3_bind_int(stmt, 3, HTTP_API_MAX_RESULTS);
-        sqlite3_bind_int(stmt, 4, offset);
-    } else {
-        BIND_QUOTED_GLOB_PARAMS(stmt, 3, pq, quoted_lower);
-        int limit_idx = 3 + pq.num_quoted * 4;
-        int offset_idx = limit_idx + 1;
-        sqlite3_bind_int(stmt, limit_idx, HTTP_API_MAX_RESULTS);
-        sqlite3_bind_int(stmt, offset_idx, offset);
-        class_main_bind = offset_idx + 1;
-    }
-
+    sqlite3_bind_int(stmt, 2, HTTP_API_MAX_RESULTS);
+    sqlite3_bind_int(stmt, 3, offset);
     if (class_join) {
-        bind_class_filter(stmt, class_main_bind, filter);
+        bind_class_filter(stmt, 4, filter);
     }
-
-    #undef BIND_QUOTED_GLOB_PARAMS
 
     /* Allocate results array */
     search_result_t *res = (search_result_t *)calloc(HTTP_API_MAX_RESULTS, sizeof(search_result_t));
