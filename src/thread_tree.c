@@ -631,6 +631,9 @@ typedef struct get_peers_worker_ctx {
     tree_response_queue_t *response_queue;  /* Per-worker response queue */
 } get_peers_worker_ctx_t;
 
+/* get_peers lookup fan-out (Stage 2; Stage 3 promotes these to config). */
+#define GP_FANOUT 8          /* one query per closest routing-table node, once each */
+#define GP_DEADLINE_MS 3000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
 /* Monotonic microseconds, used only for the per-tree get_peers lookup timing.
  * Kept isolated from the time(NULL) seconds used elsewhere in this file.
  * Returns 0 when clock_gettime() fails. */
@@ -642,13 +645,24 @@ static uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* Iterative get_peers lookup.
+/* Parallel get_peers lookup with one per-infohash deadline.
  *
- * Queries the closest routing-table nodes for `infohash` and, over at most 3
- * iterations, re-queries closer nodes learned from responses, collecting peers
- * into `out`. This is the pure lookup extracted from get_peers_worker_func: it
- * does NOT push to any peers queue and does NOT touch the tree phase — callers
- * decide what to do with the result.
+ * Fans out one get_peers query per closest routing-table node (at most
+ * GP_FANOUT nodes, each queried once — no iterative rounds) and then drains the
+ * worker's response queue until every sent query is answered, GP_DEADLINE_MS
+ * expires, the tree shuts down, or `out` fills up. This is the lookup extracted
+ * from get_peers_worker_func: it does NOT push to any peers queue and does NOT
+ * touch the tree phase — callers decide what to do with the result.
+ *
+ * The deadline is taken BEFORE the first send because tree_send_get_peers() can
+ * sleep in udp_rate_limit_acquire() (<=50 ms per send). It is CLOCK_MONOTONIC
+ * via now_us(); the response queue only ever receives small relative slices, so
+ * its internal CLOCK_REALTIME wait never sees the lookup deadline and wall-clock
+ * jumps can neither extend nor shorten the cap.
+ *
+ * Every registered TID is unregistered exactly once: when answered, when the
+ * send fails, or by the sweep on the single fall-through exit (deadline,
+ * shutdown, peers full).
  *
  * Instrumentation only: updates the tree's gp_* counters and adds the elapsed
  * microseconds to gp_lookup_us_total; no behaviour change.
@@ -680,61 +694,121 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         goto done;
     }
 
-    /* Simple iterative lookup: query initial nodes, then closer nodes from responses */
-    int max_iterations = 3;
-    for (int iter = 0; iter < max_iterations && out->peer_count < MAX_PEERS_PER_ENTRY; iter++) {
-        int queries_this_round = (iter == 0) ? n : 0;
-
-        /* Query each node */
-        for (int i = 0; i < n && out->peer_count < MAX_PEERS_PER_ENTRY; i++) {
-            /* Generate TID for this query */
-            uint8_t tid[4];
-            int tid_len = tree_protocol_gen_tid(tid);
-
-            /* Register TID with dispatcher BEFORE sending */
-            tree_dispatcher_register_tid(dispatcher, tid, tid_len, rsp_queue);
-
-            /* Send get_peers query */
-            atomic_fetch_add(&tree->gp_packets_sent, 1);
-            tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
-
-            /* Wait for response on personal queue (config: tree_get_peers_timeout_ms, default 1500ms) */
-            tree_response_t response_pkt;
-            int pop_result = tree_response_queue_pop(rsp_queue, &response_pkt, tree->get_peers_timeout_ms);
-
-            /* Unregister TID immediately after receiving (or timeout) */
-            tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
-
-            if (pop_result == 0) {
-                /* Got a response! */
-                atomic_fetch_add(&tree->gp_answers, 1);
-                tree_get_peers_response_t response;
-                if (tree_handle_get_peers_response(tree, response_pkt.data, response_pkt.len,
-                                                   &response_pkt.from, &response) == 0) {
-                    /* Collect peers */
-                    for (int p = 0; p < response.peer_count && out->peer_count < MAX_PEERS_PER_ENTRY; p++) {
-                        memcpy(&out->peers[out->peer_count], &response.peers[p],
-                               sizeof(struct sockaddr_storage));
-                        out->peer_count++;
-                    }
-
-                    /* Add closer nodes for next iteration (refresh last_seen to keep good nodes) */
-                    for (int ni = 0; ni < response.node_count && queries_this_round < 8; ni++) {
-                        tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
-                        /* Could track these for next iteration, but keeping it simple */
-                    }
-                }
-            }
-        }
-
-        /* If we found peers, we're done */
-        if (out->peer_count > 0) {
+    /* Sweep responses left in this queue by the previous lookup on this worker:
+     * late replies arrive after their slot's unregister. pop() with timeout 0
+     * returns an already-queued packet immediately (-1 only when empty). */
+    tree_response_t pkt;
+    while (tree_response_queue_count(rsp_queue) > 0) {
+        if (tree_response_queue_pop(rsp_queue, &pkt, 0) != 0) {
             break;
         }
+    }
 
-        /* Get fresh closest nodes for next iteration */
-        n = tree_routing_get_closest(rt, infohash, closest, 8);
-        if (n == 0) break;
+    /* One deadline for the whole lookup, taken BEFORE the first send: each
+     * tree_send_get_peers() runs udp_rate_limit_acquire() before taking
+     * send_lock and can sleep up to 50 ms, so 8 sends can burn hundreds of ms
+     * that must not extend the cap. */
+    const uint64_t deadline_us = now_us() + (uint64_t)GP_DEADLINE_MS * 1000;
+
+    /* Fan out one query per closest node, once each (no iterative rounds). */
+    struct {
+        uint8_t tid[4];
+        int tid_len;
+        int sent;
+    } slot[GP_FANOUT];
+    memset(slot, 0, sizeof(slot));
+    int outstanding = 0;
+
+    for (int i = 0; i < n && i < GP_FANOUT; i++) {
+        slot[i].tid_len = tree_protocol_gen_tid(slot[i].tid);
+        slot[i].sent = 0;
+
+        /* Register TID with dispatcher BEFORE sending */
+        tree_dispatcher_register_tid(dispatcher, slot[i].tid, slot[i].tid_len, rsp_queue);
+
+        /* Send get_peers query */
+        atomic_fetch_add(&tree->gp_packets_sent, 1);
+        if (tree_send_get_peers(tree, sock, slot[i].tid, slot[i].tid_len,
+                                infohash, &closest[i].addr) == 0) {
+            slot[i].sent = 1;
+            outstanding++;
+        } else {
+            /* Send failed (incl. EAGAIN): unregister immediately */
+            tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
+            slot[i].tid_len = 0;
+        }
+    }
+
+    /* Drain against the single deadline. pop() only ever gets a small RELATIVE
+     * slice, so its internal CLOCK_REALTIME wait never sees the lookup deadline
+     * and wall-clock jumps cannot extend or shorten the cap. */
+    while (outstanding > 0 && out->peer_count < MAX_PEERS_PER_ENTRY) {
+        int64_t remaining_us = (int64_t)(deadline_us - now_us());
+        if (remaining_us <= 0) {
+            break;
+        }
+        if (atomic_load(&tree->shutdown_requested)) {
+            break;  /* pop's -1 conflates timeout and shutdown */
+        }
+
+        int slice_ms = 250;
+        if (remaining_us / 1000 < slice_ms) {
+            slice_ms = (int)(remaining_us / 1000 + 1);
+        }
+        if (tree->get_peers_timeout_ms > 0 && tree->get_peers_timeout_ms < slice_ms) {
+            slice_ms = tree->get_peers_timeout_ms;  /* drain-slice cap only, not the deadline */
+        }
+
+        if (tree_response_queue_pop(rsp_queue, &pkt, slice_ms) != 0) {
+            continue;
+        }
+
+        /* Match the response TID against the slots we actually sent */
+        uint8_t rtid[4];
+        int rtid_len = 0;
+        if (tree_protocol_extract_tid(pkt.data, pkt.len, rtid, &rtid_len) != 0) {
+            continue;
+        }
+        int s = -1;
+        for (int i = 0; i < GP_FANOUT; i++) {
+            if (slot[i].sent && slot[i].tid_len > 0 && slot[i].tid_len == rtid_len &&
+                memcmp(slot[i].tid, rtid, (size_t)rtid_len) == 0) {
+                s = i;
+                break;
+            }
+        }
+        if (s < 0) {
+            continue;  /* stale/duplicate response: leave the slot alone */
+        }
+
+        outstanding--;
+        atomic_fetch_add(&tree->gp_answers, 1);
+        tree_dispatcher_unregister_tid(dispatcher, slot[s].tid, slot[s].tid_len);
+        slot[s].tid_len = 0;
+
+        tree_get_peers_response_t response;
+        if (tree_handle_get_peers_response(tree, pkt.data, pkt.len, &pkt.from, &response) == 0) {
+            /* Collect peers */
+            for (int p = 0; p < response.peer_count && out->peer_count < MAX_PEERS_PER_ENTRY; p++) {
+                memcpy(&out->peers[out->peer_count], &response.peers[p],
+                       sizeof(struct sockaddr_storage));
+                out->peer_count++;
+            }
+
+            /* Keep every node insert (routing-table upkeep) */
+            for (int ni = 0; ni < response.node_count; ni++) {
+                tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
+            }
+        }
+    }
+
+    /* Exactly one unregister per register: sweep whatever is still outstanding
+     * on the fall-through exit (deadline, shutdown, peers full). The n == 0
+     * prologue exit happens before any registration. */
+    for (int i = 0; i < GP_FANOUT; i++) {
+        if (slot[i].tid_len > 0) {
+            tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
+        }
     }
 
 done:
@@ -830,8 +904,9 @@ static void tree_start_get_peers_workers(thread_tree_t *tree) {
             tree->tree_id, tree->num_get_peers_workers);
 
     for (int i = 0; i < tree->num_get_peers_workers; i++) {
-        /* Create per-worker response queue (capacity 10 for buffering burst responses) */
-        tree_response_queue_t *response_queue = tree_response_queue_create(10);
+        /* Create per-worker response queue (capacity 16 = one parallel fan-out
+         * of GP_FANOUT queries plus slack for stale leftovers) */
+        tree_response_queue_t *response_queue = tree_response_queue_create(TREE_GP_RESPONSE_QUEUE_CAP);
         if (!response_queue) {
             log_msg(LOG_ERROR, "[tree %u] Failed to create response queue for get_peers worker %d",
                     tree->tree_id, i);

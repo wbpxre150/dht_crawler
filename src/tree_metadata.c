@@ -1479,7 +1479,7 @@ void *tree_metadata_worker_func(void *arg) {
          * tree_metadata_fresh_peer_retries (0 = disabled). The retry is not
          * counted as a separate metadata attempt. */
         if (!metadata && tree->fresh_peer_retries > 0) {
-            tree_response_queue_t *relookup_queue = tree_response_queue_create(10);
+            tree_response_queue_t *relookup_queue = tree_response_queue_create(TREE_GP_RESPONSE_QUEUE_CAP);
             if (relookup_queue) {
                 atomic_fetch_add(&tree->fresh_peer_relookups, 1);
                 atomic_fetch_add(&tree->gp_lookups_from_retry, 1);

@@ -15,6 +15,11 @@
 
 #define MAX_RESPONSE_SIZE 2048
 
+/* Capacity for the get_peers lookup response queues fed by tree_lookup_peers():
+ * one parallel fan-out of GP_FANOUT (8) queries plus slack for stale leftovers
+ * that arrive after their lookup gave up. Other queues keep their own sizing. */
+#define TREE_GP_RESPONSE_QUEUE_CAP 16
+
 typedef struct tree_response {
     uint8_t data[MAX_RESPONSE_SIZE];
     int len;
