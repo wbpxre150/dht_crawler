@@ -675,7 +675,10 @@ static void do_backup(batch_writer_t *writer) {
     }
 
     /* Create schema on first run — mirrors src/database.c but without FTS
-     * delete triggers since the backup is append-only. */
+     * delete triggers since the backup is append-only. The backup never
+     * populates torrent_docs either: it is contentless, so its rows cannot be
+     * copied by INSERT…SELECT — a restored backup gets that index from the
+     * --rebuild-docs backfill. */
     char *err = NULL;
     rc = sqlite3_exec(bak,
         "CREATE TABLE IF NOT EXISTS torrents ("
@@ -728,6 +731,9 @@ static void do_backup(batch_writer_t *writer) {
         "CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5("
         "  filename, tokenize='trigram',"
         "  content='torrent_files', content_rowid='id');"
+        "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_docs USING fts5("
+        "  body, tokenize='unicode61 remove_diacritics 2',"
+        "  content='', contentless_delete=1);"
         "CREATE TRIGGER IF NOT EXISTS torrents_ai AFTER INSERT ON torrents BEGIN"
         "  INSERT INTO torrent_search(rowid, name) VALUES (new.id, new.name); END;"
         "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON torrent_files BEGIN"

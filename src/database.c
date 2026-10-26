@@ -77,6 +77,16 @@ static const char *CREATE_FTS_SQL =
     "    tokenize='trigram',"
     "    content='torrent_files',"
     "    content_rowid='id'"
+    ");"
+    ""
+    /* Schema v2 torrent-level word index. Contentless (content='') so only the
+     * index is stored, never the body text; contentless_delete=1 (SQLite >=
+     * 3.43) lets the delete trigger drop a rowid without that original text. */
+    "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_docs USING fts5("
+    "    body,"
+    "    tokenize='unicode61 remove_diacritics 2',"
+    "    content='',"
+    "    contentless_delete=1"
     ");";
 
 static const char *CREATE_TRIGGERS_SQL =
@@ -94,6 +104,12 @@ static const char *CREATE_TRIGGERS_SQL =
     ""
     "CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON torrent_files BEGIN"
     "    INSERT INTO file_search(file_search, rowid, filename) VALUES('delete', old.id, old.filename);"
+    "END;"
+    ""
+    /* Schema v2: keep torrent_docs in step with torrent row deletions (torrents
+     * are deleted outside the ingest flush path). */
+    "CREATE TRIGGER IF NOT EXISTS torrents_docs_ad AFTER DELETE ON torrents BEGIN"
+    "    DELETE FROM torrent_docs WHERE rowid = old.id;"
     "END;";
 
 /* pthread_key destructor for a thread's read connection (defined below
