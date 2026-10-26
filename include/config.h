@@ -36,9 +36,6 @@ typedef struct {
     /* Logging */
     int log_level;  /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR */
 
-    /* Search index selection: 1 = v2 (torrent_docs, unicode61), 0 = v1 (trigram) */
-    int search_index_docs;
-
     /* HTTP API settings */
     int http_port;                 /* HTTP server port (default: 8080) */
     char http_bind[64];            /* HTTP server bind address (default: "0.0.0.0") */

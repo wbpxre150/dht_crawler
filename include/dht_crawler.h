@@ -33,7 +33,6 @@ typedef struct {
     const char *db_path;
     int dht_port;                   /* DHT port (6881) */
     log_level_t log_level;
-    int search_index_docs;          /* 1 = /search uses torrent_docs (v2), 0 = trigram (v1) */
     time_t start_time;              /* Application start timestamp */
 } app_context_t;
 

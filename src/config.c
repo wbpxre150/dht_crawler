@@ -59,9 +59,6 @@ void config_init_defaults(crawler_config_t *config) {
     /* Logging defaults */
     config->log_level = 1;  /* INFO */
 
-    /* Search index selection: 1 = v2 (torrent_docs), 0 = v1 (trigram) */
-    config->search_index_docs = 1;
-
     /* HTTP API defaults */
     config->http_port = 8080;
     strncpy(config->http_bind, "0.0.0.0", sizeof(config->http_bind) - 1);
@@ -554,17 +551,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "bep51_node_cooldown_sec") == 0) {
             config->bep51_node_cooldown_sec = atoi(value);
             if (config->bep51_node_cooldown_sec < 0) config->bep51_node_cooldown_sec = 0;
-        }
-        /* Search index selection: v1 = trigram file_search, v2 = torrent_docs */
-        else if (strcmp(key, "search_index") == 0) {
-            if (strcmp(value, "v1") == 0) {
-                config->search_index_docs = 0;
-            } else if (strcmp(value, "v2") == 0) {
-                config->search_index_docs = 1;
-            } else {
-                log_msg(LOG_WARN, "Invalid search_index '%s' (expected v1|v2); keeping '%s'",
-                        value, config->search_index_docs ? "v2" : "v1");
-            }
         }
     }
 
