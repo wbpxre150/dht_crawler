@@ -12,11 +12,13 @@
 #include "thread_tree.h"
 #include "bep51_cache.h"
 #include "http_torrent_page.h"
+#include "tree_dispatcher.h"  /* shared dispatcher counters in /stats */
 #include <civetweb.h>
 
 /* Forward declarations for tree queue functions to avoid type conflicts */
 int tree_routing_get_count(void *rt);
 int tree_infohash_queue_count(void *q);
+void tree_infohash_queue_get_stats(void *q, uint64_t *out_total, uint64_t *out_duplicates);
 /* tree_peers_queue_count() now comes in via thread_tree.h -> tree_peers_queue.h */
 #include <cJSON.h>
 #include <string.h>
@@ -620,6 +622,17 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
     snprintf(uptime_str, sizeof(uptime_str), "%d:%02d", uptime_hours, uptime_minutes);
     cJSON_AddStringToObject(root, "uptime", uptime_str);
 
+    /* Effective get_peers knobs the supervisor actually runs with (after
+     * defaulting), so a probe can tell "configured" from "built in". */
+    if (api->supervisor) {
+        cJSON *config_json = cJSON_CreateObject();
+        cJSON_AddNumberToObject(config_json, "tree_get_peers_workers",
+                                api->supervisor->num_get_peers_workers);
+        cJSON_AddNumberToObject(config_json, "tree_get_peers_timeout_ms",
+                                api->supervisor->get_peers_timeout_ms);
+        cJSON_AddItemToObject(root, "config", config_json);
+    }
+
     /* Add language filter statistics */
     language_filter_stats_t lf_stats;
     language_filter_get_stats(&lf_stats);
@@ -734,6 +747,79 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(supervisor_json, "draining_trees_max", draining_max);
         cJSON_AddNumberToObject(supervisor_json, "draining_trees_connections", draining_connections);
 
+        /* get_peers lookup totals (cumulative respawned trees + live trees) */
+        uint64_t sup_gp_lookups = 0;
+        uint64_t sup_gp_with_peers = 0;
+        uint64_t sup_gp_from_retry = 0;
+        uint64_t sup_gp_packets = 0;
+        uint64_t sup_gp_answers = 0;
+        uint64_t sup_gp_lookup_us = 0;
+        supervisor_getpeers_stats(api->supervisor, &sup_gp_lookups, &sup_gp_with_peers,
+                                  &sup_gp_from_retry, &sup_gp_packets, &sup_gp_answers,
+                                  &sup_gp_lookup_us);
+
+        cJSON *supervisor_get_peers = cJSON_CreateObject();
+        cJSON_AddNumberToObject(supervisor_get_peers, "lookups_total", (double)sup_gp_lookups);
+        cJSON_AddNumberToObject(supervisor_get_peers, "lookups_with_peers", (double)sup_gp_with_peers);
+
+        double sup_gp_yield_percent = 0.0;
+        if (sup_gp_lookups > 0) {
+            sup_gp_yield_percent = (sup_gp_with_peers * 100.0) / (double)sup_gp_lookups;
+        }
+        cJSON_AddNumberToObject(supervisor_get_peers, "yield_percent", sup_gp_yield_percent);
+
+        cJSON_AddNumberToObject(supervisor_get_peers, "packets_total", (double)sup_gp_packets);
+
+        double sup_gp_packets_per_lookup = 0.0;
+        if (sup_gp_lookups > 0) {
+            sup_gp_packets_per_lookup = (double)sup_gp_packets / (double)sup_gp_lookups;
+        }
+        cJSON_AddNumberToObject(supervisor_get_peers, "packets_per_lookup", sup_gp_packets_per_lookup);
+
+        double sup_gp_mean_lookup_ms = 0.0;
+        if (sup_gp_lookups > 0) {
+            sup_gp_mean_lookup_ms = ((double)sup_gp_lookup_us / (double)sup_gp_lookups) / 1000.0;
+        }
+        cJSON_AddNumberToObject(supervisor_get_peers, "mean_lookup_ms", sup_gp_mean_lookup_ms);
+
+        cJSON_AddNumberToObject(supervisor_get_peers, "answers_total", (double)sup_gp_answers);
+        cJSON_AddNumberToObject(supervisor_get_peers, "from_retry_total", (double)sup_gp_from_retry);
+        cJSON_AddItemToObject(supervisor_json, "get_peers", supervisor_get_peers);
+
+        /* UDP dispatcher counters. With a fixed dht_port every tree aliases the
+         * supervisor's shared dispatcher, so read it ONCE - summing per tree
+         * would multiply the counts by the tree count. Private dispatchers are
+         * summed under trees_lock. */
+        uint64_t disp_total_responses = 0;
+        uint64_t disp_routed_responses = 0;
+        uint64_t disp_dropped_responses = 0;
+        uint64_t disp_queue_full_drops = 0;
+        if (api->supervisor->shared_dispatcher) {
+            disp_total_responses = atomic_load(&api->supervisor->shared_dispatcher->total_responses);
+            disp_routed_responses = atomic_load(&api->supervisor->shared_dispatcher->routed_responses);
+            disp_dropped_responses = atomic_load(&api->supervisor->shared_dispatcher->dropped_responses);
+            disp_queue_full_drops = atomic_load(&api->supervisor->shared_dispatcher->queue_full_drops);
+        } else {
+            pthread_mutex_lock(&api->supervisor->trees_lock);
+            for (int i = 0; i < api->supervisor->max_trees; i++) {
+                thread_tree_t *disp_tree = api->supervisor->trees[i];
+                if (disp_tree && disp_tree->dispatcher) {
+                    disp_total_responses += atomic_load(&disp_tree->dispatcher->total_responses);
+                    disp_routed_responses += atomic_load(&disp_tree->dispatcher->routed_responses);
+                    disp_dropped_responses += atomic_load(&disp_tree->dispatcher->dropped_responses);
+                    disp_queue_full_drops += atomic_load(&disp_tree->dispatcher->queue_full_drops);
+                }
+            }
+            pthread_mutex_unlock(&api->supervisor->trees_lock);
+        }
+
+        cJSON *dispatcher_json = cJSON_CreateObject();
+        cJSON_AddNumberToObject(dispatcher_json, "total_responses", (double)disp_total_responses);
+        cJSON_AddNumberToObject(dispatcher_json, "routed_responses", (double)disp_routed_responses);
+        cJSON_AddNumberToObject(dispatcher_json, "dropped_responses", (double)disp_dropped_responses);
+        cJSON_AddNumberToObject(dispatcher_json, "queue_full_drops", (double)disp_queue_full_drops);
+        cJSON_AddItemToObject(supervisor_json, "dispatcher", dispatcher_json);
+
         cJSON_AddItemToObject(root, "supervisor", supervisor_json);
 
         /* BEP51 cache global stats */
@@ -798,7 +884,57 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(queues, "pause_threshold", tree->infohash_pause_threshold);
                 cJSON_AddNumberToObject(queues, "resume_threshold", tree->infohash_resume_threshold);
 
+                /* infohash queue push accounting. tree_infohash_queue_get_stats()
+                 * leaves the out-params untouched when the queue is NULL, so zero
+                 * the locals first. */
+                uint64_t infohash_push_attempts = 0;
+                uint64_t infohash_duplicates_rejected = 0;
+                if (tree->infohash_queue) {
+                    tree_infohash_queue_get_stats(tree->infohash_queue,
+                                                  &infohash_push_attempts,
+                                                  &infohash_duplicates_rejected);
+                }
+                cJSON_AddNumberToObject(queues, "infohash_push_attempts", (double)infohash_push_attempts);
+                cJSON_AddNumberToObject(queues, "infohash_duplicates_rejected", (double)infohash_duplicates_rejected);
+
                 cJSON_AddItemToObject(tree_json, "queues", queues);
+
+                /* get_peers lookup instrumentation. Every ratio is guarded on a
+                 * non-zero divisor: cJSON prints invalid JSON for NaN/Inf. */
+                uint64_t gp_lookups = atomic_load(&tree->gp_lookups);
+                uint64_t gp_with_peers = atomic_load(&tree->gp_lookups_with_peers);
+                uint64_t gp_from_retry = atomic_load(&tree->gp_lookups_from_retry);
+                uint64_t gp_packets = atomic_load(&tree->gp_packets_sent);
+                uint64_t gp_answers = atomic_load(&tree->gp_answers);
+                uint64_t gp_lookup_us = atomic_load(&tree->gp_lookup_us_total);
+
+                cJSON *get_peers = cJSON_CreateObject();
+                cJSON_AddNumberToObject(get_peers, "lookups_total", (double)gp_lookups);
+                cJSON_AddNumberToObject(get_peers, "lookups_with_peers", (double)gp_with_peers);
+
+                double gp_yield_percent = 0.0;
+                if (gp_lookups > 0) {
+                    gp_yield_percent = (gp_with_peers * 100.0) / (double)gp_lookups;
+                }
+                cJSON_AddNumberToObject(get_peers, "yield_percent", gp_yield_percent);
+
+                cJSON_AddNumberToObject(get_peers, "packets_total", (double)gp_packets);
+
+                double gp_packets_per_lookup = 0.0;
+                if (gp_lookups > 0) {
+                    gp_packets_per_lookup = (double)gp_packets / (double)gp_lookups;
+                }
+                cJSON_AddNumberToObject(get_peers, "packets_per_lookup", gp_packets_per_lookup);
+
+                double gp_mean_lookup_ms = 0.0;
+                if (gp_lookups > 0) {
+                    gp_mean_lookup_ms = ((double)gp_lookup_us / (double)gp_lookups) / 1000.0;
+                }
+                cJSON_AddNumberToObject(get_peers, "mean_lookup_ms", gp_mean_lookup_ms);
+
+                cJSON_AddNumberToObject(get_peers, "answers_total", (double)gp_answers);
+                cJSON_AddNumberToObject(get_peers, "from_retry_total", (double)gp_from_retry);
+                cJSON_AddItemToObject(tree_json, "get_peers", get_peers);
                 cJSON_AddItemToArray(trees_array, tree_json);
             }
         }

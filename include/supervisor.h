@@ -227,6 +227,13 @@ typedef struct supervisor {
     atomic_uint_fast64_t cumulative_second_strike_failures;
     atomic_uint_fast64_t cumulative_filtered_count;
     atomic_uint_fast64_t cumulative_metadata_attempts;
+    /* get_peers lookup instrumentation accumulated from respawned trees */
+    atomic_uint_fast64_t cumulative_gp_lookups;
+    atomic_uint_fast64_t cumulative_gp_lookups_with_peers;
+    atomic_uint_fast64_t cumulative_gp_lookups_from_retry;
+    atomic_uint_fast64_t cumulative_gp_packets_sent;
+    atomic_uint_fast64_t cumulative_gp_answers;
+    atomic_uint_fast64_t cumulative_gp_lookup_us_total;
 
     /* Monitor thread */
     pthread_t monitor_thread;
@@ -276,6 +283,22 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
                      uint64_t *out_first_strike, uint64_t *out_second_strike,
                      uint64_t *out_fresh_relookups, uint64_t *out_fresh_rescues,
                      uint64_t *out_metadata_piece_reasks);
+
+/**
+ * Get aggregate get_peers lookup statistics (cumulative from respawned trees
+ * plus all live trees)
+ * @param sup Supervisor instance
+ * @param out_lookups Pointer to store total tree_lookup_peers() calls
+ * @param out_with_peers Pointer to store lookups that returned peers
+ * @param out_from_retry Pointer to store lookups started by the retry path
+ * @param out_packets Pointer to store get_peers packets attempted
+ * @param out_answers Pointer to store responses consumed
+ * @param out_lookup_us Pointer to store total microseconds inside lookups
+ */
+void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
+                               uint64_t *out_with_peers, uint64_t *out_from_retry,
+                               uint64_t *out_packets, uint64_t *out_answers,
+                               uint64_t *out_lookup_us);
 
 /**
  * Get total active connections across all trees

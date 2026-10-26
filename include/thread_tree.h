@@ -200,6 +200,13 @@ typedef struct thread_tree {
     atomic_uint_fast64_t fresh_peer_relookups;    /* Metadata failures that triggered a fresh-peer re-lookup */
     atomic_uint_fast64_t fresh_peer_rescues;      /* Re-lookups whose retry fetched metadata */
     atomic_uint_fast64_t metadata_piece_reasks;   /* Pieces re-asked from another conn after the 3 s cooldown */
+    /* get_peers lookup instrumentation (per tree) */
+    atomic_uint_fast64_t gp_lookups;             /* tree_lookup_peers() calls that passed the argument guard */
+    atomic_uint_fast64_t gp_lookups_with_peers;  /* Lookups whose result had peer_count > 0 */
+    atomic_uint_fast64_t gp_lookups_from_retry;  /* Lookups started by the metadata fresh-peer retry path */
+    atomic_uint_fast64_t gp_packets_sent;        /* get_peers packets attempted (failures counted too) */
+    atomic_uint_fast64_t gp_answers;             /* Responses consumed from the queue (pop_result == 0) */
+    atomic_uint_fast64_t gp_lookup_us_total;     /* Total microseconds spent inside tree_lookup_peers() */
     atomic_uint_fast64_t last_metadata_time;
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */
@@ -273,6 +280,9 @@ const char *thread_tree_phase_name(tree_phase_t phase);
  * out->peers and out->infohash is set to infohash. This helper performs no
  * queue push and does not change the tree phase; callers decide what to do with
  * the result.
+ *
+ * Instrumentation only: updates the tree's gp_* counters and adds the elapsed
+ * microseconds to gp_lookup_us_total; no behaviour change.
  *
  * @param tree Thread tree (its routing table, socket and dispatcher are used)
  * @param infohash Target infohash (20 bytes)

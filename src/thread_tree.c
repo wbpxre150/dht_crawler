@@ -631,6 +631,17 @@ typedef struct get_peers_worker_ctx {
     tree_response_queue_t *response_queue;  /* Per-worker response queue */
 } get_peers_worker_ctx_t;
 
+/* Monotonic microseconds, used only for the per-tree get_peers lookup timing.
+ * Kept isolated from the time(NULL) seconds used elsewhere in this file.
+ * Returns 0 when clock_gettime() fails. */
+static uint64_t now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
 /* Iterative get_peers lookup.
  *
  * Queries the closest routing-table nodes for `infohash` and, over at most 3
@@ -639,6 +650,9 @@ typedef struct get_peers_worker_ctx {
  * does NOT push to any peers queue and does NOT touch the tree phase — callers
  * decide what to do with the result.
  *
+ * Instrumentation only: updates the tree's gp_* counters and adds the elapsed
+ * microseconds to gp_lookup_us_total; no behaviour change.
+ *
  * Returns the number of peers found (out->peer_count); 0 when the routing table
  * is empty or no node returned peers. */
 int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
@@ -646,6 +660,9 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
     if (!tree || !infohash || !rsp_queue || !out) {
         return 0;
     }
+
+    const uint64_t start_us = now_us();
+    atomic_fetch_add(&tree->gp_lookups, 1);
 
     tree_routing_table_t *rt = (tree_routing_table_t *)tree->routing_table;
     tree_socket_t *sock = (tree_socket_t *)tree->socket;
@@ -660,7 +677,7 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
     int n = tree_routing_get_closest(rt, infohash, closest, 8);
     if (n == 0) {
         /* No nodes to query: no peers */
-        return 0;
+        goto done;
     }
 
     /* Simple iterative lookup: query initial nodes, then closer nodes from responses */
@@ -678,6 +695,7 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
             tree_dispatcher_register_tid(dispatcher, tid, tid_len, rsp_queue);
 
             /* Send get_peers query */
+            atomic_fetch_add(&tree->gp_packets_sent, 1);
             tree_send_get_peers(tree, sock, tid, tid_len, infohash, &closest[i].addr);
 
             /* Wait for response on personal queue (config: tree_get_peers_timeout_ms, default 1500ms) */
@@ -689,6 +707,7 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
 
             if (pop_result == 0) {
                 /* Got a response! */
+                atomic_fetch_add(&tree->gp_answers, 1);
                 tree_get_peers_response_t response;
                 if (tree_handle_get_peers_response(tree, response_pkt.data, response_pkt.len,
                                                    &response_pkt.from, &response) == 0) {
@@ -718,6 +737,14 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         if (n == 0) break;
     }
 
+done:
+    if (out->peer_count > 0) {
+        atomic_fetch_add(&tree->gp_lookups_with_peers, 1);
+    }
+    const uint64_t end_us = now_us();
+    if (end_us >= start_us) {
+        atomic_fetch_add(&tree->gp_lookup_us_total, end_us - start_us);
+    }
     return out->peer_count;
 }
 
@@ -1063,6 +1090,14 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->last_metadata_time, 0);
     tree->metadata_rate = 0.0;
     atomic_init(&tree->active_connections, 0);
+
+    /* Initialize get_peers lookup instrumentation */
+    atomic_store(&tree->gp_lookups, 0);
+    atomic_store(&tree->gp_lookups_with_peers, 0);
+    atomic_store(&tree->gp_lookups_from_retry, 0);
+    atomic_store(&tree->gp_packets_sent, 0);
+    atomic_store(&tree->gp_answers, 0);
+    atomic_store(&tree->gp_lookup_us_total, 0);
 
     /* Initialize BEP51 cache statistics */
     atomic_store(&tree->bep51_nodes_cached, 0);

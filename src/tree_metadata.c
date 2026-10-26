@@ -1482,6 +1482,7 @@ void *tree_metadata_worker_func(void *arg) {
             tree_response_queue_t *relookup_queue = tree_response_queue_create(10);
             if (relookup_queue) {
                 atomic_fetch_add(&tree->fresh_peer_relookups, 1);
+                atomic_fetch_add(&tree->gp_lookups_from_retry, 1);
                 peer_entry_t fresh = {0};
                 int fresh_count = tree_lookup_peers(tree, entry.infohash, relookup_queue, &fresh);
                 if (atomic_load(&tree->shutdown_reason) != SHUTDOWN_REASON_SUPERVISOR && fresh_count > 0) {
