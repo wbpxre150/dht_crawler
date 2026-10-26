@@ -848,6 +848,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
                 cJSON_AddNumberToObject(tree_json, "active_connections", (int)atomic_load(&tree->active_connections));
                 cJSON_AddBoolToObject(tree_json, "discovery_paused", atomic_load(&tree->discovery_paused));
+                cJSON_AddBoolToObject(tree_json, "get_peers_paused", atomic_load(&tree->get_peers_paused));
 
                 /* BEP51 cache statistics */
                 cJSON_AddNumberToObject(tree_json, "bep51_nodes_cached", (double)atomic_load(&tree->bep51_nodes_cached));
