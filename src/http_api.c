@@ -1966,23 +1966,26 @@ static search_match_cache_t *search_match_cache_get(void) {
 /* The cache key: every input that determines the entry. The match set itself
  * only depends on the query, but the cached total_count also depends on the
  * class filter (the count query carries its conditions), so the whole filter
- * rides along. Nothing is normalized or lowercased here — the key holds the
+ * rides along. The index version leads the key (1 = trigram file_search, 2 =
+ * torrent_docs): a match set built from one index says nothing about the other,
+ * so a v1 entry must never be served while search_index selects v2, nor the
+ * reverse. Nothing is normalized or lowercased here — the key holds the
  * same strings the SQL binds, and a forgotten component would silently serve
  * another query's rows. */
 static char *search_match_cache_key_build(const char *query, const cls_filter_t *filter,
-                                          int has_quoted) {
+                                          int has_quoted, int index_ver) {
     size_t need = strlen(query) + 128;
     char *key = (char *)malloc(need);
     if (!key) return NULL;
 
     if (filter) {
-        (void)snprintf(key, need, "%d|f|%d|%d|%d|%d|%d|%d|%.17g|%s",
-                       has_quoted, (int)filter->adult,
+        (void)snprintf(key, need, "%d|%d|f|%d|%d|%d|%d|%d|%d|%.17g|%s",
+                       index_ver, has_quoted, (int)filter->adult,
                        filter->has_category, filter->category,
                        filter->has_tv_kind, filter->tv_kind,
                        filter->has_min_conf, filter->min_conf, query);
     } else {
-        (void)snprintf(key, need, "%d|nofilter|%s", has_quoted, query);
+        (void)snprintf(key, need, "%d|%d|nofilter|%s", index_ver, has_quoted, query);
     }
     return key;
 }
@@ -2237,7 +2240,10 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
 
     /* --- Stage 4: match-set cache lookup (metadata only: no SQL, no lock) --- */
     search_match_cache_t *cache = search_match_cache_get();
-    char *cache_key = search_match_cache_key_build(query, filter, has_quoted);
+    /* The index version leads the key (see search_match_cache_key_build): a
+     * search_index flip must never serve the other index's match set. */
+    char *cache_key =
+        search_match_cache_key_build(query, filter, has_quoted, use_docs_index ? 2 : 1);
     /* Degraded mode: database_read_db() falls back to the process-wide handle
      * when it cannot open a per-thread connection. The TEMP tables are then
      * shared by every request thread, so a hit could serve another search's
