@@ -89,8 +89,9 @@ static int random_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
-static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
-                                    int offset, search_result_t **results, int *count, int *total_count);
+static int search_torrents_filtered(database_t *db, int use_docs_index, const char *query,
+                                    const cls_filter_t *filter, int offset,
+                                    search_result_t **results, int *count, int *total_count);
 static int browse_handler(struct mg_connection *conn, void *cbdata);
 static int sb_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...);
 
@@ -1178,7 +1179,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     search_result_t *results = NULL;
     int count = 0;
     int total_count = 0;
-    int rc = search_torrents_filtered(api->database, query,
+    int rc = search_torrents_filtered(api->database, api->app_ctx->search_index_docs, query,
                                       class_filter.present ? &class_filter : NULL,
                                       offset, &results, &count, &total_count);
     free(query);
@@ -1446,6 +1447,104 @@ static int sb_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ..
     }
     *pos += (size_t)written;
     return 0;
+}
+
+/* Emit one accumulated term of build_docs_fts_query() into the FTS5
+ * expression: verbatim when the term is already quoted (the quotes are the
+ * phrase syntax) or when it is a plain [A-Za-z0-9] token, wrapped in double
+ * quotes otherwise. A single space separates terms — FTS5's implicit AND.
+ * Returns 0, or -1 when the append does not fit (see sb_append). */
+static int docs_append_term(char *out, size_t out_len, size_t *pos, const char *term,
+                            int quoted) {
+    if (*pos > 0 && sb_append(out, out_len, pos, " ") != 0) return -1;
+    if (quoted) return sb_append(out, out_len, pos, "%s", term);
+
+    int plain = (term[0] != '\0');
+    for (const char *p = term; *p; p++) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9'))) {
+            plain = 0;
+            break;
+        }
+    }
+    return plain ? sb_append(out, out_len, pos, "%s", term)
+                 : sb_append(out, out_len, pos, "\"%s\"", term);
+}
+
+/* Build the FTS5 expression for the torrent-level unicode61 index
+ * (torrent_docs, config key search_index = v2).
+ *
+ * One expression replaces the whole v1 match-set build: torrent_docs holds each
+ * torrent's name plus all of its filenames in a single document, so one MATCH
+ * over it yields the torrent rowids directly — no file_search trigram match, no
+ * instr() prefilter, no GLOB confirmation, no short/long-term split.
+ *
+ * The input is the RAW user query, not parsed_query_t: that parser splits on
+ * spaces only, drops empty quoted terms and exposes a deliberately quote-free
+ * file_fts_query (it feeds a trigram MATCH), while an FTS5 phrase here has to
+ * keep its quotes. One pass, same quote rule as build_torrent_fts_query():
+ * a '"' toggles, there are no escapes.
+ *
+ *  - a '"' is copied through: it is what turns the term into an FTS5 phrase,
+ *    and keeping it verbatim preserves the input's quote parity;
+ *  - inside quotes every byte is copied verbatim (a quoted region cannot hold a
+ *    '"' — the toggle is the only way out, so the check order below is the
+ *    guard that keeps it that way);
+ *  - outside quotes '-' becomes a separator, exactly as
+ *    build_torrent_fts_query() does: FTS5 reads a bare '-' as NOT, and both
+ *    tokenizers already split on it, so `spider-man` must match the same rows
+ *    as `spider man`;
+ *  - an unquoted token of pure [A-Za-z0-9] is emitted verbatim, anything else
+ *    is wrapped in double quotes, so no FTS5 syntax character ever reaches the
+ *    unicode61 parser unquoted (a bare '*' would be a prefix query, '(' a
+ *    syntax error);
+ *  - terms and phrases are joined by single spaces (FTS5's implicit AND).
+ *
+ * A query that ends inside a quote therefore produces an unterminated phrase,
+ * just as build_torrent_fts_query() does today: the MATCH step fails, the
+ * caller empties the match set, and /search answers HTTP 200 with count=0 (see
+ * the step-failure handling in search_torrents_filtered). Quote parity is what
+ * keeps that contract mechanical instead of a special case.
+ *
+ * Every append goes through sb_append(); returns 0 on success, -1 when the
+ * expression does not fit out (the caller then fails the request). */
+static int build_docs_fts_query(const char *raw, char *out, size_t out_len) {
+    if (!raw || !out || out_len == 0) return -1;
+    out[0] = '\0';
+
+    /* One term or one quoted phrase, verbatim. search_handler caps q at 255
+     * bytes, so this cannot fill up in practice; the bound check below keeps
+     * the function total on its own. */
+    char term[512];
+    size_t term_len = 0;
+    int term_quoted = 0;
+    size_t pos = 0;
+    int in_quotes = 0;
+
+    term[0] = '\0';
+    for (size_t i = 0;; i++) {
+        char c = raw[i];
+
+        if (c == '"') {
+            in_quotes = !in_quotes;
+            term_quoted = 1;
+        } else if (c == '\0' || (!in_quotes && (c == ' ' || c == '-'))) {
+            /* Term boundary: end of input, a space, or an unquoted '-'. */
+            if (term_len > 0 &&
+                docs_append_term(out, out_len, &pos, term, term_quoted) != 0) {
+                return -1;
+            }
+            term_len = 0;
+            term_quoted = 0;
+            term[0] = '\0';
+            if (c == '\0') return 0;
+            continue;
+        }
+        /* Everything else belongs to the current term. */
+        if (term_len + 1 >= sizeof(term)) return -1;
+        term[term_len++] = c;
+        term[term_len] = '\0';
+    }
 }
 
 /*
@@ -2093,8 +2192,13 @@ static void search_timing_log(const char *query, const char *cache_state, int ma
  * The optional stage-7 class filter rides along on the FTS rowid set: it only
  * adds the torrent_class join when it actually restricts rows, so a plain
  * search keeps its previous SQL and result set (see search_handler). */
-static int search_torrents_filtered(database_t *db, const char *query, const cls_filter_t *filter,
-                                    int offset, search_result_t **results, int *count, int *total_count) {
+/* use_docs_index selects the match-set source (config key search_index): 1 =
+ * the torrent-level unicode61 index torrent_docs (v2), 0 = the trigram
+ * file_search path plus its GLOB confirmation (v1, kept compiled and reachable
+ * until the follow-up cleanup stage deletes it). */
+static int search_torrents_filtered(database_t *db, int use_docs_index, const char *query,
+                                    const cls_filter_t *filter, int offset,
+                                    search_result_t **results, int *count, int *total_count) {
     /* Stage 7 timing: entry stamp for `total`, and one slot per phase (-1 =
      * phase did not run). Declared here so every unlock exit can print it. */
     double t_entry = now_ms();
@@ -2224,7 +2328,13 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
          * prefilter + 4 pre-built patterns, see bind_unquoted_file_half); the
          * count query only carries the class filter (from ?1); the page query
          * keeps ?1 for the ORDER BY ranking MATCH, then ?2/?3 = LIMIT/OFFSET and
-         * ?4... = class filter. */
+         * ?4... = class filter.
+         * search_index = v2 changes none of that: the docs match-set INSERT is a
+         * separate statement with its own ?1 = the unicode61 expression from
+         * build_docs_fts_query() — a DIFFERENT string from the page query's ?1,
+         * which keeps binding the porter expression against torrent_search for
+         * the ranking key. The count and page queries are untouched and gain no
+         * bind. */
         if (build_unquoted_match_sql(&pq, match_table, match_sql, sizeof(match_sql),
                                      file_sql, sizeof(file_sql), &file_side) != 0) {
             log_msg(LOG_ERROR, "Unquoted search does not fit the SQL buffer");
@@ -2424,13 +2534,88 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             return -1;
         }
 
-        /* Stage 8: the match set is built by two INSERTs — name half first,
+        /* Set by whichever match-set build runs below; the shared failure
+         * handling after it empties the set for both index versions. */
+        int build_failed = 0;
+
+        /* --- search_index = v2: one FTS5 expression over torrent_docs ---
+         * torrent_docs holds each torrent's name plus all of its filenames in
+         * one unicode61 document, so a single MATCH yields the torrent rowids
+         * directly: no file_search trigram match, no instr() prefilter, no GLOB
+         * confirmation and no short/long-term split. The expression is a bound
+         * parameter (?1), never spliced into the SQL text. */
+        if (use_docs_index) {
+            /* The handler caps q at 255 bytes and expansion is <= 2 x raw + 2
+             * per term, so 1024 cannot overflow; the -1 below stays wired as a
+             * guard on the same fail path the v1 builders use. */
+            char docs_q[1024];
+            if (build_docs_fts_query(query, docs_q, sizeof(docs_q)) != 0) {
+                log_msg(LOG_ERROR, "Docs search does not fit the FTS buffer");
+                SEARCH_TIMING_EMIT();
+                database_read_unlock(db);
+                shared_conn_search_unlock(cache_degraded);
+                free(cache_key);
+                for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+                free_parsed_query(&pq);
+                return -1;
+            }
+
+            (void)snprintf(match_sql, sizeof(match_sql),
+                           "INSERT OR IGNORE INTO %s "
+                           "SELECT rowid FROM torrent_docs WHERE torrent_docs MATCH ?1",
+                           match_table);
+
+            double t_docs = now_ms();
+            sqlite3_stmt *docs_stmt = NULL;
+            rc = sqlite3_prepare_v2(conn, match_sql, -1, &docs_stmt, NULL);
+            if (rc != SQLITE_OK) {
+                log_msg(LOG_ERROR, "Failed to prepare match set query: %s",
+                        sqlite3_errmsg(conn));
+                tm.build_name = now_ms() - t_docs;
+                tm.build = now_ms() - t_build;   /* Stage 7: partial build */
+                SEARCH_TIMING_EMIT();
+                database_read_unlock(db);
+                shared_conn_search_unlock(cache_degraded);
+                free(cache_key);
+                for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
+                free_parsed_query(&pq);
+                return -1;
+            }
+
+            sqlite3_bind_text(docs_stmt, 1, docs_q, -1, SQLITE_STATIC);
+            int docs_rc = sqlite3_step(docs_stmt);
+            /* Rows the INSERT actually stored: the same O(1) set-size answer the
+             * v1 halves take from changes(). */
+            match_rows = sqlite3_changes(conn);
+            sqlite3_finalize(docs_stmt);
+            /* The docs insert is the whole match-set build, so it takes the name
+             * phase's slot on the timing line; build_file stays unset and prints
+             * as "-". */
+            tm.build_name = now_ms() - t_docs;
+            build_failed = (docs_rc != SQLITE_DONE);
+            if (build_failed) {
+                /* Malformed expression (an unbalanced quote, say): same contract
+                 * as v1 — the shared reset below empties the set, the count query
+                 * then returns 0 and the page query is skipped, so the response
+                 * is HTTP 200 with count=0. Never a 500 from here. */
+                log_msg(LOG_DEBUG, "Search docs match set failed for query '%s': %s",
+                        query, sqlite3_errmsg(conn));
+            }
+        }
+
+        /* --- search_index = v1: the stage-8 two-half match set ---
+         * Kept compiled and reachable until the follow-up cleanup stage deletes
+         * it; a v2 request never enters this block. Its body keeps the original
+         * indentation, so the v1 statements show as untouched lines here.
+         *
+         * Stage 8: the match set is built by two INSERTs — name half first,
          * file half second — so the timing line can attribute the cost. The set
          * is the one the single UNION statement produced: the name half is
          * unique rowids, the file half keeps its SELECT DISTINCT, and OR IGNORE
          * dedupes across the two halves exactly as UNION did. The quoted branch
          * still builds its file half inside match_sql, so it runs one statement
          * here and leaves build_file unset. */
+        if (!use_docs_index) {
         double t_name = now_ms();
         sqlite3_stmt *match_stmt = NULL;
         rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
@@ -2460,7 +2645,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
         sqlite3_finalize(match_stmt);
         #undef BIND_QUOTED_GLOB_PARAMS
         tm.build_name = now_ms() - t_name;
-        int build_failed = (match_rc != SQLITE_DONE);
+        build_failed = (match_rc != SQLITE_DONE);
         if (build_failed) {
             log_msg(LOG_DEBUG, "Search name match set failed for query '%s': %s",
                     query, sqlite3_errmsg(conn));
@@ -2514,6 +2699,7 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
                 build_failed = 1;
             }
         }
+        }   /* search_index = v1 */
         tm.build = now_ms() - t_build;   /* Stage 7: build phase done */
 
         if (build_failed) {
@@ -2719,9 +2905,11 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
 
 #undef SEARCH_TIMING_EMIT
 
-/* Legacy entry point without a class filter (see search_torrents_filtered). */
+/* Legacy entry point without a class filter (see search_torrents_filtered).
+ * Nothing in the tree calls it any more, so it has no app_context_t to read
+ * search_index from and follows the configured default (v2, torrent_docs). */
 int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {
-    return search_torrents_filtered(db, query, NULL, offset, results, count, total_count);
+    return search_torrents_filtered(db, 1, query, NULL, offset, results, count, total_count);
 }
 
 /* Free search results */
