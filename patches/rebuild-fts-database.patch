@@ -30,17 +30,18 @@
          } else if (strcmp(argv[i], "--clear-failure-filter") == 0) {
              clear_failure_filter = true;
          }
-@@ -480,6 +489,30 @@
+@@ -480,6 +489,31 @@
          return 0;
      }
  
 +    /*******************************************************************
-+     * --rebuild-fts <db>: create the FTS5 search index (the table and
-+     * its triggers) in an existing database and rebuild it with the
++     * --rebuild-fts <db>: create the FTS5 tables + triggers in an
++     * existing database, rebuild the external-content torrent_search
++     * index and backfill the contentless torrent_docs index with the
 +     * bundled SQLite, which always has FTS5 compiled in (unlike the
 +     * platform SQLite). The restore path bulk-imports the base tables
 +     * from the Kotlin side first, then calls this on the TEMP database
-+     * before swapping it in, so a restore never leaves the search
++     * before swapping it in, so a restore never leaves either search
 +     * index silently empty.
 +     *******************************************************************/
 +    if (rebuild_fts_db_path) {
@@ -63,18 +64,19 @@
      signal(SIGTERM, signal_handler);
 --- a/src/database.c
 +++ b/src/database.c
-@@ -1216,6 +1216,87 @@
+@@ -1216,6 +1216,102 @@
      return -1;
  }
  
-+/* Create the FTS5 tables + triggers in an existing database and rebuild
-+ * the external-content index with the bundled SQLite (FTS5 is always
-+ * compiled in, unlike the platform SQLite). Used by `--rebuild-fts <db>`
-+ * after a bulk import has filled the base tables: the FTS objects are
-+ * created here (all IF NOT EXISTS) and the FTS5 'rebuild' command
-+ * regenerates the index from its content table. The WAL is checkpointed
-+ * and truncated so the file is self-contained for the caller's rename
-+ * into place. Returns 0 on success, -1 on failure. */
++/* Create the FTS5 tables + triggers in an existing database, rebuild the
++ * external-content torrent_search index with the bundled SQLite (FTS5 is
++ * always compiled in, unlike the platform SQLite) and backfill the
++ * contentless torrent_docs index. Used by `--rebuild-fts <db>` after a
++ * bulk import has filled the base tables: the FTS objects are created
++ * here (all IF NOT EXISTS) and the FTS5 'rebuild' command regenerates
++ * torrent_search from its content table. The WAL is checkpointed and
++ * truncated so the file is self-contained for the caller's rename into
++ * place. Returns 0 on success, -1 on failure. */
 +int database_rebuild_fts(const char *db_path) {
 +    if (!db_path) return -1;
 +
@@ -132,6 +134,20 @@
 +
 +    sqlite3_close(db);
 +
++    /* torrent_docs is a CONTENTLESS FTS5 table (content=''): its text lives
++     * only inside the inverted index, so there is no content table for the
++     * FTS5 'rebuild' command to re-read, and inserting the literal token
++     * 'rebuild' would merely index that word. Populate it with an explicit
++     * INSERT ... SELECT over the base tables instead, which is exactly what
++     * the idempotent, contentless_delete-aware database_rebuild_docs()
++     * (also used by --rebuild-docs) does, including its own WAL
++     * checkpoint/truncate so the file stays self-contained. */
++    log_msg(LOG_INFO, "rebuild-fts: backfilling torrent_docs ...");
++    if (database_rebuild_docs(db_path) != 0) {
++        log_msg(LOG_ERROR, "rebuild-fts: torrent_docs backfill failed; database left unchanged.");
++        return -1;
++    }
++
 +    /* The indexes are only usable if the database they were built from is
 +     * intact; reuse the existing helper and report its result verbatim. */
 +    int errors = database_integrity_check(db_path);
@@ -153,14 +169,15 @@
      if (!db) {
 --- a/include/database.h
 +++ b/include/database.h
-@@ -139,4 +139,10 @@
+@@ -139,4 +139,11 @@
   * replayed, or -1 on fatal error (dst_path is unlinked on failure). */
  int database_restore(const char *sql_path, const char *dst_path);
  
-+/* Create the FTS5 tables + triggers in an existing db_path database and
-+ * rebuild the external-content index (torrent_search) with the bundled
-+ * SQLite. The WAL is checkpointed and truncated so the file is
-+ * self-contained. Returns 0 on success, -1 on fatal error. */
++/* Create the FTS5 tables + triggers in an existing db_path database,
++ * rebuild the external-content index (torrent_search) and backfill the
++ * contentless torrent_docs index with the bundled SQLite. The WAL is
++ * checkpointed and truncated so the file is self-contained. Returns 0 on
++ * success, -1 on fatal error. */
 +int database_rebuild_fts(const char *db_path);
 +
  #endif /* DATABASE_H */
