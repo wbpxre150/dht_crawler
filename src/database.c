@@ -72,13 +72,6 @@ static const char *CREATE_FTS_SQL =
     "    content_rowid='id'"
     ");"
     ""
-    "CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5("
-    "    filename,"
-    "    tokenize='trigram',"
-    "    content='torrent_files',"
-    "    content_rowid='id'"
-    ");"
-    ""
     /* Schema v2 torrent-level word index. Contentless (content='') so only the
      * index is stored, never the body text; contentless_delete=1 (SQLite >=
      * 3.43) lets the delete trigger drop a rowid without that original text. */
@@ -96,14 +89,6 @@ static const char *CREATE_TRIGGERS_SQL =
     ""
     "CREATE TRIGGER IF NOT EXISTS torrents_ad AFTER DELETE ON torrents BEGIN"
     "    INSERT INTO torrent_search(torrent_search, rowid, name) VALUES('delete', old.id, old.name);"
-    "END;"
-    ""
-    "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON torrent_files BEGIN"
-    "    INSERT INTO file_search(rowid, filename) VALUES (new.id, new.filename);"
-    "END;"
-    ""
-    "CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON torrent_files BEGIN"
-    "    INSERT INTO file_search(file_search, rowid, filename) VALUES('delete', old.id, old.filename);"
     "END;"
     ""
     /* Schema v2: keep torrent_docs in step with torrent row deletions (torrents
@@ -1740,9 +1725,9 @@ int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
 
     /* Build a LIKE pattern matched against the FULL displayed path
      * (prefix/filename) so a folder-name term matches too. Escape LIKE
-     * wildcards in the user term, then wrap in %term%. Unlike the old FTS5
-     * file_search MATCH, this stays scoped to one torrent via the
-     * idx_files_torrent index, so it is a fast per-torrent scan. */
+     * wildcards in the user term, then wrap in %term%. This stays scoped
+     * to one torrent via the idx_files_torrent index, so it is a fast
+     * per-torrent scan. */
     char *like = NULL;
     if (has_filter) {
         size_t n = strlen(filter);

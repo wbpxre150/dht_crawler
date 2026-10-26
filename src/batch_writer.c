@@ -728,16 +728,11 @@ static void do_backup(batch_writer_t *writer) {
         "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_search USING fts5("
         "  name, tokenize='porter unicode61',"
         "  content='torrents', content_rowid='id');"
-        "CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5("
-        "  filename, tokenize='trigram',"
-        "  content='torrent_files', content_rowid='id');"
         "CREATE VIRTUAL TABLE IF NOT EXISTS torrent_docs USING fts5("
         "  body, tokenize='unicode61 remove_diacritics 2',"
         "  content='', contentless_delete=1);"
         "CREATE TRIGGER IF NOT EXISTS torrents_ai AFTER INSERT ON torrents BEGIN"
-        "  INSERT INTO torrent_search(rowid, name) VALUES (new.id, new.name); END;"
-        "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON torrent_files BEGIN"
-        "  INSERT INTO file_search(rowid, filename) VALUES (new.id, new.filename); END;",
+        "  INSERT INTO torrent_search(rowid, name) VALUES (new.id, new.name); END;",
         NULL, NULL, &err);
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Backup: schema creation failed: %s", err);
