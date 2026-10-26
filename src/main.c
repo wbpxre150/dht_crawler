@@ -220,6 +220,35 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* --rebuild-docs <db>: backfill the schema-v2 torrent-level word index
+     * (torrent_docs) of an existing database from its base tables. One-shot
+     * maintenance, dispatched before the daemon initialises anything, so it
+     * needs no configuration, no app context and no cleanup call. Scanned in
+     * its own loop (rather than in the argument loop above) to keep that
+     * loop's shape unchanged.
+     *
+     * Usage is documented here, not in --help, on purpose: the help printf
+     * block is patch-anchor territory for the build patch stack. */
+    const char *rebuild_docs_db_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--rebuild-docs") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--rebuild-docs requires a <database> argument");
+                return 1;
+            }
+            rebuild_docs_db_path = argv[++i];
+        }
+    }
+
+    if (rebuild_docs_db_path) {
+        log_msg(LOG_INFO, "Rebuilding torrent_docs of %s ...", rebuild_docs_db_path);
+        int docs_rc = database_rebuild_docs(rebuild_docs_db_path);
+        if (docs_rc != 0) {
+            log_msg(LOG_ERROR, "--rebuild-docs failed; database left unchanged.");
+            return 1;
+        }
+        return 0;
+    }
     /* Increase file descriptor limit to support max_concurrent_connections
      * The default soft limit is often 1024, which is too low for high-concurrency crawling.
      * We raise it to the hard limit (typically 524288 on modern systems). */

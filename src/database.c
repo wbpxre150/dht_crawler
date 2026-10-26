@@ -502,6 +502,217 @@ int database_create_schema(database_t *db) {
     return 0;
 }
 
+/* Rebuild the schema-v2 torrent-level word index (torrent_docs) of an existing
+ * database from its base tables. Used by `--rebuild-docs <db>`: the table, its
+ * delete trigger and the ingest path all ship with the daemon, but a database
+ * that predates them has an empty torrent_docs and has to be backfilled once.
+ *
+ * The index is contentless (content='', contentless_delete=1), so rows are
+ * inserted explicitly with the same body the flush path builds: the torrent
+ * name plus every leaf filename of that torrent. The backfill runs in bounded
+ * chunks of torrent ids, one transaction per chunk, deleting the chunk's rowid
+ * range first so a re-run is idempotent (rowids in a gap are harmless). On a
+ * chunk failure the chunk is rolled back; earlier chunks stay committed and a
+ * re-run continues idempotently. The WAL is checkpointed and truncated at the
+ * end so the file is self-contained for copy/push. Deliberately no
+ * database_integrity_check(): that is a full-database scan, and the idempotent
+ * re-run plus the row-count checks are the verification here.
+ *
+ * Returns 0 on success, -1 on failure. */
+int database_rebuild_docs(const char *db_path) {
+    if (!db_path) return -1;
+
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to open %s: %s",
+                db_path, sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_stmt *hi_stmt = NULL;
+    sqlite3_stmt *del_stmt = NULL;
+    sqlite3_stmt *ins_stmt = NULL;
+
+    sqlite3_busy_timeout(db, 30000);
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+
+    char *err = NULL;
+    log_msg(LOG_INFO, "rebuild-docs: creating torrent_docs and its trigger ...");
+    rc = sqlite3_exec(db, CREATE_FTS_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to create FTS tables: %s", err);
+        sqlite3_free(err);
+        goto fail;
+    }
+    rc = sqlite3_exec(db, CREATE_TRIGGERS_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to create FTS triggers: %s", err);
+        sqlite3_free(err);
+        goto fail;
+    }
+
+    /* Assert that contentless_delete actually took effect. A DELETE on an
+     * *empty* contentless table succeeds even without the option, so probe
+     * with a real row: insert one at the top of the rowid range, delete it. */
+    log_msg(LOG_INFO, "rebuild-docs: probing contentless_delete support ...");
+    rc = sqlite3_exec(db,
+                      "INSERT INTO torrent_docs(rowid, body) "
+                      "VALUES(9223372036854775807, 'rebuild-docs probe');"
+                      "DELETE FROM torrent_docs WHERE rowid = 9223372036854775807;",
+                      NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: contentless-delete probe failed: %s", err);
+        sqlite3_free(err);
+        log_msg(LOG_ERROR, "this SQLite build rejects contentless_delete; "
+                           "torrent_docs requires SQLite >= 3.43 with FTS5");
+        goto fail;
+    }
+
+    /* Total is only used for progress reporting. */
+    sqlite3_int64 total = 0;
+    sqlite3_stmt *count_stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM torrents", -1, &count_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to count torrents: %s", sqlite3_errmsg(db));
+        goto fail;
+    }
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int64(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
+    count_stmt = NULL;
+    log_msg(LOG_INFO, "rebuild-docs: %lld torrents to index", (long long)total);
+
+    /* Chunk bounds: the highest id in the next 10000-id window after ?1. */
+    rc = sqlite3_prepare_v2(db,
+                            "SELECT MAX(id) FROM (SELECT id FROM torrents "
+                            "WHERE id > ?1 ORDER BY id LIMIT 10000)",
+                            -1, &hi_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to prepare chunk bound statement: %s",
+                sqlite3_errmsg(db));
+        goto fail;
+    }
+
+    /* Idempotent re-run: drop whatever the previous run (or the live ingest
+     * path) left in this rowid range before re-inserting it. */
+    rc = sqlite3_prepare_v2(db,
+                            "DELETE FROM torrent_docs WHERE rowid > ?1 AND rowid <= ?2;",
+                            -1, &del_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to prepare chunk delete statement: %s",
+                sqlite3_errmsg(db));
+        goto fail;
+    }
+
+    /* Same body the flush path builds: torrent name plus its leaf filenames. */
+    rc = sqlite3_prepare_v2(db,
+                            "INSERT INTO torrent_docs(rowid, body) "
+                            "SELECT t.id, t.name || ' ' || COALESCE((SELECT "
+                            "group_concat(f.filename, ' ') FROM torrent_files f "
+                            "WHERE f.torrent_id = t.id), '') "
+                            "FROM torrents t WHERE t.id > ?1 AND t.id <= ?2 "
+                            "ORDER BY t.id;",
+                            -1, &ins_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-docs: failed to prepare chunk insert statement: %s",
+                sqlite3_errmsg(db));
+        goto fail;
+    }
+
+    sqlite3_int64 last_id = 0;
+    sqlite3_int64 done = 0;
+    int chunks = 0;
+
+    for (;;) {
+        sqlite3_reset(hi_stmt);
+        sqlite3_bind_int64(hi_stmt, 1, last_id);
+        if (sqlite3_step(hi_stmt) != SQLITE_ROW || sqlite3_column_type(hi_stmt, 0) == SQLITE_NULL) {
+            sqlite3_reset(hi_stmt);
+            break;
+        }
+        sqlite3_int64 chunk_lo = last_id;
+        sqlite3_int64 chunk_hi = sqlite3_column_int64(hi_stmt, 0);
+        sqlite3_reset(hi_stmt);
+
+        rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, &err);
+        if (rc != SQLITE_OK) {
+            log_msg(LOG_ERROR, "rebuild-docs: BEGIN failed: %s", err);
+            sqlite3_free(err);
+            goto fail;
+        }
+
+        sqlite3_reset(del_stmt);
+        sqlite3_bind_int64(del_stmt, 1, chunk_lo);
+        sqlite3_bind_int64(del_stmt, 2, chunk_hi);
+        int chunk_rc = sqlite3_step(del_stmt);
+        sqlite3_reset(del_stmt);
+        if (chunk_rc == SQLITE_DONE) {
+            sqlite3_reset(ins_stmt);
+            sqlite3_bind_int64(ins_stmt, 1, chunk_lo);
+            sqlite3_bind_int64(ins_stmt, 2, chunk_hi);
+            chunk_rc = sqlite3_step(ins_stmt);
+            sqlite3_reset(ins_stmt);
+        }
+
+        if (chunk_rc != SQLITE_DONE) {
+            log_msg(LOG_ERROR,
+                    "rebuild-docs: torrent_docs chunk (%lld, %lld] failed: %s",
+                    (long long)chunk_lo, (long long)chunk_hi, sqlite3_errmsg(db));
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            goto fail;
+        }
+
+        done += (sqlite3_int64)sqlite3_changes(db);
+
+        rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, &err);
+        if (rc != SQLITE_OK) {
+            log_msg(LOG_ERROR, "rebuild-docs: COMMIT of chunk (%lld, %lld] failed: %s",
+                    (long long)chunk_lo, (long long)chunk_hi, err);
+            sqlite3_free(err);
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            goto fail;
+        }
+
+        last_id = chunk_hi;
+        chunks++;
+        if (chunks % 50 == 0) {
+            log_msg(LOG_INFO, "torrent_docs: %lld / %lld rows",
+                    (long long)done, (long long)total);
+        }
+    }
+
+    /* The caller may copy or push this file, so fold the WAL back in. */
+    {
+        int nLog = 0, nCkpt = 0;
+        int ckpt_rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE,
+                                                &nLog, &nCkpt);
+        if (ckpt_rc != SQLITE_OK) {
+            log_msg(LOG_ERROR, "rebuild-docs: WAL checkpoint failed: %d: %s (%d of %d frames)",
+                    ckpt_rc, sqlite3_errstr(ckpt_rc), nCkpt, nLog);
+            goto fail;
+        }
+        log_msg(LOG_INFO, "rebuild-docs: WAL checkpointed (%d of %d frames)", nCkpt, nLog);
+    }
+
+    sqlite3_finalize(hi_stmt);
+    sqlite3_finalize(del_stmt);
+    sqlite3_finalize(ins_stmt);
+    sqlite3_close(db);
+
+    log_msg(LOG_INFO, "--rebuild-docs: complete (%lld rows)", (long long)done);
+    return 0;
+
+fail:
+    sqlite3_finalize(hi_stmt);
+    sqlite3_finalize(del_stmt);
+    sqlite3_finalize(ins_stmt);
+    sqlite3_close(db);
+    return -1;
+}
+
 /* Check if torrent exists */
 int database_check_exists(database_t *db, const uint8_t *info_hash) {
     if (!db || !info_hash) {
