@@ -289,6 +289,12 @@ int main(int argc, char *argv[]) {
      * "data/torrents.db", preserving the previous default behaviour. */
     g_app_ctx.db_path = config.db_path;
     log_msg(LOG_DEBUG, "Using database path: %s", g_app_ctx.db_path);
+    /* Search index selection (v1 = trigram file_search, v2 = torrent_docs).
+     * Default is v2; the effective mode is logged at INFO so it is verifiable
+     * from the on-device log without re-reading config.ini. */
+    g_app_ctx.search_index_docs = config.search_index_docs;
+    log_msg(LOG_INFO, "search index: %s",
+            config.search_index_docs ? "v2 (torrent_docs)" : "v1 (trigram)");
     /* Configure the process-wide UDP send rate limiter before any thread
      * that sends DHT UDP packets (trees, refresh thread) is spawned. */
     udp_rate_limit_init((uint32_t)config.udp_rate_limit_pps);
