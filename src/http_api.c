@@ -2478,8 +2478,12 @@ static int search_torrents_filtered(database_t *db, const char *query, const cls
             double t_file = now_ms();
             char **patterns = build_short_pattern_block(&pq);
             sqlite3_stmt *file_stmt = NULL;
-            rc = patterns ? sqlite3_prepare_v2(conn, file_sql, -1, &file_stmt, NULL)
-                          : SQLITE_NOMEM;
+            /* A NULL block only means the build failed when there are short
+             * terms to constrain: with none, the file half binds just ?1 and
+             * needs no patterns at all. */
+            rc = (patterns || pq.num_short_glob == 0)
+                     ? sqlite3_prepare_v2(conn, file_sql, -1, &file_stmt, NULL)
+                     : SQLITE_NOMEM;
             if (rc != SQLITE_OK) {
                 log_msg(LOG_ERROR, "Failed to prepare file match set query: %s",
                         sqlite3_errmsg(conn));
