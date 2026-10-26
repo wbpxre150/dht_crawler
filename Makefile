@@ -103,20 +103,38 @@ tsan:
 valgrind: debug
 	valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
 
-# Host unit tests for torrent_search (standalone: no dependency on all/$(TARGET),
-# no patch targets, no libbloom). Run from the repo root so the test binary finds
+# Host unit tests (standalone: no dependency on all/$(TARGET) and no patch
+# targets). Run from the repo root so the test binary finds
 # torrent_search_keywords.txt relative to cwd.
+#
+# tests-search needs nothing but libc; tests-docs links src/database.c, which
+# references bloom_filter_add() from src/bloom_filter.c (itself a wrapper over
+# libbloom), so the test also compiles that module and links the libbloom
+# archive plus SQLite and libuv (database_t holds a uv_mutex_t). The bloom is
+# never set on the database handle, so nothing is ever added to it.
 TEST_SRCS = tests/test_torrent_search.c src/torrent_search.c tests/stub_log.c
 TEST_BIN = $(BUILD_DIR)/test_torrent_search
 TEST_CFLAGS =
 TEST_LDFLAGS =
 
-tests:
+DOCS_TEST_SRCS = tests/test_torrent_docs.c src/database.c src/bloom_filter.c \
+                 tests/stub_log.c
+DOCS_TEST_BIN = $(BUILD_DIR)/test_torrent_docs
+DOCS_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+
+tests: tests-search tests-docs
+
+tests-search:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(TEST_SRCS) -o $(TEST_BIN) $(TEST_LDFLAGS)
 	./$(TEST_BIN)
 
+tests-docs: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(DOCS_TEST_SRCS) -o $(DOCS_TEST_BIN) $(TEST_LDFLAGS) $(DOCS_TEST_LDFLAGS)
+	./$(DOCS_TEST_BIN)
+
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
-.PHONY: run debug asan tsan valgrind tests tests-asan
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-asan
