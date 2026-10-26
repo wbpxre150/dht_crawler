@@ -66,6 +66,7 @@ typedef struct {
     sqlite3 *db;
     sqlite3_stmt *insert_torrent_stmt;
     sqlite3_stmt *insert_class_stmt;  /* Stage 5: torrent_class row */
+    sqlite3_stmt *insert_doc_stmt;    /* Schema v2: torrent_docs row (rowid = torrents.id) */
     sqlite3_stmt *insert_file_stmt;
     sqlite3_stmt *insert_prefix_stmt;
     sqlite3_stmt *lookup_prefix_stmt;

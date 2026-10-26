@@ -487,6 +487,18 @@ int database_create_schema(database_t *db) {
         return -1;
     }
 
+    /* Schema v2: one document per torrent for the torrent-level word index.
+     * body = torrents.name plus every leaf filename of that torrent, built in
+     * database_insert_torrent_unsafe() from the in-memory batch item. */
+    const char *insert_doc_sql =
+        "INSERT INTO torrent_docs(rowid, body) VALUES (?, ?)";
+
+    rc = sqlite3_prepare_v2(db->db, insert_doc_sql, -1, &db->insert_doc_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Failed to prepare insert doc statement: %s", sqlite3_errmsg(db->db));
+        return -1;
+    }
+
     return 0;
 }
 
@@ -616,6 +628,35 @@ static int64_t get_or_create_prefix(database_t *db, const char *prefix) {
     return prefix_id;
 }
 
+/* Append `text` to a growable NUL-terminated buffer, doubling the capacity as
+ * needed (capacity is the allocated size in bytes, len the current length).
+ * Returns 0 on success, -1 when realloc fails; on failure the buffer is left
+ * valid and unchanged. Used to build the torrent_docs body in memory. */
+static int doc_body_append(char **buf, size_t *len, size_t *cap, const char *text) {
+    if (!text) {
+        return 0;
+    }
+
+    size_t add = strlen(text);
+    if (*len + add + 1 > *cap) {
+        size_t want = (*cap > 0) ? *cap : 64;
+        while (want < *len + add + 1) {
+            want *= 2;
+        }
+        char *grown = realloc(*buf, want);
+        if (!grown) {
+            return -1;
+        }
+        *buf = grown;
+        *cap = want;
+    }
+
+    memcpy(*buf + *len, text, add);
+    *len += add;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
 /* Internal function: Insert torrent without mutex (transaction-safe)
  * MUST be called within a transaction or with external mutex held */
 static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata_t *torrent,
@@ -647,6 +688,21 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
     }
 
     int64_t torrent_id = sqlite3_last_insert_rowid(db->db);
+
+    /* Schema v2: build this torrent's torrent_docs body — its name plus the leaf
+     * filename of every file row that is actually inserted below — from the
+     * in-memory batch item. The database is never re-read for it. */
+    size_t doc_len = 0;
+    size_t doc_cap = 0;
+    char *doc_body = NULL;
+    int doc_body_ok = 1;
+    if (doc_body_append(&doc_body, &doc_len, &doc_cap,
+                        torrent->name ? torrent->name : "") != 0) {
+        log_msg(LOG_ERROR, "Failed to build torrent_docs body for torrent_id %lld: out of memory",
+                (long long)torrent_id);
+        return -1;
+    }
+
     /* Stage 5: the classification row rides in the caller's transaction (one
      * BEGIN...COMMIT per batch flush), so it is never a second transaction.
      * A failure here is logged but does not fail the torrent insert: the
@@ -725,11 +781,66 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
                    prefix ? prefix : "(null)",
                    filename ? filename : "(null)",
                    (long long)torrent_id, sqlite3_errmsg(db->db));
+        } else if (doc_body_ok &&
+                   (doc_body_append(&doc_body, &doc_len, &doc_cap, " ") != 0 ||
+                    doc_body_append(&doc_body, &doc_len, &doc_cap, filename) != 0)) {
+            /* Only files whose row really made it into torrent_files belong in
+             * the document, so this sits on the success path. Keep inserting
+             * the remaining files (the torrent row is already written) and fail
+             * the item at the end, exactly like a failed doc insert. */
+            log_msg(LOG_ERROR, "Failed to build torrent_docs body for torrent_id %lld: out of memory",
+                    (long long)torrent_id);
+            doc_body_ok = 0;
         }
 
         free(prefix);
         free(filename);
     }
+
+    if (!doc_body_ok) {
+        free(doc_body);
+        return -1;
+    }
+
+    /* Schema v2: one torrent_docs row per torrent, written in the caller's
+     * transaction — the same BEGIN...COMMIT that writes the torrent and its
+     * files, so the index can never lag behind the rows it describes.
+     *
+     * There is deliberately NO insert trigger for torrent_docs: the body is a
+     * concatenation of the torrent name plus *all* of that torrent's filenames,
+     * which a per-row trigger cannot build (a trigger on torrents fires before
+     * the file rows exist, and a trigger on torrent_files would have to keep
+     * rewriting an ever-growing document). This explicit insert is therefore the
+     * only writer of the table. The delete trigger torrents_docs_ad from the
+     * schema is still required, because torrent rows are also deleted outside
+     * this flush path — the batched purges in category_filter_cleanup.c:244 and
+     * language_filter_cleanup.c:289/302.
+     *
+     * Orphan note: the torrents insert above is INSERT OR REPLACE and
+     * recursive_triggers is off, so re-ingesting an info_hash that already
+     * exists REPLACEs the row with a new rowid without firing torrents_docs_ad;
+     * the old rowid's document is then left behind. That is rare by construction
+     * (the bloom filter keeps already-ingested hashes out of new batches), it is
+     * exactly what torrent_search has always done, and a full --rebuild-docs
+     * re-run deletes the docs of every id range it processes, which cleans them.
+     *
+     * A failure here fails the whole item (log + -1): database_insert_batch()
+     * records it in success_flags[] and leaves it out of the post-commit bloom
+     * update, so the item is re-fetched later. No silent index skip. */
+    sqlite3_reset(db->insert_doc_stmt);
+    sqlite3_bind_int64(db->insert_doc_stmt, 1, torrent_id);
+    sqlite3_bind_text(db->insert_doc_stmt, 2, doc_body, -1, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(db->insert_doc_stmt);
+    sqlite3_reset(db->insert_doc_stmt);
+    if (rc != SQLITE_DONE) {
+        log_msg(LOG_ERROR, "Failed to insert torrent_docs for torrent_id %lld: %s",
+                (long long)torrent_id, sqlite3_errmsg(db->db));
+        free(doc_body);
+        return -1;
+    }
+
+    free(doc_body);
 
     return 0;
 }
@@ -864,6 +975,7 @@ int database_wal_checkpoint(database_t *db) {
     if (db->insert_file_stmt)    sqlite3_reset(db->insert_file_stmt);
     if (db->insert_prefix_stmt)  sqlite3_reset(db->insert_prefix_stmt);
     if (db->lookup_prefix_stmt)  sqlite3_reset(db->lookup_prefix_stmt);
+    if (db->insert_doc_stmt)     sqlite3_reset(db->insert_doc_stmt);
 
     /* Set busy timeout so TRUNCATE waits for any stragglers the rwlock
      * didn't cover (e.g. database_rebuild_bloom's separate connection). */
@@ -1316,6 +1428,7 @@ void database_cleanup(database_t *db) {
         if (db->insert_file_stmt)    sqlite3_reset(db->insert_file_stmt);
         if (db->insert_prefix_stmt)  sqlite3_reset(db->insert_prefix_stmt);
         if (db->lookup_prefix_stmt)  sqlite3_reset(db->lookup_prefix_stmt);
+        if (db->insert_doc_stmt)     sqlite3_reset(db->insert_doc_stmt);
 
         sqlite3_busy_timeout(db->db, 30000);
         int nLog = 0, nCkpt = 0;
