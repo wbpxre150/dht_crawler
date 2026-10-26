@@ -89,7 +89,7 @@ static int random_handler(struct mg_connection *conn, void *cbdata);
 static void format_hex(const uint8_t *data, size_t len, char *out);
 static void format_size(int64_t bytes, char *out, size_t out_len);
 static char* url_decode(const char *str);
-static int search_torrents_filtered(database_t *db, int use_docs_index, const char *query,
+static int search_torrents_filtered(database_t *db, const char *query,
                                     const cls_filter_t *filter, int offset,
                                     search_result_t **results, int *count, int *total_count);
 static int browse_handler(struct mg_connection *conn, void *cbdata);
@@ -1179,7 +1179,7 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
     search_result_t *results = NULL;
     int count = 0;
     int total_count = 0;
-    int rc = search_torrents_filtered(api->database, api->app_ctx->search_index_docs, query,
+    int rc = search_torrents_filtered(api->database, query,
                                       class_filter.present ? &class_filter : NULL,
                                       offset, &results, &count, &total_count);
     free(query);
@@ -1202,34 +1202,12 @@ static int search_handler(struct mg_connection *conn, void *cbdata) {
 
 /* --- Quoted search query parsing --- */
 
-#define MAX_QUERY_PARTS 16
-
 typedef struct {
-    char *quoted[MAX_QUERY_PARTS];
-    int num_quoted;
-    char *unquoted[MAX_QUERY_PARTS];
-    int num_unquoted;
     char *torrent_fts_query;  /* full query with quotes (porter handles natively) */
-    char *file_fts_query;     /* unquoted terms only (for trigram MATCH) */
-    /* Stage 5: the unquoted branch's file side, split by whether the trigram
-     * tokenizer can index the term (see split_file_terms). file_fts_long holds
-     * the 3+-byte terms joined for the trigram MATCH; short_glob holds the
-     * lowercased sub-trigram terms that are refined by word-boundary GLOB
-     * instead of being silently dropped by FTS5. */
-    char *file_fts_long;
-    int num_file_long;
-    char **short_glob;
-    int num_short_glob;
 } parsed_query_t;
 
 static void free_parsed_query(parsed_query_t *pq) {
-    for (int i = 0; i < pq->num_quoted; i++) free(pq->quoted[i]);
-    for (int i = 0; i < pq->num_unquoted; i++) free(pq->unquoted[i]);
-    for (int i = 0; i < pq->num_short_glob; i++) free(pq->short_glob[i]);
-    free(pq->short_glob);
-    free(pq->file_fts_long);
     free(pq->torrent_fts_query);
-    free(pq->file_fts_query);
     memset(pq, 0, sizeof(*pq));
 }
 
@@ -1239,9 +1217,9 @@ static void free_parsed_query(parsed_query_t *pq) {
  * query such as `Spider-Man Into The Spider Verse 2018` is parsed as
  * `Spider - Man ...` and the MATCH expression fails with "no such column:
  * Man". The handler swallows the statement error and reports zero results.
- * The index side has no such trouble: both the porter and the trigram
- * tokenizer already treat '-' as a separator inside torrent names, so
- * `spider man into ...` matches exactly the rows the hyphenated query should.
+ * The index side has no such trouble: the porter tokenizer already treats '-'
+ * as a separator inside torrent names, so `spider man into ...` matches exactly
+ * the rows the hyphenated query should.
  * Normalizing unquoted '-' to a space therefore aligns the query tokens with
  * the tokens that were actually indexed.
  *
@@ -1272,159 +1250,13 @@ static char *build_torrent_fts_query(const char *raw) {
     return out;
 }
 
-/* Stage 5: split the file side of the query into terms the trigram index can
- * serve and terms it cannot.
- *
- * file_search is an FTS5 trigram index, and a token shorter than 3 bytes yields
- * no trigram at all: FTS5 drops such a token from the MATCH expression without
- * an error. `best of ac dc` therefore constrained the file side exactly like
- * `best` (measured: the same 331,190-row set), so the file half of the match set
- * was dominated by torrents whose filenames contain neither `ac` nor `dc`.
- * The 3+-byte terms stay in the trigram MATCH string (?2); every short term is
- * refined with the same word-boundary GLOB tests the quoted path applies
- * instead of vanishing, so a term is never silently dropped. (Stage 8 puts an
- * instr() prefilter and pre-built patterns in front of those tests, see
- * build_unquoted_file_subquery.)
- *
- * strlen() is the right test here: it counts bytes, which is the unit the
- * byte-level trigram tokenizer works in. A 2-character UTF-8 term is not a
- * 3-byte trigram, so this must not be "fixed" to a character count.
- *
- * The input is the normalized torrent FTS string, so whenever every term is 3+
- * bytes the long-term string is trigram-equivalent to what the file side bound
- * before this change: build_torrent_fts_query has already turned unquoted '-'
- * into a separator, and the byte-level trigram tokenizer splits on it either
- * way, so `spider-man` and `spider man` produce the same trigram postings even
- * though the bound string itself is not byte-identical (the space replaces the
- * hyphen).
- *
- * Returns 0, or -1 on allocation failure (the caller fails the request). */
-static int split_file_terms(parsed_query_t *pq) {
-    const char *src = pq->torrent_fts_query;
-    if (!src) return -1;
-
-    pq->file_fts_long = (char *)malloc(strlen(src) + 1);
-    if (!pq->file_fts_long) return -1;
-    size_t long_len = 0;
-
-    const char *p = src;
-    while (*p) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-
-        const char *start = p;
-        while (*p && *p != ' ') p++;
-        size_t len = (size_t)(p - start);
-
-        if (len >= 3) {
-            if (pq->num_file_long > 0) pq->file_fts_long[long_len++] = ' ';
-            memcpy(pq->file_fts_long + long_len, start, len);
-            long_len += len;
-            pq->num_file_long++;
-        } else {
-            char **grown = (char **)realloc(pq->short_glob,
-                                            sizeof(*pq->short_glob) *
-                                                (size_t)(pq->num_short_glob + 1));
-            if (!grown) return -1;
-            pq->short_glob = grown;
-
-            char *term = (char *)malloc(len + 1);
-            if (!term) return -1;
-            /* Lowercased exactly like the quoted path's quoted_lower: the GLOB
-             * patterns match LOWER(tf.filename) and GLOB is case-sensitive. */
-            for (size_t i = 0; i < len; i++) {
-                char c = start[i];
-                term[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-            }
-            term[len] = '\0';
-            pq->short_glob[pq->num_short_glob++] = term;
-        }
-    }
-    pq->file_fts_long[long_len] = '\0';
-    return 0;
-}
-
 static int parse_search_query(const char *raw, parsed_query_t *pq) {
     memset(pq, 0, sizeof(*pq));
 
     /* Build torrent FTS query: keep quotes (porter handles them natively) but
-     * normalize unquoted hyphens, see build_torrent_fts_query() */
+     * normalize unquoted hyphens, see build_torrent_fts_query(). */
     pq->torrent_fts_query = build_torrent_fts_query(raw);
-    if (!pq->torrent_fts_query) return -1;
-
-    /* Parse quoted and unquoted segments */
-    const char *p = raw;
-    char file_fts_buf[512] = {0};
-    int file_fts_len = 0;
-
-    while (*p) {
-        /* Skip whitespace */
-        while (*p && *p == ' ') p++;
-        if (!*p) break;
-
-        if (*p == '"') {
-            /* Quoted term */
-            p++; /* skip opening quote */
-            const char *start = p;
-            while (*p && *p != '"') p++;
-            int len = (int)(p - start);
-            if (*p == '"') p++; /* skip closing quote */
-
-            /* Skip empty quoted terms */
-            if (len == 0) continue;
-            if (pq->num_quoted >= MAX_QUERY_PARTS) continue;
-
-            pq->quoted[pq->num_quoted] = strndup(start, len);
-            pq->num_quoted++;
-        } else {
-            /* Unquoted term */
-            const char *start = p;
-            while (*p && *p != ' ' && *p != '"') p++;
-            int len = (int)(p - start);
-            if (len == 0) continue;
-            if (pq->num_unquoted >= MAX_QUERY_PARTS) continue;
-
-            pq->unquoted[pq->num_unquoted] = strndup(start, len);
-            pq->num_unquoted++;
-
-        }
-    }
-
-    /* Build file FTS query: ALL terms (quoted + unquoted) without quotes.
-     * Trigram tokenizer does substring matching, so including quoted terms here
-     * lets the FTS index pre-filter candidates before GLOB refines to word boundaries.
-     * This avoids a catastrophic full table scan when only quoted terms exist. */
-    for (int qi = 0; qi < pq->num_unquoted; qi++) {
-        if (file_fts_len > 0 && file_fts_len < (int)sizeof(file_fts_buf) - 1)
-            file_fts_buf[file_fts_len++] = ' ';
-        int len = (int)strlen(pq->unquoted[qi]);
-        int space = (int)sizeof(file_fts_buf) - file_fts_len - 1;
-        if (len < space) {
-            memcpy(file_fts_buf + file_fts_len, pq->unquoted[qi], len);
-            file_fts_len += len;
-        }
-    }
-    for (int qi = 0; qi < pq->num_quoted; qi++) {
-        if (file_fts_len > 0 && file_fts_len < (int)sizeof(file_fts_buf) - 1)
-            file_fts_buf[file_fts_len++] = ' ';
-        int len = (int)strlen(pq->quoted[qi]);
-        int space = (int)sizeof(file_fts_buf) - file_fts_len - 1;
-        if (len < space) {
-            memcpy(file_fts_buf + file_fts_len, pq->quoted[qi], len);
-            file_fts_len += len;
-        }
-    }
-    file_fts_buf[file_fts_len] = '\0';
-    pq->file_fts_query = strdup(file_fts_buf);
-
-    /* Stage 5: the unquoted branch's file side needs its terms partitioned by
-     * whether the trigram tokenizer can index them; see split_file_terms(). */
-    if (split_file_terms(pq) != 0) {
-        free_parsed_query(pq);
-        return -1;
-    }
-
-    return 0;
+    return pq->torrent_fts_query ? 0 : -1;
 }
 
 /* Bounded string append for the dynamically built SQL fragments. Unlike
@@ -1472,17 +1304,14 @@ static int docs_append_term(char *out, size_t out_len, size_t *pos, const char *
 }
 
 /* Build the FTS5 expression for the torrent-level unicode61 index
- * (torrent_docs, config key search_index = v2).
+ * (torrent_docs).
  *
- * One expression replaces the whole v1 match-set build: torrent_docs holds each
- * torrent's name plus all of its filenames in a single document, so one MATCH
- * over it yields the torrent rowids directly — no file_search trigram match, no
- * instr() prefilter, no GLOB confirmation, no short/long-term split.
+ * torrent_docs holds each torrent's name plus all of its filenames in a single
+ * document, so one MATCH over it yields the torrent rowids directly.
  *
- * The input is the RAW user query, not parsed_query_t: that parser splits on
- * spaces only, drops empty quoted terms and exposes a deliberately quote-free
- * file_fts_query (it feeds a trigram MATCH), while an FTS5 phrase here has to
- * keep its quotes. One pass, same quote rule as build_torrent_fts_query():
+ * The input is the RAW user query, not parsed_query_t: that parser normalizes
+ * the unquoted '-' for the porter index, while an FTS5 phrase here has to keep
+ * its quotes. One pass, same quote rule as build_torrent_fts_query():
  * a '"' toggles, there are no escapes.
  *
  *  - a '"' is copied through: it is what turns the term into an FTS5 phrase,
@@ -1491,9 +1320,9 @@ static int docs_append_term(char *out, size_t out_len, size_t *pos, const char *
  *    '"' — the toggle is the only way out, so the check order below is the
  *    guard that keeps it that way);
  *  - outside quotes '-' becomes a separator, exactly as
- *    build_torrent_fts_query() does: FTS5 reads a bare '-' as NOT, and both
- *    tokenizers already split on it, so `spider-man` must match the same rows
- *    as `spider man`;
+ *    build_torrent_fts_query() does: FTS5 reads a bare '-' as NOT, and the
+ *    porter tokenizer already splits on it, so `spider-man` must match the same
+ *    rows as `spider man`;
  *  - an unquoted token of pure [A-Za-z0-9] is emitted verbatim, anything else
  *    is wrapped in double quotes, so no FTS5 syntax character ever reaches the
  *    unicode61 parser unquoted (a bare '*' would be a prefix query, '(' a
@@ -1547,318 +1376,6 @@ static int build_docs_fts_query(const char *raw, char *out, size_t out_len) {
     }
 }
 
-/*
- * Build a word-boundary SQL condition for a quoted term against a column.
- * Appends to buf through sb_append, which bounds-checks the write. Uses GLOB
- * patterns with [^a-zA-Z0-9] for boundaries. bind_idx is the 1-based
- * sqlite3_bind parameter index for the lowercase term. Returns the number of
- * bind parameters consumed (always 4), or -1 when the condition does not fit.
- */
-static int append_word_boundary_condition(char *buf, size_t bufsize, size_t *pos,
-                                          const char *column, int bind_idx) {
-    int rc = sb_append(buf, bufsize, pos,
-        "(LOWER(%s) GLOB '*[^a-zA-Z0-9]' || ?%d || '[^a-zA-Z0-9]*'"
-        " OR LOWER(%s) GLOB ?%d || '[^a-zA-Z0-9]*'"
-        " OR LOWER(%s) GLOB '*[^a-zA-Z0-9]' || ?%d"
-        " OR LOWER(%s) = ?%d)",
-        column, bind_idx,
-        column, bind_idx + 1,
-        column, bind_idx + 2,
-        column, bind_idx + 3);
-    if (rc != 0) return -1;
-    return 4; /* number of bind params consumed */
-}
-
-/*
- * Build the file_search half of the quoted-term query: the trigram FTS
- * pre-filter (?2, all terms) followed by one word-boundary condition per quoted
- * term. The fragment grows by ~200 bytes per term and q can carry
- * MAX_QUERY_PARTS (16) of them, which overflows a fixed buffer, so every append
- * is bounds-checked: returns 0 when the whole fragment fitted, -1 when it did
- * not (out is then unusable and the caller has to fail the request instead of
- * running a truncated query).
- */
-static int build_quoted_file_subquery(const parsed_query_t *pq, char *out, size_t out_len) {
-    size_t pos = 0;
-    if (sb_append(out, out_len, &pos,
-                  "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-                  "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?2)") != 0) {
-        return -1;
-    }
-
-    for (int qi = 0; qi < pq->num_quoted; qi++) {
-        if (sb_append(out, out_len, &pos, " AND ") != 0) return -1;
-        if (append_word_boundary_condition(out, out_len, &pos, "tf.filename", 3 + qi * 4) != 4) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/* --- Stage 8: pre-built word-boundary patterns for sub-trigram terms -------
- *
- * The measured problem: the warm match-set build for q='best of ac dc' took
- * 14.06 s while producing 13 match rows, and the same query built in ~3 s on
- * the pre-stage-5 build over the identical 331,190-candidate scan. The delta
- * is this branch's per-candidate machinery: up to 12 LOWER(tf.filename)
- * evaluations, 12 SQL-side 'literal' || ? || 'literal' concatenations and 12
- * GLOB matches per candidate row, all to confirm word boundaries for the terms
- * the trigram index cannot serve.
- *
- * Stage 8 keeps the same four tests per term but (1) prefilters candidates with
- * a plain substring probe, so a row that does not even contain the term is
- * rejected by instr() before any GLOB runs, and (2) binds pre-built pattern
- * strings, so the survivors pay four binds instead of twelve concatenations.
- * ---------------------------------------------------------------------- */
-
-/* Patterns one sub-trigram term contributes, in bind order (see the tables
- * below). */
-#define SHORT_TERM_PATTERNS 4
-/* Bound parameters one sub-trigram term contributes: the instr() prefilter
- * needle plus its four patterns. */
-#define SHORT_TERM_BINDS (1 + SHORT_TERM_PATTERNS)
-
-/* Bind indices of one sub-trigram term's parameters in the file-half statement,
- * where ?1 is the trigram terms string. Both the SQL builder and the binder go
- * through these two, so the emitted placeholders and the binds cannot drift
- * apart (the stage-5 arithmetic was duplicated in both places). */
-static int short_instr_bind(int si) {
-    return 2 + si * SHORT_TERM_BINDS;
-}
-
-static int short_pattern_bind(int si) {
-    return 3 + si * SHORT_TERM_BINDS;
-}
-
-/* "boundary before and after", "boundary after", "boundary before", and the
- * bare term (bound to the '=' test). Concatenated around the term these are
- * byte-identical to what the previous SQL-side '||' expression produced,
- * including for a term that itself carries GLOB metacharacters: the term is
- * pasted into the pattern, never escaped, which is the pre-existing accepted
- * behaviour (review P2 #4). */
-static const char *const SHORT_PATTERN_PREFIX[SHORT_TERM_PATTERNS] = {
-    "*[^a-zA-Z0-9]", "", "*[^a-zA-Z0-9]", ""
-};
-static const char *const SHORT_PATTERN_SUFFIX[SHORT_TERM_PATTERNS] = {
-    "[^a-zA-Z0-9]*", "[^a-zA-Z0-9]*", "", ""
-};
-
-/* The needle the instr() prefilter binds for one sub-trigram term.
- *
- * For a term without GLOB metacharacters the literal bytes are a necessary
- * condition of the term's word-boundary group: every pattern in that group can
- * only match where the term occurs verbatim (a word-bounded occurrence is a
- * substring occurrence), so a row that fails instr() would fail the group too
- * and the prefilter can only remove work, never rows.
- *
- * A term that does carry metacharacters ('*', '?', '[') breaks that argument:
- * those bytes act as wildcards inside the pattern, so the literal term is not
- * implied by a match. Such a term binds an empty needle instead — instr(X, '')
- * is 1 for every non-NULL X ("if Y is an empty string then instr() returns
- * 1"), i.e. a tautology that leaves the GLOB group as the only decider, exactly
- * as before stage 8. (A NULL filename yields NULL either way, which the WHERE
- * clause rejects, so that case is unchanged as well.) */
-static const char *short_term_instr_needle(const char *term) {
-    if (strpbrk(term, "*?[") != NULL) return "";
-    return term;
-}
-
-/* One pattern string. The buffer is sized from its three pieces and written
- * through sb_append, so nothing can be truncated; NULL on allocation failure. */
-static char *short_pattern_build(const char *prefix, const char *term, const char *suffix) {
-    size_t need = strlen(prefix) + strlen(term) + strlen(suffix) + 1;
-    char *pattern = (char *)malloc(need);
-    if (!pattern) return NULL;
-
-    size_t pos = 0;
-    if (sb_append(pattern, need, &pos, "%s%s%s", prefix, term, suffix) != 0) {
-        free(pattern);
-        return NULL;
-    }
-    return pattern;
-}
-
-/* Free a block from build_short_pattern_block(): num_short_glob terms times
- * SHORT_TERM_PATTERNS strings. Tolerates NULL. */
-static void free_short_pattern_block(char **block, int num_short_glob) {
-    if (!block) return;
-    for (int i = 0; i < num_short_glob * SHORT_TERM_PATTERNS; i++) free(block[i]);
-    free(block);
-}
-
-/* Build every pattern the file half binds: one block of
- * num_short_glob * SHORT_TERM_PATTERNS strings, term si's patterns at
- * [si * SHORT_TERM_PATTERNS]. Built once per rebuild instead of concatenated
- * per candidate row. NULL on allocation failure (or when there is nothing to
- * build); the caller fails the request rather than running a partial set. */
-static char **build_short_pattern_block(const parsed_query_t *pq) {
-    if (pq->num_short_glob <= 0) return NULL;
-
-    size_t count = (size_t)pq->num_short_glob * SHORT_TERM_PATTERNS;
-    char **block = (char **)calloc(count, sizeof(*block));
-    if (!block) return NULL;
-
-    for (int si = 0; si < pq->num_short_glob; si++) {
-        for (int pi = 0; pi < SHORT_TERM_PATTERNS; pi++) {
-            char *pattern = short_pattern_build(SHORT_PATTERN_PREFIX[pi], pq->short_glob[si],
-                                                SHORT_PATTERN_SUFFIX[pi]);
-            if (!pattern) {
-                free_short_pattern_block(block, pq->num_short_glob);
-                return NULL;
-            }
-            block[si * SHORT_TERM_PATTERNS + pi] = pattern;
-        }
-    }
-    return block;
-}
-
-/*
- * Build the word-boundary SQL condition for a sub-trigram term against a
- * column, on pre-built patterns. The four tests are the ones
- * append_word_boundary_condition() emits for a quoted term, but each GLOB takes
- * one bound pattern instead of an SQL-side '||' concatenation (the '=' test
- * still binds the bare term). bind_idx is the 1-based index of the term's first
- * pattern; index+3 is the bare term. Returns the number of bind parameters
- * consumed (always 4), or -1 when the condition does not fit.
- */
-static int append_prebuilt_pattern_condition(char *buf, size_t bufsize, size_t *pos,
-                                             const char *column, int bind_idx) {
-    int rc = sb_append(buf, bufsize, pos,
-        "(LOWER(%s) GLOB ?%d"
-        " OR LOWER(%s) GLOB ?%d"
-        " OR LOWER(%s) GLOB ?%d"
-        " OR LOWER(%s) = ?%d)",
-        column, bind_idx,
-        column, bind_idx + 1,
-        column, bind_idx + 2,
-        column, bind_idx + 3);
-    if (rc != 0) return -1;
-    return 4; /* number of bind params consumed */
-}
-
-/*
- * Build the file_search half of the unquoted-term query as a standalone
- * statement body: the trigram FTS pre-filter (?1, the 3+-byte terms only), the
- * instr() prefilter of every sub-trigram term, then one word-boundary GLOB
- * condition per sub-trigram term.
- *
- * Bind layout: ?1 = the trigram terms, then five binds per sub-trigram term in
- * emission order — the instr needle followed by the four patterns (see
- * bind_unquoted_file_half, which must stay in step with this function).
- *
- * The instr predicates are hoisted ahead of every GLOB group. That is a pure
- * AND reorder, so the intersection is unchanged, but it lets a candidate that
- * lacks one of the terms exit after a couple of memmem-style probes instead of
- * paying four GLOB matches per term; only substring-passing candidates reach
- * the word-boundary confirmation.
- *
- * Bounds-checked for the same reason as the quoted variant: the fragment grows
- * by ~200 bytes per term, so every append can fail and the caller must then not
- * run a truncated fragment.
- */
-static int build_unquoted_file_subquery(const parsed_query_t *pq, char *out, size_t out_len) {
-    size_t pos = 0;
-    if (sb_append(out, out_len, &pos,
-                  "SELECT DISTINCT tf.torrent_id FROM torrent_files tf "
-                  "WHERE tf.id IN (SELECT rowid FROM file_search WHERE filename MATCH ?1)") != 0) {
-        return -1;
-    }
-
-    for (int si = 0; si < pq->num_short_glob; si++) {
-        if (sb_append(out, out_len, &pos, " AND instr(LOWER(tf.filename), ?%d) > 0",
-                      short_instr_bind(si)) != 0) {
-            return -1;
-        }
-    }
-
-    for (int si = 0; si < pq->num_short_glob; si++) {
-        if (sb_append(out, out_len, &pos, " AND ") != 0) return -1;
-        if (append_prebuilt_pattern_condition(out, out_len, &pos, "tf.filename",
-                                              short_pattern_bind(si)) != SHORT_TERM_PATTERNS) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/*
- * Bind the file-half statement built by build_unquoted_file_subquery().
- *
- * ?1 is the trigram-servable terms string; every sub-trigram term then owns
- * SHORT_TERM_BINDS consecutive parameters, starting at ?2 for the first term:
- * the instr() needle, then the four patterns from the block. The bound text
- * outlives the statement (SQLITE_STATIC), so both the parsed query and the
- * pattern block must still be alive when this statement is finalized.
- */
-static void bind_unquoted_file_half(sqlite3_stmt *stmt, const parsed_query_t *pq,
-                                    char *const *patterns) {
-    sqlite3_bind_text(stmt, 1, pq->file_fts_long, -1, SQLITE_STATIC);
-    for (int si = 0; si < pq->num_short_glob; si++) {
-        int bi = short_instr_bind(si);
-        sqlite3_bind_text(stmt, bi, short_term_instr_needle(pq->short_glob[si]), -1,
-                          SQLITE_STATIC);
-        for (int pi = 0; pi < SHORT_TERM_PATTERNS; pi++) {
-            sqlite3_bind_text(stmt, bi + 1 + pi, patterns[si * SHORT_TERM_PATTERNS + pi], -1,
-                              SQLITE_STATIC);
-        }
-    }
-}
-
-/*
- * Build the match set for a query without quoted terms as *two* statements
- * (stage 8): the name half into name_out and, when it can be built, the file
- * half into file_out. Splitting them lets the timing line attribute the cost,
- * and the resulting set is the one the single UNION statement produced — the
- * name half is unique rowids, the file half keeps its SELECT DISTINCT, and
- * OR IGNORE dedupes across the halves exactly as UNION did.
- *
- * Bind layout of the two statements, both numbered from ?1: the name half binds
- * only ?1 = the torrent (porter) FTS query; the file half's layout is documented
- * on build_unquoted_file_subquery(). No user input ever reaches the SQL text.
- *
- * The file half is left out in two cases, both of which only *narrow* the
- * result set and are logged by the caller:
- *   - no term is 3 bytes or longer (q=hd, q=3d, q=4k): the trigram index cannot
- *     serve the query at all, and a word-boundary GLOB scan over the whole
- *     torrent_files table (285M rows) is far worse than the answers it adds;
- *   - the GLOB fragment for this many short terms does not fit *file_out*:
- *     dropping the file half beats running a fragment that silently matched
- *     something else.
- *
- * Returns 0 (also when the file half was skipped) and sets *file_side, or -1
- * when even the name-side-only statement did not fit.
- */
-static int build_unquoted_match_sql(const parsed_query_t *pq, const char *match_table,
-                                    char *name_out, size_t name_len,
-                                    char *file_out, size_t file_len, int *file_side) {
-    size_t pos = 0;
-    *file_side = 0;
-    file_out[0] = '\0';
-
-    if (sb_append(name_out, name_len, &pos,
-                  "INSERT OR IGNORE INTO %s "
-                  "SELECT rowid FROM torrent_search WHERE name MATCH ?1",
-                  match_table) != 0) {
-        return -1;
-    }
-    if (pq->num_file_long == 0) return 0;
-
-    pos = 0;
-    if (sb_append(file_out, file_len, &pos, "INSERT OR IGNORE INTO %s ", match_table) == 0 &&
-        build_unquoted_file_subquery(pq, file_out + pos, file_len - pos) == 0) {
-        *file_side = 1;
-        return 0;
-    }
-
-    /* Not fatal: keep the name half (see above). sb_append leaves the buffer
-     * NUL-terminated, so dropping the partial file statement is well defined. */
-    file_out[0] = '\0';
-    log_msg(LOG_WARN,
-            "file search: GLOB fragment for %d short term(s) does not fit the SQL buffer, "
-            "using name matches only",
-            pq->num_short_glob);
-    return 0;
-}
 
 /* --- Stage 4: per-thread /search match-set cache ---------------------------
  *
@@ -1966,26 +1483,22 @@ static search_match_cache_t *search_match_cache_get(void) {
 /* The cache key: every input that determines the entry. The match set itself
  * only depends on the query, but the cached total_count also depends on the
  * class filter (the count query carries its conditions), so the whole filter
- * rides along. The index version leads the key (1 = trigram file_search, 2 =
- * torrent_docs): a match set built from one index says nothing about the other,
- * so a v1 entry must never be served while search_index selects v2, nor the
- * reverse. Nothing is normalized or lowercased here — the key holds the
+ * rides along. Nothing is normalized or lowercased here — the key holds the
  * same strings the SQL binds, and a forgotten component would silently serve
  * another query's rows. */
-static char *search_match_cache_key_build(const char *query, const cls_filter_t *filter,
-                                          int has_quoted, int index_ver) {
+static char *search_match_cache_key_build(const char *query, const cls_filter_t *filter) {
     size_t need = strlen(query) + 128;
     char *key = (char *)malloc(need);
     if (!key) return NULL;
 
     if (filter) {
-        (void)snprintf(key, need, "%d|%d|f|%d|%d|%d|%d|%d|%d|%.17g|%s",
-                       index_ver, has_quoted, (int)filter->adult,
+        (void)snprintf(key, need, "f|%d|%d|%d|%d|%d|%d|%.17g|%s",
+                       (int)filter->adult,
                        filter->has_category, filter->category,
                        filter->has_tv_kind, filter->tv_kind,
                        filter->has_min_conf, filter->min_conf, query);
     } else {
-        (void)snprintf(key, need, "%d|%d|nofilter|%s", index_ver, has_quoted, query);
+        (void)snprintf(key, need, "nofilter|%s", query);
     }
     return key;
 }
@@ -2111,10 +1624,6 @@ static void shared_conn_search_unlock(int degraded) {
  *   conn       = database_read_db() (may open the per-thread connection)
  *   build      = match-set rebuild: CREATE/DELETE reset through the last
  *                INSERT finalize
- *   build_name = stage 8: the name-half INSERT of the match set (prepare, bind,
- *                step, finalize); on the quoted branch, whose file half still
- *                rides in the same statement, this is the whole build
- *   build_file = stage 8: the file-half INSERT (unquoted branch only)
  *   count      = the count query (prepare, bind, step, finalize)
  *   page       = the page query (prepare, bind, step loop, finalize) minus rows
  *   rows       = the per-row num_files count + fetch_result_files() work
@@ -2128,8 +1637,6 @@ static void shared_conn_search_unlock(int degraded) {
 typedef struct {
     double conn;        /* -1 = phase did not run */
     double build;
-    double build_name;  /* stage 8: name-half INSERT */
-    double build_file;  /* stage 8: file-half INSERT */
     double count;
     double page;
     double rows;
@@ -2163,13 +1670,11 @@ static const char *timing_count_str(char *buf, size_t len, int n) {
 /* One line per request, so `adb logcat -d | grep "search timing"` is enough. */
 static void search_timing_log(const char *query, const char *cache_state, int match_rows,
                               const search_timing_t *tm) {
-    char b_conn[24], b_build[24], b_build_name[24], b_build_file[24];
+    char b_conn[24], b_build[24];
     char b_count[24], b_page[24], b_rows[24], b_total[24];
     char b_match_rows[24];
     const char *conn = timing_ms_str(b_conn, sizeof(b_conn), tm->conn);
     const char *build = timing_ms_str(b_build, sizeof(b_build), tm->build);
-    const char *build_name = timing_ms_str(b_build_name, sizeof(b_build_name), tm->build_name);
-    const char *build_file = timing_ms_str(b_build_file, sizeof(b_build_file), tm->build_file);
     const char *count = timing_ms_str(b_count, sizeof(b_count), tm->count);
     const char *page = timing_ms_str(b_page, sizeof(b_page), tm->page);
     const char *rows = timing_ms_str(b_rows, sizeof(b_rows), tm->rows);
@@ -2177,17 +1682,15 @@ static void search_timing_log(const char *query, const char *cache_state, int ma
     const char *set_rows = timing_count_str(b_match_rows, sizeof(b_match_rows), match_rows);
 
     log_msg(LOG_DEBUG,
-            "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s build_name=%s "
-            "build_file=%s count=%s page=%s rows=%s total=%s",
-            query, cache_state, set_rows, conn, build, build_name, build_file, count, page, rows,
-            total);
+            "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s "
+            "count=%s page=%s rows=%s total=%s",
+            query, cache_state, set_rows, conn, build, count, page, rows, total);
     if (tm->total >= 1000.0) {
         /* Slow request: repeat at INFO so the device default level shows it. */
         log_msg(LOG_INFO,
-                "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s build_name=%s "
-                "build_file=%s count=%s page=%s rows=%s total=%s",
-                query, cache_state, set_rows, conn, build, build_name, build_file, count, page,
-                rows, total);
+                "search timing: q='%s' cache=%s match_rows=%s conn=%s build=%s "
+                "count=%s page=%s rows=%s total=%s",
+                query, cache_state, set_rows, conn, build, count, page, rows, total);
     }
 }
 
@@ -2195,17 +1698,13 @@ static void search_timing_log(const char *query, const char *cache_state, int ma
  * The optional stage-7 class filter rides along on the FTS rowid set: it only
  * adds the torrent_class join when it actually restricts rows, so a plain
  * search keeps its previous SQL and result set (see search_handler). */
-/* use_docs_index selects the match-set source (config key search_index): 1 =
- * the torrent-level unicode61 index torrent_docs (v2), 0 = the trigram
- * file_search path plus its GLOB confirmation (v1, kept compiled and reachable
- * until the follow-up cleanup stage deletes it). */
-static int search_torrents_filtered(database_t *db, int use_docs_index, const char *query,
+static int search_torrents_filtered(database_t *db, const char *query,
                                     const cls_filter_t *filter, int offset,
                                     search_result_t **results, int *count, int *total_count) {
     /* Stage 7 timing: entry stamp for `total`, and one slot per phase (-1 =
      * phase did not run). Declared here so every unlock exit can print it. */
     double t_entry = now_ms();
-    search_timing_t tm = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0};
+    search_timing_t tm = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0};
     /* Stage 7: rows the match-set rebuild stored; -1 when this request reused a
      * cached set (no rebuild ran). */
     int match_rows = -1;
@@ -2229,21 +1728,15 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
         return -1;
     }
 
-    /* Parse query for quoted terms */
+    /* Parse the query into the torrent FTS expression */
     parsed_query_t pq;
     if (parse_search_query(query, &pq) != 0) {
         return -1;
     }
 
-    /* Fast path: no quoted terms — use original simple queries */
-    int has_quoted = (pq.num_quoted > 0);
-
     /* --- Stage 4: match-set cache lookup (metadata only: no SQL, no lock) --- */
     search_match_cache_t *cache = search_match_cache_get();
-    /* The index version leads the key (see search_match_cache_key_build): a
-     * search_index flip must never serve the other index's match set. */
-    char *cache_key =
-        search_match_cache_key_build(query, filter, has_quoted, use_docs_index ? 2 : 1);
+    char *cache_key = search_match_cache_key_build(query, filter);
     /* Degraded mode: database_read_db() falls back to the process-wide handle
      * when it cannot open a per-thread connection. The TEMP tables are then
      * shared by every request thread, so a hit could serve another search's
@@ -2291,23 +1784,20 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
     shared_conn_search_lock(cache_degraded);
     database_read_lock(db);
 
-    /*
-     * Build dynamic SQL for file_search subquery.
-     * - No quoted terms: trigram FTS MATCH on the 3+-byte terms, an instr()
-     *   substring prefilter and GLOB word-boundary checks for the sub-trigram
-     *   ones (stage 5), built as two statements (stage 8).
-     * - Has quoted terms + unquoted terms: FTS MATCH on unquoted, plus GLOB word-boundary checks.
-     * - Only quoted terms: skip FTS, use GLOB word-boundary checks on torrent_files directly.
-     */
     char match_sql[4096];
-    char file_sql[4096];
     char count_sql[4096];
     char main_sql[4096];
 
-    /* Stage 5: set when the no-quoted branch kept the file_search half of the
-     * match set, i.e. when ?1 = the trigram terms and the sub-trigram binds
-     * exist in file_sql. */
-    int file_side = 0;
+    /* Bind indices of the three /search statements:
+     *   - match-set INSERT: ?1 = the unicode61 expression built by
+     *     build_docs_fts_query() from the raw query;
+     *   - count query: ?1... = the class filter, only when the class join is
+     *     active (bind_class_filter(..., 1, ...));
+     *   - page query: ?1 = the porter expression over torrent_search, used for
+     *     the name-matches-first ORDER BY ranking (a DIFFERENT string from the
+     *     match-set ?1), ?2 = LIMIT, ?3 = OFFSET, ?4... = the class filter.
+     * Only literal SQL is prepared here: the slot table name is a compile-time
+     * constant and every piece of user input stays a bound parameter. */
 
     /* Stage 7: the class join goes into the count query only when the filter
      * restricts rows, so a plain /search?q= keeps the legacy count query. The
@@ -2317,190 +1807,50 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
     char class_count_join[512];
     char class_main_join[512];
 
-    /* Lowercase versions of quoted terms for binding */
-    char *quoted_lower[MAX_QUERY_PARTS];
-    for (int qi = 0; qi < pq.num_quoted; qi++) {
-        quoted_lower[qi] = strdup(pq.quoted[qi]);
-        for (char *c = quoted_lower[qi]; *c; c++) {
-            if (*c >= 'A' && *c <= 'Z') *c += 32;
-        }
+    class_count_join[0] = '\0';
+    int cpos = 0;
+    if (class_join) {
+        cpos = snprintf(class_count_join, sizeof(class_count_join),
+                        " JOIN torrent_class c ON c.torrent_id = t.id");
+        append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 1);
     }
 
-    if (!has_quoted) {
-        /* No quoted terms — original queries, plus the stage-7 class join.
-         * Stage 8 bind indices, both statements numbered from ?1: the name-half
-         * INSERT owns only ?1 = torrent FTS; the file-half INSERT owns ?1 = the
-         * trigram-servable terms, then 5 binds per sub-trigram term (1 instr
-         * prefilter + 4 pre-built patterns, see bind_unquoted_file_half); the
-         * count query only carries the class filter (from ?1); the page query
-         * keeps ?1 for the ORDER BY ranking MATCH, then ?2/?3 = LIMIT/OFFSET and
-         * ?4... = class filter.
-         * search_index = v2 changes none of that: the docs match-set INSERT is a
-         * separate statement with its own ?1 = the unicode61 expression from
-         * build_docs_fts_query() — a DIFFERENT string from the page query's ?1,
-         * which keeps binding the porter expression against torrent_search for
-         * the ranking key. The count and page queries are untouched and gain no
-         * bind. */
-        if (build_unquoted_match_sql(&pq, match_table, match_sql, sizeof(match_sql),
-                                     file_sql, sizeof(file_sql), &file_side) != 0) {
-            log_msg(LOG_ERROR, "Unquoted search does not fit the SQL buffer");
-            SEARCH_TIMING_EMIT();
-            database_read_unlock(db);
-            shared_conn_search_unlock(cache_degraded);
-            free(cache_key);
-            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-            free_parsed_query(&pq);
-            return -1;
-        }
-        if (pq.num_short_glob > 0) {
-            /* These terms are shorter than a trigram, so the FTS5 trigram index
-             * drops them from MATCH. They constrain the file side through
-             * word-boundary GLOB instead of vanishing (stage 5). */
-            log_msg(LOG_DEBUG,
-                    "file search: %d short term(s) constrained by GLOB, %d long term(s) in trigram match",
-                    pq.num_short_glob, pq.num_file_long);
-            if (!file_side && pq.num_file_long == 0) {
-                log_msg(LOG_DEBUG,
-                        "file search: no trigram-servable term for query '%s', using name matches only",
-                        query);
-            }
-        }
-
-        class_count_join[0] = '\0';
-        int cpos = 0;
-        if (class_join) {
-            cpos = snprintf(class_count_join, sizeof(class_count_join),
-                            " JOIN torrent_class c ON c.torrent_id = t.id");
-            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 1);
-        }
-
-        cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
-                        class_join
-                            ? "JOIN torrent_class c ON c.torrent_id = t.id"
-                            : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
-        if (class_join) {
-            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 4);
-        }
-
-        /* Count from the materialized match set: same rows as before, but the
-         * FTS match is no longer evaluated a second time. The torrent_class
-         * join is on its torrent_id PK, so it cannot multiply rows and
-         * COUNT(*) equals the previous COUNT(DISTINCT t.id). */
-        (void)snprintf(count_sql, sizeof(count_sql),
-            "SELECT COUNT(*) "
-            "FROM torrents t%s "
-            "WHERE t.id IN (SELECT id FROM %s)", class_count_join, match_table);
-
-        /* No COUNT(f.id) in the SELECT list: aggregating the file count over
-         * the whole match set (~79.8k torrents x ~47 files ~= 3.75M index
-         * entries) was ~9 s of a 14.6 s query, only to print a per-row file
-         * count for the 50 rows on this page. The count is filled per returned
-         * row in the row loop instead (see page_files_count_sql below).
-         * GROUP BY t.id stays: the torrent_class join is on its torrent_id PK
-         * so it cannot multiply rows, and it keeps the page query's shape
-         * identical to the pre-stage-3 one. */
-        (void)snprintf(main_sql, sizeof(main_sql),
-            "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-            "       t.added_timestamp, "
-            "       c.category, c.tv_kind, c.adult, c.confidence "
-            "FROM torrents t "
-            "%s "
-            "WHERE t.id IN (SELECT id FROM %s) "
-            "GROUP BY t.id "
-            "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
-            "t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?2 OFFSET ?3", class_main_join, match_table);
-    } else {
-        /* Has quoted terms — build dynamic file_search subquery with word-boundary checks */
-
-        /* Torrent search part: porter tokenizer handles quotes natively */
-        /* File search part: word-boundary GLOB conditions for quoted terms */
-
-        /* Build file subquery portion. Every append is bounds-checked: the
-         * word-boundary fragment grows by ~200 bytes per quoted term and q can
-         * carry MAX_QUERY_PARTS (16) of them, so a query with 10+ quoted terms
-         * does not fit into this buffer any more. Failing the request is the
-         * graceful answer there — a truncated fragment would run a query that
-         * silently matched something else. */
-        char file_subquery[2048];
-        if (build_quoted_file_subquery(&pq, file_subquery, sizeof(file_subquery)) != 0) {
-            log_msg(LOG_ERROR, "Quoted search does not fit the SQL buffer (%d quoted terms)",
-                    pq.num_quoted);
-            SEARCH_TIMING_EMIT();
-            database_read_unlock(db);
-            shared_conn_search_unlock(cache_degraded);
-            free(cache_key);
-            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-            free_parsed_query(&pq);
-            return -1;
-        }
-
-        /* Bind indices: the INSERT owns ?1 = torrent FTS query, ?2 = file FTS
-         * query (all terms for the trigram pre-filter) and ?3... = quoted term
-         * GLOB binds (4 per quoted term). The trigram FTS MATCH narrows the
-         * candidates through its index (file_fts_query holds ALL terms, quoted
-         * and unquoted), then the GLOB conditions refine them to exact words.
-         * The count query then only carries the class filter (from ?1), and the
-         * page query keeps ?1 for the ORDER BY ranking MATCH followed by ?2/?3
-         * = LIMIT/OFFSET and ?4... = class filter. */
-        (void)snprintf(match_sql, sizeof(match_sql),
-            "INSERT OR IGNORE INTO %s "
-            "SELECT rowid FROM torrent_search WHERE name MATCH ?1"
-            " UNION "
-            "%s", match_table, file_subquery);
-
-        /* Stage 7: the class join rides on the match set, so the count query
-         * numbers its binds from ?1 and the main query from ?4. SQLite binds by
-         * explicit index, so placeholders that do not appear in textual order
-         * are fine. */
-        class_count_join[0] = '\0';
-        int cpos = 0;
-        if (class_join) {
-            cpos = snprintf(class_count_join, sizeof(class_count_join),
-                            " JOIN torrent_class c ON c.torrent_id = t.id");
-            append_class_conditions(class_count_join, sizeof(class_count_join), &cpos, filter, 1);
-        }
-
-        cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
-                        class_join
-                            ? "JOIN torrent_class c ON c.torrent_id = t.id"
-                            : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
-        if (class_join) {
-            append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 4);
-        }
-
-        (void)snprintf(count_sql, sizeof(count_sql),
-            "SELECT COUNT(*) "
-            "FROM torrents t%s "
-            "WHERE t.id IN (SELECT id FROM %s)", class_count_join, match_table);
-
-        /* Same shape as the no-quoted branch: no COUNT(f.id) aggregate, the
-         * per-row file count is filled in the row loop, and the page query
-         * reads the same materialized match set the count query used. */
-        (void)snprintf(main_sql, sizeof(main_sql),
-            "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
-            "       t.added_timestamp, "
-            "       c.category, c.tv_kind, c.adult, c.confidence "
-            "FROM torrents t "
-            "%s "
-            "WHERE t.id IN (SELECT id FROM %s) "
-            "GROUP BY t.id "
-            "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
-            "t.total_peers DESC, t.added_timestamp DESC "
-            "LIMIT ?2 OFFSET ?3", class_main_join, match_table);
+    cpos = snprintf(class_main_join, sizeof(class_main_join), "%s",
+                    class_join
+                        ? "JOIN torrent_class c ON c.torrent_id = t.id"
+                        : "LEFT JOIN torrent_class c ON c.torrent_id = t.id");
+    if (class_join) {
+        append_class_conditions(class_main_join, sizeof(class_main_join), &cpos, filter, 4);
     }
 
-    /* Helper macro: bind quoted term GLOB params starting at start_idx */
-    #define BIND_QUOTED_GLOB_PARAMS(stmt, start_idx, pq, quoted_lower) do { \
-        int _bi = (start_idx); \
-        for (int _qi = 0; _qi < (pq).num_quoted; _qi++) { \
-            sqlite3_bind_text((stmt), _bi,     quoted_lower[_qi], -1, SQLITE_STATIC); \
-            sqlite3_bind_text((stmt), _bi + 1, quoted_lower[_qi], -1, SQLITE_STATIC); \
-            sqlite3_bind_text((stmt), _bi + 2, quoted_lower[_qi], -1, SQLITE_STATIC); \
-            sqlite3_bind_text((stmt), _bi + 3, quoted_lower[_qi], -1, SQLITE_STATIC); \
-            _bi += 4; \
-        } \
-    } while(0)
+    /* Count from the materialized match set: same rows as before, but the
+     * FTS match is no longer evaluated a second time. The torrent_class
+     * join is on its torrent_id PK, so it cannot multiply rows and
+     * COUNT(*) equals the previous COUNT(DISTINCT t.id). */
+    (void)snprintf(count_sql, sizeof(count_sql),
+        "SELECT COUNT(*) "
+        "FROM torrents t%s "
+        "WHERE t.id IN (SELECT id FROM %s)", class_count_join, match_table);
+
+    /* No COUNT(f.id) in the SELECT list: aggregating the file count over
+     * the whole match set (~79.8k torrents x ~47 files ~= 3.75M index
+     * entries) was ~9 s of a 14.6 s query, only to print a per-row file
+     * count for the 50 rows on this page. The count is filled per returned
+     * row in the row loop instead (see page_files_count_sql below).
+     * GROUP BY t.id stays: the torrent_class join is on its torrent_id PK
+     * so it cannot multiply rows, and it keeps the page query's shape
+     * identical to the pre-stage-3 one. */
+    (void)snprintf(main_sql, sizeof(main_sql),
+        "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
+        "       t.added_timestamp, "
+        "       c.category, c.tv_kind, c.adult, c.confidence "
+        "FROM torrents t "
+        "%s "
+        "WHERE t.id IN (SELECT id FROM %s) "
+        "GROUP BY t.id "
+        "ORDER BY (t.id IN (SELECT rowid FROM torrent_search WHERE name MATCH ?1)) DESC, "
+        "t.total_peers DESC, t.added_timestamp DESC "
+        "LIMIT ?2 OFFSET ?3", class_main_join, match_table);
 
     /* --- Build the match set (stage 3) or reuse the cached one (stage 4) --- */
     /* The FTS match over the whole corpus is the expensive part of /search: it
@@ -2535,177 +1885,70 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
-            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
             return -1;
         }
 
-        /* Set by whichever match-set build runs below; the shared failure
-         * handling after it empties the set for both index versions. */
+        /* Set by the match-set build below; the shared failure handling after
+         * it empties the set. */
         int build_failed = 0;
 
-        /* --- search_index = v2: one FTS5 expression over torrent_docs ---
+        /* --- One FTS5 expression over torrent_docs ---
          * torrent_docs holds each torrent's name plus all of its filenames in
          * one unicode61 document, so a single MATCH yields the torrent rowids
-         * directly: no file_search trigram match, no instr() prefilter, no GLOB
-         * confirmation and no short/long-term split. The expression is a bound
-         * parameter (?1), never spliced into the SQL text. */
-        if (use_docs_index) {
-            /* The handler caps q at 255 bytes and expansion is <= 2 x raw + 2
-             * per term, so 1024 cannot overflow; the -1 below stays wired as a
-             * guard on the same fail path the v1 builders use. */
-            char docs_q[1024];
-            if (build_docs_fts_query(query, docs_q, sizeof(docs_q)) != 0) {
-                log_msg(LOG_ERROR, "Docs search does not fit the FTS buffer");
-                SEARCH_TIMING_EMIT();
-                database_read_unlock(db);
-                shared_conn_search_unlock(cache_degraded);
-                free(cache_key);
-                for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-                free_parsed_query(&pq);
-                return -1;
-            }
-
-            (void)snprintf(match_sql, sizeof(match_sql),
-                           "INSERT OR IGNORE INTO %s "
-                           "SELECT rowid FROM torrent_docs WHERE torrent_docs MATCH ?1",
-                           match_table);
-
-            double t_docs = now_ms();
-            sqlite3_stmt *docs_stmt = NULL;
-            rc = sqlite3_prepare_v2(conn, match_sql, -1, &docs_stmt, NULL);
-            if (rc != SQLITE_OK) {
-                log_msg(LOG_ERROR, "Failed to prepare match set query: %s",
-                        sqlite3_errmsg(conn));
-                tm.build_name = now_ms() - t_docs;
-                tm.build = now_ms() - t_build;   /* Stage 7: partial build */
-                SEARCH_TIMING_EMIT();
-                database_read_unlock(db);
-                shared_conn_search_unlock(cache_degraded);
-                free(cache_key);
-                for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-                free_parsed_query(&pq);
-                return -1;
-            }
-
-            sqlite3_bind_text(docs_stmt, 1, docs_q, -1, SQLITE_STATIC);
-            int docs_rc = sqlite3_step(docs_stmt);
-            /* Rows the INSERT actually stored: the same O(1) set-size answer the
-             * v1 halves take from changes(). */
-            match_rows = sqlite3_changes(conn);
-            sqlite3_finalize(docs_stmt);
-            /* The docs insert is the whole match-set build, so it takes the name
-             * phase's slot on the timing line; build_file stays unset and prints
-             * as "-". */
-            tm.build_name = now_ms() - t_docs;
-            build_failed = (docs_rc != SQLITE_DONE);
-            if (build_failed) {
-                /* Malformed expression (an unbalanced quote, say): same contract
-                 * as v1 — the shared reset below empties the set, the count query
-                 * then returns 0 and the page query is skipped, so the response
-                 * is HTTP 200 with count=0. Never a 500 from here. */
-                log_msg(LOG_DEBUG, "Search docs match set failed for query '%s': %s",
-                        query, sqlite3_errmsg(conn));
-            }
+         * directly. The expression is a bound parameter (?1), never spliced
+         * into the SQL text. */
+        /* The handler caps q at 255 bytes and expansion is <= 2 x raw + 2
+         * per term, so 1024 cannot overflow; the -1 below stays wired as a
+         * guard on the same fail path. */
+        char docs_q[1024];
+        if (build_docs_fts_query(query, docs_q, sizeof(docs_q)) != 0) {
+            log_msg(LOG_ERROR, "Docs search does not fit the FTS buffer");
+            SEARCH_TIMING_EMIT();
+            database_read_unlock(db);
+            shared_conn_search_unlock(cache_degraded);
+            free(cache_key);
+            free_parsed_query(&pq);
+            return -1;
         }
 
-        /* --- search_index = v1: the stage-8 two-half match set ---
-         * Kept compiled and reachable until the follow-up cleanup stage deletes
-         * it; a v2 request never enters this block. Its body keeps the original
-         * indentation, so the v1 statements show as untouched lines here.
-         *
-         * Stage 8: the match set is built by two INSERTs — name half first,
-         * file half second — so the timing line can attribute the cost. The set
-         * is the one the single UNION statement produced: the name half is
-         * unique rowids, the file half keeps its SELECT DISTINCT, and OR IGNORE
-         * dedupes across the two halves exactly as UNION did. The quoted branch
-         * still builds its file half inside match_sql, so it runs one statement
-         * here and leaves build_file unset. */
-        if (!use_docs_index) {
-        double t_name = now_ms();
-        sqlite3_stmt *match_stmt = NULL;
-        rc = sqlite3_prepare_v2(conn, match_sql, -1, &match_stmt, NULL);
+        (void)snprintf(match_sql, sizeof(match_sql),
+                       "INSERT OR IGNORE INTO %s "
+                       "SELECT rowid FROM torrent_docs WHERE torrent_docs MATCH ?1",
+                       match_table);
+
+        double t_docs = now_ms();
+        sqlite3_stmt *docs_stmt = NULL;
+        rc = sqlite3_prepare_v2(conn, match_sql, -1, &docs_stmt, NULL);
         if (rc != SQLITE_OK) {
-            log_msg(LOG_ERROR, "Failed to prepare match set query: %s", sqlite3_errmsg(conn));
-            tm.build_name = now_ms() - t_name;
+            log_msg(LOG_ERROR, "Failed to prepare match set query: %s",
+                    sqlite3_errmsg(conn));
             tm.build = now_ms() - t_build;   /* Stage 7: partial build */
             SEARCH_TIMING_EMIT();
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
-            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
             return -1;
         }
 
-        sqlite3_bind_text(match_stmt, 1, pq.torrent_fts_query, -1, SQLITE_STATIC);
-        if (has_quoted) {
-            sqlite3_bind_text(match_stmt, 2, pq.file_fts_query, -1, SQLITE_STATIC);
-            BIND_QUOTED_GLOB_PARAMS(match_stmt, 3, pq, quoted_lower);
-        }
-
-        int match_rc = sqlite3_step(match_stmt);
+        sqlite3_bind_text(docs_stmt, 1, docs_q, -1, SQLITE_STATIC);
+        int docs_rc = sqlite3_step(docs_stmt);
         /* Rows the INSERT actually stored: an O(1) answer to "is this set
          * pathological?" that does not rescan a multi-million-row temp btree. */
         match_rows = sqlite3_changes(conn);
-        sqlite3_finalize(match_stmt);
-        #undef BIND_QUOTED_GLOB_PARAMS
-        tm.build_name = now_ms() - t_name;
-        build_failed = (match_rc != SQLITE_DONE);
+        sqlite3_finalize(docs_stmt);
+        tm.build = now_ms() - t_docs;
+        build_failed = (docs_rc != SQLITE_DONE);
         if (build_failed) {
-            log_msg(LOG_DEBUG, "Search name match set failed for query '%s': %s",
+            /* Malformed expression (an unbalanced quote, say): the shared reset
+             * below empties the set, the count query then returns 0 and the page
+             * query is skipped, so the response is HTTP 200 with count=0. Never
+             * a 500 from here. */
+            log_msg(LOG_DEBUG, "Search docs match set failed for query '%s': %s",
                     query, sqlite3_errmsg(conn));
         }
 
-        if (file_side && !build_failed) {
-            /* File half: ?1 = the 3+-byte terms the trigram index can serve, then
-             * 5 binds per sub-trigram term (see bind_unquoted_file_half). The
-             * patterns and the terms outlive the statement: the binds are
-             * SQLITE_STATIC, so the block is freed only after finalize.
-             *
-             * Skipped when the name half already failed: the reset below wipes
-             * the set either way, so running the file scan would only spend the
-             * time the failure already made pointless. */
-            double t_file = now_ms();
-            char **patterns = build_short_pattern_block(&pq);
-            sqlite3_stmt *file_stmt = NULL;
-            /* A NULL block only means the build failed when there are short
-             * terms to constrain: with none, the file half binds just ?1 and
-             * needs no patterns at all. */
-            rc = (patterns || pq.num_short_glob == 0)
-                     ? sqlite3_prepare_v2(conn, file_sql, -1, &file_stmt, NULL)
-                     : SQLITE_NOMEM;
-            if (rc != SQLITE_OK) {
-                log_msg(LOG_ERROR, "Failed to prepare file match set query: %s",
-                        sqlite3_errmsg(conn));
-                tm.build_file = now_ms() - t_file;
-                tm.build = now_ms() - t_build;
-                free_short_pattern_block(patterns, pq.num_short_glob);
-                SEARCH_TIMING_EMIT();
-                database_read_unlock(db);
-                shared_conn_search_unlock(cache_degraded);
-                free(cache_key);
-                for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
-                free_parsed_query(&pq);
-                return -1;
-            }
-
-            bind_unquoted_file_half(file_stmt, &pq, patterns);
-            int file_rc = sqlite3_step(file_stmt);
-            /* Only the rows this half added: OR IGNORE already dropped the ones
-             * the name half stored, so the two changes() values sum to the size
-             * of the match set. */
-            match_rows += sqlite3_changes(conn);
-            sqlite3_finalize(file_stmt);
-            free_short_pattern_block(patterns, pq.num_short_glob);
-            tm.build_file = now_ms() - t_file;
-            if (file_rc != SQLITE_DONE) {
-                log_msg(LOG_DEBUG, "Search file match set failed for query '%s': %s",
-                        query, sqlite3_errmsg(conn));
-                build_failed = 1;
-            }
-        }
-        }   /* search_index = v1 */
         tm.build = now_ms() - t_build;   /* Stage 7: build phase done */
 
         if (build_failed) {
@@ -2714,8 +1957,8 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
              * an error, so keep that contract: empty the match set and let the
              * count query below return 0, which short-circuits the page query.
              * The empty set is then cached like any other: it is exact and cheap.
-             * A failure in either half empties the whole set — a half-built set
-             * must never be counted or cached as if it were complete. */
+             * A failed build must never be counted or cached as if it were
+             * complete. */
             (void)sqlite3_exec(conn, reset_sql, NULL, NULL, NULL);
             match_rows = 0;
         }
@@ -2731,7 +1974,6 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
             database_read_unlock(db);
             shared_conn_search_unlock(cache_degraded);
             free(cache_key);
-            for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
             free_parsed_query(&pq);
             return -1;
         }
@@ -2785,7 +2027,6 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
         shared_conn_search_unlock(cache_degraded);
         *results = NULL;  /* send_json_results handles a NULL array with count 0 */
         *count = 0;
-        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
         log_msg(LOG_DEBUG, "Search found 0 results (offset %d) for query: %s", offset, query);
         return 0;
@@ -2803,7 +2044,6 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
         SEARCH_TIMING_EMIT();
         database_read_unlock(db);
         shared_conn_search_unlock(cache_degraded);
-        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
         return -1;
     }
@@ -2824,7 +2064,6 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
         SEARCH_TIMING_EMIT();
         database_read_unlock(db);
         shared_conn_search_unlock(cache_degraded);
-        for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
         free_parsed_query(&pq);
         return -1;
     }
@@ -2902,7 +2141,6 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
     *results = res;
     *count = i;
 
-    for (int qi = 0; qi < pq.num_quoted; qi++) free(quoted_lower[qi]);
     free_parsed_query(&pq);
 
     log_msg(LOG_DEBUG, "Search found %d results (offset %d, total %d) for query: %s", i, offset, *total_count, query);
@@ -2912,10 +2150,9 @@ static int search_torrents_filtered(database_t *db, int use_docs_index, const ch
 #undef SEARCH_TIMING_EMIT
 
 /* Legacy entry point without a class filter (see search_torrents_filtered).
- * Nothing in the tree calls it any more, so it has no app_context_t to read
- * search_index from and follows the configured default (v2, torrent_docs). */
+ * Nothing in the tree calls it any more. */
 int search_torrents(database_t *db, const char *query, int offset, search_result_t **results, int *count, int *total_count) {
-    return search_torrents_filtered(db, 1, query, NULL, offset, results, count, total_count);
+    return search_torrents_filtered(db, query, NULL, offset, results, count, total_count);
 }
 
 /* Free search results */
