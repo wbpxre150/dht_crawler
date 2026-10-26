@@ -633,7 +633,8 @@ typedef struct get_peers_worker_ctx {
 
 /* get_peers lookup fan-out (Stage 2; Stage 3 promotes these to config). */
 #define GP_FANOUT 8          /* one query per closest routing-table node, once each */
-#define GP_DEADLINE_MS 3000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
+#define GP_DEADLINE_MS 6000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
+#define GP_SEND_GAP_US 8000  /* space the fan-out burst so the UDP token bucket paces it instead of stalling it */
 /* Monotonic microseconds, used only for the per-tree get_peers lookup timing.
  * Kept isolated from the time(NULL) seconds used elsewhere in this file.
  * Returns 0 when clock_gettime() fails. */
@@ -720,6 +721,7 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
     int outstanding = 0;
 
     for (int i = 0; i < n && i < GP_FANOUT; i++) {
+        if (i > 0) usleep(GP_SEND_GAP_US);  /* pace the burst (see GP_SEND_GAP_US) */
         slot[i].tid_len = tree_protocol_gen_tid(slot[i].tid);
         slot[i].sent = 0;
 
