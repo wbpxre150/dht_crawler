@@ -143,8 +143,9 @@ typedef struct {
 int db_get_torrent_by_hash(database_t *db, const char *hex_hash, torrent_summary_t *out);
 
 /* Get a paginated, optionally substring-filtered, list of files for a torrent.
- * `filter` may be NULL or empty for no filter; otherwise files whose filename
- * matches the trigram FTS query are returned.
+ * `filter` may be NULL or empty for no filter; otherwise files whose full
+ * displayed path (prefix/filename) matches the escaped %term% LIKE pattern
+ * are returned.
  * On success returns 0; caller must free each row's `path` and the array via
  * db_free_torrent_file_rows(). */
 int db_get_torrent_files_paginated(database_t *db, const char *hex_hash,
