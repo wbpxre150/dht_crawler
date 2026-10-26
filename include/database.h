@@ -115,6 +115,11 @@ sqlite3 *database_read_db(database_t *db);
 /* Function declarations */
 int database_init(database_t *db, const char *db_path, app_context_t *app_ctx);
 int database_create_schema(database_t *db);
+/* Write the schema DDL (the CREATE statements, one per line) to `out`.
+ *
+ * Backs the --print-schema one-shot so external tooling can take the schema
+ * from the crawler itself instead of a hand-copied dump. */
+void database_print_schema(FILE *out);
 void database_set_bloom(database_t *db, struct bloom_filter *bloom);
 int database_insert_torrent(database_t *db, const torrent_metadata_t *torrent,
                            const file_info_t *files, int num_files);

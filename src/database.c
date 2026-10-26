@@ -96,6 +96,49 @@ static const char *CREATE_TRIGGERS_SQL =
     "CREATE TRIGGER IF NOT EXISTS torrents_docs_ad AFTER DELETE ON torrents BEGIN"
     "    DELETE FROM torrent_docs WHERE rowid = old.id;"
     "END;";
+/* Write the schema DDL to `out`, one CREATE statement per line.
+ *
+ * The three constants above are newline-free concatenated string literals, so
+ * the statements are split here instead. The split point is the ';' that
+ * completes a whole statement as judged by sqlite3_complete(), not every ';':
+ * the inner statements of a CREATE TRIGGER ... BEGIN ... END body end in ';'
+ * too, and a trigger must stay on one line to remain one statement. Used by the
+ * --print-schema one-shot, so external tooling (the host database rebuild
+ * script) takes its schema from this file rather than a hand-copied dump. */
+void database_print_schema(FILE *out) {
+    const char *parts[] = {
+        CREATE_TABLES_SQL, CREATE_FTS_SQL, CREATE_TRIGGERS_SQL
+    };
+    char stmt[8192];   /* longest statement is a ~200 byte trigger body */
+    size_t len = 0;
+
+    if (!out) {
+        return;
+    }
+    stmt[0] = '\0';
+    for (size_t p = 0; p < sizeof(parts) / sizeof(parts[0]); p++) {
+        for (const char *s = parts[p]; *s; s++) {
+            if (len + 2 >= sizeof(stmt)) {
+                /* Unreachable with the current DDL; emit rather than truncate. */
+                fwrite(stmt, 1, len, out);
+                len = 0;
+                stmt[0] = '\0';
+            }
+            stmt[len++] = *s;
+            stmt[len] = '\0';
+            if (*s == ';' && sqlite3_complete(stmt)) {
+                fwrite(stmt, 1, len, out);
+                fputc('\n', out);
+                len = 0;
+                stmt[0] = '\0';
+            }
+        }
+    }
+    if (len > 0) {
+        fwrite(stmt, 1, len, out);
+    }
+    fflush(out);
+}
 
 /* pthread_key destructor for a thread's read connection (defined below
  * database_read_unlock). Forward-declared because database_init() registers

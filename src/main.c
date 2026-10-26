@@ -227,8 +227,15 @@ int main(int argc, char *argv[]) {
      * its own loop (rather than in the argument loop above) to keep that
      * loop's shape unchanged.
      *
+     * --print-schema: write the schema DDL to stdout, one CREATE statement
+     * per line, and exit 0. Read-only and side-effect free; the host database
+     * rebuild script uses it so the target schema is the crawler's own.
+     * Declared here rather than with the other flags above because that
+     * declaration block is context for the build patch stack.
+     *
      * Usage is documented here, not in --help, on purpose: the help printf
      * block is patch-anchor territory for the build patch stack. */
+    bool print_schema = false;
     const char *rebuild_docs_db_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rebuild-docs") == 0) {
@@ -237,7 +244,14 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             rebuild_docs_db_path = argv[++i];
+        } else if (strcmp(argv[i], "--print-schema") == 0) {
+            print_schema = true;
         }
+    }
+
+    if (print_schema) {
+        database_print_schema(stdout);
+        return 0;
     }
 
     if (rebuild_docs_db_path) {
