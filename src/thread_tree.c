@@ -729,7 +729,7 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         /* Send get_peers query */
         atomic_fetch_add(&tree->gp_packets_sent, 1);
         if (tree_send_get_peers(tree, sock, slot[i].tid, slot[i].tid_len,
-                                infohash, &closest[i].addr) == 0) {
+                                infohash, &closest[i].addr) > 0) {
             slot[i].sent = 1;
             outstanding++;
         } else {
