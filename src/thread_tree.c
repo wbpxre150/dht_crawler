@@ -636,6 +636,15 @@ typedef struct get_peers_worker_ctx {
 #define GP_FANOUT_MAX 12  /* compile-time slot/closest bound; runtime fanout is clamped 2-12 below */
 #define GP_DEADLINE_MS 6000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
 #define GP_SEND_GAP_US 8000  /* space the fan-out burst so the UDP token bucket paces it instead of stalling it */
+#define GP_MAX_CANDIDATES 32  /* candidate-set cap: responses repeat the same nodes heavily */
+/* A node worth querying in a later round: learned from a response's closer-node
+ * list, ordered by XOR distance to the infohash. One set per lookup, never per
+ * round (~148 B each, ~4.8 KB for the set). */
+typedef struct {
+    uint8_t id[20];
+    struct sockaddr_storage addr;
+    int queried;                 /* 1 once a get_peers has been sent to it */
+} gp_candidate_t;
 /* Monotonic microseconds, used only for the per-tree get_peers lookup timing.
  * Kept isolated from the time(NULL) seconds used elsewhere in this file.
  * Returns 0 when clock_gettime() fails. */
@@ -647,15 +656,23 @@ static uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* Parallel get_peers lookup with one per-infohash deadline.
+/* Iterative get_peers lookup with one per-infohash deadline and packet budget.
  *
- * Fans out one get_peers query per closest routing-table node (at most
- * tree->get_peers_fanout nodes, each queried once — no iterative rounds) and
- * then drains the worker's response queue until every sent query is answered,
- * tree->get_peers_deadline_ms expires, the tree shuts down, or `out` fills up.
- * This is the lookup extracted from get_peers_worker_func: it does NOT push to
- * any peers queue and does NOT touch the tree phase — callers decide what to do
- * with the result.
+ * Round 1 fans out one get_peers query per closest routing-table node (at most
+ * tree->get_peers_fanout nodes). When that yields no peers, later rounds query
+ * the closer nodes the responders named — but only while that still makes
+ * progress: a candidate is queried only if it is XOR-closer to the infohash
+ * than the closest node that has actually RESPONDED (a node that timed out
+ * never tightens the bound, it proves nothing). Two caps keep it honest:
+ * tree->get_peers_max_queries bounds total send attempts across all rounds
+ * (failed sends count too) and tree->get_peers_deadline_ms bounds wall time,
+ * send pacing included.
+ *
+ * The candidate set (GP_MAX_CANDIDATES entries, deduped by node id, ordered by
+ * distance to the infohash) lives for the whole lookup; only the slot table is
+ * per round. This is the lookup extracted from get_peers_worker_func: it does
+ * NOT push to any peers queue and does NOT touch the tree phase — callers
+ * decide what to do with the result.
  *
  * The deadline is taken BEFORE the first send because tree_send_get_peers() can
  * sleep in udp_rate_limit_acquire() (<=50 ms per send). It is CLOCK_MONOTONIC
@@ -664,11 +681,14 @@ static uint64_t now_us(void) {
  * jumps can neither extend nor shorten the cap.
  *
  * Every registered TID is unregistered exactly once: when answered, when the
- * send fails, or by the sweep on the single fall-through exit (deadline,
- * shutdown, peers full).
+ * send fails, or by the sweep at the end of its own round — so no registration
+ * outlives its round and a late reply is dropped by the dispatcher instead of
+ * being consumed by the next round. The n == 0 prologue exit happens before any
+ * registration, so it sweeps nothing.
  *
- * Instrumentation only: updates the tree's gp_* counters and adds the elapsed
- * microseconds to gp_lookup_us_total; no behaviour change.
+ * Instrumentation only: updates the tree's gp_* counters (gp_rounds_total counts
+ * completed rounds after the first) and adds the elapsed microseconds to
+ * gp_lookup_us_total; no behaviour change outside the lookup itself.
  *
  * Returns the number of peers found (out->peer_count); 0 when the routing table
  * is empty or no node returned peers. */
@@ -697,121 +717,262 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         goto done;
     }
 
-    /* Sweep responses left in this queue by the previous lookup on this worker:
-     * late replies arrive after their slot's unregister. pop() with timeout 0
-     * returns an already-queued packet immediately (-1 only when empty). */
-    tree_response_t pkt;
-    while (tree_response_queue_count(rsp_queue) > 0) {
-        if (tree_response_queue_pop(rsp_queue, &pkt, 0) != 0) {
-            break;
-        }
+    /* Candidate set, seeded with the closest nodes. Round 1 attempts
+     * closest[0..fanout), and a failed send still counts as an attempt, so those
+     * are marked queried up front; the rest stay available for later rounds. */
+    gp_candidate_t cand[GP_MAX_CANDIDATES];
+    int cand_count = 0;
+    for (int i = 0; i < n && i < GP_MAX_CANDIDATES; i++) {
+        memcpy(cand[cand_count].id, closest[i].node_id, 20);
+        cand[cand_count].addr = closest[i].addr;
+        cand[cand_count].queried = (i < tree->get_peers_fanout) ? 1 : 0;
+        cand_count++;
     }
 
-    /* One deadline for the whole lookup, taken BEFORE the first send: each
-     * tree_send_get_peers() runs udp_rate_limit_acquire() before taking
-     * send_lock and can sleep up to 50 ms, so 8 sends can burn hundreds of ms
-     * that must not extend the cap. */
-    const uint64_t deadline_us = now_us() + (uint64_t)tree->get_peers_deadline_ms * 1000;
+    /* The closest node that actually RESPONDED this lookup — the progress rule
+     * keeps a candidate only while it is closer than this. */
+    uint8_t best_responder_id[20];
+    int have_responder = 0;
 
-    /* Fan out one query per closest node, once each (no iterative rounds). */
+    int queries_sent = 0;  /* total send attempts, all rounds (== gp_packets_sent delta) */
+    int round_index = 0;
+
+    /* Per-round slot table and outstanding count; declared once so the frame
+     * does not grow per round, re-initialised at the top of every round. */
     struct {
         uint8_t tid[4];
         int tid_len;
         int sent;
     } slot[GP_FANOUT_MAX];
-    memset(slot, 0, sizeof(slot));
     int outstanding = 0;
 
-    for (int i = 0; i < n && i < tree->get_peers_fanout; i++) {
-        if (i > 0) usleep(GP_SEND_GAP_US);  /* pace the burst (see GP_SEND_GAP_US) */
-        slot[i].tid_len = tree_protocol_gen_tid(slot[i].tid);
-        slot[i].sent = 0;
+    tree_response_t pkt;
 
-        /* Register TID with dispatcher BEFORE sending */
-        tree_dispatcher_register_tid(dispatcher, slot[i].tid, slot[i].tid_len, rsp_queue);
+    /* One deadline for the whole lookup, taken BEFORE the first send: each
+     * tree_send_get_peers() runs udp_rate_limit_acquire() before taking
+     * send_lock and can sleep up to 50 ms, so the sends of every round can burn
+     * hundreds of ms that must not extend the cap. */
+    const uint64_t deadline_us = now_us() + (uint64_t)tree->get_peers_deadline_ms * 1000;
 
-        /* Send get_peers query */
-        atomic_fetch_add(&tree->gp_packets_sent, 1);
-        if (tree_send_get_peers(tree, sock, slot[i].tid, slot[i].tid_len,
-                                infohash, &closest[i].addr) > 0) {
-            slot[i].sent = 1;
-            outstanding++;
-        } else {
-            /* Send failed (incl. EAGAIN): unregister immediately */
-            tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
-            slot[i].tid_len = 0;
-        }
-    }
-
-    /* Drain against the single deadline. pop() only ever gets a small RELATIVE
-     * slice, so its internal CLOCK_REALTIME wait never sees the lookup deadline
-     * and wall-clock jumps cannot extend or shorten the cap. */
-    while (outstanding > 0 && out->peer_count < MAX_PEERS_PER_ENTRY) {
-        int64_t remaining_us = (int64_t)(deadline_us - now_us());
-        if (remaining_us <= 0) {
-            break;
-        }
-        if (atomic_load(&tree->shutdown_requested)) {
-            break;  /* pop's -1 conflates timeout and shutdown */
-        }
-
-        int slice_ms = 250;
-        if (remaining_us / 1000 < slice_ms) {
-            slice_ms = (int)(remaining_us / 1000 + 1);
-        }
-        if (tree->get_peers_timeout_ms > 0 && tree->get_peers_timeout_ms < slice_ms) {
-            slice_ms = tree->get_peers_timeout_ms;  /* drain-slice cap only, not the deadline */
-        }
-
-        if (tree_response_queue_pop(rsp_queue, &pkt, slice_ms) != 0) {
-            continue;
-        }
-
-        /* Match the response TID against the slots we actually sent */
-        uint8_t rtid[4];
-        int rtid_len = 0;
-        if (tree_protocol_extract_tid(pkt.data, pkt.len, rtid, &rtid_len) != 0) {
-            continue;
-        }
-        int s = -1;
-        for (int i = 0; i < tree->get_peers_fanout; i++) {
-            if (slot[i].sent && slot[i].tid_len > 0 && slot[i].tid_len == rtid_len &&
-                memcmp(slot[i].tid, rtid, (size_t)rtid_len) == 0) {
-                s = i;
+    for (;;) {
+        /* Sweep responses left in this queue by the previous lookup or the
+         * previous round: late replies arrive after their slot's unregister.
+         * pop() with timeout 0 returns an already-queued packet immediately
+         * (-1 only when empty). A 16-slot queue must not be eaten by leftovers. */
+        while (tree_response_queue_count(rsp_queue) > 0) {
+            if (tree_response_queue_pop(rsp_queue, &pkt, 0) != 0) {
                 break;
             }
         }
-        if (s < 0) {
-            continue;  /* stale/duplicate response: leave the slot alone */
-        }
 
-        outstanding--;
-        atomic_fetch_add(&tree->gp_answers, 1);
-        tree_dispatcher_unregister_tid(dispatcher, slot[s].tid, slot[s].tid_len);
-        slot[s].tid_len = 0;
-
-        tree_get_peers_response_t response;
-        if (tree_handle_get_peers_response(tree, pkt.data, pkt.len, &pkt.from, &response) == 0) {
-            /* Collect peers */
-            for (int p = 0; p < response.peer_count && out->peer_count < MAX_PEERS_PER_ENTRY; p++) {
-                memcpy(&out->peers[out->peer_count], &response.peers[p],
-                       sizeof(struct sockaddr_storage));
-                out->peer_count++;
+        if (round_index > 0) {
+            /* Later rounds are optional: stop rather than spend packets when the
+             * budget or the wall clock is gone, or the tree is going down. */
+            if (queries_sent >= tree->get_peers_max_queries) {
+                break;
             }
-
-            /* Keep every node insert (routing-table upkeep) */
-            for (int ni = 0; ni < response.node_count; ni++) {
-                tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
+            if (now_us() >= deadline_us) {
+                break;
+            }
+            if (atomic_load(&tree->shutdown_requested)) {
+                break;  /* pop's -1 conflates timeout and shutdown */
             }
         }
-    }
 
-    /* Exactly one unregister per register: sweep whatever is still outstanding
-     * on the fall-through exit (deadline, shutdown, peers full). The n == 0
-     * prologue exit happens before any registration. */
-    for (int i = 0; i < tree->get_peers_fanout; i++) {
-        if (slot[i].tid_len > 0) {
-            tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
+        memset(slot, 0, sizeof(slot));
+        outstanding = 0;
+
+        /* Pick this round's targets (indices into cand[]). Round 1 is the plain
+         * fan-out over the closest nodes; later rounds walk the candidate set in
+         * distance order and take only un-queried nodes that beat the closest
+         * responder, bounded by what is left of the packet budget. */
+        int picked[GP_FANOUT_MAX];
+        int picked_count = 0;
+        if (round_index == 0) {
+            for (int i = 0; i < n && i < tree->get_peers_fanout; i++) {
+                if (queries_sent + picked_count >= tree->get_peers_max_queries) {
+                    break;
+                }
+                picked[picked_count++] = i;
+            }
+        } else {
+            for (int c = 0; c < cand_count && picked_count < tree->get_peers_fanout; c++) {
+                if (cand[c].queried) {
+                    continue;
+                }
+                /* Progress rule: a candidate is worth a packet only if it is
+                 * closer than the closest node that has answered so far. With no
+                 * responder yet, every candidate qualifies (bounded by the cap). */
+                if (have_responder &&
+                    tree_routing_xor_compare(infohash, cand[c].id, best_responder_id) >= 0) {
+                    continue;
+                }
+                if (queries_sent + picked_count >= tree->get_peers_max_queries) {
+                    break;
+                }
+                picked[picked_count++] = c;
+            }
+            if (picked_count == 0) {
+                break;  /* nothing eligible left: the search is exhausted */
+            }
+        }
+
+        /* Fan out this round's targets: register the TID before sending, count
+         * every attempt against the budget, unregister immediately on failure. */
+        for (int k = 0; k < picked_count; k++) {
+            gp_candidate_t *c = &cand[picked[k]];
+            if (k > 0) usleep(GP_SEND_GAP_US);  /* pace the burst (see GP_SEND_GAP_US) */
+            slot[k].tid_len = tree_protocol_gen_tid(slot[k].tid);
+            slot[k].sent = 0;
+            c->queried = 1;
+
+            /* Register TID with dispatcher BEFORE sending */
+            tree_dispatcher_register_tid(dispatcher, slot[k].tid, slot[k].tid_len, rsp_queue);
+
+            /* Send get_peers query */
+            atomic_fetch_add(&tree->gp_packets_sent, 1);
+            queries_sent++;
+            if (tree_send_get_peers(tree, sock, slot[k].tid, slot[k].tid_len,
+                                    infohash, &c->addr) > 0) {
+                slot[k].sent = 1;
+                outstanding++;
+            } else {
+                /* Send failed (incl. EAGAIN): unregister immediately */
+                tree_dispatcher_unregister_tid(dispatcher, slot[k].tid, slot[k].tid_len);
+                slot[k].tid_len = 0;
+            }
+        }
+
+        /* Drain against the single deadline. pop() only ever gets a small RELATIVE
+         * slice, so its internal CLOCK_REALTIME wait never sees the lookup deadline
+         * and wall-clock jumps cannot extend or shorten the cap. */
+        while (outstanding > 0 && out->peer_count < MAX_PEERS_PER_ENTRY) {
+            int64_t remaining_us = (int64_t)(deadline_us - now_us());
+            if (remaining_us <= 0) {
+                break;
+            }
+            if (atomic_load(&tree->shutdown_requested)) {
+                break;  /* pop's -1 conflates timeout and shutdown */
+            }
+
+            int slice_ms = 250;
+            if (remaining_us / 1000 < slice_ms) {
+                slice_ms = (int)(remaining_us / 1000 + 1);
+            }
+            if (tree->get_peers_timeout_ms > 0 && tree->get_peers_timeout_ms < slice_ms) {
+                slice_ms = tree->get_peers_timeout_ms;  /* drain-slice cap only, not the deadline */
+            }
+
+            if (tree_response_queue_pop(rsp_queue, &pkt, slice_ms) != 0) {
+                continue;
+            }
+
+            /* Match the response TID against the slots we actually sent */
+            uint8_t rtid[4];
+            int rtid_len = 0;
+            if (tree_protocol_extract_tid(pkt.data, pkt.len, rtid, &rtid_len) != 0) {
+                continue;
+            }
+            int s = -1;
+            for (int i = 0; i < tree->get_peers_fanout; i++) {
+                if (slot[i].sent && slot[i].tid_len > 0 && slot[i].tid_len == rtid_len &&
+                    memcmp(slot[i].tid, rtid, (size_t)rtid_len) == 0) {
+                    s = i;
+                    break;
+                }
+            }
+            if (s < 0) {
+                continue;  /* stale/duplicate response: leave the slot alone */
+            }
+
+            outstanding--;
+            atomic_fetch_add(&tree->gp_answers, 1);
+            tree_dispatcher_unregister_tid(dispatcher, slot[s].tid, slot[s].tid_len);
+            slot[s].tid_len = 0;
+
+            tree_get_peers_response_t response;
+            if (tree_handle_get_peers_response(tree, pkt.data, pkt.len, &pkt.from, &response) == 0) {
+                /* Collect peers */
+                for (int p = 0; p < response.peer_count && out->peer_count < MAX_PEERS_PER_ENTRY; p++) {
+                    memcpy(&out->peers[out->peer_count], &response.peers[p],
+                           sizeof(struct sockaddr_storage));
+                    out->peer_count++;
+                }
+
+                /* Keep every node insert (routing-table upkeep) */
+                for (int ni = 0; ni < response.node_count; ni++) {
+                    tree_routing_add_node(rt, response.nodes[ni], &response.node_addrs[ni]);
+                }
+
+                /* Only a node that answered can tighten the progress bound. */
+                if (response.has_responder &&
+                    (!have_responder ||
+                     tree_routing_xor_compare(infohash, response.responder_id,
+                                              best_responder_id) < 0)) {
+                    memcpy(best_responder_id, response.responder_id, 20);
+                    have_responder = 1;
+                }
+
+                /* Merge the closer nodes this response named: IPv4 only (the v6
+                 * send path is unverified), skip ids already in the set (they are
+                 * either queued or already queried — responses repeat nodes
+                 * heavily), insert in distance order, drop the farthest beyond
+                 * the cap. */
+                for (int ni = 0; ni < response.node_count; ni++) {
+                    if (response.node_addrs[ni].ss_family != AF_INET) {
+                        continue;
+                    }
+                    int known = 0;
+                    for (int ci = 0; ci < cand_count; ci++) {
+                        if (memcmp(cand[ci].id, response.nodes[ni], 20) == 0) {
+                            known = 1;
+                            break;
+                        }
+                    }
+                    if (known) {
+                        continue;
+                    }
+                    int pos = cand_count;
+                    while (pos > 0 &&
+                           tree_routing_xor_compare(infohash, response.nodes[ni],
+                                                    cand[pos - 1].id) < 0) {
+                        pos--;
+                    }
+                    if (pos >= GP_MAX_CANDIDATES) {
+                        continue;  /* farther than the whole set: drop it */
+                    }
+                    if (cand_count >= GP_MAX_CANDIDATES) {
+                        cand_count--;  /* evict the farthest to make room */
+                    }
+                    if (pos < cand_count) {
+                        memmove(&cand[pos + 1], &cand[pos],
+                                (size_t)(cand_count - pos) * sizeof(cand[0]));
+                    }
+                    memcpy(cand[pos].id, response.nodes[ni], 20);
+                    cand[pos].addr = response.node_addrs[ni];
+                    cand[pos].queried = 0;
+                    cand_count++;
+                }
+            }
+        }
+
+        /* Exactly one unregister per register: sweep whatever this round left
+         * outstanding before the next round starts and before returning. */
+        for (int i = 0; i < GP_FANOUT_MAX; i++) {
+            if (slot[i].tid_len > 0) {
+                tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
+            }
+        }
+
+        /* Completed round after the first: /stats reports mean_rounds_per_lookup
+         * as (lookups_total + rounds_total) / lookups_total. */
+        if (round_index > 0) {
+            atomic_fetch_add(&tree->gp_rounds_total, 1);
+        }
+        round_index++;
+
+        if (out->peer_count > 0) {
+            break;  /* peers found: no reason to spend more packets */
         }
     }
 
