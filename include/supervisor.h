@@ -240,6 +240,7 @@ typedef struct supervisor {
     atomic_uint_fast64_t cumulative_gp_packets_sent;
     atomic_uint_fast64_t cumulative_gp_answers;
     atomic_uint_fast64_t cumulative_gp_lookup_us_total;
+    atomic_uint_fast64_t cumulative_gp_rounds_total;
 
     /* Monitor thread */
     pthread_t monitor_thread;
@@ -300,11 +301,12 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
  * @param out_packets Pointer to store get_peers packets attempted
  * @param out_answers Pointer to store responses consumed
  * @param out_lookup_us Pointer to store total microseconds inside lookups
+ * @param out_rounds Pointer to store completed get_peers rounds after the first
  */
 void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
                                uint64_t *out_with_peers, uint64_t *out_from_retry,
                                uint64_t *out_packets, uint64_t *out_answers,
-                               uint64_t *out_lookup_us);
+                               uint64_t *out_lookup_us, uint64_t *out_rounds);
 
 /**
  * Get total active connections across all trees

@@ -214,6 +214,7 @@ typedef struct thread_tree {
     atomic_uint_fast64_t gp_answers;             /* Responses consumed from the queue (pop_result == 0) */
     atomic_uint_fast64_t gp_lookup_us_total;     /* Total microseconds spent inside tree_lookup_peers() */
     atomic_uint_fast64_t last_metadata_time;
+    atomic_uint_fast64_t gp_rounds_total;       /* Completed rounds after the first, summed over lookups */
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */
 

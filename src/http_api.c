@@ -760,9 +760,10 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         uint64_t sup_gp_packets = 0;
         uint64_t sup_gp_answers = 0;
         uint64_t sup_gp_lookup_us = 0;
+        uint64_t sup_gp_rounds = 0;
         supervisor_getpeers_stats(api->supervisor, &sup_gp_lookups, &sup_gp_with_peers,
                                   &sup_gp_from_retry, &sup_gp_packets, &sup_gp_answers,
-                                  &sup_gp_lookup_us);
+                                  &sup_gp_lookup_us, &sup_gp_rounds);
 
         cJSON *supervisor_get_peers = cJSON_CreateObject();
         cJSON_AddNumberToObject(supervisor_get_peers, "lookups_total", (double)sup_gp_lookups);
@@ -790,6 +791,15 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
 
         cJSON_AddNumberToObject(supervisor_get_peers, "answers_total", (double)sup_gp_answers);
         cJSON_AddNumberToObject(supervisor_get_peers, "from_retry_total", (double)sup_gp_from_retry);
+
+        cJSON_AddNumberToObject(supervisor_get_peers, "rounds_total", (double)sup_gp_rounds);
+
+        double sup_gp_mean_rounds_per_lookup = 0.0;
+        if (sup_gp_lookups > 0) {
+            sup_gp_mean_rounds_per_lookup =
+                ((double)sup_gp_lookups + (double)sup_gp_rounds) / (double)sup_gp_lookups;
+        }
+        cJSON_AddNumberToObject(supervisor_get_peers, "mean_rounds_per_lookup", sup_gp_mean_rounds_per_lookup);
         cJSON_AddItemToObject(supervisor_json, "get_peers", supervisor_get_peers);
 
         /* UDP dispatcher counters. With a fixed dht_port every tree aliases the
@@ -914,6 +924,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 uint64_t gp_packets = atomic_load(&tree->gp_packets_sent);
                 uint64_t gp_answers = atomic_load(&tree->gp_answers);
                 uint64_t gp_lookup_us = atomic_load(&tree->gp_lookup_us_total);
+                uint64_t gp_rounds = atomic_load(&tree->gp_rounds_total);
 
                 cJSON *get_peers = cJSON_CreateObject();
                 /* Effective knobs this tree runs with, next to its counters, so
@@ -947,6 +958,15 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
 
                 cJSON_AddNumberToObject(get_peers, "answers_total", (double)gp_answers);
                 cJSON_AddNumberToObject(get_peers, "from_retry_total", (double)gp_from_retry);
+
+                cJSON_AddNumberToObject(get_peers, "rounds_total", (double)gp_rounds);
+
+                double gp_mean_rounds_per_lookup = 0.0;
+                if (gp_lookups > 0) {
+                    gp_mean_rounds_per_lookup =
+                        ((double)gp_lookups + (double)gp_rounds) / (double)gp_lookups;
+                }
+                cJSON_AddNumberToObject(get_peers, "mean_rounds_per_lookup", gp_mean_rounds_per_lookup);
                 cJSON_AddItemToObject(tree_json, "get_peers", get_peers);
                 cJSON_AddItemToArray(trees_array, tree_json);
             }

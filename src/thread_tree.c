@@ -1181,6 +1181,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->gp_packets_sent, 0);
     atomic_store(&tree->gp_answers, 0);
     atomic_store(&tree->gp_lookup_us_total, 0);
+    atomic_store(&tree->gp_rounds_total, 0);
 
     /* Initialize BEP51 cache statistics */
     atomic_store(&tree->bep51_nodes_cached, 0);

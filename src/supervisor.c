@@ -146,6 +146,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_gp_packets_sent, 0);
     atomic_init(&sup->cumulative_gp_answers, 0);
     atomic_init(&sup->cumulative_gp_lookup_us_total, 0);
+    atomic_init(&sup->cumulative_gp_rounds_total, 0);
 
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
@@ -1177,6 +1178,7 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_gp_packets_sent = atomic_load(&tree->gp_packets_sent);
                     uint64_t tree_gp_answers = atomic_load(&tree->gp_answers);
                     uint64_t tree_gp_lookup_us_total = atomic_load(&tree->gp_lookup_us_total);
+                    uint64_t tree_gp_rounds_total = atomic_load(&tree->gp_rounds_total);
 
                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
@@ -1192,6 +1194,7 @@ static void *monitor_thread_func(void *arg) {
                     atomic_fetch_add(&sup->cumulative_gp_packets_sent, tree_gp_packets_sent);
                     atomic_fetch_add(&sup->cumulative_gp_answers, tree_gp_answers);
                     atomic_fetch_add(&sup->cumulative_gp_lookup_us_total, tree_gp_lookup_us_total);
+                    atomic_fetch_add(&sup->cumulative_gp_rounds_total, tree_gp_rounds_total);
 
                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
@@ -1394,7 +1397,7 @@ void supervisor_stats(supervisor_t *sup, int *out_active_trees, uint64_t *out_to
 void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
                                uint64_t *out_with_peers, uint64_t *out_from_retry,
                                uint64_t *out_packets, uint64_t *out_answers,
-                               uint64_t *out_lookup_us) {
+                               uint64_t *out_lookup_us, uint64_t *out_rounds) {
     if (!sup) {
         if (out_lookups) *out_lookups = 0;
         if (out_with_peers) *out_with_peers = 0;
@@ -1402,6 +1405,7 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
         if (out_packets) *out_packets = 0;
         if (out_answers) *out_answers = 0;
         if (out_lookup_us) *out_lookup_us = 0;
+        if (out_rounds) *out_rounds = 0;
         return;
     }
 
@@ -1412,6 +1416,7 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
     uint64_t cumulative_packets = atomic_load(&sup->cumulative_gp_packets_sent);
     uint64_t cumulative_answers = atomic_load(&sup->cumulative_gp_answers);
     uint64_t cumulative_lookup_us = atomic_load(&sup->cumulative_gp_lookup_us_total);
+    uint64_t cumulative_rounds = atomic_load(&sup->cumulative_gp_rounds_total);
 
     /* Add current active trees' counts */
     uint64_t active_lookups = 0;
@@ -1420,6 +1425,7 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
     uint64_t active_packets = 0;
     uint64_t active_answers = 0;
     uint64_t active_lookup_us = 0;
+    uint64_t active_rounds = 0;
 
     pthread_mutex_lock(&sup->trees_lock);
 
@@ -1431,6 +1437,7 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
             active_packets += atomic_load(&sup->trees[i]->gp_packets_sent);
             active_answers += atomic_load(&sup->trees[i]->gp_answers);
             active_lookup_us += atomic_load(&sup->trees[i]->gp_lookup_us_total);
+            active_rounds += atomic_load(&sup->trees[i]->gp_rounds_total);
         }
     }
 
@@ -1454,6 +1461,9 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
     }
     if (out_lookup_us) {
         *out_lookup_us = cumulative_lookup_us + active_lookup_us;
+    }
+    if (out_rounds) {
+        *out_rounds = cumulative_rounds + active_rounds;
     }
 }
 
