@@ -55,6 +55,8 @@ typedef struct {
     int node_count;
     uint8_t token[64];                 /* Token for announce_peer (if needed) */
     int token_len;
+    uint8_t responder_id[20];          /* Responder's node ID (copied from packet) */
+    int has_responder;                 /* Whether responder_id was present */
 } tree_get_peers_response_t;
 
 /**

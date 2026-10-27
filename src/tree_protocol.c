@@ -583,6 +583,12 @@ int tree_handle_get_peers_response(struct thread_tree *tree,
                               sender_id, from);
     }
 
+    /* Record responder identity (who answered) for iterative lookup progress */
+    if (sender_id) {
+        memcpy(out_response->responder_id, sender_id, 20);
+        out_response->has_responder = 1;
+    }
+
     return 0;
 }
 
