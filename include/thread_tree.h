@@ -283,8 +283,9 @@ const char *thread_tree_phase_name(tree_phase_t phase);
  * Run an iterative get_peers lookup for infohash and collect discovered peers.
  *
  * Queries the closest routing-table nodes first, then — while no peers turn up —
- * the closer nodes those responders name, one candidate at a time and only if it
- * is XOR-closer to the infohash than the closest node that has actually
+ * the closer nodes those responders name, in rounds of up to
+ * tree->get_peers_fanout candidates each, and only if a candidate is XOR-closer
+ * to the infohash than the closest node that has actually
  * responded. Bounded by tree->get_peers_max_queries total packets and
  * tree->get_peers_deadline_ms wall time per infohash. Peers are written into
  * out->peers and out->infohash is set to infohash. This helper performs no
