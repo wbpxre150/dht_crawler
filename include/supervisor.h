@@ -74,6 +74,9 @@ typedef struct supervisor_config {
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
     int get_peers_timeout_ms;       /* get_peers timeout (default: 1500) */
+    int get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
+    int get_peers_fanout;           /* get_peers queries per lookup (default: 8, 2-12) */
+    int get_peers_max_queries;      /* get_peers query budget (default: 16, 8-32, >= fanout) */
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;
@@ -163,6 +166,9 @@ typedef struct supervisor {
     /* Stage 4 settings (get_peers) */
     int peers_queue_capacity;
     int get_peers_timeout_ms;
+    int get_peers_deadline_ms;
+    int get_peers_fanout;
+    int get_peers_max_queries;
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;

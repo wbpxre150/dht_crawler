@@ -102,6 +102,9 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Stage 4 settings (get_peers) */
     sup->peers_queue_capacity = config->peers_queue_capacity > 0 ? config->peers_queue_capacity : 2000;
     sup->get_peers_timeout_ms = config->get_peers_timeout_ms > 0 ? config->get_peers_timeout_ms : 1500;
+    sup->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : 6000;
+    sup->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : 8;
+    sup->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
@@ -484,6 +487,9 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Stage 4 settings */
         .peers_queue_capacity = sup->peers_queue_capacity,
         .get_peers_timeout_ms = sup->get_peers_timeout_ms,
+        .get_peers_deadline_ms = sup->get_peers_deadline_ms,
+        .get_peers_fanout = sup->get_peers_fanout,
+        .get_peers_max_queries = sup->get_peers_max_queries,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
         .parallel_peers = sup->parallel_peers,

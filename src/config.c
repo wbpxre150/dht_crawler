@@ -142,6 +142,9 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_get_peers_workers = 8;             /* 8 get_peers workers per tree */
     config->tree_peers_queue_capacity = 2000;       /* 2000 peers queue capacity */
     config->tree_get_peers_timeout_ms = 1500;       /* 1.5s get_peers timeout */
+    config->tree_get_peers_deadline_ms = 6000;      /* 6s get_peers lookup deadline (500-8000) */
+    config->tree_get_peers_fanout = 8;              /* 8 concurrent get_peers queries per round (2-12) */
+    config->tree_get_peers_max_queries = 16;        /* 16 get_peers packets per infohash (8-32, >= fanout) */
 
     /* Thread tree Stage 5 defaults (metadata) */
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
@@ -429,6 +432,42 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "tree_get_peers_timeout_ms") == 0) {
             config->tree_get_peers_timeout_ms = atoi(value);
             if (config->tree_get_peers_timeout_ms < 100) config->tree_get_peers_timeout_ms = 100;
+        } else if (strcmp(key, "tree_get_peers_deadline_ms") == 0) {
+            config->tree_get_peers_deadline_ms = atoi(value);
+            if (config->tree_get_peers_deadline_ms < 500) {
+                log_msg(LOG_WARN, "tree_get_peers_deadline_ms %d out of range (500-8000); clamping to 500",
+                        config->tree_get_peers_deadline_ms);
+                config->tree_get_peers_deadline_ms = 500;
+            }
+            if (config->tree_get_peers_deadline_ms > 8000) {
+                log_msg(LOG_WARN, "tree_get_peers_deadline_ms %d out of range (500-8000); clamping to 8000",
+                        config->tree_get_peers_deadline_ms);
+                config->tree_get_peers_deadline_ms = 8000;
+            }
+        } else if (strcmp(key, "tree_get_peers_fanout") == 0) {
+            config->tree_get_peers_fanout = atoi(value);
+            if (config->tree_get_peers_fanout < 2) {
+                log_msg(LOG_WARN, "tree_get_peers_fanout %d out of range (2-12); clamping to 2",
+                        config->tree_get_peers_fanout);
+                config->tree_get_peers_fanout = 2;
+            }
+            if (config->tree_get_peers_fanout > 12) {
+                log_msg(LOG_WARN, "tree_get_peers_fanout %d out of range (2-12); clamping to 12",
+                        config->tree_get_peers_fanout);
+                config->tree_get_peers_fanout = 12;
+            }
+        } else if (strcmp(key, "tree_get_peers_max_queries") == 0) {
+            config->tree_get_peers_max_queries = atoi(value);
+            if (config->tree_get_peers_max_queries < 8) {
+                log_msg(LOG_WARN, "tree_get_peers_max_queries %d out of range (8-32); clamping to 8",
+                        config->tree_get_peers_max_queries);
+                config->tree_get_peers_max_queries = 8;
+            }
+            if (config->tree_get_peers_max_queries > 32) {
+                log_msg(LOG_WARN, "tree_get_peers_max_queries %d out of range (8-32); clamping to 32",
+                        config->tree_get_peers_max_queries);
+                config->tree_get_peers_max_queries = 32;
+            }
         }
         /* Thread tree Stage 5 settings (metadata) */
         else if (strcmp(key, "tree_metadata_workers") == 0) {
@@ -554,6 +593,17 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         }
     }
 
+    /* Cross-key invariant: a lookup can never issue more rounds than the
+     * per-infohash packet budget, so max_queries must be at least fanout.
+     * Applied once after the whole file is parsed, so the result does not
+     * depend on the order the two keys appear in config.ini. */
+    if (config->tree_get_peers_max_queries < config->tree_get_peers_fanout) {
+        log_msg(LOG_WARN, "tree_get_peers_max_queries %d below fanout %d; raised to %d",
+                config->tree_get_peers_max_queries, config->tree_get_peers_fanout,
+                config->tree_get_peers_fanout);
+        config->tree_get_peers_max_queries = config->tree_get_peers_fanout;
+    }
+
     fclose(f);
     log_msg(LOG_DEBUG, "Loaded configuration from %s", config_file);
     return 0;
@@ -628,6 +678,9 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
     log_msg(LOG_DEBUG, "DHT Settings:");
     log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
+    log_msg(LOG_DEBUG, "  get_peers: deadline_ms=%d fanout=%d max_queries=%d",
+            config->tree_get_peers_deadline_ms, config->tree_get_peers_fanout,
+            config->tree_get_peers_max_queries);
     log_msg(LOG_DEBUG, "Database Settings:");
     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
     log_msg(LOG_DEBUG, "Logging:");

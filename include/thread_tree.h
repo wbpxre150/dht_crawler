@@ -77,6 +77,9 @@ typedef struct tree_config {
     /* Stage 4: Get_peers settings */
     int peers_queue_capacity;       /* Peers queue size (default: 2000) */
     int get_peers_timeout_ms;       /* Get_peers response timeout (default: 1500) */
+    int get_peers_deadline_ms;      /* Get_peers lookup deadline (default: 6000, 500-8000) */
+    int get_peers_fanout;           /* Get_peers queries per lookup (default: 8, 2-12) */
+    int get_peers_max_queries;      /* Get_peers query budget (default: 16, 8-32, >= fanout) */
 
     /* Stage 5: Metadata fetcher settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
@@ -144,6 +147,9 @@ typedef struct thread_tree {
     /* Stage 4 config */
     int peers_queue_capacity;
     int get_peers_timeout_ms;
+    int get_peers_deadline_ms;
+    int get_peers_fanout;
+    int get_peers_max_queries;
 
     /* Stage 5 config */
     int tcp_connect_timeout_ms;

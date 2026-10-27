@@ -630,6 +630,12 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                                 api->supervisor->num_get_peers_workers);
         cJSON_AddNumberToObject(config_json, "tree_get_peers_timeout_ms",
                                 api->supervisor->get_peers_timeout_ms);
+        cJSON_AddNumberToObject(config_json, "tree_get_peers_deadline_ms",
+                                api->supervisor->get_peers_deadline_ms);
+        cJSON_AddNumberToObject(config_json, "tree_get_peers_fanout",
+                                api->supervisor->get_peers_fanout);
+        cJSON_AddNumberToObject(config_json, "tree_get_peers_max_queries",
+                                api->supervisor->get_peers_max_queries);
         cJSON_AddItemToObject(root, "config", config_json);
     }
 
@@ -910,6 +916,12 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 uint64_t gp_lookup_us = atomic_load(&tree->gp_lookup_us_total);
 
                 cJSON *get_peers = cJSON_CreateObject();
+                /* Effective knobs this tree runs with, next to its counters, so
+                 * every /stats snapshot carries the settings it was measured
+                 * under. */
+                cJSON_AddNumberToObject(get_peers, "deadline_ms", (double)tree->get_peers_deadline_ms);
+                cJSON_AddNumberToObject(get_peers, "fanout", (double)tree->get_peers_fanout);
+                cJSON_AddNumberToObject(get_peers, "max_queries", (double)tree->get_peers_max_queries);
                 cJSON_AddNumberToObject(get_peers, "lookups_total", (double)gp_lookups);
                 cJSON_AddNumberToObject(get_peers, "lookups_with_peers", (double)gp_with_peers);
 

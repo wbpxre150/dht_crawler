@@ -1448,6 +1448,19 @@ void *tree_metadata_worker_func(void *arg) {
         .tree = tree
     };
 
+    /* One long-lived response queue for the optional fresh-peer relookup below.
+     * Created once here and destroyed once after the loop, instead of being
+     * allocated per failed metadata fetch. tree_lookup_peers() drains stale
+     * entries and matches responses by TID, so a queue reused across relookups
+     * is safe against late responses from a previous lookup. */
+    tree_response_queue_t *relookup_queue = tree_response_queue_create(TREE_GP_RESPONSE_QUEUE_CAP);
+    if (!relookup_queue) {
+        log_msg(LOG_ERROR, "[tree %u] Metadata worker %d failed to create relookup response queue; exiting",
+                tree->tree_id, worker_id);
+        free(ctx);
+        return NULL;
+    }
+
     while (!atomic_load(&tree->shutdown_requested)) {
         /* Pop peer entry from queue */
         peer_entry_t entry;
@@ -1479,18 +1492,14 @@ void *tree_metadata_worker_func(void *arg) {
          * tree_metadata_fresh_peer_retries (0 = disabled). The retry is not
          * counted as a separate metadata attempt. */
         if (!metadata && tree->fresh_peer_retries > 0) {
-            tree_response_queue_t *relookup_queue = tree_response_queue_create(TREE_GP_RESPONSE_QUEUE_CAP);
-            if (relookup_queue) {
-                atomic_fetch_add(&tree->fresh_peer_relookups, 1);
-                atomic_fetch_add(&tree->gp_lookups_from_retry, 1);
-                peer_entry_t fresh = {0};
-                int fresh_count = tree_lookup_peers(tree, entry.infohash, relookup_queue, &fresh);
-                if (atomic_load(&tree->shutdown_reason) != SHUTDOWN_REASON_SUPERVISOR && fresh_count > 0) {
-                    metadata = tree_fetch_metadata_parallel(
-                        entry.infohash, fresh.peers, fresh_count, &config);
-                    if (metadata) atomic_fetch_add(&tree->fresh_peer_rescues, 1);
-                }
-                tree_response_queue_destroy(relookup_queue);
+            atomic_fetch_add(&tree->fresh_peer_relookups, 1);
+            atomic_fetch_add(&tree->gp_lookups_from_retry, 1);
+            peer_entry_t fresh = {0};
+            int fresh_count = tree_lookup_peers(tree, entry.infohash, relookup_queue, &fresh);
+            if (atomic_load(&tree->shutdown_reason) != SHUTDOWN_REASON_SUPERVISOR && fresh_count > 0) {
+                metadata = tree_fetch_metadata_parallel(
+                    entry.infohash, fresh.peers, fresh_count, &config);
+                if (metadata) atomic_fetch_add(&tree->fresh_peer_rescues, 1);
             }
         }
 
@@ -1663,6 +1672,8 @@ void *tree_metadata_worker_func(void *arg) {
             tree_free_metadata(metadata);
         }
     }
+
+    tree_response_queue_destroy(relookup_queue);
 
     free(ctx);
     log_msg(LOG_DEBUG, "[tree %u] Metadata worker %d exiting", tree->tree_id, worker_id);

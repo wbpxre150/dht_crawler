@@ -714,6 +714,9 @@ int main(int argc, char *argv[]) {
         /* Stage 4 settings (get_peers) */
         .peers_queue_capacity = config.tree_peers_queue_capacity,
         .get_peers_timeout_ms = config.tree_get_peers_timeout_ms,
+        .get_peers_deadline_ms = config.tree_get_peers_deadline_ms,
+        .get_peers_fanout = config.tree_get_peers_fanout,
+        .get_peers_max_queries = config.tree_get_peers_max_queries,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
         .parallel_peers = config.tree_parallel_peers,
