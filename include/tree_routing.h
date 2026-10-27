@@ -73,6 +73,17 @@ typedef struct tree_routing_table {
 tree_routing_table_t *tree_routing_create(const uint8_t *our_node_id);
 
 /**
+ * Compare two node IDs by XOR distance to a target
+ * Uses memcmp semantics on the 20-byte XOR distance vector, so it is
+ * suitable as a qsort comparator over candidate nodes.
+ * @param target 20-byte target ID
+ * @param a 20-byte node ID to compare
+ * @param b 20-byte node ID to compare
+ * @return <0 if a is closer to target than b, 0 if equal, >0 if farther
+ */
+int tree_routing_xor_compare(const uint8_t *target, const uint8_t *a, const uint8_t *b);
+
+/**
  * Destroy a routing table and free all memory
  * @param rt Routing table to destroy
  */

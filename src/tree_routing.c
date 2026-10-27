@@ -32,15 +32,13 @@ static int get_bucket_index(const uint8_t *our_id, const uint8_t *node_id) {
     return 0;  /* Same ID (shouldn't happen) */
 }
 
-/* Compare XOR distances for sorting (reserved for future use) */
-#if 0
-static int compare_distance(const uint8_t *target, const uint8_t *id1, const uint8_t *id2) {
+/* Compare XOR distances to a target (memcmp semantics on the 20-byte distance) */
+int tree_routing_xor_compare(const uint8_t *target, const uint8_t *a, const uint8_t *b) {
     uint8_t dist1[20], dist2[20];
-    xor_distance(target, id1, dist1);
-    xor_distance(target, id2, dist2);
+    xor_distance(target, a, dist1);
+    xor_distance(target, b, dist2);
     return memcmp(dist1, dist2, 20);
 }
-#endif
 
 tree_routing_table_t *tree_routing_create(const uint8_t *our_node_id) {
     if (!our_node_id) {
