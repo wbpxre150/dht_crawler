@@ -73,6 +73,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->failure_strike_count = 2;           /* Two-strike policy */
     config->bloom_error_rate = 0.001;
     config->bloom_persist = 1;
+    config->bloom_persist_interval_sec = 300;   /* min seconds between bloom-filter disk saves (0=every flush) */
     strncpy(config->bloom_path, "data/bloom.dat", sizeof(config->bloom_path) - 1);
 
     /* Metadata fetcher defaults */
@@ -299,6 +300,23 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->bloom_error_rate = atof(value);
         } else if (strcmp(key, "bloom_persist") == 0) {
             config->bloom_persist = atoi(value);
+        } else if (strcmp(key, "bloom_persist_interval_sec") == 0) {
+            config->bloom_persist_interval_sec = atoi(value);
+            if (config->bloom_persist_interval_sec < 0) {
+                log_msg(LOG_WARN, "bloom_persist_interval_sec %d out of range (0, or 30-3600); clamping to 0",
+                        config->bloom_persist_interval_sec);
+                config->bloom_persist_interval_sec = 0;
+            }
+            if (config->bloom_persist_interval_sec > 0 && config->bloom_persist_interval_sec < 30) {
+                log_msg(LOG_WARN, "bloom_persist_interval_sec %d out of range (0, or 30-3600); clamping to 30",
+                        config->bloom_persist_interval_sec);
+                config->bloom_persist_interval_sec = 30;
+            }
+            if (config->bloom_persist_interval_sec > 3600) {
+                log_msg(LOG_WARN, "bloom_persist_interval_sec %d out of range (0, or 30-3600); clamping to 3600",
+                        config->bloom_persist_interval_sec);
+                config->bloom_persist_interval_sec = 3600;
+            }
         } else if (strcmp(key, "bloom_path") == 0) {
             strncpy(config->bloom_path, value, sizeof(config->bloom_path) - 1);
         }
@@ -685,5 +703,6 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
     log_msg(LOG_DEBUG, "Logging:");
     log_msg(LOG_DEBUG, "  Level: %s", log_levels[config->log_level]);
+    log_msg(LOG_DEBUG, "Bloom persist interval: %d sec", config->bloom_persist_interval_sec);
 }
 

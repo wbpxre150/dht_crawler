@@ -45,6 +45,13 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
 void batch_writer_set_bloom(batch_writer_t *writer, bloom_filter_t *bloom, const char *bloom_path);
 
 /**
+ * Set minimum seconds between bloom-filter disk saves after batch writes
+ * @param writer Batch writer instance
+ * @param sec Minimum interval in seconds (0 = save on every flush)
+ */
+void batch_writer_set_bloom_persist_interval(batch_writer_t *writer, int sec);
+
+/**
  * Set failure bloom filter for persistence after batch writes
  * @param writer Batch writer instance
  * @param failure_bloom Failure bloom filter instance
@@ -142,6 +149,20 @@ uint64_t batch_writer_get_torrent_count(batch_writer_t *writer);
  * @return Total number of files in database (cached, updated on batch writes)
  */
 uint64_t batch_writer_get_file_count(batch_writer_t *writer);
+
+/**
+ * Get the number of bloom-filter save events (both filters written together)
+ * @param writer Batch writer instance
+ * @return Save events since process start (0 if writer is NULL)
+ */
+uint64_t batch_writer_get_bloom_saves_total(const batch_writer_t *writer);
+
+/**
+ * Get the number of bytes written by bloom-filter saves
+ * @param writer Batch writer instance
+ * @return Bytes written by successful filter saves since process start
+ */
+uint64_t batch_writer_get_bloom_bytes_written_total(const batch_writer_t *writer);
 
 /**
  * Prevent any new daily backup from starting (call before supervisor shutdown)

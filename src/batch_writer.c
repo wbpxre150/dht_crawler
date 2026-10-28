@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -64,6 +65,13 @@ struct batch_writer {
     char *rclone_remote;
     char *rclone_dest_path;
     char *rclone_bookmark_path;
+
+    /* Bloom-filter persistence throttle and counters (see batch_writer_flush) */
+    int bloom_persist_interval_sec;                 /* 0 = save on every flush */
+    uint64_t bloom_last_save_ms;                    /* CLOCK_MONOTONIC ms, 0 = never saved */
+    bool bloom_save_force;                          /* Force the next flush to save */
+    atomic_uint_fast64_t bloom_saves_total;         /* Save events (both filters together) */
+    atomic_uint_fast64_t bloom_bytes_written_total; /* Bytes written by those saves */
 };
 
 /* Background thread for periodic flush.
@@ -120,6 +128,11 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     writer->bloom_path = NULL;
     writer->failure_bloom = NULL;
     writer->failure_bloom_path = NULL;
+    writer->bloom_persist_interval_sec = 0;  /* fail-open: save every flush until set */
+    writer->bloom_last_save_ms = 0;
+    writer->bloom_save_force = false;
+    atomic_init(&writer->bloom_saves_total, 0);
+    atomic_init(&writer->bloom_bytes_written_total, 0);
     writer->batch_capacity = batch_capacity;
     writer->batch_size = 0;
     writer->flush_interval_sec = flush_interval_sec;
@@ -233,6 +246,16 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     return writer;
 }
 
+/* Monotonic milliseconds, used only for the bloom-persist interval check.
+ * Kept isolated from the time(NULL) seconds used elsewhere in this file. */
+static uint64_t bloom_save_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
 void batch_writer_set_bloom(batch_writer_t *writer, bloom_filter_t *bloom, const char *bloom_path) {
     if (!writer) {
         log_msg(LOG_WARN, "batch_writer_set_bloom: writer is NULL");
@@ -242,6 +265,18 @@ void batch_writer_set_bloom(batch_writer_t *writer, bloom_filter_t *bloom, const
     writer->bloom_path = bloom_path;
     log_msg(LOG_DEBUG, "Bloom filter connected to batch writer for persistence (path: %s)",
             bloom_path ? bloom_path : "(null)");
+}
+
+void batch_writer_set_bloom_persist_interval(batch_writer_t *writer, int sec) {
+    if (!writer) {
+        log_msg(LOG_WARN, "batch_writer_set_bloom_persist_interval: writer is NULL");
+        return;
+    }
+    uv_mutex_lock(&writer->mutex);
+    writer->bloom_persist_interval_sec = sec;
+    uv_mutex_unlock(&writer->mutex);
+
+    log_msg(LOG_DEBUG, "Bloom filter persist interval set to %d sec (0 = save every flush)", sec);
 }
 
 void batch_writer_set_failure_bloom(batch_writer_t *writer,
@@ -972,11 +1007,11 @@ int batch_writer_flush(batch_writer_t *writer) {
     /* Use actual DB-reported count, not the batch size assumption */
     size_t written = (ret == 0) ? actual_written : 0;
 
-    /* CRITICAL: Update bloom filter in memory and save to disk after successful batch write
+    /* CRITICAL: Update bloom filter in memory after every successful batch write
      * This ensures the bloom filter stays synchronized with the database.
      * Steps:
-     * 1. Add all successfully written infohashes to bloom filter (in-memory)
-     * 2. Save bloom filter to disk
+     * 1. Add all successfully written infohashes to bloom filter (in-memory) - never throttled
+     * 2. Save both bloom filters to disk, at most once per bloom_persist_interval_sec
      * If the application crashes, the bloom filter will accurately reflect
      * all info_hashes that were successfully written to the database. */
     if (ret == 0 && written > 0 && writer->bloom) {
@@ -985,18 +1020,48 @@ int batch_writer_flush(batch_writer_t *writer) {
             bloom_filter_add(writer->bloom, batch_copy[i]->info_hash);
         }
 
-        /* Save bloom filter to disk */
-        if (writer->bloom_path) {
-            if (bloom_filter_save(writer->bloom, writer->bloom_path) != 0) {
-                log_msg(LOG_WARN, "Failed to save bloom filter after batch write");
-            }
-        }
+        /* Persist both filters at most once per bloom_persist_interval_sec.
+         * The in-memory adds above already ran, so a skipped save only costs a
+         * replay of recent hashes on restart, never correctness. The timestamp
+         * and counters are updated only inside do_save: a skipped save must
+         * never push the next save out. */
+        uint64_t now_ms = bloom_save_now_ms();
+        bool do_save = writer->bloom_save_force ||
+                       writer->bloom_persist_interval_sec == 0 ||
+                       writer->bloom_last_save_ms == 0 ||
+                       (now_ms - writer->bloom_last_save_ms) >=
+                           (uint64_t)writer->bloom_persist_interval_sec * 1000ULL;
 
-        /* Save failure bloom filter to disk */
-        if (writer->failure_bloom && writer->failure_bloom_path) {
-            if (bloom_filter_save(writer->failure_bloom, writer->failure_bloom_path) != 0) {
-                log_msg(LOG_WARN, "Failed to save failure bloom filter after batch write");
+        if (do_save) {
+            uint64_t written_bytes = 0;
+
+            /* Save bloom filter to disk */
+            if (writer->bloom_path) {
+                if (bloom_filter_save(writer->bloom, writer->bloom_path) != 0) {
+                    log_msg(LOG_WARN, "Failed to save bloom filter after batch write");
+                } else {
+                    uint64_t capacity = 0, bytes = 0;
+                    double error_rate = 0.0;
+                    bloom_filter_stats(writer->bloom, &capacity, &error_rate, &bytes);
+                    written_bytes += bytes;
+                }
             }
+
+            /* Save failure bloom filter to disk */
+            if (writer->failure_bloom && writer->failure_bloom_path) {
+                if (bloom_filter_save(writer->failure_bloom, writer->failure_bloom_path) != 0) {
+                    log_msg(LOG_WARN, "Failed to save failure bloom filter after batch write");
+                } else {
+                    uint64_t capacity = 0, bytes = 0;
+                    double error_rate = 0.0;
+                    bloom_filter_stats(writer->failure_bloom, &capacity, &error_rate, &bytes);
+                    written_bytes += bytes;
+                }
+            }
+
+            writer->bloom_last_save_ms = now_ms;
+            atomic_fetch_add(&writer->bloom_saves_total, 1);
+            atomic_fetch_add(&writer->bloom_bytes_written_total, written_bytes);
         }
     }
 
@@ -1171,6 +1236,22 @@ uint64_t batch_writer_get_file_count(batch_writer_t *writer) {
     return count;
 }
 
+uint64_t batch_writer_get_bloom_saves_total(const batch_writer_t *writer) {
+    if (!writer) {
+        return 0;
+    }
+
+    return atomic_load(&writer->bloom_saves_total);
+}
+
+uint64_t batch_writer_get_bloom_bytes_written_total(const batch_writer_t *writer) {
+    if (!writer) {
+        return 0;
+    }
+
+    return atomic_load(&writer->bloom_bytes_written_total);
+}
+
 void batch_writer_inhibit_backup(batch_writer_t *writer) {
     if (!writer) return;
     uv_mutex_lock(&writer->mutex);
@@ -1198,8 +1279,11 @@ void batch_writer_shutdown(batch_writer_t *writer) {
     writer->running = false;
     uv_mutex_unlock(&writer->mutex);
 
-    /* Flush any pending writes */
+    /* Flush any pending writes. The periodic saves are throttled, so force the
+     * final flush to persist both bloom filters before the process exits. */
+    writer->bloom_save_force = true;
     batch_writer_flush(writer);
+    writer->bloom_save_force = false;
 }
 
 void batch_writer_cleanup(batch_writer_t *writer) {

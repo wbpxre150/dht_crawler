@@ -836,6 +836,14 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(dispatcher_json, "queue_full_drops", (double)disp_queue_full_drops);
         cJSON_AddItemToObject(supervisor_json, "dispatcher", dispatcher_json);
 
+        /* Bloom persistence throttle counters (one save event = both filters) */
+        if (api->batch_writer) {
+            cJSON_AddNumberToObject(supervisor_json, "bloom_saves_total",
+                                    (double)batch_writer_get_bloom_saves_total(api->batch_writer));
+            cJSON_AddNumberToObject(supervisor_json, "bloom_bytes_written_total",
+                                    (double)batch_writer_get_bloom_bytes_written_total(api->batch_writer));
+        }
+
         cJSON_AddItemToObject(root, "supervisor", supervisor_json);
 
         /* BEP51 cache global stats */

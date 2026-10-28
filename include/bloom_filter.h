@@ -72,7 +72,9 @@ void bloom_filter_stats(bloom_filter_t *filter, uint64_t *out_capacity,
  * @return 0 on success, -1 on error
  *
  * Thread-safe: Uses internal mutex to ensure consistent snapshot.
- * Should only be called during shutdown after all worker threads have stopped.
+ * Called from the batch writer's throttled per-flush path (at most once per
+ * bloom_persist_interval_sec), at shutdown, and by maintenance rebuilds; all
+ * callers hold no other lock and the save itself takes filter->mutex.
  */
 int bloom_filter_save(bloom_filter_t *filter, const char *path);
 

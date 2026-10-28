@@ -662,6 +662,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    /* Throttle bloom-filter persistence: the in-memory adds still happen on
+     * every flush, but the 2x53.9 MB disk write runs at most once per interval. */
+    batch_writer_set_bloom_persist_interval(g_batch_writer, config.bloom_persist_interval_sec);
+
     /* Connect bloom filter to batch writer */
     if (g_bloom && config.bloom_persist) {
         batch_writer_set_bloom(g_batch_writer, g_bloom, config.bloom_path);

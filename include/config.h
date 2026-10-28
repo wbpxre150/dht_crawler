@@ -51,6 +51,7 @@ typedef struct {
     double bloom_error_rate;
     int bloom_persist;
     char bloom_path[512];
+    int bloom_persist_interval_sec;  /* min seconds between bloom-filter disk saves (0=every flush, else 30-3600; default: 300) */
 
     /* Metadata fetcher settings */
     int max_concurrent_connections;
