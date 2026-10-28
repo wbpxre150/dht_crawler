@@ -15,6 +15,7 @@
 #include "refresh_thread.h"
 #include "refresh_query.h"
 #include "classify_backfill.h"
+#include "classify_backfill_daemon.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -970,6 +971,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    /* Start the classify-backfill thread: the DB, the classifier and the HTTP
+     * API are all up by now, so /stats can serve its object from the first
+     * request. Non-blocking - the thread takes its own first decision. */
+    classify_backfill_daemon_start(&g_app_ctx, &g_database);
+    
     log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
     log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
             config.num_trees, config.tree_bep51_workers,
@@ -987,6 +993,11 @@ int main(int argc, char *argv[]) {
     /* Release any thread blocked in udp_rate_limit_acquire() so shutdown
      * cannot deadlock waiting for a token. */
     udp_rate_limit_shutdown();
+    
+    /* Stop the classify-backfill thread first: the request is asynchronous
+     * (stop flag + cooperative engine stop), so an in-flight pass is bounded to
+     * the batch it is in and the join below cannot hang. */
+    classify_backfill_daemon_request_shutdown();
     
     log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
     http_api_stop(&g_http_api);
@@ -1021,6 +1032,9 @@ int main(int argc, char *argv[]) {
     if (g_refresh_thread) {
         refresh_thread_destroy(g_refresh_thread);
     }
+    /* Join the backfill thread after http_api_stop() and before
+     * database_cleanup(): an in-flight batch must commit before the DB closes. */
+    classify_backfill_daemon_destroy();
     supervisor_destroy(g_supervisor);
     cleanup_app_context(&g_app_ctx);
     batch_writer_cleanup(g_batch_writer);

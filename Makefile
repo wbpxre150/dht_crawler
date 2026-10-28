@@ -130,7 +130,21 @@ BACKFILL_TEST_SRCS = tests/test_classify_backfill.c src/classify_backfill.c \
 BACKFILL_TEST_BIN = $(BUILD_DIR)/test_classify_backfill
 BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-backfill
+# The daemon-thread test drives src/classify_backfill_daemon.c through its test
+# hooks (-DCLF_BACKFILL_DAEMON_TEST), so the engine and the classifier are fakes
+# and no database, model files or 60 s poll interval are involved.
+# src/classify_backfill.c is still linked, for the real state names and the
+# progress accessor; its classifier dependencies are answered by the test's own
+# stubs, exactly like the backfill test above.
+BACKFILL_DAEMON_TEST_SRCS = tests/test_classify_backfill_daemon.c \
+                            src/classify_backfill_daemon.c \
+                            src/classify_backfill.c src/database.c \
+                            src/bloom_filter.c tests/stub_log.c
+BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_classify_backfill_daemon
+BACKFILL_DAEMON_TEST_CFLAGS = -DCLF_BACKFILL_DAEMON_TEST
+BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+
+tests: tests-search tests-docs tests-backfill tests-backfill-daemon
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -147,6 +161,11 @@ tests-backfill: libbloom
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(BACKFILL_TEST_SRCS) -o $(BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_TEST_LDFLAGS)
 	./$(BACKFILL_TEST_BIN)
 
+tests-backfill-daemon: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(BACKFILL_DAEMON_TEST_SRCS) -o $(BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_DAEMON_TEST_LDFLAGS)
+	./$(BACKFILL_DAEMON_TEST_BIN)
+
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
@@ -154,6 +173,10 @@ tests-asan:
 # binary, so its leak/UB verdict never depends on the other test binaries.
 tests-asan-backfill:
 	$(MAKE) tests-backfill TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
+# Same scoped gate for the daemon-thread test (threads + sanitizers).
+tests-asan-backfill-daemon:
+	$(MAKE) tests-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
 # CLF-enabled host build for --classify-backfill maintenance runs: the plain
 # build keeps src/classifier.c inert (no -DCLF_ENABLED); this flavor adds it,
@@ -181,4 +204,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-asan tests-asan-backfill clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-asan tests-asan-backfill tests-asan-backfill-daemon clf-backfill

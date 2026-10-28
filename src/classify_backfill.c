@@ -6,6 +6,7 @@
 #include "classifier.h"
 #include "dht_crawler.h"
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -618,6 +619,48 @@ static int cb_prepare_statements(cb_ctx_t *c) {
 }
 
 /* ------------------------------------------------------------------------ *
+ * Live progress snapshot
+ * ------------------------------------------------------------------------ */
+
+/* run() keeps its counters in a function-local struct, so without this channel
+ * nothing could see a pass in flight: the caller's *out was filled once, at
+ * return. g_progress is the pollable copy — the engine republishes it at every
+ * observable step (run start, each committed batch, each window, each exit
+ * path) and any thread may read the last one through
+ * classify_backfill_get_progress().
+ *
+ * Locking: g_progress_mutex is never held while db->mutex is held and never
+ * held across classification or I/O. The counters are copied after a batch has
+ * committed and db->mutex has been released, so the pass's own contract
+ * (db->mutex around BEGIN ... COMMIT only) is untouched. */
+static classify_backfill_progress_t g_progress;
+static pthread_mutex_t g_progress_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Publish the pass's counters for pollers and, when the caller asked for one,
+ * hand the same values back through *out — so the pollable snapshot and the
+ * caller's struct can never disagree. Every publish point (run start, each
+ * committed batch, each window, each exit path) goes through here, and each one
+ * sits outside db->mutex. */
+static void cb_report(const classify_backfill_progress_t *p,
+                      classify_backfill_progress_t *out) {
+    pthread_mutex_lock(&g_progress_mutex);
+    g_progress = *p;
+    pthread_mutex_unlock(&g_progress_mutex);
+    if (out) {
+        *out = *p;
+    }
+}
+
+void classify_backfill_get_progress(classify_backfill_progress_t *out) {
+    if (!out) {
+        return;   /* nothing to report to; polling must never crash a caller */
+    }
+    pthread_mutex_lock(&g_progress_mutex);
+    *out = g_progress;
+    pthread_mutex_unlock(&g_progress_mutex);
+}
+
+/* ------------------------------------------------------------------------ *
  * Public API
  * ------------------------------------------------------------------------ */
 
@@ -640,9 +683,7 @@ int classify_backfill_run(database_t *db, const classify_backfill_opts_t *opts,
     if (!db || !db->db) {
         log_msg(LOG_ERROR, "classify-backfill: no database connection");
         progress.state = CLASSIFY_BACKFILL_FAILED;
-        if (out) {
-            *out = progress;
-        }
+        cb_report(&progress, out);
         return -1;
     }
 
@@ -659,9 +700,7 @@ int classify_backfill_run(database_t *db, const classify_backfill_opts_t *opts,
         progress.state = CLASSIFY_BACKFILL_DISABLED;
         progress.target_clf_ver = target;
         cb_log_summary(&progress);
-        if (out) {
-            *out = progress;
-        }
+        cb_report(&progress, out);
         return 1;
     }
 
@@ -681,9 +720,7 @@ int classify_backfill_run(database_t *db, const classify_backfill_opts_t *opts,
     if (cb_count_candidates(db, start_id, target, &rows_total) != 0) {
         progress.state = CLASSIFY_BACKFILL_FAILED;
         cb_log_summary(&progress);
-        if (out) {
-            *out = progress;
-        }
+        cb_report(&progress, out);
         return -1;
     }
     progress.rows_total = rows_total;
@@ -695,11 +732,16 @@ int classify_backfill_run(database_t *db, const classify_backfill_opts_t *opts,
                 rows_total, target);
         progress.state = CLASSIFY_BACKFILL_DONE;
         cb_log_summary(&progress);
-        if (out) {
-            *out = progress;
-        }
+        cb_report(&progress, out);
         return 0;
     }
+
+    /* The pass is live from here on: publish RUNNING with the counters it just
+     * resolved, so a poller sees the work start before the first batch. A dry
+     * run is excluded on purpose — it never processes a row, so it goes straight
+     * from idle to its DONE at the exit path rather than flashing running. */
+    progress.state = CLASSIFY_BACKFILL_RUNNING;
+    cb_report(&progress, NULL);
 
     ctx.batch = malloc((size_t)ctx.batch_rows * sizeof(*ctx.batch));
     if (!ctx.batch) {
@@ -752,6 +794,9 @@ int classify_backfill_run(database_t *db, const classify_backfill_opts_t *opts,
                     progress.state = CLASSIFY_BACKFILL_FAILED;
                     goto cleanup;
                 }
+                /* One committed batch: republish so rows_done/rows_updated/
+                 * rows_inserted/last_id move for a poller while the pass walks. */
+                cb_report(&progress, NULL);
                 /* The batch in flight always commits before a stop is seen. */
                 if (cb_stop_requested) {
                     stopped = 1;
@@ -776,6 +821,8 @@ int classify_backfill_run(database_t *db, const classify_backfill_opts_t *opts,
                 progress.rows_done, progress.rows_total, progress.rows_updated,
                 progress.rows_inserted, progress.rows_skipped, progress.rows_failed,
                 progress.last_id);
+        /* End of a window: publish the counters the log line just reported. */
+        cb_report(&progress, NULL);
 
         if (stopped) {
             break;
@@ -804,9 +851,7 @@ cleanup:
     free(ctx.batch);
     ctx.batch = NULL;
     cb_log_summary(&progress);
-    if (out) {
-        *out = progress;
-    }
+    cb_report(&progress, out);
     return result;
 }
 

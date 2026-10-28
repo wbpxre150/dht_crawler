@@ -5,6 +5,7 @@
 #include "batch_writer.h"
 #include "language_filter.h"
 #include "classifier.h"
+#include "classify_backfill_daemon.h"
 #include "category_filter_cleanup.h"
 #include "torrent_search.h"
 #include "supervisor.h"
@@ -700,6 +701,25 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddItemToObject(classifier, "by_category", by_category);
 
         cJSON_AddItemToObject(root, "classifier", classifier);
+    }
+
+    /* Classifier backfill: live progress of the background re-classification
+     * pass (present in every build, "disabled" when the classifier is inert). */
+    {
+        classify_backfill_daemon_stats_t cb_stats;
+        classify_backfill_daemon_get_stats(&cb_stats);
+
+        cJSON *classifier_backfill = cJSON_CreateObject();
+        cJSON_AddStringToObject(classifier_backfill, "state", cb_stats.state);
+        cJSON_AddNumberToObject(classifier_backfill, "target_clf_ver", cb_stats.target_clf_ver);
+        cJSON_AddNumberToObject(classifier_backfill, "rows_left", (double)cb_stats.rows_left);
+        cJSON_AddNumberToObject(classifier_backfill, "rows_processed",
+                                (double)cb_stats.rows_processed);
+        cJSON_AddNumberToObject(classifier_backfill, "rows_total", (double)cb_stats.rows_total);
+        cJSON_AddNumberToObject(classifier_backfill, "started_at", (double)cb_stats.started_at);
+        cJSON_AddNumberToObject(classifier_backfill, "finished_at", (double)cb_stats.finished_at);
+        cJSON_AddStringToObject(classifier_backfill, "last_error", cb_stats.last_error);
+        cJSON_AddItemToObject(root, "classifier_backfill", classifier_backfill);
     }
 
     /* "Categories to save": ingest drops caused by save_categories /

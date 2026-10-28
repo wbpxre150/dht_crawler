@@ -36,6 +36,7 @@
  *
  *     make tests        # or: make tests-backfill / make tests-asan-backfill
  */
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,6 +84,16 @@ static int stub_fail_all = 0;
 static int stub_write_meta_calls = 0;
 static stub_call_t stub_calls[STUB_MAX_CALLS];
 static int stub_call_count;
+
+/* --- live-progress case (10) state ---------------------------------------
+ * The poller thread below reads the published snapshot while a pass runs; the
+ * stub classifier stalls on a name starting with "SLOW" until the poller has
+ * actually observed the pass, so the case cannot race the engine. */
+static volatile int stub_stall_for_poller = 0;
+static volatile int poller_stop_flag = 0;
+static volatile int poller_saw_running = 0;
+static volatile int poller_monotonic = 1;
+static volatile long long poller_max_done = -1;
 
 /* database_init() stores the pointer, so this has to outlive every fixture. */
 static app_context_t test_app_ctx;
@@ -468,6 +479,16 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     }
     record_call(meta);
 
+    /* Case 10 only: hold the pass inside the classifier until the poller thread
+     * has read a RUNNING snapshot that carries progress. Bounded, so a broken
+     * accessor fails the case instead of hanging the suite. */
+    if (stub_stall_for_poller && meta->name && strncmp(meta->name, "SLOW", 4) == 0) {
+        for (int waited_us = 0; waited_us < 2000000 && poller_max_done < 1;
+             waited_us += 1000) {
+            usleep(1000);
+        }
+    }
+
     if (stub_fail_all || (meta->name && strncmp(meta->name, "FAIL", 4) == 0)) {
         return 1;
     }
@@ -815,8 +836,183 @@ static void case_disabled(database_t *db) {
            classify_backfill_state_name(prog.state));
 }
 
+/* ------------------------------------------------------------------------- *
+ * Live progress (classify_backfill_get_progress)
+ * ------------------------------------------------------------------------- */
+
+/* 9: after a completed pass the published snapshot is exactly the progress the
+ * caller's *out carries — a late poller sees the final state, never a stale
+ * mid-run copy. */
+static void case_progress_after_run(database_t *db) {
+    classify_backfill_opts_t opts;
+    classify_backfill_progress_t prog;
+    classify_backfill_progress_t snap;
+
+    memset(&opts, 0, sizeof opts);
+    memset(&prog, 0, sizeof prog);
+    memset(&snap, 0, sizeof snap);
+
+    if (classify_backfill_run(db, &opts, &prog) != 0) {
+        fail("pass before the progress comparison", "returned non-zero");
+    }
+    classify_backfill_get_progress(&snap);
+
+    if (prog.state != CLASSIFY_BACKFILL_DONE) {
+        fail("progress after a pass: run state", classify_backfill_state_name(prog.state));
+    }
+    if (snap.state != CLASSIFY_BACKFILL_DONE) {
+        fail("progress after a pass: published state",
+             classify_backfill_state_name(snap.state));
+    }
+    /* Guard against a vacuous comparison: this fixture has candidates. */
+    if (prog.rows_total != FIXTURE_TORRENTS || prog.rows_done != FIXTURE_TORRENTS) {
+        char detail[96];
+        snprintf(detail, sizeof detail, "total=%lld done=%lld", prog.rows_total,
+                 prog.rows_done);
+        fail("progress after a pass: the fixture was not fully processed", detail);
+    }
+    if (snap.target_clf_ver != prog.target_clf_ver || snap.rows_total != prog.rows_total ||
+        snap.rows_done != prog.rows_done || snap.rows_updated != prog.rows_updated ||
+        snap.rows_inserted != prog.rows_inserted || snap.rows_skipped != prog.rows_skipped ||
+        snap.rows_failed != prog.rows_failed || snap.last_id != prog.last_id) {
+        char detail[384];
+        snprintf(detail, sizeof detail,
+                 "published target=%lld total=%lld done=%lld updated=%lld inserted=%lld "
+                 "skipped=%lld failed=%lld last_id=%lld, *out target=%lld total=%lld "
+                 "done=%lld updated=%lld inserted=%lld skipped=%lld failed=%lld last_id=%lld",
+                 snap.target_clf_ver, snap.rows_total, snap.rows_done, snap.rows_updated,
+                 snap.rows_inserted, snap.rows_skipped, snap.rows_failed, snap.last_id,
+                 prog.target_clf_ver, prog.rows_total, prog.rows_done, prog.rows_updated,
+                 prog.rows_inserted, prog.rows_skipped, prog.rows_failed, prog.last_id);
+        fail("the published snapshot must match the caller's *out", detail);
+    }
+    printf("  case 9 ok: get_progress() reports state=%s total=%lld done=%lld updated=%lld "
+           "inserted=%lld failed=%lld, same as *out\n",
+           classify_backfill_state_name(snap.state), snap.rows_total, snap.rows_done,
+           snap.rows_updated, snap.rows_inserted, snap.rows_failed);
+}
+
+/* Case 10's poller: reads the snapshot exactly like a /stats reader would and
+ * records whether the pass was visible while it ran. */
+static void *progress_poller_main(void *arg) {
+    classify_backfill_progress_t seen;
+    long long prev_done = 0;
+    int running_seen = 0;
+
+    (void)arg;
+    while (!poller_stop_flag) {
+        classify_backfill_get_progress(&seen);
+        if (seen.state == CLASSIFY_BACKFILL_RUNNING) {
+            if (running_seen && seen.rows_done < prev_done) {
+                poller_monotonic = 0;   /* live progress must never go backwards */
+            }
+            prev_done = seen.rows_done;
+            running_seen = 1;
+            poller_saw_running = 1;
+            poller_max_done = seen.rows_done;
+        }
+        usleep(200);
+    }
+    return NULL;
+}
+
+/* 10: mid-run visibility. A poller thread reads the published snapshot while the
+ * pass is in flight: it must observe state=RUNNING at least once, with rows_done
+ * non-decreasing, and the snapshot must end up DONE. batch_rows=1 forces a
+ * commit (and therefore a publication) after every row, and the fixture's third
+ * torrent stalls inside the stub classifier until the poller has seen RUNNING
+ * with progress in it — that is what a much bigger fixture would otherwise buy. */
+static void case_live_progress(database_t *db) {
+    classify_backfill_opts_t opts;
+    classify_backfill_progress_t prog;
+    classify_backfill_progress_t snap;
+    pthread_t poller;
+    int rc;
+
+    memset(&opts, 0, sizeof opts);
+    memset(&prog, 0, sizeof prog);
+    memset(&snap, 0, sizeof snap);
+    opts.batch_rows = 1;   /* one publication per row instead of per 500 */
+
+    poller_stop_flag = 0;
+    poller_saw_running = 0;
+    poller_monotonic = 1;
+    poller_max_done = -1;
+    stub_stall_for_poller = 1;
+
+    if (pthread_create(&poller, NULL, progress_poller_main, NULL) != 0) {
+        stub_stall_for_poller = 0;
+        fail("progress poller", "pthread_create failed");
+    }
+
+    rc = classify_backfill_run(db, &opts, &prog);
+
+    poller_stop_flag = 1;
+    pthread_join(poller, NULL);
+    stub_stall_for_poller = 0;
+
+    if (rc != 0) {
+        fail("pass under a polling reader", "returned non-zero");
+    }
+    if (prog.state != CLASSIFY_BACKFILL_DONE) {
+        fail("pass under a polling reader: run state",
+             classify_backfill_state_name(prog.state));
+    }
+    if (!poller_saw_running) {
+        fail("mid-run visibility",
+             "the poller never saw state=running while the pass was in flight");
+    }
+    if (!poller_monotonic) {
+        fail("mid-run visibility", "rows_done went backwards between two polls");
+    }
+    if (poller_max_done < 1) {
+        fail("mid-run visibility",
+             "the poller never saw a running snapshot with rows_done > 0");
+    }
+    classify_backfill_get_progress(&snap);
+    if (snap.state != CLASSIFY_BACKFILL_DONE || snap.rows_done != prog.rows_done) {
+        char detail[128];
+        snprintf(detail, sizeof detail, "state=%s done=%lld, run ended state=%s done=%lld",
+                 classify_backfill_state_name(snap.state), snap.rows_done,
+                 classify_backfill_state_name(prog.state), prog.rows_done);
+        fail("the published snapshot must end at the run's final state", detail);
+    }
+    printf("  case 10 ok: poller saw state=running (rows_done up to %lld, monotonic) and "
+           "the snapshot ended state=%s done=%lld\n",
+           poller_max_done, classify_backfill_state_name(snap.state), snap.rows_done);
+}
+
+/* 11: the accessor tolerates a NULL out (no-op, no crash) and the snapshot
+ * before the first pass of the process is the zeroed IDLE state. */
+static void case_progress_null_safe(void) {
+    classify_backfill_progress_t snap;
+
+    memset(&snap, 0xFF, sizeof snap);   /* poisoned: the accessor must fill it */
+    classify_backfill_get_progress(&snap);
+    if (snap.state != CLASSIFY_BACKFILL_IDLE || snap.target_clf_ver != 0 ||
+        snap.rows_total != 0 || snap.rows_done != 0 || snap.rows_updated != 0 ||
+        snap.rows_inserted != 0 || snap.rows_skipped != 0 || snap.rows_failed != 0 ||
+        snap.last_id != 0) {
+        char detail[160];
+        snprintf(detail, sizeof detail,
+                 "state=%s target=%lld total=%lld done=%lld last_id=%lld",
+                 classify_backfill_state_name(snap.state), snap.target_clf_ver,
+                 snap.rows_total, snap.rows_done, snap.last_id);
+        fail("before the first pass the snapshot must be a zeroed IDLE state", detail);
+    }
+    classify_backfill_get_progress(NULL);   /* must not crash */
+    classify_backfill_get_progress(&snap);
+    if (snap.state != CLASSIFY_BACKFILL_IDLE) {
+        fail("get_progress(NULL)", "the no-op changed the published snapshot");
+    }
+    printf("  case 11 ok: get_progress(NULL) is a no-op; the snapshot starts IDLE\n");
+}
+
 int main(void) {
     database_t db;
+
+    /* Case 11 needs no fixture: it pins the pre-pass snapshot and NULL safety. */
+    case_progress_null_safe();
 
     /* Cases 1-5 and 6a share one fixture: 1-2 write nothing, 3-5 is the single
      * real pass, 6a proves a re-run writes nothing even when a row cannot be
@@ -843,6 +1039,18 @@ int main(void) {
     /* Case 8 flips the models toggle, so it runs last. */
     build_fixture(&db);
     case_disabled(&db);
+    database_cleanup(&db);
+
+    /* Case 9 compares the published snapshot with a completed pass's *out. */
+    build_fixture(&db);
+    case_progress_after_run(&db);
+    database_cleanup(&db);
+
+    /* Case 10 needs a pass slow enough to be observed in flight: its fixture's
+     * third torrent stalls in the stub classifier until the poller thread has
+     * read a RUNNING snapshot that carries progress. */
+    build_fixture_named(&db, "SLOW-gamma");
+    case_live_progress(&db);
     database_cleanup(&db);
 
     remove_scratch_db();

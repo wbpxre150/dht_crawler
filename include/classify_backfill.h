@@ -90,4 +90,22 @@ int classify_backfill_needed(database_t *db, long long target_clf_ver,
  */
 void classify_backfill_request_stop(void);
 
+/*
+ * Last published progress of the most recent pass, for anything that has to
+ * watch a pass it did not start (/stats, a supervising thread, a test).
+ *
+ * Safe to call from any thread at any time, including while a pass is running:
+ * it copies the module-global snapshot under its own mutex, so reading progress
+ * never requires holding database_t.mutex and never blocks the pass. The
+ * snapshot carries the state and every counter classify_backfill_run() reports
+ * through *out, republished at run start, after each committed batch, after each
+ * window and at every exit path. Before the first pass in this process it is the
+ * zeroed IDLE state. *out may be NULL (no-op).
+ *
+ * rows_total is counted from the resume point, so a live pass reports
+ * rows_left == rows_total - rows_done rather than a lifetime total; a reader that
+ * wants "work still to do" derives it and needs no extra field here.
+ */
+void classify_backfill_get_progress(classify_backfill_progress_t *out);
+
 #endif /* CLASSIFY_BACKFILL_H */
