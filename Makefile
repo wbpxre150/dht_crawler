@@ -122,7 +122,15 @@ DOCS_TEST_SRCS = tests/test_torrent_docs.c src/database.c src/bloom_filter.c \
 DOCS_TEST_BIN = $(BUILD_DIR)/test_torrent_docs
 DOCS_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs
+# The backfill test defines its own stub classifier symbols (models_loaded,
+# current_version, write_meta, classify) so it never links src/classifier.c:
+# the host build compiles that module inert, which could never insert a row.
+BACKFILL_TEST_SRCS = tests/test_classify_backfill.c src/classify_backfill.c \
+                     src/database.c src/bloom_filter.c tests/stub_log.c
+BACKFILL_TEST_BIN = $(BUILD_DIR)/test_classify_backfill
+BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+
+tests: tests-search tests-docs tests-backfill
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -134,7 +142,43 @@ tests-docs: libbloom
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(DOCS_TEST_SRCS) -o $(DOCS_TEST_BIN) $(TEST_LDFLAGS) $(DOCS_TEST_LDFLAGS)
 	./$(DOCS_TEST_BIN)
 
+tests-backfill: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(BACKFILL_TEST_SRCS) -o $(BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_TEST_LDFLAGS)
+	./$(BACKFILL_TEST_BIN)
+
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-asan
+# Scoped sanitizer gate for the backfill engine: builds and runs only that test
+# binary, so its leak/UB verdict never depends on the other test binaries.
+tests-asan-backfill:
+	$(MAKE) tests-backfill TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
+# CLF-enabled host build for --classify-backfill maintenance runs: the plain
+# build keeps src/classifier.c inert (no -DCLF_ENABLED); this flavor adds it,
+# the vendored tparse/ftc headers, and links the prebuilt host students.
+# Override TPARSE_LIB / FTC_LIB if the classifier-model build lives elsewhere.
+TPARSE_LIB ?= $(HOME)/apps/classifier-model/build/tparse/libtparse.a
+FTC_LIB ?= $(HOME)/apps/classifier-model/build/ftc/libftc.a
+CLF_DIR = build/clf
+CLF_TARGET = $(CLF_DIR)/dht_crawler
+CLF_OBJS = $(SRCS:$(SRC_DIR)/%.c=$(CLF_DIR)/%.o)
+# Absolute on purpose: this target is built from the Gradle-prepared copy
+# (app/build/native/src/dht_crawler), where ../dht_crawler-android does not
+# resolve.
+CLF_ANDROID_DIR ?= $(HOME)/apps/torrent_kotlin_app/app/src/main/cpp/dht_crawler-android
+CLF_INCLUDES = -I$(CLF_ANDROID_DIR)/tparse -I$(CLF_ANDROID_DIR)/ftc
+
+$(CLF_DIR):
+	mkdir -p $(CLF_DIR)
+
+$(CLF_DIR)/%.o: $(SRC_DIR)/%.c | $(CLF_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DCLF_ENABLED $(CLF_INCLUDES) -c $< -o $@
+
+$(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(CLF_OBJS) $(LIB_OBJS) $(LDFLAGS) -lstdc++ $(TPARSE_LIB) $(FTC_LIB)
+
+clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
+
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-asan tests-asan-backfill clf-backfill

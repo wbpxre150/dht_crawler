@@ -14,6 +14,7 @@
 #include "batch_writer.h"
 #include "refresh_thread.h"
 #include "refresh_query.h"
+#include "classify_backfill.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -233,10 +234,24 @@ int main(int argc, char *argv[]) {
      * Declared here rather than with the other flags above because that
      * declaration block is context for the build patch stack.
      *
+     * --classify-backfill <db> [--write] [--classify-backfill-limit <n>]:
+     * re-classify the torrent_class rows of <db> with the model generation the
+     * loaded manifest describes. Resumable and upsert-only: no row is ever
+     * removed, and an interrupted pass continues from the resume key in
+     * classifier_meta. Dry run by default - it only counts the candidates;
+     * --write commits the rows. --classify-backfill-limit <n> stops after n
+     * candidates (0 = unlimited), for smoke tests. Dispatched after
+     * classifier_init(), because a backfill without loaded models can only
+     * report DISABLED, but before database_init(), so it opens <db> alone and
+     * never touches the configured daemon database.
+     *
      * Usage is documented here, not in --help, on purpose: the help printf
      * block is patch-anchor territory for the build patch stack. */
     bool print_schema = false;
     const char *rebuild_docs_db_path = NULL;
+    const char *classify_backfill_db = NULL;
+    long long classify_backfill_limit = 0;
+    bool classify_backfill_write = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rebuild-docs") == 0) {
             if (i + 1 >= argc) {
@@ -246,6 +261,29 @@ int main(int argc, char *argv[]) {
             rebuild_docs_db_path = argv[++i];
         } else if (strcmp(argv[i], "--print-schema") == 0) {
             print_schema = true;
+        } else if (strcmp(argv[i], "--classify-backfill") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--classify-backfill requires a <database> argument");
+                return 1;
+            }
+            classify_backfill_db = argv[++i];
+        } else if (strcmp(argv[i], "--classify-backfill-limit") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--classify-backfill-limit requires a <rows> argument");
+                return 1;
+            }
+            const char *limit_arg = argv[++i];
+            char *limit_end = NULL;
+            errno = 0;
+            long long limit_rows = strtoll(limit_arg, &limit_end, 10);
+            if (errno != 0 || limit_end == limit_arg || *limit_end != '\0' || limit_rows < 0) {
+                log_msg(LOG_ERROR, "--classify-backfill-limit requires a non-negative integer, got '%s'",
+                        limit_arg);
+                return 1;
+            }
+            classify_backfill_limit = limit_rows;
+        } else if (strcmp(argv[i], "--write") == 0) {
+            classify_backfill_write = true;
         }
     }
 
@@ -524,6 +562,72 @@ int main(int argc, char *argv[]) {
      * it is what the operator wrote, and it decides whether an adult-tagged row
      * is stored (tag) or discarded (drop). Set once, before any worker thread. */
     classifier_set_adult_mode(config.adult_mode);
+
+    /* --classify-backfill <db>: one-shot maintenance over the database named on
+     * the command line. Dispatched here on purpose: after classifier_init(), so
+     * the models a backfill needs are loaded, but before database_init(), so the
+     * configured daemon database is never opened and classifier_write_meta()
+     * never runs against it. The pass works purely on the flag's path, through
+     * its own database handle. */
+    if (classify_backfill_db) {
+        classify_backfill_opts_t bf_opts = {
+            .target_clf_ver = 0,  /* whatever the loaded manifest describes */
+            .chunk_ids = 0,       /* engine defaults */
+            .batch_rows = 0,
+            .dry_run = classify_backfill_write ? 0 : 1,
+            .limit_rows = classify_backfill_limit,
+        };
+        classify_backfill_progress_t bf_progress;
+        database_t bf_db;
+
+        memset(&bf_progress, 0, sizeof(bf_progress));
+        log_msg(LOG_INFO, "classify-backfill: %s %s ...",
+                classify_backfill_write ? "write pass on" : "dry run on", classify_backfill_db);
+
+        rc = database_init(&bf_db, classify_backfill_db, &g_app_ctx);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "classify-backfill: cannot open %s: %d",
+                    classify_backfill_db, rc);
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        rc = database_create_schema(&bf_db);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "classify-backfill: cannot create the schema of %s: %d",
+                    classify_backfill_db, rc);
+            database_cleanup(&bf_db);
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        int bf_rc = classify_backfill_run(&bf_db, &bf_opts, &bf_progress);
+        log_msg(bf_rc == 0 ? LOG_INFO : LOG_ERROR,
+                "classify-backfill: state=%s target_clf_ver=%lld total=%lld done=%lld "
+                "updated=%lld inserted=%lld skipped=%lld failed=%lld last_id=%lld",
+                classify_backfill_state_name(bf_progress.state),
+                bf_progress.target_clf_ver, bf_progress.rows_total,
+                bf_progress.rows_done, bf_progress.rows_updated,
+                bf_progress.rows_inserted, bf_progress.rows_skipped,
+                bf_progress.rows_failed, bf_progress.last_id);
+
+        database_cleanup(&bf_db);
+        /* Teardown for everything initialised so far. No porn filter cleanup:
+         * remove-porn-filter.patch removes both the filter and its sources. */
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        cleanup_app_context(&g_app_ctx);
+        /* DISABLED and FAILED must both fail loudly: a backfill that cannot run
+         * must never look like a success. */
+        return (bf_rc == 0) ? 0 : 1;
+    }
 
     /* Initialize torrent search module for title extraction */
     log_msg(LOG_DEBUG, "Initializing torrent search module...");

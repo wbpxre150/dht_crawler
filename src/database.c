@@ -1607,6 +1607,11 @@ void database_cleanup(database_t *db) {
         db->insert_class_stmt = NULL;
     }
 
+    if (db->insert_doc_stmt) {
+        sqlite3_finalize(db->insert_doc_stmt);
+        db->insert_doc_stmt = NULL;
+    }
+
     if (db->insert_file_stmt) {
         sqlite3_finalize(db->insert_file_stmt);
         db->insert_file_stmt = NULL;
