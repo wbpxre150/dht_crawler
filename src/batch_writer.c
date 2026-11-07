@@ -679,6 +679,59 @@ static void make_dirs(const char *path) {
     mkdir(tmp, 0755);
 }
 
+/* Add one column to an existing backup file when it is missing.
+ *
+ * The backup destination is appended to across runs, so a file created before
+ * the movie-kind columns existed keeps its narrower torrent_class and the
+ * INSERT ... SELECT * copies of do_backup() would fail on the column count.
+ * Guarded and idempotent exactly like src/database.c's migration: a fresh file
+ * gets the columns from the DDL and the check finds nothing to do. Returns 0
+ * when the column exists afterwards, -1 on a SQL error (logged). */
+static int backup_ensure_column(sqlite3 *db, const char *table, const char *column,
+                                const char *declaration) {
+    sqlite3_stmt *stmt = NULL;
+    char pragma_sql[128];
+    char alter_sql[256];
+    char *err_msg = NULL;
+    int found = 0;
+    int rc;
+
+    snprintf(pragma_sql, sizeof pragma_sql, "PRAGMA table_info(%s)", table);
+    rc = sqlite3_prepare_v2(db, pragma_sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Backup: cannot inspect %s (%d: %s)", table, rc, sqlite3_errmsg(db));
+        return -1;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 1);
+        if (name && strcmp((const char *)name, column) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (!found && rc != SQLITE_DONE) {
+        log_msg(LOG_ERROR, "Backup: cannot read the columns of %s (%d: %s)", table, rc,
+                sqlite3_errmsg(db));
+        return -1;
+    }
+    if (found) {
+        return 0;
+    }
+
+    snprintf(alter_sql, sizeof alter_sql, "ALTER TABLE %s ADD COLUMN %s %s", table, column,
+             declaration);
+    rc = sqlite3_exec(db, alter_sql, NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Backup: cannot add %s.%s: %s", table, column,
+                err_msg ? err_msg : sqlite3_errmsg(db));
+        sqlite3_free(err_msg);
+        return -1;
+    }
+    log_msg(LOG_INFO, "Backup: added the missing column %s.%s", table, column);
+    return 0;
+}
+
 /* Perform the daily incremental backup using SQLite ATTACH.
  * Opens the backup DB as the primary connection, attaches the live DB as a
  * read-only source, then appends only rows with id > MAX(id) already in the
@@ -749,7 +802,13 @@ static void do_backup(batch_writer_t *writer) {
         "  episode_lo INTEGER, episode_hi INTEGER,"
         "  resolution INTEGER,"
         "  confidence REAL,"
-        "  clf_ver INTEGER NOT NULL);"
+        /* Movie-kind (Stage C): the same two columns src/database.c adds. An
+         * existing backup file predates them and CREATE TABLE IF NOT EXISTS
+         * cannot widen it, so do_backup() runs the guarded ALTER below as well -
+         * without it the INSERT ... SELECT * copies of torrent_class fail on a
+         * column-count mismatch. */
+        "  clf_ver INTEGER NOT NULL,"
+        "  movie_kind_mask INTEGER, movie_kind_clf_ver INTEGER);"
         "CREATE INDEX IF NOT EXISTS idx_class_cat"
         "  ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
         "CREATE INDEX IF NOT EXISTS idx_class_ver"
@@ -772,6 +831,14 @@ static void do_backup(batch_writer_t *writer) {
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Backup: schema creation failed: %s", err);
         sqlite3_free(err);
+        sqlite3_close(bak);
+        goto done_fail;
+    }
+
+    /* Widen a backup file created before the movie-kind columns existed, so the
+     * INSERT ... SELECT * copies below keep matching the live schema. */
+    if (backup_ensure_column(bak, "torrent_class", "movie_kind_mask", "INTEGER") != 0 ||
+        backup_ensure_column(bak, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0) {
         sqlite3_close(bak);
         goto done_fail;
     }

@@ -16,6 +16,9 @@
 #include "refresh_query.h"
 #include "classify_backfill.h"
 #include "classify_backfill_daemon.h"
+#include "movie_kind.h"
+#include "movie_backfill.h"
+#include "movie_backfill_daemon.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -253,6 +256,12 @@ int main(int argc, char *argv[]) {
     const char *classify_backfill_db = NULL;
     long long classify_backfill_limit = 0;
     bool classify_backfill_write = false;
+    const char *movie_backfill_db = NULL;
+    long long movie_backfill_limit = 0;
+    bool movie_backfill_dry_run = false;
+    const char *movie_bench_db = NULL;
+    int movie_bench_rows = 0;
+    bool movie_bench_dump_masks = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rebuild-docs") == 0) {
             if (i + 1 >= argc) {
@@ -285,6 +294,53 @@ int main(int argc, char *argv[]) {
             classify_backfill_limit = limit_rows;
         } else if (strcmp(argv[i], "--write") == 0) {
             classify_backfill_write = true;
+        } else if (strcmp(argv[i], "--movie-kind-backfill") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--movie-kind-backfill requires a <database> argument");
+                return 1;
+            }
+            movie_backfill_db = argv[++i];
+        } else if (strcmp(argv[i], "--movie-kind-bench") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--movie-kind-bench requires a <database> argument");
+                return 1;
+            }
+            movie_bench_db = argv[++i];
+            /* Optional <rows> operand: a bare non-negative integer. */
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                const char *rows_arg = argv[i + 1];
+                char *rows_end = NULL;
+                errno = 0;
+                long long rows = strtoll(rows_arg, &rows_end, 10);
+                if (errno != 0 || rows_end == rows_arg || *rows_end != '\0' || rows <= 0 ||
+                    rows > 1000000) {
+                    log_msg(LOG_ERROR,
+                            "--movie-kind-bench takes a positive <rows> count, got '%s'",
+                            rows_arg);
+                    return 1;
+                }
+                movie_bench_rows = (int)rows;
+                i++;
+            }
+        } else if (strcmp(argv[i], "--dry-run") == 0) {
+            movie_backfill_dry_run = true;
+        } else if (strcmp(argv[i], "--limit") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--limit requires a <rows> argument");
+                return 1;
+            }
+            const char *limit_arg = argv[++i];
+            char *limit_end = NULL;
+            errno = 0;
+            long long limit_rows = strtoll(limit_arg, &limit_end, 10);
+            if (errno != 0 || limit_end == limit_arg || *limit_end != '\0' || limit_rows < 0) {
+                log_msg(LOG_ERROR, "--limit requires a non-negative integer, got '%s'",
+                        limit_arg);
+                return 1;
+            }
+            movie_backfill_limit = limit_rows;
+        } else if (strcmp(argv[i], "--dump-masks") == 0) {
+            movie_bench_dump_masks = true;
         }
     }
 
@@ -564,6 +620,19 @@ int main(int argc, char *argv[]) {
      * is stored (tag) or discarded (drop). Set once, before any worker thread. */
     classifier_set_adult_mode(config.adult_mode);
 
+    /* Movie-kind (v9) classifier: manifest/sha256 gated and lazy - the 152.8 MiB
+     * backbone is only mapped by the first classify, so a crawler that never
+     * backfills never pays for it. Non-fatal: a phone without the v9 assets
+     * leaves the module disabled, and the backfill daemon then reports
+     * "disabled" without touching the database. */
+    if (config.movie_kind_enabled) {
+        if (movie_kind_init(config.movie_kind_model_dir) == 0) {
+            movie_kind_set_threads(config.movie_kind_threads);
+        }
+    } else {
+        log_msg(LOG_DEBUG, "Movie-kind classifier disabled");
+    }
+
     /* --classify-backfill <db>: one-shot maintenance over the database named on
      * the command line. Dispatched here on purpose: after classifier_init(), so
      * the models a backfill needs are loaded, but before database_init(), so the
@@ -628,6 +697,94 @@ int main(int argc, char *argv[]) {
         /* DISABLED and FAILED must both fail loudly: a backfill that cannot run
          * must never look like a success. */
         return (bf_rc == 0) ? 0 : 1;
+    }
+
+    /* --movie-kind-backfill <db> [--dry-run] [--limit N]: one-shot maintenance
+     * over the database named on the command line, dispatched exactly like
+     * --classify-backfill above - after movie_kind_init(), so the v9 manifest is
+     * verified, but before database_init(), so the configured daemon database is
+     * never opened. Write mode by default; --dry-run only counts the
+     * movie+adult=0 candidates and prints the count. */
+    if (movie_backfill_db) {
+        movie_backfill_opts_t mb_opts = {
+            .target_clf_ver = 0, /* whatever the loaded manifest describes */
+            .chunk_ids = 0,      /* engine defaults */
+            .batch_rows = 0,
+            .dry_run = movie_backfill_dry_run ? 1 : 0,
+            .limit_rows = movie_backfill_limit,
+            .thermal_backoff_c = config.movie_kind_thermal_backoff_c,
+        };
+        movie_backfill_progress_t mb_progress;
+        database_t mb_db;
+
+        memset(&mb_progress, 0, sizeof(mb_progress));
+        log_msg(LOG_INFO, "movie-kind-backfill: %s %s ...",
+                movie_backfill_dry_run ? "dry run on" : "write pass on", movie_backfill_db);
+
+        rc = database_init(&mb_db, movie_backfill_db, &g_app_ctx);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "movie-kind-backfill: cannot open %s: %d", movie_backfill_db,
+                    rc);
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        rc = database_create_schema(&mb_db);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "movie-kind-backfill: cannot create the schema of %s: %d",
+                    movie_backfill_db, rc);
+            database_cleanup(&mb_db);
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        int mb_rc = movie_backfill_run(&mb_db, &mb_opts, &mb_progress);
+        log_msg(mb_rc == 0 ? LOG_INFO : LOG_ERROR,
+                "movie-kind-backfill: state=%s target_clf_ver=%lld total=%lld done=%lld "
+                "updated=%lld skipped=%lld failed=%lld thermal_pauses=%lld last_id=%lld",
+                movie_backfill_state_name(mb_progress.state), mb_progress.target_clf_ver,
+                mb_progress.rows_total, mb_progress.rows_done, mb_progress.rows_updated,
+                mb_progress.rows_skipped, mb_progress.rows_failed,
+                mb_progress.thermal_pauses, mb_progress.last_id);
+        if (movie_backfill_dry_run) {
+            /* The candidate count is the point of a dry run, so it goes to
+             * stdout as well as the log. */
+            printf("movie-kind-backfill: dry run, %lld candidate(s) at generation %lld, "
+                   "nothing written\n",
+                   mb_progress.rows_total, mb_progress.target_clf_ver);
+            fflush(stdout);
+        }
+
+        database_cleanup(&mb_db);
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        cleanup_app_context(&g_app_ctx);
+        /* DISABLED and a failed pass must both fail loudly: a backfill that
+         * cannot run must never look like a success. */
+        return (mb_rc == 0) ? 0 : 1;
+    }
+
+    /* --movie-kind-bench <db> [N] [--dump-masks]: measure the v9 encode pipeline
+     * over the first N movie+adult=0 names. Read-only (the bench opens the
+     * database SQLITE_OPEN_READONLY) and dispatched here for the same reason as
+     * the backfill above: the model must be initialised, the daemon database must
+     * not be opened. */
+    if (movie_bench_db) {
+        int bench_rc = movie_backfill_bench(movie_bench_db, movie_bench_rows,
+                                            config.movie_kind_threads,
+                                            movie_bench_dump_masks ? 1 : 0);
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        cleanup_app_context(&g_app_ctx);
+        return (bench_rc == 0) ? 0 : 1;
     }
 
     /* Initialize torrent search module for title extraction */
@@ -975,6 +1132,10 @@ int main(int argc, char *argv[]) {
      * API are all up by now, so /stats can serve its object from the first
      * request. Non-blocking - the thread takes its own first decision. */
     classify_backfill_daemon_start(&g_app_ctx, &g_database);
+
+    /* Same for the movie-kind pass: the v9 module, the database and the HTTP API
+     * are all up, so /stats serves its object from the first request. */
+    movie_backfill_daemon_start(&g_app_ctx, &g_database, config.movie_kind_thermal_backoff_c);
     
     log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
     log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
@@ -998,6 +1159,10 @@ int main(int argc, char *argv[]) {
      * (stop flag + cooperative engine stop), so an in-flight pass is bounded to
      * the batch it is in and the join below cannot hang. */
     classify_backfill_daemon_request_shutdown();
+
+    /* Same cooperative stop for the movie-kind thread (it interrupts a thermal
+     * pause as well as a batch). */
+    movie_backfill_daemon_request_shutdown();
     
     log_msg(LOG_DEBUG, "Step 1: Stopping HTTP API...");
     http_api_stop(&g_http_api);
@@ -1035,6 +1200,9 @@ int main(int argc, char *argv[]) {
     /* Join the backfill thread after http_api_stop() and before
      * database_cleanup(): an in-flight batch must commit before the DB closes. */
     classify_backfill_daemon_destroy();
+
+    /* Same rule for the movie-kind thread: join before the database closes. */
+    movie_backfill_daemon_destroy();
     supervisor_destroy(g_supervisor);
     cleanup_app_context(&g_app_ctx);
     batch_writer_cleanup(g_batch_writer);

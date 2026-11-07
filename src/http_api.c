@@ -6,6 +6,8 @@
 #include "language_filter.h"
 #include "classifier.h"
 #include "classify_backfill_daemon.h"
+#include "movie_kind.h"
+#include "movie_backfill_daemon.h"
 #include "category_filter_cleanup.h"
 #include "torrent_search.h"
 #include "supervisor.h"
@@ -720,6 +722,78 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(classifier_backfill, "finished_at", (double)cb_stats.finished_at);
         cJSON_AddStringToObject(classifier_backfill, "last_error", cb_stats.last_error);
         cJSON_AddItemToObject(root, "classifier_backfill", classifier_backfill);
+    }
+
+    /* Movie-kind (v9 JEV head): counters, present even at zero, so a dashboard
+     * can tell "no data yet" from "not built in". Independent of the fastText
+     * objects above, which this pass never touches. */
+    {
+        movie_kind_stats_t mk_stats;
+        movie_kind_get_stats(&mk_stats);
+
+        cJSON *movie_kind = cJSON_CreateObject();
+        cJSON_AddBoolToObject(movie_kind, "enabled", mk_stats.enabled ? 1 : 0);
+        cJSON_AddBoolToObject(movie_kind, "model_ready", mk_stats.model_ready ? 1 : 0);
+        cJSON_AddNumberToObject(movie_kind, "generation", (double)mk_stats.generation);
+        cJSON_AddNumberToObject(movie_kind, "genre_count", mk_stats.genre_count);
+        cJSON_AddNumberToObject(movie_kind, "n_labels", mk_stats.n_labels);
+        cJSON_AddNumberToObject(movie_kind, "hidden", mk_stats.hidden);
+        cJSON_AddStringToObject(movie_kind, "model_dir", mk_stats.model_dir);
+        cJSON_AddStringToObject(movie_kind, "backbone_sha256", mk_stats.backbone_sha);
+        cJSON_AddStringToObject(movie_kind, "head_sha256", mk_stats.head_sha);
+        cJSON_AddNumberToObject(movie_kind, "total_classified",
+                                (double)mk_stats.total_classified);
+        cJSON_AddNumberToObject(movie_kind, "failures", (double)mk_stats.failures);
+        cJSON_AddNumberToObject(movie_kind, "model_load_failures",
+                                (double)mk_stats.model_load_failures);
+        cJSON_AddNumberToObject(movie_kind, "thermal_pauses",
+                                (double)mk_stats.thermal_pauses);
+
+        double mk_mean_us = 0.0;
+        if (mk_stats.total_classified > 0) {
+            mk_mean_us = (double)mk_stats.total_us / (double)mk_stats.total_classified;
+        }
+        cJSON_AddNumberToObject(movie_kind, "mean_us_per_item", mk_mean_us);
+
+        /* Only the genres that actually occurred, keyed by manifest name: bit j
+         * of a mask is manifest.genres[j]. */
+        cJSON *mk_by_genre = cJSON_CreateObject();
+        for (int i = 0; i < mk_stats.genre_count && i < MOVIE_KIND_MAX_GENRES; i++) {
+            const char *genre = movie_kind_genre_name(i);
+            if (genre && mk_stats.by_genre[i] > 0) {
+                cJSON_AddNumberToObject(mk_by_genre, genre, (double)mk_stats.by_genre[i]);
+            }
+        }
+        cJSON_AddItemToObject(movie_kind, "by_genre", mk_by_genre);
+
+        cJSON_AddItemToObject(root, "movie_kind", movie_kind);
+    }
+
+    /* Movie-kind backfill: live progress of the background movie pass (present
+     * in every build, "disabled" when the module is inert). */
+    {
+        movie_backfill_daemon_stats_t mb_stats;
+        movie_backfill_daemon_get_stats(&mb_stats);
+
+        cJSON *movie_kind_backfill = cJSON_CreateObject();
+        cJSON_AddStringToObject(movie_kind_backfill, "state", mb_stats.state);
+        cJSON_AddNumberToObject(movie_kind_backfill, "target_clf_ver",
+                                mb_stats.target_clf_ver);
+        cJSON_AddNumberToObject(movie_kind_backfill, "rows_left", (double)mb_stats.rows_left);
+        cJSON_AddNumberToObject(movie_kind_backfill, "rows_processed",
+                                (double)mb_stats.rows_processed);
+        cJSON_AddNumberToObject(movie_kind_backfill, "rows_total",
+                                (double)mb_stats.rows_total);
+        cJSON_AddNumberToObject(movie_kind_backfill, "started_at",
+                                (double)mb_stats.started_at);
+        cJSON_AddNumberToObject(movie_kind_backfill, "finished_at",
+                                (double)mb_stats.finished_at);
+        cJSON_AddStringToObject(movie_kind_backfill, "last_error", mb_stats.last_error);
+        cJSON_AddNumberToObject(movie_kind_backfill, "thermal_pauses",
+                                (double)mb_stats.thermal_pauses);
+        cJSON_AddNumberToObject(movie_kind_backfill, "model_load_failures",
+                                (double)mb_stats.model_load_failures);
+        cJSON_AddItemToObject(root, "movie_kind_backfill", movie_kind_backfill);
     }
 
     /* "Categories to save": ingest drops caused by save_categories /

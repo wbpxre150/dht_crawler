@@ -159,7 +159,34 @@ MOVIE_KIND_TEST_BIN = $(BUILD_DIR)/test_movie_kind
 # inert on the host (no CLF_ENABLED), so no ftc/tparse is needed.
 MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto
 
-tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind
+# The movie-kind backfill engine test links the real src/movie_backfill.c and the
+# real src/movie_kind.c (host flavour: manifest/sha256 only), and drives the
+# engine's seams with -DMOVIE_BACKFILL_TEST so a pass can label rows without a
+# model and pause for heat without a hot CPU. src/database.c builds the fixture
+# through the ingest path, exactly like the fastText backfill test.
+MOVIE_BACKFILL_TEST_SRCS = tests/test_movie_backfill.c src/movie_backfill.c \
+                           src/movie_kind.c src/jevhead.c src/classifier.c \
+                           src/database.c src/bloom_filter.c lib/cJSON/cJSON.c \
+                           tests/stub_log.c
+MOVIE_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_movie_backfill
+MOVIE_BACKFILL_TEST_CFLAGS = -DMOVIE_BACKFILL_TEST
+MOVIE_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
+
+# The daemon-thread test drives src/movie_backfill_daemon.c through its test hooks
+# (-DMOVIE_BACKFILL_DAEMON_TEST): the engine and the movie-kind module are fakes,
+# so no database, model files or 60 s poll interval are involved. The real engine
+# and movie-kind modules are still linked, for the state names and the defaults.
+MOVIE_BACKFILL_DAEMON_TEST_SRCS = tests/test_movie_backfill_daemon.c \
+                                  src/movie_backfill_daemon.c src/movie_backfill.c \
+                                  src/movie_kind.c src/jevhead.c src/classifier.c \
+                                  src/database.c src/bloom_filter.c \
+                                  lib/cJSON/cJSON.c tests/stub_log.c
+MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
+MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
+MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
+
+tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind \
+       tests-movie-backfill tests-movie-backfill-daemon
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -186,6 +213,16 @@ tests-movie-kind:
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
 	./$(MOVIE_KIND_TEST_BIN)
 
+tests-movie-backfill: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_BACKFILL_TEST_CFLAGS) $(INCLUDES) $(MOVIE_BACKFILL_TEST_SRCS) -o $(MOVIE_BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_BACKFILL_TEST_LDFLAGS)
+	./$(MOVIE_BACKFILL_TEST_BIN)
+
+tests-movie-backfill-daemon: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(MOVIE_BACKFILL_DAEMON_TEST_SRCS) -o $(MOVIE_BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS)
+	./$(MOVIE_BACKFILL_DAEMON_TEST_BIN)
+
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
@@ -197,6 +234,13 @@ tests-asan-backfill:
 # Same scoped gate for the daemon-thread test (threads + sanitizers).
 tests-asan-backfill-daemon:
 	$(MAKE) tests-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
+# Scoped sanitizer gates for the two movie-kind backfill test binaries.
+tests-asan-movie-backfill:
+	$(MAKE) tests-movie-backfill TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
+tests-asan-movie-backfill-daemon:
+	$(MAKE) tests-movie-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
 # CLF-enabled host build for --classify-backfill maintenance runs: the plain
 # build keeps src/classifier.c inert (no -DCLF_ENABLED); this flavor adds it,
@@ -224,4 +268,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-asan tests-asan-backfill tests-asan-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-backfill tests-movie-backfill-daemon tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

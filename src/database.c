@@ -56,7 +56,14 @@ static const char *CREATE_TABLES_SQL =
     "    episode_hi INTEGER,"
     "    resolution INTEGER,"
     "    confidence REAL,"
-    "    clf_ver INTEGER NOT NULL"
+    "    clf_ver INTEGER NOT NULL,"
+    /* Movie-kind (Stage C): the v9 JEV genre mask and the generation that
+     * produced it. Additive and nullable on purpose - a database that predates
+     * them has neither, and "unclassified" is movie_kind_clf_ver IS NULL (a
+     * mask of 0 is a valid `none` verdict, never a marker). Deliberately no
+     * index: the candidate walk reuses idx_class_cat below. */
+    "    movie_kind_mask INTEGER,"
+    "    movie_kind_clf_ver INTEGER"
     ");"
     ""
     "CREATE INDEX IF NOT EXISTS idx_class_cat ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
@@ -418,6 +425,64 @@ void database_set_bloom(database_t *db, bloom_filter_t *bloom) {
     db->bloom = bloom;
 }
 
+/* Additive column migration for a schema that already exists.
+ *
+ * torrent_class gained its two movie-kind columns (Stage C) after databases were
+ * already in the field, and this tree has no ALTER TABLE precedent, so the
+ * migration is a guarded, idempotent PRAGMA table_info() check: it adds only the
+ * columns that are missing and is therefore safe to run on every start
+ * (main.c calls database_create_schema() on each launch, against a live
+ * multi-gigabyte database). ALTER TABLE ... ADD COLUMN is a metadata-only
+ * change - it rewrites no row - and a database created by CREATE TABLE above
+ * already has the columns, so the check finds nothing to do there. Nothing here
+ * touches an index: the movie-kind walk reuses idx_class_cat.
+ *
+ * Returns 0 when the column exists afterwards, -1 on a SQL error (logged). */
+static int database_ensure_column(sqlite3 *db, const char *table, const char *column,
+                                  const char *declaration) {
+    sqlite3_stmt *stmt = NULL;
+    char pragma_sql[128];
+    char alter_sql[256];
+    char *err_msg = NULL;
+    int found = 0;
+    int rc;
+
+    snprintf(pragma_sql, sizeof pragma_sql, "PRAGMA table_info(%s)", table);
+    rc = sqlite3_prepare_v2(db, pragma_sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Schema: cannot inspect %s (%d: %s)", table, rc, sqlite3_errmsg(db));
+        return -1;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 1);
+        if (name && strcmp((const char *)name, column) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (!found && rc != SQLITE_DONE) {
+        log_msg(LOG_ERROR, "Schema: cannot read the columns of %s (%d: %s)", table, rc,
+                sqlite3_errmsg(db));
+        return -1;
+    }
+    if (found) {
+        return 0;
+    }
+
+    snprintf(alter_sql, sizeof alter_sql, "ALTER TABLE %s ADD COLUMN %s %s", table, column,
+             declaration);
+    rc = sqlite3_exec(db, alter_sql, NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "Schema: cannot add %s.%s: %s", table, column,
+                err_msg ? err_msg : sqlite3_errmsg(db));
+        sqlite3_free(err_msg);
+        return -1;
+    }
+    log_msg(LOG_INFO, "Schema: added the missing column %s.%s", table, column);
+    return 0;
+}
+
 /* Create database schema */
 int database_create_schema(database_t *db) {
     if (!db || !db->db) {
@@ -432,6 +497,13 @@ int database_create_schema(database_t *db) {
     if (rc != SQLITE_OK) {
         log_msg(LOG_ERROR, "Failed to create tables: %s", err_msg);
         sqlite3_free(err_msg);
+        return -1;
+    }
+
+    /* Additive migration for a database created before the movie-kind columns
+     * existed. Idempotent and metadata-only, so it runs on every start. */
+    if (database_ensure_column(db->db, "torrent_class", "movie_kind_mask", "INTEGER") != 0 ||
+        database_ensure_column(db->db, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0) {
         return -1;
     }
 
