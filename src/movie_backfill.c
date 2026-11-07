@@ -1053,6 +1053,23 @@ static void mb_print_mask_line(uint16_t mask, const char *name) {
     putchar('\n');
 }
 
+/* Whether one row of the `--dump-masks` loop gets a mask line. A failed classify
+ * call must never reach the dump: mask 0 is a genuine `none` verdict, so printing
+ * the untouched 0 of a failed row would be indistinguishable from a real verdict
+ * and would silently weaken the on-device spot check. The row is skipped instead
+ * and the bench JSON `failures` counter stays the loud per-run signal. */
+static int mb_should_print_mask(int classify_rc) {
+    return classify_rc == 0;
+}
+
+#ifdef MOVIE_BACKFILL_TEST
+/* Test-only entry point (see include/movie_backfill.h): the daemon build keeps
+ * the decision private. */
+int movie_backfill_test_should_print_mask(int classify_rc) {
+    return mb_should_print_mask(classify_rc);
+}
+#endif /* MOVIE_BACKFILL_TEST */
+
 int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_masks) {
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
@@ -1188,7 +1205,7 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
             } else {
                 failures++;
             }
-            if (dump_masks) {
+            if (dump_masks && mb_should_print_mask(classify_rc)) {
                 mb_print_mask_line(mask, names[i]);
             }
             temp_c = mb_thermal_max_c();

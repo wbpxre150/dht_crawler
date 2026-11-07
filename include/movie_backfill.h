@@ -170,6 +170,14 @@ typedef struct {
 } movie_backfill_hooks_t;
 
 void movie_backfill_set_hooks(const movie_backfill_hooks_t *hooks);
+
+/*
+ * Test-only view of the `--dump-masks` per-row decision: 1 when that row's mask
+ * line is printed. A row whose classify call failed is skipped, because mask 0
+ * is a genuine `none` verdict and a printed 0 for a failed row would be
+ * indistinguishable from a real one.
+ */
+int movie_backfill_test_should_print_mask(int classify_rc);
 #endif /* MOVIE_BACKFILL_TEST */
 
 #endif /* MOVIE_BACKFILL_H */

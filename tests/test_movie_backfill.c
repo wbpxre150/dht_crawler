@@ -39,6 +39,8 @@
  *                                                      the pause ends it as stopped
  *   8 movie_backfill_needed()                       -> meta-only-behind, rows-left and
  *                                                      disabled cases
+ *   9 --dump-masks                                  -> a failed classify call gets no mask
+ *                                                      line (mask 0 is a real verdict)
  *
  *     make tests-movie-backfill      # or: make tests / make tests-asan-movie-backfill
  */
@@ -1055,6 +1057,22 @@ static void case_needed(database_t *db) {
     printf("  case 8 ok: needed() reports rows-left and meta-only-behind in both directions\n");
 }
 
+/* 9: the `--dump-masks` loop prints a mask line only for a row that classified.
+ * A failed row must be skipped - never printed as mask 0, which is a real `none`
+ * verdict and would make a failure indistinguishable from it. */
+static void case_dump_masks(void) {
+    if (!movie_backfill_test_should_print_mask(0)) {
+        fail("case 9 dump masks", "a measured row must print its mask line");
+    }
+    if (movie_backfill_test_should_print_mask(-1)) {
+        fail("case 9 dump masks", "an I/O error row must not print a mask line");
+    }
+    if (movie_backfill_test_should_print_mask(1)) {
+        fail("case 9 dump masks", "a no-verdict row must not print a mask line");
+    }
+    printf("  case 9 ok: --dump-masks prints no mask line for a failed row\n");
+}
+
 int main(void) {
     database_t db;
 
@@ -1082,6 +1100,7 @@ int main(void) {
     database_cleanup(&db);
     case_needed(&db);
     database_cleanup(&db);
+    case_dump_masks();
 
     remove_scratch_db();
     printf("test_movie_backfill: all assertions passed\n");
