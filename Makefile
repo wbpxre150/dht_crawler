@@ -144,7 +144,22 @@ BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_classify_backfill_daemon
 BACKFILL_DAEMON_TEST_CFLAGS = -DCLF_BACKFILL_DAEMON_TEST
 BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-backfill tests-backfill-daemon
+# The movie-kind test links the real src/movie_kind.c and src/jevhead.c. Both
+# compile without MK_ENABLED: the manifest/sha256 half is plain C99 + cJSON +
+# OpenSSL, and jevhead.c is pure arithmetic, so the host test exercises the
+# genuine refusal paths. The encoder half (llama.cpp) and the NFC cases only
+# exist under -DMK_ENABLED, which this Makefile never defines -- utf8proc is
+# vendored in the outer repo only (movie-kind Stage A). cJSON is compiled in
+# directly and -lcrypto backs the pinned sha256s.
+MOVIE_KIND_TEST_SRCS = tests/test_movie_kind.c src/movie_kind.c src/jevhead.c \
+                       src/classifier.c lib/cJSON/cJSON.c tests/stub_log.c
+MOVIE_KIND_TEST_BIN = $(BUILD_DIR)/test_movie_kind
+# src/classifier.c is here for clf_sha256_file() alone (include/clf_sha256.h): the
+# manifest gate and the fastText loader must verify with the same code. It links
+# inert on the host (no CLF_ENABLED), so no ftc/tparse is needed.
+MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto
+
+tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -165,6 +180,11 @@ tests-backfill-daemon: libbloom
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(BACKFILL_DAEMON_TEST_SRCS) -o $(BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_DAEMON_TEST_LDFLAGS)
 	./$(BACKFILL_DAEMON_TEST_BIN)
+
+tests-movie-kind:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
+	./$(MOVIE_KIND_TEST_BIN)
 
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
@@ -204,4 +224,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-asan tests-asan-backfill tests-asan-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-asan tests-asan-backfill tests-asan-backfill-daemon clf-backfill

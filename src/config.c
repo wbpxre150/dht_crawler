@@ -123,6 +123,14 @@ void config_init_defaults(crawler_config_t *config) {
     config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
     strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
 
+    /* Movie-kind defaults (movie-kind Stage B): v9 ships in models/v9, 4 threads
+     * is the measured steady state, and 82 °C is the backfill engine's pause
+     * threshold. */
+    config->movie_kind_enabled = 1;
+    strncpy(config->movie_kind_model_dir, "models/v9", sizeof(config->movie_kind_model_dir) - 1);
+    config->movie_kind_threads = 4;
+    config->movie_kind_thermal_backoff_c = 82;
+
     /* "Categories to save" defaults: every bit set, so nothing is filtered at
      * ingest until save_categories / save_tv_kinds narrow the selection. */
     config->save_category_mask = CATEGORY_FILTER_ALL_CATEGORIES;
@@ -372,6 +380,19 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->classifier_enabled = atoi(value);
         } else if (strcmp(key, "classifier_model_dir") == 0) {
             strncpy(config->classifier_model_dir, value, sizeof(config->classifier_model_dir) - 1);
+        }
+        /* Movie-kind settings (movie-kind Stage B) */
+        else if (strcmp(key, "movie_kind_enabled") == 0) {
+            config->movie_kind_enabled = atoi(value);
+        } else if (strcmp(key, "movie_kind_model_dir") == 0) {
+            strncpy(config->movie_kind_model_dir, value, sizeof(config->movie_kind_model_dir) - 1);
+        } else if (strcmp(key, "movie_kind_threads") == 0) {
+            config->movie_kind_threads = atoi(value);
+            if (config->movie_kind_threads < 1) config->movie_kind_threads = 1;
+            if (config->movie_kind_threads > 8) config->movie_kind_threads = 8;
+        } else if (strcmp(key, "movie_kind_thermal_backoff_c") == 0) {
+            config->movie_kind_thermal_backoff_c = atoi(value);
+            if (config->movie_kind_thermal_backoff_c < 0) config->movie_kind_thermal_backoff_c = 0;
         }
         /* Stage 6 adult handling settings */
         else if (strcmp(key, "adult_mode") == 0) {

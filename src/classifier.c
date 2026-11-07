@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <openssl/sha.h>
+
+#include "clf_sha256.h"
 
 /* ------------------------------------------------------------------------ *
  * Shared between both build flavours (the Android wrapper build defines
@@ -33,10 +36,59 @@ static const char *clf_normalize_adult_mode(const char *adult_mode) {
     return (adult_mode && strcmp(adult_mode, "drop") == 0) ? "drop" : "tag";
 }
 
+/* Shared by both flavours (see include/clf_sha256.h): the fastText loader verifies
+ * {adult,category,tv_kind}.ftz with it, and src/movie_kind.c verifies the movie
+ * backbone and head the same way. Unverified bytes are never loaded.
+ *
+ * OpenSSL 3 deprecates this incremental SHA256_* API in favour of EVP; the crawler
+ * has used it since bep51_cache.c and the Android build maps it onto mbedTLS (where
+ * nothing is deprecated), so it stays -- with the warning silenced locally instead of
+ * spreading EVP through the tree or a -Wno- flag across the whole build. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+int clf_sha256_file(const char *path, char *out_hex) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    SHA256_CTX ctx;
+    if (!SHA256_Init(&ctx)) {
+        fclose(f);
+        return -1;
+    }
+
+    unsigned char buf[65536];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (!SHA256_Update(&ctx, buf, n)) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(f)) ok = 0;
+
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    if (!SHA256_Final(digest, &ctx)) ok = 0;
+    fclose(f);
+    if (!ok) return -1;
+
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        out_hex[i * 2] = hex[digest[i] >> 4];
+        out_hex[i * 2 + 1] = hex[digest[i] & 0x0F];
+    }
+    out_hex[SHA256_DIGEST_LENGTH * 2] = '\0';
+    return 0;
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #ifdef CLF_ENABLED
 
 #include <cJSON.h>
-#include <openssl/sha.h>
 
 #include "ftc.h"
 #include "taxonomy.h"
@@ -50,7 +102,6 @@ typedef char clf_tv_none_is_zero[TP_TV_NONE == 0 ? 1 : -1];
 #define CLF_MODEL_DIR_DEFAULT "models/v1"
 #define CLF_FEATURE_CAP 8192
 #define CLF_PATH_CAP 1200
-#define CLF_SHA_HEX_LEN 64
 /* Only used when the manifest has no usable value; the shipped manifest always
  * carries the calibrated 0.917039 hide threshold. */
 #define CLF_ADULT_HIDE_DEFAULT 0.5
@@ -88,41 +139,6 @@ static uint64_t clf_elapsed_us(const struct timespec *t0, const struct timespec 
                  ((int64_t)t1->tv_nsec - (int64_t)t0->tv_nsec);
     if (ns <= 0) return 0;
     return (uint64_t)(ns / 1000);
-}
-
-static int clf_sha256_file(const char *path, char *out_hex) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-
-    SHA256_CTX ctx;
-    if (!SHA256_Init(&ctx)) {
-        fclose(f);
-        return -1;
-    }
-
-    unsigned char buf[65536];
-    size_t n;
-    int ok = 1;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-        if (!SHA256_Update(&ctx, buf, n)) {
-            ok = 0;
-            break;
-        }
-    }
-    if (ferror(f)) ok = 0;
-
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    if (!SHA256_Final(digest, &ctx)) ok = 0;
-    fclose(f);
-    if (!ok) return -1;
-
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        out_hex[i * 2] = hex[digest[i] >> 4];
-        out_hex[i * 2 + 1] = hex[digest[i] & 0x0F];
-    }
-    out_hex[SHA256_DIGEST_LENGTH * 2] = '\0';
-    return 0;
 }
 
 /* Whole manifest as a NUL-terminated string; NULL when unreadable (a missing

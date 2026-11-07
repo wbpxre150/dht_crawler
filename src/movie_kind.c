@@ -1,0 +1,708 @@
+/* movie_kind — see include/movie_kind.h.
+ *
+ * Two halves, split by *dependency* rather than by feature (the same shape
+ * src/classifier.c uses: its category table, its stats struct and its sha
+ * helper live outside `#ifdef CLF_ENABLED`, and only the model-dependent code
+ * is gated):
+ *
+ *   - the core — manifest parse (cJSON), generation resolution, genre order,
+ *     pinned-size + sha256 verification, the stats block — is plain C99 with
+ *     cJSON and OpenSSL, so the crawler's own host `make` build compiles it
+ *     and tests/test_movie_kind.c exercises the *real* refusal paths;
+ *   - the encoder — llama.cpp model/context, `llama_encode`, utf8proc NFC —
+ *     is `MK_ENABLED`-gated, with an inert `#else` that answers "no verdict"
+ *     exactly like classifier.c's host stubs, so a plain CMake configure and
+ *     the host Makefile stay llama-free and utf8proc-free.
+ */
+
+#include "movie_kind.h"
+
+#include "clf_sha256.h"
+#include "dht_crawler.h"
+#include "jevhead.h"
+
+#include <cJSON.h>
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef MK_ENABLED
+/* llama.cpp's public headers are C11 (redundant typedefs are legal there) while
+ * the crawler compiles as C99, so the one diagnostic that disagrees is silenced
+ * for this include rather than relaxing the whole target to C11. Clang-only by
+ * construction: the host build is gcc and never defines MK_ENABLED. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wtypedef-redefinition"
+#endif
+#include <llama.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+#include <utf8proc.h>
+#endif
+
+/* A manifest is a few KiB; the cap is the same one clf_load_manifest() uses, so
+ * a runaway file can never be slurped into the daemon. */
+#define MK_MANIFEST_CAP (1024 * 1024)
+/* model_dir (<= 511) + '/' + file name (<= 127) + NUL, with room to spare. */
+#define MK_MODEL_PATH_CAP (MOVIE_KIND_PATH_CAP + MOVIE_KIND_FILE_CAP + 2)
+/* config.movie_kind_threads default; 8 is 35-40 % slower on the target SoC than 4. */
+#define MK_DEFAULT_THREADS 4
+#define MK_MIN_THREADS 1
+#define MK_MAX_THREADS 8
+
+static struct {
+    /* Manifest state: written once by movie_kind_init(), read-only afterwards,
+     * so the accessors below need no lock for it (main.c calls init before any
+     * worker thread exists, like classifier_init()). */
+    int manifest_ok;    /* manifest parsed and both pinned files verified */
+    int enabled;        /* manifest_ok AND this build has an encoder */
+    long long generation;
+    int genre_count;
+    int n_labels;
+    int hidden;
+    char genres[MOVIE_KIND_MAX_GENRES][MOVIE_KIND_GENRE_CAP];
+    char model_dir[MOVIE_KIND_PATH_CAP];
+    char backbone_file[MOVIE_KIND_FILE_CAP];
+    char head_file[MOVIE_KIND_FILE_CAP];
+    long long backbone_bytes;
+    long long head_bytes;
+    char backbone_sha[MOVIE_KIND_SHA_CAP];
+    char head_sha[MOVIE_KIND_SHA_CAP];
+    int threads;
+
+    /* Everything below is behind `mutex`: the lazily loaded model/context, the
+     * head, and the counters (whole-struct copy on read, like
+     * classifier_get_stats()). */
+    pthread_mutex_t mutex;
+    int model_ready;
+    jevhead head;
+    movie_kind_stats_t stats;
+#ifdef MK_ENABLED
+    struct llama_model *model;
+    struct llama_context *context;
+#endif
+} mk = {
+    .model_dir = MOVIE_KIND_MODEL_DIR_DEFAULT,
+    .threads = MK_DEFAULT_THREADS,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+/* ---- small helpers ----------------------------------------------------- */
+
+
+/* Whole manifest as a NUL-terminated string; NULL when unreadable or oversized. */
+static char *mk_read_text_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size <= 0 || size > MK_MANIFEST_CAP) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    char *text = (char *)malloc((size_t)size + 1);
+    if (!text) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(text, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) {
+        free(text);
+        return NULL;
+    }
+    text[size] = '\0';
+    return text;
+}
+
+static const cJSON *mk_json_object(const cJSON *parent, const char *key) {
+    const cJSON *item = parent ? cJSON_GetObjectItemCaseSensitive(parent, key) : NULL;
+    return cJSON_IsObject(item) ? item : NULL;
+}
+
+static long long mk_json_int(const cJSON *parent, const char *key, long long fallback) {
+    const cJSON *item = parent ? cJSON_GetObjectItemCaseSensitive(parent, key) : NULL;
+    if (!cJSON_IsNumber(item)) return fallback;
+    return (long long)item->valuedouble;
+}
+
+/* `manifest.version` is the generation string ("v9"): take its digits, never a
+ * literal, so shipping v10 needs no code change. Returns 0 and *out set on
+ * success, -1 when there is no positive number in the string. */
+static int mk_parse_generation(const char *version, long long *out) {
+    if (!version || !out) return -1;
+    const char *p = version;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (!*p) return -1;
+    long long value = 0;
+    while (*p >= '0' && *p <= '9') {
+        if (value > 100000000LL) return -1; /* absurd; refuse rather than wrap */
+        value = value * 10 + (*p - '0');
+        p++;
+    }
+    if (value <= 0) return -1;
+    *out = value;
+    return 0;
+}
+
+/* One pinned file: it must exist, be exactly `bytes` long and hash to
+ * `expected_sha`. Unverified bytes are never loaded — that is the whole point
+ * of the manifest, and the reason a mismatch is LOG_ERROR rather than a quiet
+ * "parser-only" degradation. */
+static int mk_verify_file(const char *dir, const char *file, long long bytes,
+                          const char *expected_sha) {
+    char path[MK_MODEL_PATH_CAP];
+    snprintf(path, sizeof(path), "%s/%s", dir, file);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        log_msg(LOG_ERROR, "MovieKind: %s is missing; refusing to load", path);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        log_msg(LOG_ERROR, "MovieKind: %s cannot be sized; refusing to load", path);
+        return -1;
+    }
+    long size = ftell(f);
+    fclose(f);
+    if (size < 0) {
+        log_msg(LOG_ERROR, "MovieKind: %s cannot be sized; refusing to load", path);
+        return -1;
+    }
+    if ((long long)size != bytes) {
+        log_msg(LOG_ERROR, "MovieKind: %s is %ld bytes, the manifest pins %lld; refusing to load",
+                path, size, bytes);
+        return -1;
+    }
+
+    char actual[CLF_SHA_HEX_LEN + 1];
+    if (clf_sha256_file(path, actual) != 0) {
+        log_msg(LOG_ERROR, "MovieKind: %s is unreadable; refusing to load", path);
+        return -1;
+    }
+    if (strcmp(actual, expected_sha) != 0) {
+        log_msg(LOG_ERROR, "MovieKind: %s sha256 mismatch (manifest %.16s.., file %.16s..); "
+                           "refusing to load", path, expected_sha, actual);
+        return -1;
+    }
+    return 0;
+}
+
+/* Pull {file, bytes, sha256} out of a manifest sub-object. */
+static int mk_read_file_spec(const cJSON *entry, const char *what, char *file, size_t file_cap,
+                             long long *bytes, char *sha, size_t sha_cap) {
+    const cJSON *name = entry ? cJSON_GetObjectItemCaseSensitive(entry, "file") : NULL;
+    const cJSON *size = entry ? cJSON_GetObjectItemCaseSensitive(entry, "bytes") : NULL;
+    const cJSON *hash = entry ? cJSON_GetObjectItemCaseSensitive(entry, "sha256") : NULL;
+
+    if (!cJSON_IsString(name) || name->valuestring[0] == '\0' ||
+        strlen(name->valuestring) >= file_cap) {
+        log_msg(LOG_ERROR, "MovieKind: manifest has no usable %s.file", what);
+        return -1;
+    }
+    if (!cJSON_IsNumber(size) || size->valuedouble <= 0) {
+        log_msg(LOG_ERROR, "MovieKind: manifest has no usable %s.bytes", what);
+        return -1;
+    }
+    if (!cJSON_IsString(hash) || strlen(hash->valuestring) != CLF_SHA_HEX_LEN) {
+        log_msg(LOG_ERROR, "MovieKind: manifest has no usable %s.sha256", what);
+        return -1;
+    }
+    snprintf(file, file_cap, "%s", name->valuestring);
+    *bytes = (long long)size->valuedouble;
+    snprintf(sha, sha_cap, "%s", hash->valuestring);
+    return 0;
+}
+
+/* ---- manifest ---------------------------------------------------------- */
+
+/* Parse <model_dir>/manifest.json and verify both files it pins. Fills the
+ * manifest half of `mk`; returns 0 when the module may be enabled. Called with
+ * `mutex` held (it bumps model_load_failures). */
+static int mk_manifest_load_locked(void) {
+    char path[MK_MODEL_PATH_CAP];
+    snprintf(path, sizeof(path), "%s/manifest.json", mk.model_dir);
+
+    char *text = mk_read_text_file(path);
+    if (!text) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s not readable; movie-kind disabled", path);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(text);
+    free(text);
+    if (!root) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s is not valid JSON; movie-kind disabled", path);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+
+    int status = -1;
+
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "version");
+    if (!cJSON_IsString(version) || mk_parse_generation(version->valuestring, &mk.generation) != 0) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s has no usable version (\"v9\" form); "
+                           "movie-kind disabled", path);
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+
+    /* Bit j of the mask is genres[j], in manifest order: copy, never re-sort. */
+    const cJSON *genres = cJSON_GetObjectItemCaseSensitive(root, "genres");
+    if (!cJSON_IsArray(genres)) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s has no genres array; movie-kind disabled", path);
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+    int count = cJSON_GetArraySize(genres);
+    if (count < 1 || count > MOVIE_KIND_MAX_GENRES) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s declares %d genres, this build supports 1..%d",
+                path, count, MOVIE_KIND_MAX_GENRES);
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+    for (int index = 0; index < count; index++) {
+        const cJSON *item = cJSON_GetArrayItem(genres, index);
+        if (!cJSON_IsString(item) || item->valuestring[0] == '\0' ||
+            strlen(item->valuestring) >= MOVIE_KIND_GENRE_CAP) {
+            log_msg(LOG_ERROR, "MovieKind: manifest %s genre %d is unusable", path, index);
+            mk.stats.model_load_failures++;
+            goto done;
+        }
+        snprintf(mk.genres[index], sizeof(mk.genres[index]), "%s", item->valuestring);
+    }
+    mk.genre_count = count;
+
+    const cJSON *backbone = mk_json_object(root, "backbone");
+    const cJSON *head = mk_json_object(root, "head");
+    if (!backbone || !head) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s lacks a backbone or head object; "
+                           "movie-kind disabled", path);
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+
+    long long hidden = mk_json_int(backbone, "hidden", 0);
+    long long n_labels = mk_json_int(head, "n_labels", 0);
+    if (hidden <= 0 || n_labels <= 0) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s has no usable hidden/n_labels; movie-kind disabled",
+                path);
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+    /* A label count that disagrees with the genre list makes "bit j = genres[j]"
+     * undefined, so it is a refusal rather than a clamp. */
+    long long head_hidden = mk_json_int(head, "hidden", hidden);
+    if (n_labels != (long long)mk.genre_count || head_hidden != hidden) {
+        log_msg(LOG_ERROR, "MovieKind: manifest %s head is %lld labels / %lld hidden but declares "
+                           "%d genres / %lld hidden; movie-kind disabled",
+                path, n_labels, head_hidden, mk.genre_count, hidden);
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+    mk.n_labels = (int)n_labels;
+    mk.hidden = (int)hidden;
+
+    if (mk_read_file_spec(backbone, "backbone", mk.backbone_file, sizeof(mk.backbone_file),
+                          &mk.backbone_bytes, mk.backbone_sha, sizeof(mk.backbone_sha)) != 0 ||
+        mk_read_file_spec(head, "head", mk.head_file, sizeof(mk.head_file), &mk.head_bytes,
+                          mk.head_sha, sizeof(mk.head_sha)) != 0) {
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+
+    if (mk_verify_file(mk.model_dir, mk.backbone_file, mk.backbone_bytes, mk.backbone_sha) != 0 ||
+        mk_verify_file(mk.model_dir, mk.head_file, mk.head_bytes, mk.head_sha) != 0) {
+        mk.stats.model_load_failures++;
+        goto done;
+    }
+
+    log_msg(LOG_INFO, "MovieKind: manifest %s verified (generation %lld, %d genres, "
+                      "backbone %lld B %.16s.., head %lld B %.16s..)",
+            path, mk.generation, mk.genre_count, mk.backbone_bytes, mk.backbone_sha,
+            mk.head_bytes, mk.head_sha);
+    mk.manifest_ok = 1;
+    status = 0;
+
+done:
+    cJSON_Delete(root);
+    return status;
+}
+
+/* ---- public API: initialisation and accessors --------------------------- */
+
+void movie_kind_set_threads(int threads) {
+    if (threads < MK_MIN_THREADS) threads = MK_MIN_THREADS;
+    if (threads > MK_MAX_THREADS) threads = MK_MAX_THREADS;
+    pthread_mutex_lock(&mk.mutex);
+    mk.threads = threads;
+    pthread_mutex_unlock(&mk.mutex);
+}
+
+int movie_kind_init(const char *model_dir) {
+    const char *dir = (model_dir && model_dir[0]) ? model_dir : MOVIE_KIND_MODEL_DIR_DEFAULT;
+
+    pthread_mutex_lock(&mk.mutex);
+    /* Everything init owns is reset; the mutex and the thread count survive so
+     * movie_kind_set_threads() keeps its value across a re-init. */
+    mk.manifest_ok = 0;
+    mk.enabled = 0;
+    mk.generation = 0;
+    mk.genre_count = 0;
+    mk.n_labels = 0;
+    mk.hidden = 0;
+    mk.model_ready = 0;
+    mk.backbone_file[0] = '\0';
+    mk.head_file[0] = '\0';
+    mk.backbone_bytes = 0;
+    mk.head_bytes = 0;
+    mk.backbone_sha[0] = '\0';
+    mk.head_sha[0] = '\0';
+    memset(mk.genres, 0, sizeof(mk.genres));
+    memset(&mk.stats, 0, sizeof(mk.stats));
+    snprintf(mk.model_dir, sizeof(mk.model_dir), "%s", dir);
+
+    if (mk_manifest_load_locked() == 0) {
+#ifdef MK_ENABLED
+        mk.enabled = 1;
+#else
+        /* Host build (plain gcc, no llama.cpp, no utf8proc): the manifest and
+         * its pins are still checked -- that is what the host test asserts --
+         * but this flavour can never produce a verdict. */
+        log_msg(LOG_WARN, "MovieKind: built without MK_ENABLED; movie-kind classification disabled");
+#endif
+    }
+    int manifest_ok = mk.manifest_ok;
+    pthread_mutex_unlock(&mk.mutex);
+
+    /* 0 means "the manifest and its pins verified"; whether this build can then
+     * produce verdicts is movie_kind_enabled()'s answer (never, without
+     * MK_ENABLED). */
+    return manifest_ok ? 0 : -1;
+}
+
+int movie_kind_enabled(void) {
+    /* Set once by movie_kind_init() before any worker thread exists; without
+     * MK_ENABLED it is never set at all. */
+    return mk.enabled ? 1 : 0;
+}
+
+int movie_kind_manifest_ok(void) {
+    return mk.manifest_ok ? 1 : 0;
+}
+
+int movie_kind_model_ready(void) {
+    pthread_mutex_lock(&mk.mutex);
+    int ready = mk.model_ready;
+    pthread_mutex_unlock(&mk.mutex);
+    return ready;
+}
+
+long long movie_kind_generation(void) {
+    return mk.generation;
+}
+
+int movie_kind_genre_count(void) {
+    return mk.genre_count;
+}
+
+const char *movie_kind_genre_name(int index) {
+    if (index < 0 || index >= mk.genre_count) return NULL;
+    return mk.genres[index];
+}
+
+void movie_kind_get_stats(movie_kind_stats_t *out) {
+    if (!out) return;
+    pthread_mutex_lock(&mk.mutex);
+    *out = mk.stats;
+    /* The descriptive fields are module state, not counters: publish them on
+     * every read so /stats can tell "no data" from "not built in". */
+    out->enabled = mk.enabled;
+    out->model_ready = mk.model_ready;
+    out->generation = mk.generation;
+    out->genre_count = mk.genre_count;
+    out->n_labels = mk.n_labels;
+    out->hidden = mk.hidden;
+    snprintf(out->model_dir, sizeof(out->model_dir), "%s", mk.model_dir);
+    snprintf(out->backbone_sha, sizeof(out->backbone_sha), "%s", mk.backbone_sha);
+    snprintf(out->head_sha, sizeof(out->head_sha), "%s", mk.head_sha);
+    pthread_mutex_unlock(&mk.mutex);
+}
+
+void movie_kind_note_thermal_pause(void) {
+    pthread_mutex_lock(&mk.mutex);
+    mk.stats.thermal_pauses++;
+    pthread_mutex_unlock(&mk.mutex);
+}
+
+/* ---- the encoder half -------------------------------------------------- */
+
+#ifdef MK_ENABLED
+
+/* llama.cpp's backend init is process-global and idempotent-by-convention: run
+ * it once, on the first model load (not at init, which must stay cheap). */
+static int mk_backend_ready = 0;
+
+/* Encoder wall time, microseconds. Only the gated half measures anything, so
+ * this lives here rather than with the shared helpers (an unused static would
+ * fail the host build's -Wall). */
+static uint64_t mk_elapsed_us(const struct timespec *t0, const struct timespec *t1) {
+    int64_t ns = (int64_t)(t1->tv_sec - t0->tv_sec) * 1000000000LL +
+                 ((int64_t)t1->tv_nsec - t0->tv_nsec);
+    if (ns <= 0) return 0;
+    return (uint64_t)(ns / 1000);
+}
+
+/* NFC-normalise the name. Invalid UTF-8 is *not* an error here: DB names are
+ * not always valid (stage-7 finding), and utf8proc_map() refuses invalid input
+ * by writing nothing, so a failure means "use the bytes as they are". */
+static char *mk_nfc_dup(const char *name) {
+    utf8proc_uint8_t *normalised = NULL;
+    /* NFC is "compose, stably": utf8proc has no UTF8PROC_NFC option (its
+     * utf8proc_NFC() shortcut leaves the destination uninitialised on error, so
+     * the explicit utf8proc_map() call with a NULLed-out destination is used). */
+    utf8proc_ssize_t rc = utf8proc_map((const utf8proc_uint8_t *)name, 0, &normalised,
+                                       (utf8proc_option_t)(UTF8PROC_COMPOSE | UTF8PROC_STABLE));
+    if (rc < 0 || normalised == NULL) {
+        free(normalised);
+        return strdup(name);
+    }
+    char *copy = strdup((const char *)normalised);
+    free(normalised);
+    return copy;
+}
+
+/* The serving text, allocated: "Torrent: " + NFC(name) + "\nFilm genres:". */
+static char *mk_prompt_dup(const char *name) {
+    char *normalised = mk_nfc_dup(name);
+    if (!normalised) return NULL;
+    size_t cap = strlen(normalised) + sizeof(MOVIE_KIND_PROMPT_PREFIX) +
+                 sizeof(MOVIE_KIND_PROMPT_SUFFIX);
+    char *prompt = (char *)malloc(cap);
+    if (!prompt) {
+        free(normalised);
+        return NULL;
+    }
+    snprintf(prompt, cap, "%s%s%s", MOVIE_KIND_PROMPT_PREFIX, normalised,
+             MOVIE_KIND_PROMPT_SUFFIX);
+    free(normalised);
+    return prompt;
+}
+
+int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
+    if (!name || !out || cap == 0) return -1;
+    char *prompt = mk_prompt_dup(name);
+    if (!prompt) return -1;
+    int written = snprintf(out, cap, "%s", prompt);
+    free(prompt);
+    return (written > 0 && (size_t)written < cap) ? 0 : -1;
+}
+
+/* Load the head and the backbone on first use. Called with `mutex` held. */
+static int mk_model_ensure_locked(void) {
+    if (mk.model_ready) return 0;
+    if (!mk.manifest_ok) return -1;
+
+    char path[MK_MODEL_PATH_CAP];
+    char err[160];
+
+    snprintf(path, sizeof(path), "%s/%s", mk.model_dir, mk.head_file);
+    int head_status = jevhead_load(path, &mk.head, err, sizeof(err));
+    if (head_status != JEVHEAD_OK) {
+        log_msg(LOG_ERROR, "MovieKind: head %s unusable (%s); movie-kind disabled", path, err);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+    if ((int)mk.head.n_labels != mk.genre_count || (int)mk.head.hidden != mk.hidden) {
+        log_msg(LOG_ERROR, "MovieKind: head %s is %u labels / %u hidden, the manifest says %d/%d; "
+                           "refusing to use it", path, mk.head.n_labels, mk.head.hidden,
+                mk.genre_count, mk.hidden);
+        jevhead_free(&mk.head);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+
+    if (!mk_backend_ready) {
+        llama_backend_init();
+        mk_backend_ready = 1;
+    }
+
+    snprintf(path, sizeof(path), "%s/%s", mk.model_dir, mk.backbone_file);
+    struct llama_model_params model_params = llama_model_default_params();
+    /* CPU-only on the phone; mmap is the default load mode and is what keeps
+     * the 152.8 MiB out of RSS until the pages are touched. */
+    model_params.n_gpu_layers = 0;
+    mk.model = llama_model_load_from_file(path, model_params);
+    if (!mk.model) {
+        log_msg(LOG_ERROR, "MovieKind: backbone %s failed to load; movie-kind disabled", path);
+        jevhead_free(&mk.head);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+
+    int n_embd = (int)llama_model_n_embd(mk.model);
+    if (n_embd != mk.hidden) {
+        log_msg(LOG_ERROR, "MovieKind: backbone %s embeds %d floats, the head expects %d; "
+                           "refusing to use it", path, n_embd, mk.hidden);
+        llama_model_free(mk.model);
+        mk.model = NULL;
+        jevhead_free(&mk.head);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+
+    /* The production 64-token window, expressible only through this direct API
+     * (a llama-embedding-shaped harness pads to n_ctx_seq — the v1 §10.6 blocker). */
+    struct llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = MOVIE_KIND_MAX_TOKENS;
+    context_params.n_batch = MOVIE_KIND_MAX_TOKENS;
+    context_params.n_ubatch = MOVIE_KIND_MAX_TOKENS;
+    context_params.n_seq_max = 1;
+    context_params.n_threads = mk.threads;
+    context_params.n_threads_batch = mk.threads;
+    context_params.pooling_type = LLAMA_POOLING_TYPE_CLS;
+    context_params.embeddings = true;
+    mk.context = llama_init_from_model(mk.model, context_params);
+    if (!mk.context) {
+        log_msg(LOG_ERROR, "MovieKind: context for %s failed to initialise; movie-kind disabled", path);
+        llama_model_free(mk.model);
+        mk.model = NULL;
+        jevhead_free(&mk.head);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+
+    mk.model_ready = 1;
+    log_msg(LOG_INFO, "MovieKind: model loaded (generation %lld, %d genres, %d threads): %s",
+            mk.generation, mk.genre_count, mk.threads, path);
+    return 0;
+}
+
+/* Tokenise the serving text with the GGUF's own tokenizer, cut to
+ * MOVIE_KIND_MAX_TOKENS, encode one row and run the head. Called with `mutex`
+ * held and the model resident. */
+static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
+    char *prompt = mk_prompt_dup(name);
+    if (!prompt) return -1;
+
+    const struct llama_vocab *vocab = llama_model_get_vocab(mk.model);
+    if (!vocab) {
+        free(prompt);
+        return -1;
+    }
+
+    int32_t text_len = (int32_t)strlen(prompt);
+    int32_t needed = llama_tokenize(vocab, prompt, text_len, NULL, 0, true, false);
+    if (needed == 0) {
+        free(prompt);
+        return -1;
+    }
+    if (needed < 0) needed = -needed; /* the tokenizer reports the shortfall negative */
+    llama_token *tokens = (llama_token *)malloc((size_t)needed * sizeof(llama_token));
+    if (!tokens) {
+        free(prompt);
+        return -1;
+    }
+    int32_t got = llama_tokenize(vocab, prompt, text_len, tokens, needed, true, false);
+    free(prompt);
+    if (got <= 0) {
+        free(tokens);
+        return -1;
+    }
+
+    int32_t n_tokens = got;
+    if (n_tokens > MOVIE_KIND_MAX_TOKENS) n_tokens = MOVIE_KIND_MAX_TOKENS;
+    struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
+    int32_t encoded = llama_encode(mk.context, batch);
+    free(tokens);
+    if (encoded != 0) {
+        log_msg(LOG_WARN, "MovieKind: llama_encode failed (%d)", encoded);
+        return -1;
+    }
+
+    /* Pooling is CLS and the head was fitted on *unnormalised* states: do not
+     * L2-normalise here, whatever an embedding example does. */
+    float *embedding = llama_get_embeddings(mk.context);
+    if (!embedding) {
+        log_msg(LOG_WARN, "MovieKind: llama_encode produced no CLS embedding");
+        return -1;
+    }
+
+    uint32_t mask = 0;
+    uint32_t count = 0;
+    if (jevhead_predict(&mk.head, embedding, &mask, &count) != JEVHEAD_OK) {
+        return -1;
+    }
+    if (mk.genre_count > 0 && mk.genre_count < 32) {
+        mask &= ((uint32_t)1u << mk.genre_count) - 1u;
+    }
+    uint16_t bits = (uint16_t)mask;
+    for (int bit = 0; bit < mk.genre_count; bit++) {
+        if (bits & (uint16_t)((uint16_t)1u << bit)) mk.stats.by_genre[bit]++;
+    }
+    *out_mask = bits;
+    return 0;
+}
+
+int movie_kind_classify(const char *name, uint16_t *mask) {
+    if (!name || !mask) return 1;
+
+    struct timespec t0;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    pthread_mutex_lock(&mk.mutex);
+    uint16_t bits = MOVIE_KIND_NONE;
+    int status = 1;
+    if (mk.enabled) {
+        if (mk_model_ensure_locked() == 0 && mk_embed_mask_locked(name, &bits) == 0) {
+            status = 0;
+            mk.stats.total_classified++;
+        } else {
+            /* The module is on but produced no verdict: a real failure, unlike a
+             * call on a disabled/absent module, which the caller never makes. */
+            mk.stats.failures++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    mk.stats.total_us += mk_elapsed_us(&t0, &t1);
+    pthread_mutex_unlock(&mk.mutex);
+
+    if (status == 0) *mask = bits;
+    return status;
+}
+
+#else /* !MK_ENABLED */
+
+/*
+ * Host build (`make`, plain gcc, no llama.cpp and no utf8proc include path):
+ * the encoder is compiled out. The manifest core above still parses and
+ * verifies, so tests/test_movie_kind.c can pin the refusal paths, but nothing
+ * here can ever produce a verdict -- the same contract as classifier.c's inert
+ * half (`movie_kind_enabled()` 0, `movie_kind_classify()` 1).
+ */
+
+int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
+    (void)name;
+    (void)out;
+    (void)cap;
+    return -1;
+}
+
+int movie_kind_classify(const char *name, uint16_t *mask) {
+    (void)name;
+    (void)mask;
+    return 1;
+}
+
+#endif /* MK_ENABLED */

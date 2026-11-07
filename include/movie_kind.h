@@ -1,0 +1,153 @@
+#ifndef MOVIE_KIND_H
+#define MOVIE_KIND_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * Movie-genre classification (the "movie kind" of a movie torrent).
+ *
+ * A torrent's *kind* is a 16-bit genre mask produced by the v9 JEV head
+ * (`include/jevhead.h`) over the **unnormalised CLS embedding** of
+ *
+ *     "Torrent: " + NFC(name) + "\nFilm genres:"
+ *
+ * encoded by the quantised GGUF backbone (`models/v9/…Q8_0.gguf`) through a
+ * direct `llama_encode` call — not through any `llama-embedding`-shaped
+ * harness, whose 512-token padding was the v1 §10.6 blocker. Bit j of the mask
+ * is `manifest.genres[j]` (taxonomy index j+1; `none` is not a bit), and a
+ * mask of 0 is the `none` answer.
+ *
+ * Everything is gated on the *pinned* manifest: `movie_kind_init()` refuses to
+ * enable the module unless `<model_dir>/manifest.json` parses and both files it
+ * names match their pinned byte size **and** sha256. A mismatch is loud, never
+ * a silent degradation — the fastText classifier's "silently degrades to
+ * parser-only" precedent is exactly what this gate exists to avoid.
+ *
+ * Build gating: the encoder half needs llama.cpp and utf8proc, which only the
+ * Android wrapper build provides (it defines `MK_ENABLED`). The manifest /
+ * sha256 / generation / genre-order core is plain C99 + cJSON + OpenSSL and is
+ * compiled in every flavour, which is what the host test
+ * (`tests/test_movie_kind.c`) exercises. Without `MK_ENABLED`,
+ * `movie_kind_enabled()`, `movie_kind_model_ready()` and
+ * `movie_kind_classify()` answer 0/0/1 (never a verdict) and the module logs
+ * once that it was built out — mirroring `src/classifier.c`'s inert half.
+ */
+
+/*: v9 taxonomy size. The mask is 16 bits, so a manifest may not declare more. */
+#define MOVIE_KIND_MAX_GENRES 16
+/*: Genre bits that survived their threshold; 0 is the `none` answer. */
+#define MOVIE_KIND_NONE 0u
+/*: Production token window: ids are cut to this many before `llama_encode`. */
+#define MOVIE_KIND_MAX_TOKENS 64
+/*: Longest genre name copied out of the manifest, including the NUL. */
+#define MOVIE_KIND_GENRE_CAP 24
+/*: Longest model-directory path, including the NUL (matches config's char[512]). */
+#define MOVIE_KIND_PATH_CAP 512
+/*: Longest file name from the manifest, including the NUL. */
+#define MOVIE_KIND_FILE_CAP 128
+/*: Lowercase sha256 hex plus the NUL. */
+#define MOVIE_KIND_SHA_CAP 65
+
+/*: The serving text's wrapper, split so the renderer never formats it ad hoc. */
+#define MOVIE_KIND_PROMPT_PREFIX "Torrent: "
+#define MOVIE_KIND_PROMPT_SUFFIX "\nFilm genres:"
+
+/*: Default model directory, cwd-relative like the keyword files and `models/v1`. */
+#define MOVIE_KIND_MODEL_DIR_DEFAULT "models/v9"
+
+typedef struct {
+    int enabled;                 /* 1 when movie_kind_init() verified the manifest
+                                  * and this build has an encoder (MK_ENABLED) */
+    int model_ready;             /* 1 once the GGUF + head are resident (lazy) */
+    long long generation;        /* digits of manifest.version ("v9" -> 9); 0 = none */
+    int genre_count;             /* manifest.genres entries (bit count) */
+    int n_labels;                /* head.n_labels from the manifest */
+    int hidden;                  /* backbone.hidden (the embedding width, 768) */
+    char model_dir[MOVIE_KIND_PATH_CAP];
+    char backbone_sha[MOVIE_KIND_SHA_CAP]; /* pinned sha256 actually verified */
+    char head_sha[MOVIE_KIND_SHA_CAP];
+    uint64_t total_classified;   /* names that produced a mask */
+    uint64_t total_us;           /* summed classify() wall time, microseconds */
+    uint64_t failures;           /* classify() calls that produced no verdict */
+    uint64_t model_load_failures;/* unusable manifest (counted once) plus each
+                                  * model/head that failed to load or verify */
+    uint64_t thermal_pauses;     /* back-off pauses reported by the caller
+                                  * (classify_backfill-style engine, Stage C) */
+    uint64_t by_genre[MOVIE_KIND_MAX_GENRES]; /* per genre bit, all verdicts */
+} movie_kind_stats_t;
+
+/*
+ * Initialise the module for `model_dir` (NULL/empty falls back to
+ * "models/v9"). Reads and verifies the manifest; the 152.8 MiB backbone is NOT
+ * mapped here — the first movie_kind_classify() call loads it, so a crawler
+ * that never backfills never pays for it.
+ *
+ * Non-fatal by contract, like classifier_init(): an unreadable manifest, a
+ * missing/short/wrong-sha file or a manifest without a usable generation only
+ * leaves the module disabled, with a LOG_ERROR naming the reason and
+ * `model_load_failures` bumped. Call once from main.c before the worker
+ * threads start, and only when config.movie_kind_enabled is set.
+ *
+ * @return 0 when the module is usable, -1 when it stayed disabled.
+ */
+int movie_kind_init(const char *model_dir);
+
+/*
+ * Classify one torrent name: NFC-normalise, render the serving text, tokenise
+ * with the GGUF's own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, one-row
+ * `llama_encode`, unnormalised CLS embedding, then the JEV head.
+ *
+ * Thread-safe (one model and one context behind an internal mutex) and
+ * lazy-loading: the first call pays the model load.
+ *
+ * @param name raw torrent name; invalid UTF-8 is passed through untouched
+ *             (DB names are not always valid — NFC failure means "use the
+ *             bytes as they are", never a dropped row).
+ * @param mask out: the genre bit mask; MOVIE_KIND_NONE is a *successful*
+ *             `none` verdict, not a failure.
+ * @return 0 and *mask filled on success; 1 when no verdict is available
+ *         (feature disabled, built without MK_ENABLED, model/head
+ *         missing/unusable, or an encode failure). The caller leaves the row
+ *         untouched on 1 — the `classifier_classify()` contract.
+ */
+int movie_kind_classify(const char *name, uint16_t *mask);
+
+/*
+ * Render the exact serving text for `name` (NFC + the fixed wrapper) into
+ * `out`. Exposed so the byte-level contract can be pinned by a test; returns 0
+ * on success, -1 when `out` is too small or the build has no NFC support
+ * (no MK_ENABLED). `cap` should be strlen(name) + 32.
+ */
+int movie_kind_prompt_text(const char *name, char *out, size_t cap);
+
+/* Encoder thread count (config.movie_kind_threads, default 4). Applied on the
+ * next model load; call before the first classify. Clamped to 1..8. */
+void movie_kind_set_threads(int threads);
+
+/* 1 when this build can classify AND the manifest verified (MK_ENABLED only). */
+int movie_kind_enabled(void);
+
+/* 1 when the manifest parsed and both pinned files verified their size+sha256.
+ * Answerable in every flavour: it is what the host test asserts. */
+int movie_kind_manifest_ok(void);
+
+/* 1 once the backbone + head are resident (always 0 without MK_ENABLED). */
+int movie_kind_model_ready(void);
+
+/* Model generation from the manifest ("v9" -> 9), for `movie_kind_clf_ver`
+ * and for generation-scoped backfill resumes. 0 when no manifest was read. */
+long long movie_kind_generation(void);
+
+/* manifest.genres count, and bit -> name in manifest order (NULL when the
+ * index is out of range or no manifest was read). */
+int movie_kind_genre_count(void);
+const char *movie_kind_genre_name(int index);
+
+/* Copy the current counters into *out (whole-struct copy under the mutex). */
+void movie_kind_get_stats(movie_kind_stats_t *out);
+
+/* Count one thermal back-off pause (the backfill engine reports it here). */
+void movie_kind_note_thermal_pause(void);
+
+#endif /* MOVIE_KIND_H */

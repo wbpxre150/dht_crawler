@@ -20,6 +20,8 @@ typedef struct {
      *   - language_filter.c (language_filter_non_latin_threshold)
      *   - classifier.c (classifier_enabled, classifier_model_dir,
      *     adult_hide_threshold, adult_mode)
+     *   - movie_kind.c (movie_kind_enabled, movie_kind_model_dir,
+     *     movie_kind_threads; the backfill engine reads movie_kind_thermal_backoff_c)
      *   - tree_metadata.c (adult_mode), hard_block.c (hard_block_file)
      *   - failure_bloom filter (failure_bloom_capacity)
      */
@@ -92,6 +94,14 @@ typedef struct {
     char adult_mode[8];                 /* "tag" (default) or "drop" at ingest */
     double adult_hide_threshold;        /* Classifier adult tag threshold; 0 = take it from the manifest */
     char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
+
+    /* Movie-kind (genre mask) settings — movie-kind Stage B. The model directory
+     * pins the manifest whose sha256s gate the load; the thermal ceiling is read
+     * by the backfill engine (Stage C) between batches. */
+    int movie_kind_enabled;             /* Enable movie-kind classification (0=disabled, default: 1) */
+    char movie_kind_model_dir[512];     /* manifest.json + pinned GGUF/head (default: "models/v9") */
+    int movie_kind_threads;             /* llama.cpp encoder threads (default: 4; 8 is slower on this SoC) */
+    int movie_kind_thermal_backoff_c;   /* Pause the movie backfill above this CPU temp in °C (default: 82) */
 
     /* "Categories to save" (see category_filter_cleanup.h). Both are bitmasks
      * over the tparse taxonomy and default to every bit set, which means "save
