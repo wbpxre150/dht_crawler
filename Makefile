@@ -151,8 +151,8 @@ BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/l
 # exist under -DMK_ENABLED, which this Makefile never defines -- utf8proc is
 # vendored in the outer repo only (movie-kind Stage A). cJSON is compiled in
 # directly and -lcrypto backs the pinned sha256s.
-MOVIE_KIND_TEST_SRCS = tests/test_movie_kind.c src/movie_kind.c src/jevhead.c \
-                       src/classifier.c lib/cJSON/cJSON.c tests/stub_log.c
+MOVIE_KIND_TEST_SRCS = tests/test_movie_kind.c src/movie_kind.c src/movie_kind_render.c \
+                       src/jevhead.c src/classifier.c lib/cJSON/cJSON.c tests/stub_log.c
 MOVIE_KIND_TEST_BIN = $(BUILD_DIR)/test_movie_kind
 # The embedding-provider seam (include/movie_kind.h): lets the host test drive
 # the real guarded classify path with synthetic 768-float vectors instead of a
@@ -163,15 +163,30 @@ MOVIE_KIND_TEST_CFLAGS = -DMOVIE_KIND_TEST
 # inert on the host (no CLF_ENABLED), so no ftc/tparse is needed.
 MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto
 
+# The renderer test compiles src/movie_kind_render.c, which is deliberately
+# ungated: the stage-11 P0 was a broken NFC length *inside* the MK_ENABLED half,
+# where the host build only ever saw a stub, so the one broken function had no
+# coverage. Built twice — plain (passthrough NFC) and with -DMK_NFC_ENABLED plus
+# the vendored utf8proc, which is what the shipped NDK binary compiles. The outer
+# wrapper directory is reached by absolute path for the same reason as
+# clf-backfill: this target is also built from the Gradle-prepared copy
+# (app/build/native/src/dht_crawler), where ../dht_crawler-android does not
+# resolve.
+RENDER_TEST_SRCS = tests/test_movie_kind_render.c src/movie_kind_render.c
+RENDER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_render
+RENDER_TEST_NFC_BIN = $(BUILD_DIR)/test_movie_kind_render_nfc
+RENDER_NFC_CFLAGS = -DMK_NFC_ENABLED -I$(CLF_ANDROID_DIR)/utf8proc
+RENDER_NFC_SRCS = $(RENDER_TEST_SRCS) $(CLF_ANDROID_DIR)/utf8proc/utf8proc.c
+
 # The movie-kind backfill engine test links the real src/movie_backfill.c and the
 # real src/movie_kind.c (host flavour: manifest/sha256 only), and drives the
 # engine's seams with -DMOVIE_BACKFILL_TEST so a pass can label rows without a
 # model and pause for heat without a hot CPU. src/database.c builds the fixture
 # through the ingest path, exactly like the fastText backfill test.
 MOVIE_BACKFILL_TEST_SRCS = tests/test_movie_backfill.c src/movie_backfill.c \
-                           src/movie_kind.c src/jevhead.c src/classifier.c \
-                           src/database.c src/bloom_filter.c lib/cJSON/cJSON.c \
-                           tests/stub_log.c
+                           src/movie_kind.c src/movie_kind_render.c src/jevhead.c \
+                           src/classifier.c src/database.c src/bloom_filter.c \
+                           lib/cJSON/cJSON.c tests/stub_log.c
 MOVIE_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_movie_backfill
 MOVIE_BACKFILL_TEST_CFLAGS = -DMOVIE_BACKFILL_TEST
 MOVIE_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
@@ -182,15 +197,16 @@ MOVIE_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom
 # and movie-kind modules are still linked, for the state names and the defaults.
 MOVIE_BACKFILL_DAEMON_TEST_SRCS = tests/test_movie_backfill_daemon.c \
                                   src/movie_backfill_daemon.c src/movie_backfill.c \
-                                  src/movie_kind.c src/jevhead.c src/classifier.c \
-                                  src/database.c src/bloom_filter.c \
-                                  lib/cJSON/cJSON.c tests/stub_log.c
+                                  src/movie_kind.c src/movie_kind_render.c \
+                                  src/jevhead.c src/classifier.c src/database.c \
+                                  src/bloom_filter.c lib/cJSON/cJSON.c \
+                                  tests/stub_log.c
 MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
 MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
 MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
 
 tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind \
-       tests-movie-backfill tests-movie-backfill-daemon
+       tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -216,6 +232,13 @@ tests-movie-kind:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
 	./$(MOVIE_KIND_TEST_BIN)
+
+tests-movie-kind-render:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(RENDER_TEST_SRCS) -o $(RENDER_TEST_BIN) $(TEST_LDFLAGS)
+	./$(RENDER_TEST_BIN)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(RENDER_NFC_CFLAGS) $(INCLUDES) $(RENDER_NFC_SRCS) -o $(RENDER_TEST_NFC_BIN) $(TEST_LDFLAGS)
+	./$(RENDER_TEST_NFC_BIN)
 
 tests-movie-backfill: libbloom
 	@mkdir -p $(BUILD_DIR)
@@ -275,4 +298,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-backfill tests-movie-backfill-daemon tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

@@ -443,8 +443,13 @@ static void case_manifest_ok(void) {
     if (mask != 0xFFFFu) {
         fail("a declined classify leaves the mask untouched", "classify");
     }
-    if (movie_kind_prompt_text("x", (char[64]){0}, 64) != -1) {
-        fail("the host build has no NFC renderer", "prompt_text");
+    /* The renderer is ungated (stage 11): the host build renders the real
+     * serving text with the documented passthrough, so the name is present. The
+     * byte-level cases live in tests/test_movie_kind_render.c. */
+    char host_prompt[64] = {0};
+    if (movie_kind_prompt_text("Some.2024.1080p.mkv", host_prompt, sizeof(host_prompt)) != 0 ||
+        strstr(host_prompt, "Some.2024.1080p.mkv") == NULL) {
+        fail("the host build renders the serving text (passthrough, no NFC)", host_prompt);
     }
 #endif
 
@@ -560,34 +565,11 @@ static void case_refusals(void) {
     printf("  case 5 ok: every manifest refusal path disables the module and counts a failure\n");
 }
 
-/* ---- NFC (MK_ENABLED only) --------------------------------------------- */
-
-#ifdef MK_ENABLED
-static void case_nfc(void) {
-    char prompt[256];
-
-    /* "Amélie" with a decomposed e + U+0301 must reach the model composed. */
-    if (movie_kind_prompt_text("Am\u0065\u0301lie", prompt, sizeof(prompt)) != 0) {
-        fail("the NFC renderer succeeds", "prompt_text");
-        return;
-    }
-    if (strcmp(prompt, "Torrent: Am\u00e9lie\nFilm genres:") != 0) {
-        fail("a decomposed name is NFC-composed in the serving text", prompt);
-    }
-
-    /* Invalid UTF-8 passes through untouched: DB names are not always valid, and
-     * utf8proc_map() refuses such input rather than rewriting it. */
-    const char invalid[] = "Bad\xFFname\xC3";
-    if (movie_kind_prompt_text(invalid, prompt, sizeof(prompt)) != 0) {
-        fail("the renderer accepts invalid UTF-8", "prompt_text");
-        return;
-    }
-    if (strcmp(prompt, "Torrent: Bad\xFFname\xC3\nFilm genres:") != 0) {
-        fail("invalid UTF-8 passes through untouched", "prompt_text");
-    }
-    printf("  case 6 ok: NFC composes, invalid UTF-8 passes through\n");
-}
-#endif
+/* The serving-text/NFC cases live in tests/test_movie_kind_render.c (stage 11):
+ * the renderer is ungated now, so that test compiles the real
+ * src/movie_kind_render.c in both the passthrough and the utf8proc flavour —
+ * here they were gated on MK_ENABLED, which the host build never defines, which
+ * is exactly how the stage-11 P0 went unnoticed. */
 
 /* ---- the embedding seam: the guarded classify path without a GGUF ------ *
  *
@@ -850,12 +832,6 @@ int main(void) {
     case_manifest_ok();
     case_refusals();
     case_embedding_seam();
-#ifdef MK_ENABLED
-    case_nfc();
-#else
-    printf("  (NFC cases skipped: this host build has no MK_ENABLED/utf8proc;\n"
-           "   the on-device spot check covers them)\n");
-#endif
 
     /* Leave nothing behind. */
     char path[512];

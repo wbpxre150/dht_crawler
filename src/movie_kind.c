@@ -9,10 +9,22 @@
  *     pinned-size + sha256 verification, the stats block — is plain C99 with
  *     cJSON and OpenSSL, so the crawler's own host `make` build compiles it
  *     and tests/test_movie_kind.c exercises the *real* refusal paths;
- *   - the encoder — llama.cpp model/context, `llama_encode`, utf8proc NFC —
- *     is `MK_ENABLED`-gated, with an inert `#else` that answers "no verdict"
+ *   - the encoder — llama.cpp model/context and `llama_encode` — is
+ *     `MK_ENABLED`-gated, with an inert `#else` that answers "no verdict"
  *     exactly like classifier.c's host stubs, so a plain CMake configure and
- *     the host Makefile stay llama-free and utf8proc-free.
+ *     the host Makefile stay llama-free;
+ *   - the serving-text renderer (NFC + the fixed wrapper) is *not* gated at
+ *     all: it lives in src/movie_kind_render.c, which both builds compile, and
+ *     only its NFC step has a switch (`MK_NFC_ENABLED`, defined by the Android
+ *     wrapper beside `MK_ENABLED`). Stage 11 moved it out because the renderer
+ *     used to sit in the MK_ENABLED half, where the host build compiled a stub
+ *     returning -1 — so the stage-11 P0 (`utf8proc_map()` handed length 0, so
+ *     every movie rendered the bare wrapper "Torrent: \nFilm genres:") had no
+ *     host coverage whatsoever.
+ *
+ * Without MK_ENABLED this flavour reports `movie_kind_enabled()` 0 -- never a
+ * verdict -- unless a test installs a synthetic embedding provider through the
+ * seam, which is the same contract as classifier.c's inert half.
  */
 
 #include "movie_kind.h"
@@ -43,7 +55,6 @@
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
-#include <utf8proc.h>
 #endif
 
 /* A manifest is a few KiB; the cap is the same one clf_load_manifest() uses, so
@@ -486,51 +497,6 @@ void movie_kind_note_thermal_pause(void) {
  * it once, on the first model load (not at init, which must stay cheap). */
 static int mk_backend_ready = 0;
 
-/* NFC-normalise the name. Invalid UTF-8 is *not* an error here: DB names are
- * not always valid (stage-7 finding), and utf8proc_map() refuses invalid input
- * by writing nothing, so a failure means "use the bytes as they are". */
-static char *mk_nfc_dup(const char *name) {
-    utf8proc_uint8_t *normalised = NULL;
-    /* NFC is "compose, stably": utf8proc has no UTF8PROC_NFC option (its
-     * utf8proc_NFC() shortcut leaves the destination uninitialised on error, so
-     * the explicit utf8proc_map() call with a NULLed-out destination is used). */
-    utf8proc_ssize_t rc = utf8proc_map((const utf8proc_uint8_t *)name, 0, &normalised,
-                                       (utf8proc_option_t)(UTF8PROC_COMPOSE | UTF8PROC_STABLE));
-    if (rc < 0 || normalised == NULL) {
-        free(normalised);
-        return strdup(name);
-    }
-    char *copy = strdup((const char *)normalised);
-    free(normalised);
-    return copy;
-}
-
-/* The serving text, allocated: "Torrent: " + NFC(name) + "\nFilm genres:". */
-static char *mk_prompt_dup(const char *name) {
-    char *normalised = mk_nfc_dup(name);
-    if (!normalised) return NULL;
-    size_t cap = strlen(normalised) + sizeof(MOVIE_KIND_PROMPT_PREFIX) +
-                 sizeof(MOVIE_KIND_PROMPT_SUFFIX);
-    char *prompt = (char *)malloc(cap);
-    if (!prompt) {
-        free(normalised);
-        return NULL;
-    }
-    snprintf(prompt, cap, "%s%s%s", MOVIE_KIND_PROMPT_PREFIX, normalised,
-             MOVIE_KIND_PROMPT_SUFFIX);
-    free(normalised);
-    return prompt;
-}
-
-int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
-    if (!name || !out || cap == 0) return -1;
-    char *prompt = mk_prompt_dup(name);
-    if (!prompt) return -1;
-    int written = snprintf(out, cap, "%s", prompt);
-    free(prompt);
-    return (written > 0 && (size_t)written < cap) ? 0 : -1;
-}
-
 /* Load the backbone (and the head it has to agree with) on first use. Called
  * with `mutex` held. */
 static int mk_model_ensure_locked(void) {
@@ -609,8 +575,16 @@ static int mk_model_ensure_locked(void) {
  * fallback could only be unreachable dead code that re-opens the wrong path. */
 static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden) {
     (void)userdata;
-    char *prompt = mk_prompt_dup(name);
+    /* The serving text comes from the ungated renderer (src/movie_kind_render.c),
+     * so the encoder cannot drift from what tests/test_movie_kind_render.c pins.
+     * strlen(name) + 32 covers the wrapper with room to spare (include/movie_kind.h). */
+    size_t prompt_cap = strlen(name) + 32;
+    char *prompt = (char *)malloc(prompt_cap);
     if (!prompt) return -1;
+    if (movie_kind_prompt_text(name, prompt, prompt_cap) != 0) {
+        free(prompt);
+        return -1;
+    }
 
     const struct llama_vocab *vocab = llama_model_get_vocab(mk.model);
     if (!vocab) {
@@ -791,6 +765,23 @@ static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
     return 0;
 }
 
+/* The empty-prompt signature: a non-empty name whose serving text equals the one
+ * the *empty* name renders, i.e. the name contributed nothing. Stage 11 is
+ * exactly that failure: utf8proc_map() was given length 0, so NFC(name) was
+ * empty for every movie, the embedding was constant and so was the mask. The
+ * check is state-free (no "same prompt twice" memory to keep) and costs two
+ * strdup+snprintf pairs, i.e. nothing beside the encode it guards. An empty
+ * input name legitimately renders the bare wrapper, so it is exempt. */
+static int mk_prompt_lacks_name(const char *name) {
+    if (name[0] == 0) return 0;
+    char bare[sizeof(MOVIE_KIND_PROMPT_PREFIX) + sizeof(MOVIE_KIND_PROMPT_SUFFIX)];
+    char rendered[sizeof(bare)];
+    if (movie_kind_prompt_text("", bare, sizeof(bare)) != 0) return 0;
+    /* A name long enough to truncate (-1) cannot be the empty-prompt signature. */
+    if (movie_kind_prompt_text(name, rendered, sizeof(rendered)) != 0) return 0;
+    return strcmp(rendered, bare) == 0;
+}
+
 int movie_kind_classify(const char *name, uint16_t *mask) {
     if (!name || !mask) return 1;
 
@@ -802,7 +793,14 @@ int movie_kind_classify(const char *name, uint16_t *mask) {
     uint16_t bits = MOVIE_KIND_NONE;
     int status = 1;
     if (mk.enabled) {
-        if (mk_ensure_locked() == 0 && mk_embed_mask_locked(name, &bits) == 0) {
+        if (mk_prompt_lacks_name(name)) {
+            /* Tripwire for the stage-11 bug class: a non-empty name whose serving
+             * text is the bare wrapper would encode to one constant embedding. */
+            log_msg(LOG_WARN,
+                    "MovieKind: a non-empty name rendered the bare serving text -- the "
+                    "renderer is broken, refusing to classify");
+            mk.stats.failures++;
+        } else if (mk_ensure_locked() == 0 && mk_embed_mask_locked(name, &bits) == 0) {
             status = 0;
             mk.stats.total_classified++;
         } else {
@@ -832,22 +830,3 @@ void movie_kind_test_set_embedding_provider(movie_kind_embedding_provider_t prov
 }
 #endif /* MOVIE_KIND_TEST */
 
-#ifndef MK_ENABLED /* the NFC renderer is the only thing utf8proc owns */
-
-/*
- * Host build (`make`, plain gcc, no llama.cpp and no utf8proc include path):
- * the encoder is compiled out, so only the NFC renderer is missing here. The
- * manifest core, the head load and the guarded classify path above are shared,
- * and this flavour reports `movie_kind_enabled()` 0 -- never a verdict --
- * unless a test installs a synthetic embedding provider through the seam, which
- * is the same contract as classifier.c's inert half.
- */
-
-int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
-    (void)name;
-    (void)out;
-    (void)cap;
-    return -1;
-}
-
-#endif /* !MK_ENABLED */

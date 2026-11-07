@@ -24,11 +24,15 @@
  * a silent degradation — the fastText classifier's "silently degrades to
  * parser-only" precedent is exactly what this gate exists to avoid.
  *
- * Build gating: the encoder half needs llama.cpp and utf8proc, which only the
- * Android wrapper build provides (it defines `MK_ENABLED`). The manifest /
- * sha256 / generation / genre-order core is plain C99 + cJSON + OpenSSL and is
- * compiled in every flavour, which is what the host test
- * (`tests/test_movie_kind.c`) exercises. Without `MK_ENABLED`,
+ * Build gating: the encoder half needs llama.cpp, which only the Android wrapper
+ * build provides (it defines `MK_ENABLED`). The manifest / sha256 / generation /
+ * genre-order core is plain C99 + cJSON + OpenSSL and is compiled in every
+ * flavour, which is what the host test (`tests/test_movie_kind.c`) exercises.
+ * The serving-text renderer (`src/movie_kind_render.c`) is *not* gated either —
+ * `tests/test_movie_kind_render.c` compiles the real thing — and only its NFC
+ * step needs utf8proc, behind its own `MK_NFC_ENABLED` define (set by the same
+ * Android wrapper; without it the name's bytes pass through unchanged). Without
+ * `MK_ENABLED`,
  * `movie_kind_enabled()`, `movie_kind_model_ready()` and
  * `movie_kind_classify()` answer 0/0/1 (never a verdict) and the module logs
  * once that it was built out — mirroring `src/classifier.c`'s inert half.
@@ -128,16 +132,22 @@ int movie_kind_init(const char *model_dir);
  *             `none` verdict, not a failure.
  * @return 0 and *mask filled on success; 1 when no verdict is available
  *         (feature disabled, built without MK_ENABLED, model/head
- *         missing/unusable, or an encode failure). The caller leaves the row
- *         untouched on 1 — the `classifier_classify()` contract.
+ *         missing/unusable, an encode failure, or a non-empty name whose
+ *         serving text lost the name — the stage-11 empty-prompt tripwire).
+ *         The caller leaves the row untouched on 1 — the
+ *         `classifier_classify()` contract.
  */
 int movie_kind_classify(const char *name, uint16_t *mask);
 
 /*
- * Render the exact serving text for `name` (NFC + the fixed wrapper) into
- * `out`. Exposed so the byte-level contract can be pinned by a test; returns 0
- * on success, -1 when `out` is too small or the build has no NFC support
- * (no MK_ENABLED). `cap` should be strlen(name) + 32.
+ * Render the exact serving text for `name` — MOVIE_KIND_PROMPT_PREFIX + NFC(name)
+ * + MOVIE_KIND_PROMPT_SUFFIX — into `out`. Exposed so the byte-level contract can
+ * be pinned by a test (`tests/test_movie_kind_render.c`, built in both the
+ * passthrough and the utf8proc flavour); returns 0 on success, -1 when `out` is
+ * too small or the renderer cannot allocate. NFC is applied when the build
+ * defines `MK_NFC_ENABLED` (the shipped NDK binary); without it the name's bytes
+ * pass through unchanged, which is also what invalid UTF-8 gets in either
+ * flavour. `cap` should be strlen(name) + 32.
  */
 int movie_kind_prompt_text(const char *name, char *out, size_t cap);
 
