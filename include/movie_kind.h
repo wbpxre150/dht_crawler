@@ -58,7 +58,8 @@
 
 typedef struct {
     int enabled;                 /* 1 when movie_kind_init() verified the manifest
-                                  * and this build has an encoder (MK_ENABLED) */
+                                  * and this build has an embedding provider
+                                  * (MK_ENABLED, or the test seam) */
     int model_ready;             /* 1 once the GGUF + head are resident (lazy) */
     long long generation;        /* digits of manifest.version ("v9" -> 9); 0 = none */
     int genre_count;             /* manifest.genres entries (bit count) */
@@ -76,6 +77,25 @@ typedef struct {
                                   * (classify_backfill-style engine, Stage C) */
     uint64_t by_genre[MOVIE_KIND_MAX_GENRES]; /* per genre bit, all verdicts */
 } movie_kind_stats_t;
+
+/*
+ * The embedding provider: the one step that needs llama.cpp - render the
+ * serving text, tokenise it with the GGUF's own tokenizer, `llama_encode`, read
+ * the pooled CLS vector. Everything downstream of it (the zero-embedding guard,
+ * the JEV head, the mask) is plain arithmetic, which is why this step is the
+ * module's seam: a host test installs a synthetic provider and drives the real
+ * classify path with 768-float vectors, no 152.8 MiB GGUF required.
+ *
+ * @param userdata whatever was registered with the provider
+ * @param name     raw torrent name, byte-exact from the database
+ * @param out      destination, exactly `hidden` floats, *unnormalised*
+ * @param hidden   the manifest's backbone.hidden (768 in v9)
+ * @return 0 when `out` holds a real embedding; non-zero when none is available
+ *         (tokenize/encode failure, or no pooled sequence) - a classify
+ *         failure, never a verdict
+ */
+typedef int (*movie_kind_embedding_provider_t)(void *userdata, const char *name, float *out,
+                                              int hidden);
 
 /*
  * Initialise the module for `model_dir` (NULL/empty falls back to
@@ -125,7 +145,8 @@ int movie_kind_prompt_text(const char *name, char *out, size_t cap);
  * next model load; call before the first classify. Clamped to 1..8. */
 void movie_kind_set_threads(int threads);
 
-/* 1 when this build can classify AND the manifest verified (MK_ENABLED only). */
+/* 1 when the manifest verified AND this build has an embedding provider
+ * (MK_ENABLED, or the test seam). */
 int movie_kind_enabled(void);
 
 /* 1 when the manifest parsed and both pinned files verified their size+sha256.
@@ -149,5 +170,20 @@ void movie_kind_get_stats(movie_kind_stats_t *out);
 
 /* Count one thermal back-off pause (the backfill engine reports it here). */
 void movie_kind_note_thermal_pause(void);
+
+#ifdef MOVIE_KIND_TEST
+/*
+ * Test-only seam, compiled only when MOVIE_KIND_TEST is defined (the
+ * tests-movie-kind Makefile target): install a synthetic embedding provider so
+ * a host build can exercise the *guarded* classify path - the zero-embedding
+ * guard, the head arithmetic, the mask - without llama.cpp and without a model.
+ *
+ * The module is enabled exactly when the manifest verified AND a provider is
+ * installed, so passing NULL restores the inert host behaviour (`enabled` 0,
+ * `classify` 1). The daemon build exports none of this.
+ */
+void movie_kind_test_set_embedding_provider(movie_kind_embedding_provider_t provider,
+                                            void *userdata);
+#endif /* MOVIE_KIND_TEST */
 
 #endif /* MOVIE_KIND_H */

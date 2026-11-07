@@ -23,6 +23,7 @@
 
 #include <cJSON.h>
 
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,7 +81,17 @@ static struct {
      * classifier_get_stats()). */
     pthread_mutex_t mutex;
     int model_ready;
+    int head_ready;                    /* jevhead loaded + scratch allocated */
     jevhead head;
+    /* The embedding seam: the one step that needs llama.cpp. Defaults to the
+     * llama.cpp encoder in an MK_ENABLED build and to NULL otherwise (a host
+     * test installs a synthetic one through movie_kind_test_set_embedding_
+     * provider()). */
+    movie_kind_embedding_provider_t embed_provider;
+    void *embed_userdata;
+    /* hidden floats, allocated with the head and reused under `mutex`:
+     * classify is serialised, so one scratch vector is enough. */
+    float *embedding;
     movie_kind_stats_t stats;
 #ifdef MK_ENABLED
     struct llama_model *model;
@@ -91,6 +102,25 @@ static struct {
     .threads = MK_DEFAULT_THREADS,
     .mutex = PTHREAD_MUTEX_INITIALIZER,
 };
+
+/* ---- shared internals, declared ahead of the gated encoder half -------- */
+
+/* Head load plus the scratch embedding vector. jevhead.c is pure arithmetic, so
+ * this half exists in every flavour and the host test drives it directly. */
+static int mk_head_ensure_locked(void);
+static void mk_head_release_locked(void);
+/* enabled == "the manifest verified AND this build has an embedding provider". */
+static void mk_update_enabled_locked(void);
+/* Which ensure the classify path runs: the full backbone load in an MK_ENABLED
+ * build, the head alone otherwise (a test provider supplies the embedding). */
+static int mk_ensure_locked(void);
+
+#ifdef MK_ENABLED
+/* The llama.cpp embedding provider (render -> tokenise -> llama_encode -> read
+ * the pooled CLS vector) and the backbone/context load behind it. */
+static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden);
+static int mk_model_ensure_locked(void);
+#endif
 
 /* ---- small helpers ----------------------------------------------------- */
 
@@ -354,7 +384,9 @@ int movie_kind_init(const char *model_dir) {
 
     pthread_mutex_lock(&mk.mutex);
     /* Everything init owns is reset; the mutex and the thread count survive so
-     * movie_kind_set_threads() keeps its value across a re-init. */
+     * movie_kind_set_threads() keeps its value across a re-init. A re-init must
+     * not leak the previous head or scratch vector. */
+    mk_head_release_locked();
     mk.manifest_ok = 0;
     mk.enabled = 0;
     mk.generation = 0;
@@ -373,14 +405,15 @@ int movie_kind_init(const char *model_dir) {
     snprintf(mk.model_dir, sizeof(mk.model_dir), "%s", dir);
 
     if (mk_manifest_load_locked() == 0) {
-#ifdef MK_ENABLED
-        mk.enabled = 1;
-#else
-        /* Host build (plain gcc, no llama.cpp, no utf8proc): the manifest and
-         * its pins are still checked -- that is what the host test asserts --
-         * but this flavour can never produce a verdict. */
-        log_msg(LOG_WARN, "MovieKind: built without MK_ENABLED; movie-kind classification disabled");
-#endif
+        mk_update_enabled_locked();
+        if (!mk.enabled) {
+            /* Host build (plain gcc, no llama.cpp, no utf8proc) with no test
+             * provider: the manifest and its pins are still checked -- that is
+             * what the host test asserts -- but this flavour can never produce
+             * a verdict. */
+            log_msg(LOG_WARN,
+                    "MovieKind: built without MK_ENABLED; movie-kind classification disabled");
+        }
     }
     int manifest_ok = mk.manifest_ok;
     pthread_mutex_unlock(&mk.mutex);
@@ -453,16 +486,6 @@ void movie_kind_note_thermal_pause(void) {
  * it once, on the first model load (not at init, which must stay cheap). */
 static int mk_backend_ready = 0;
 
-/* Encoder wall time, microseconds. Only the gated half measures anything, so
- * this lives here rather than with the shared helpers (an unused static would
- * fail the host build's -Wall). */
-static uint64_t mk_elapsed_us(const struct timespec *t0, const struct timespec *t1) {
-    int64_t ns = (int64_t)(t1->tv_sec - t0->tv_sec) * 1000000000LL +
-                 ((int64_t)t1->tv_nsec - t0->tv_nsec);
-    if (ns <= 0) return 0;
-    return (uint64_t)(ns / 1000);
-}
-
 /* NFC-normalise the name. Invalid UTF-8 is *not* an error here: DB names are
  * not always valid (stage-7 finding), and utf8proc_map() refuses invalid input
  * by writing nothing, so a failure means "use the bytes as they are". */
@@ -508,29 +531,13 @@ int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
     return (written > 0 && (size_t)written < cap) ? 0 : -1;
 }
 
-/* Load the head and the backbone on first use. Called with `mutex` held. */
+/* Load the backbone (and the head it has to agree with) on first use. Called
+ * with `mutex` held. */
 static int mk_model_ensure_locked(void) {
-    if (mk.model_ready) return 0;
-    if (!mk.manifest_ok) return -1;
-
     char path[MK_MODEL_PATH_CAP];
-    char err[160];
 
-    snprintf(path, sizeof(path), "%s/%s", mk.model_dir, mk.head_file);
-    int head_status = jevhead_load(path, &mk.head, err, sizeof(err));
-    if (head_status != JEVHEAD_OK) {
-        log_msg(LOG_ERROR, "MovieKind: head %s unusable (%s); movie-kind disabled", path, err);
-        mk.stats.model_load_failures++;
-        return -1;
-    }
-    if ((int)mk.head.n_labels != mk.genre_count || (int)mk.head.hidden != mk.hidden) {
-        log_msg(LOG_ERROR, "MovieKind: head %s is %u labels / %u hidden, the manifest says %d/%d; "
-                           "refusing to use it", path, mk.head.n_labels, mk.head.hidden,
-                mk.genre_count, mk.hidden);
-        jevhead_free(&mk.head);
-        mk.stats.model_load_failures++;
-        return -1;
-    }
+    if (mk.model_ready) return 0;
+    if (mk_head_ensure_locked() != 0) return -1;
 
     if (!mk_backend_ready) {
         llama_backend_init();
@@ -545,7 +552,7 @@ static int mk_model_ensure_locked(void) {
     mk.model = llama_model_load_from_file(path, model_params);
     if (!mk.model) {
         log_msg(LOG_ERROR, "MovieKind: backbone %s failed to load; movie-kind disabled", path);
-        jevhead_free(&mk.head);
+        mk_head_release_locked();
         mk.stats.model_load_failures++;
         return -1;
     }
@@ -556,7 +563,7 @@ static int mk_model_ensure_locked(void) {
                            "refusing to use it", path, n_embd, mk.hidden);
         llama_model_free(mk.model);
         mk.model = NULL;
-        jevhead_free(&mk.head);
+        mk_head_release_locked();
         mk.stats.model_load_failures++;
         return -1;
     }
@@ -577,7 +584,7 @@ static int mk_model_ensure_locked(void) {
         log_msg(LOG_ERROR, "MovieKind: context for %s failed to initialise; movie-kind disabled", path);
         llama_model_free(mk.model);
         mk.model = NULL;
-        jevhead_free(&mk.head);
+        mk_head_release_locked();
         mk.stats.model_load_failures++;
         return -1;
     }
@@ -588,10 +595,20 @@ static int mk_model_ensure_locked(void) {
     return 0;
 }
 
-/* Tokenise the serving text with the GGUF's own tokenizer, cut to
- * MOVIE_KIND_MAX_TOKENS, encode one row and run the head. Called with `mutex`
- * held and the model resident. */
-static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
+/* The llama.cpp embedding provider: tokenise the serving text with the GGUF's
+ * own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, encode one row, read the pooled
+ * CLS vector. Called with `mutex` held and the model resident.
+ *
+ * The read is llama_get_embeddings_seq(ctx, 0) - the *pooled* accessor. The
+ * context is always built with LLAMA_POOLING_TYPE_CLS, and llama_get_embeddings()
+ * is documented as the LLAMA_POOLING_TYPE_NONE accessor: with pooling set it
+ * does not return the pooled vector. On the phone it handed back a zero-filled
+ * 768-float buffer, so sigmoid(0 + b_j) >= thr_j produced one constant mask for
+ * every movie (the stage-9 P0: mask 20744 on all 500 sampled names). There is
+ * deliberately no NONE-pooling fallback: this module never pools NONE, so the
+ * fallback could only be unreachable dead code that re-opens the wrong path. */
+static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden) {
+    (void)userdata;
     char *prompt = mk_prompt_dup(name);
     if (!prompt) return -1;
 
@@ -632,15 +649,135 @@ static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
 
     /* Pooling is CLS and the head was fitted on *unnormalised* states: do not
      * L2-normalise here, whatever an embedding example does. */
-    float *embedding = llama_get_embeddings(mk.context);
+    const float *embedding = llama_get_embeddings_seq(mk.context, 0);
     if (!embedding) {
-        log_msg(LOG_WARN, "MovieKind: llama_encode produced no CLS embedding");
+        log_msg(LOG_WARN, "MovieKind: llama_encode produced no pooled CLS embedding (seq 0)");
+        return -1;
+    }
+    memcpy(out, embedding, (size_t)hidden * sizeof(float));
+    return 0;
+}
+
+#endif /* MK_ENABLED (backend init, NFC, prompt text, backbone/context, provider) */
+
+/* ---- the classify path: shared, provider-independent ------------------- *
+ *
+ * Everything below is plain C99: the elapsed-time accounting, the head load,
+ * the zero-embedding guard, the head arithmetic and the mask. Only the
+ * embedding itself comes from the provider, which is why this half compiles in
+ * the host build too - the seam below installs a synthetic provider and the
+ * *real* guarded path runs, no GGUF and no llama.cpp required.
+ * ------------------------------------------------------------------------ */
+
+/* Classify wall time, microseconds. Shared: every flavour measures. */
+static uint64_t mk_elapsed_us(const struct timespec *t0, const struct timespec *t1) {
+    int64_t ns = (int64_t)(t1->tv_sec - t0->tv_sec) * 1000000000LL +
+                 ((int64_t)t1->tv_nsec - t0->tv_nsec);
+    if (ns <= 0) return 0;
+    return (uint64_t)(ns / 1000);
+}
+
+/* Load the head on first use and allocate the scratch embedding vector. Called
+ * with `mutex` held. Shared: jevhead.c is pure arithmetic. */
+static int mk_head_ensure_locked(void) {
+    if (mk.head_ready) return 0;
+    if (!mk.manifest_ok) return -1;
+
+    char path[MK_MODEL_PATH_CAP];
+    char err[160];
+
+    snprintf(path, sizeof(path), "%s/%s", mk.model_dir, mk.head_file);
+    int head_status = jevhead_load(path, &mk.head, err, sizeof(err));
+    if (head_status != JEVHEAD_OK) {
+        log_msg(LOG_ERROR, "MovieKind: head %s unusable (%s); movie-kind disabled", path, err);
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+    if ((int)mk.head.n_labels != mk.genre_count || (int)mk.head.hidden != mk.hidden) {
+        log_msg(LOG_ERROR, "MovieKind: head %s is %u labels / %u hidden, the manifest says %d/%d; "
+                           "refusing to use it", path, mk.head.n_labels, mk.head.hidden,
+                mk.genre_count, mk.hidden);
+        jevhead_free(&mk.head);
+        memset(&mk.head, 0, sizeof(mk.head));
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+
+    /* One scratch vector, reused under `mutex` (classify is serialised), so a
+     * classify never allocates. */
+    mk.embedding = (float *)malloc((size_t)mk.hidden * sizeof(float));
+    if (!mk.embedding) {
+        log_msg(LOG_ERROR, "MovieKind: out of memory for the %d-float embedding", mk.hidden);
+        jevhead_free(&mk.head);
+        memset(&mk.head, 0, sizeof(mk.head));
+        mk.stats.model_load_failures++;
+        return -1;
+    }
+    mk.head_ready = 1;
+    return 0;
+}
+
+/* Drop the head and its scratch vector: a failed backbone load disables the
+ * module, and a re-init must not leak either. Called with `mutex` held. */
+static void mk_head_release_locked(void) {
+    if (mk.head_ready) {
+        jevhead_free(&mk.head);
+        memset(&mk.head, 0, sizeof(mk.head));
+    }
+    free(mk.embedding);
+    mk.embedding = NULL;
+    mk.head_ready = 0;
+}
+
+/* enabled == "the manifest verified AND this build has an embedding provider".
+ * Called with `mutex` held. */
+static void mk_update_enabled_locked(void) {
+#ifdef MK_ENABLED
+    /* This build always has the llama.cpp encoder; a real re-init puts it back
+     * over anything the test seam installed. */
+    mk.embed_provider = mk_llama_embed;
+#endif
+    mk.enabled = (mk.manifest_ok && mk.embed_provider != NULL) ? 1 : 0;
+}
+
+/* Which ensure the classify path runs. */
+static int mk_ensure_locked(void) {
+#ifdef MK_ENABLED
+    return mk_model_ensure_locked();
+#else
+    return mk_head_ensure_locked();
+#endif
+}
+
+/* Ask the provider for one embedding, then guard it and run the head. Called
+ * with `mutex` held and the head resident. */
+static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
+    if (!mk.embed_provider || !mk.embedding) return -1;
+
+    if (mk.embed_provider(mk.embed_userdata, name, mk.embedding, mk.hidden) != 0) {
+        /* The provider logs its own reason (tokenize/encode/no pooled sequence). */
+        return -1;
+    }
+
+    /* Zero-embedding guard: an all-zero vector is a broken read path, not an
+     * embedding. A genuine unnormalised CLS vector has L1 ~ 750 (||x|| ~ 41.3),
+     * so L1 == 0 always means the encoder handed back nothing. Failing here is
+     * what makes the whole zero-buffer bug class loud: without it,
+     * sigmoid(0 + b_j) >= thr_j emits one degenerate mask for every movie. */
+    double l1 = 0.0;
+    for (int index = 0; index < mk.hidden; index++) {
+        l1 += fabs((double)mk.embedding[index]);
+    }
+    if (l1 == 0.0) {
+        log_msg(LOG_WARN,
+                "MovieKind: the %d-float embedding is all zeros (L1 == 0); the encoder read path "
+                "is broken, refusing to classify", mk.hidden);
         return -1;
     }
 
     uint32_t mask = 0;
     uint32_t count = 0;
-    if (jevhead_predict(&mk.head, embedding, &mask, &count) != JEVHEAD_OK) {
+    if (jevhead_predict(&mk.head, mk.embedding, &mask, &count) != JEVHEAD_OK) {
         return -1;
     }
     if (mk.genre_count > 0 && mk.genre_count < 32) {
@@ -665,7 +802,7 @@ int movie_kind_classify(const char *name, uint16_t *mask) {
     uint16_t bits = MOVIE_KIND_NONE;
     int status = 1;
     if (mk.enabled) {
-        if (mk_model_ensure_locked() == 0 && mk_embed_mask_locked(name, &bits) == 0) {
+        if (mk_ensure_locked() == 0 && mk_embed_mask_locked(name, &bits) == 0) {
             status = 0;
             mk.stats.total_classified++;
         } else {
@@ -682,14 +819,28 @@ int movie_kind_classify(const char *name, uint16_t *mask) {
     return status;
 }
 
-#else /* !MK_ENABLED */
+#ifdef MOVIE_KIND_TEST
+void movie_kind_test_set_embedding_provider(movie_kind_embedding_provider_t provider,
+                                            void *userdata) {
+    pthread_mutex_lock(&mk.mutex);
+    mk.embed_provider = provider;
+    mk.embed_userdata = userdata;
+    /* Installing a provider is what turns the host build into a classifier, so
+     * `enabled` has to follow it (the manifest was verified by the caller). */
+    mk_update_enabled_locked();
+    pthread_mutex_unlock(&mk.mutex);
+}
+#endif /* MOVIE_KIND_TEST */
+
+#ifndef MK_ENABLED /* the NFC renderer is the only thing utf8proc owns */
 
 /*
  * Host build (`make`, plain gcc, no llama.cpp and no utf8proc include path):
- * the encoder is compiled out. The manifest core above still parses and
- * verifies, so tests/test_movie_kind.c can pin the refusal paths, but nothing
- * here can ever produce a verdict -- the same contract as classifier.c's inert
- * half (`movie_kind_enabled()` 0, `movie_kind_classify()` 1).
+ * the encoder is compiled out, so only the NFC renderer is missing here. The
+ * manifest core, the head load and the guarded classify path above are shared,
+ * and this flavour reports `movie_kind_enabled()` 0 -- never a verdict --
+ * unless a test installs a synthetic embedding provider through the seam, which
+ * is the same contract as classifier.c's inert half.
  */
 
 int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
@@ -699,10 +850,4 @@ int movie_kind_prompt_text(const char *name, char *out, size_t cap) {
     return -1;
 }
 
-int movie_kind_classify(const char *name, uint16_t *mask) {
-    (void)name;
-    (void)mask;
-    return 1;
-}
-
-#endif /* MK_ENABLED */
+#endif /* !MK_ENABLED */

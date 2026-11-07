@@ -259,9 +259,10 @@ int main(int argc, char *argv[]) {
     const char *movie_backfill_db = NULL;
     long long movie_backfill_limit = 0;
     bool movie_backfill_dry_run = false;
+    bool movie_backfill_reset_flag = false;
     const char *movie_bench_db = NULL;
     int movie_bench_rows = 0;
-    bool movie_bench_dump_masks = false;
+    bool dump_masks = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rebuild-docs") == 0) {
             if (i + 1 >= argc) {
@@ -340,7 +341,11 @@ int main(int argc, char *argv[]) {
             }
             movie_backfill_limit = limit_rows;
         } else if (strcmp(argv[i], "--dump-masks") == 0) {
-            movie_bench_dump_masks = true;
+            dump_masks = true;
+        } else if (strcmp(argv[i], "--reset") == 0) {
+            /* --movie-kind-backfill <db> --reset: clear the rows a broken pass
+             * labelled (stage 10). See include/movie_backfill.h. */
+            movie_backfill_reset_flag = true;
         }
     }
 
@@ -699,12 +704,30 @@ int main(int argc, char *argv[]) {
         return (bf_rc == 0) ? 0 : 1;
     }
 
-    /* --movie-kind-backfill <db> [--dry-run] [--limit N]: one-shot maintenance
-     * over the database named on the command line, dispatched exactly like
-     * --classify-backfill above - after movie_kind_init(), so the v9 manifest is
-     * verified, but before database_init(), so the configured daemon database is
-     * never opened. Write mode by default; --dry-run only counts the
-     * movie+adult=0 candidates and prints the count. */
+    /* --movie-kind-backfill <db> --reset: the stage-10 one-shot that clears the
+     * movie columns of every row a broken pass labelled, plus the resume and
+     * completion meta keys (include/movie_backfill.h). Dispatched before the
+     * pass below because it is a pure UPDATE - it needs no model at all - and
+     * it must be run with the pass stopped. */
+    if (movie_backfill_db && movie_backfill_reset_flag) {
+        long long rows_reset = 0;
+        int reset_rc = movie_backfill_reset(movie_backfill_db, &rows_reset);
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        cleanup_app_context(&g_app_ctx);
+        /* A reset that cannot run must never look like a success. */
+        return (reset_rc == 0) ? 0 : 1;
+    }
+
+    /* --movie-kind-backfill <db> [--dry-run] [--limit N] [--dump-masks]:
+     * one-shot maintenance over the database named on the command line,
+     * dispatched exactly like --classify-backfill above - after
+     * movie_kind_init(), so the v9 manifest is verified, but before
+     * database_init(), so the configured daemon database is never opened. Write
+     * mode by default; --dry-run only counts the movie+adult=0 candidates and
+     * prints the count; --dump-masks echoes "<mask> <hex(name)>" per labelled
+     * row so the real pass's output can be observed (the bench's format). */
     if (movie_backfill_db) {
         movie_backfill_opts_t mb_opts = {
             .target_clf_ver = 0, /* whatever the loaded manifest describes */
@@ -713,6 +736,7 @@ int main(int argc, char *argv[]) {
             .dry_run = movie_backfill_dry_run ? 1 : 0,
             .limit_rows = movie_backfill_limit,
             .thermal_backoff_c = config.movie_kind_thermal_backoff_c,
+            .dump_masks = dump_masks ? 1 : 0,
         };
         movie_backfill_progress_t mb_progress;
         database_t mb_db;
@@ -779,7 +803,7 @@ int main(int argc, char *argv[]) {
     if (movie_bench_db) {
         int bench_rc = movie_backfill_bench(movie_bench_db, movie_bench_rows,
                                             config.movie_kind_threads,
-                                            movie_bench_dump_masks ? 1 : 0);
+                                            dump_masks ? 1 : 0);
         hard_block_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);

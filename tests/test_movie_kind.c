@@ -589,6 +589,258 @@ static void case_nfc(void) {
 }
 #endif
 
+/* ---- the embedding seam: the guarded classify path without a GGUF ------ *
+ *
+ * The stage-9 P0 was an *embedding read* bug: llama_get_embeddings() is the
+ * LLAMA_POOLING_TYPE_NONE accessor, so with CLS pooling it handed back 768
+ * zeros, and sigmoid(0 + b_j) >= thr_j then produced one constant mask (20744)
+ * for every movie. These cases pin that bug class through the real classify
+ * path - with synthetic vectors and no model - so the guard can never be
+ * dropped again without a red host test.
+ * ------------------------------------------------------------------------ */
+
+#define SEAM_HIDDEN 768
+#define SEAM_LABELS MOVIE_KIND_MAX_GENRES
+#define SEAM_HEAD_BYTES \
+    (JEVHEAD_HEADER_SIZE + 4u * ((size_t)SEAM_LABELS * SEAM_HIDDEN + 2u * SEAM_LABELS))
+
+/* The constant mask the zero-buffer bug produced on the phone: 0x5108. */
+#define SEAM_ZERO_MASK 20744u
+/* The genre bits the zero vector lights up with the head staged below. */
+static const int SEAM_HOT_BITS[] = {3, 8, 12, 14};
+
+/* What the provider hands out, plus a call counter so the case can prove the
+ * guarded path really went through the seam. */
+static float seam_embedding[SEAM_HIDDEN];
+static int seam_provider_calls = 0;
+
+static int seam_provider(void *userdata, const char *name, float *out, int hidden) {
+    (void)userdata;
+    (void)name;
+    seam_provider_calls++;
+    if (hidden != SEAM_HIDDEN) return -1;
+    memcpy(out, seam_embedding, sizeof(seam_embedding));
+    return 0;
+}
+
+/* A 768x16 JEVH head: label i sees only dimension i (W[i][i] = 1), every
+ * threshold is 0.5, and the bias is +1 on SEAM_HOT_BITS and -1 elsewhere. Two
+ * properties are deliberate:
+ *   - the all-zero vector then answers 0x5108 = 20744 - the documented
+ *     constant-mask signature of the bug, identical for every name;
+ *   - logit 0 sits exactly on the threshold, so a +/-0.1 embedding change
+ *     flips one bit (the `>=` boundary rule jevhead.h pins). */
+static int seam_write_head(const char *path) {
+    static float payload[(size_t)SEAM_LABELS * SEAM_HIDDEN + 2 * SEAM_LABELS];
+    unsigned char buffer[JEVHEAD_HEADER_SIZE + sizeof(payload)];
+    uint32_t version = JEVHEAD_VERSION;
+    uint32_t hidden = SEAM_HIDDEN;
+    uint32_t labels = SEAM_LABELS;
+    float *bias = payload + (size_t)SEAM_LABELS * SEAM_HIDDEN;
+    float *thresholds = bias + SEAM_LABELS;
+
+    memset(payload, 0, sizeof(payload));
+    for (uint32_t label = 0; label < SEAM_LABELS; label++) {
+        int hot = 0;
+        payload[(size_t)label * SEAM_HIDDEN + label] = 1.0f;
+        for (size_t index = 0; index < sizeof(SEAM_HOT_BITS) / sizeof(SEAM_HOT_BITS[0]); index++) {
+            if ((int)label == SEAM_HOT_BITS[index]) hot = 1;
+        }
+        bias[label] = hot ? 1.0f : -1.0f;
+        thresholds[label] = 0.5f;
+    }
+
+    memset(buffer, 0, sizeof(buffer));
+    memcpy(buffer, JEVHEAD_MAGIC, 4);
+    memcpy(buffer + 4, &version, sizeof(version));
+    memcpy(buffer + 8, &hidden, sizeof(hidden));
+    memcpy(buffer + 12, &labels, sizeof(labels));
+    /* taxonomy_sha256 stays zero: the head loader does not check it. */
+    memcpy(buffer + JEVHEAD_HEADER_SIZE, payload, sizeof(payload));
+    return write_file(path, buffer, sizeof(buffer));
+}
+
+/* Fill the provider's vector: `value` everywhere (dims past the head's 16
+ * weights are irrelevant), then the listed dimensions. */
+static void seam_fill(float value, int dim0, float value0, int dim1, float value1) {
+    for (int index = 0; index < SEAM_HIDDEN; index++) seam_embedding[index] = value;
+    if (dim0 >= 0) seam_embedding[dim0] = value0;
+    if (dim1 >= 0) seam_embedding[dim1] = value1;
+}
+
+static void case_embedding_seam(void) {
+    char backbone_sha[CLF_SHA_HEX_LEN + 1];
+    char head_sha[CLF_SHA_HEX_LEN + 1];
+    char path[512];
+    uint16_t mask_a = 0;
+    uint16_t mask_b = 0;
+    uint16_t mask_c = 0;
+    uint16_t mask_d = 0;
+    uint16_t mask = 0xFFFFu;
+    movie_kind_stats_t before;
+    movie_kind_stats_t after;
+
+    if (stage_model_dir(backbone_sha, head_sha) != 0) {
+        fail("the seam model directory stages", SCRATCH_DIR);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/%s", SCRATCH_DIR, HEAD_FILE);
+    if (seam_write_head(path) != 0) {
+        fail("the 768x16 seam head is writable", path);
+        return;
+    }
+    if (clf_sha256_file(path, head_sha) != 0) {
+        fail("the seam head hashes", path);
+        return;
+    }
+    manifest_spec_t spec = {
+        .version = "v9",
+        .backbone_bytes = BACKBONE_BYTES,
+        .backbone_sha = backbone_sha,
+        .head_bytes = (long long)SEAM_HEAD_BYTES,
+        .head_sha = head_sha,
+        .n_labels = SEAM_LABELS,
+        .head_hidden = SEAM_HIDDEN,
+    };
+    if (write_manifest(SCRATCH_DIR, &spec) != 0) {
+        fail("the seam manifest is writable", SCRATCH_DIR);
+        return;
+    }
+    if (movie_kind_init(SCRATCH_DIR) != 0) {
+        fail("the seam model directory initialises the module", SCRATCH_DIR);
+        return;
+    }
+
+    /* A provider is what turns this build into a classifier. */
+    movie_kind_test_set_embedding_provider(seam_provider, NULL);
+    if (movie_kind_enabled() != 1) {
+        fail("an installed embedding provider enables the module", "enabled");
+        return;
+    }
+
+    /* (a) Two different non-zero embeddings must yield different masks. */
+    /* A: +2 on 0..7, -2 on 8..15 -> bits 0..7. */
+    for (int index = 0; index < SEAM_HIDDEN; index++) {
+        seam_embedding[index] = (index < 8) ? 2.0f : ((index < 16) ? -2.0f : 0.0f);
+    }
+    if (movie_kind_classify("Some.2024.1080p.mkv", &mask_a) != 0) {
+        fail("the seam classifies the first synthetic embedding", "classify");
+        return;
+    }
+    /* B: +2 on 0..2, -2 on 3..15 -> bits 0..2. */
+    for (int index = 0; index < SEAM_HIDDEN; index++) {
+        seam_embedding[index] = (index < 3) ? 2.0f : ((index < 16) ? -2.0f : 0.0f);
+    }
+    if (movie_kind_classify("Some.2024.1080p.mkv", &mask_b) != 0) {
+        fail("the seam classifies the second synthetic embedding", "classify");
+        return;
+    }
+    if (mask_a != 0x00FFu) {
+        fail_int("the first embedding yields bits 0..7", (long long)mask_a, 0x00FF);
+    }
+    if (mask_b != 0x0007u) {
+        fail_int("the second embedding yields bits 0..2", (long long)mask_b, 0x0007);
+    }
+    if (mask_a == mask_b) {
+        fail_int("two different embeddings never share a mask", (long long)mask_a,
+                 (long long)mask_b);
+    }
+
+    /* (a) A threshold-sensitive change flips exactly one bit: logit 0 is
+     * -1 + e[0], so e[0] = 0.9 is below the 0.5 cut and 1.1 is on/above it. */
+    seam_fill(-2.0f, 0, 0.9f, -1, 0.0f);
+    if (movie_kind_classify("Some.2024.1080p.mkv", &mask_c) != 0) {
+        fail("the seam classifies the below-threshold embedding", "classify");
+        return;
+    }
+    seam_fill(-2.0f, 0, 1.1f, -1, 0.0f);
+    if (movie_kind_classify("Some.2024.1080p.mkv", &mask_d) != 0) {
+        fail("the seam classifies the above-threshold embedding", "classify");
+        return;
+    }
+    if (mask_c != 0x0000u) {
+        fail_int("a logit just under the cut clears every bit", (long long)mask_c, 0);
+    }
+    if (mask_d != 0x0001u) {
+        fail_int("a logit just over the cut sets bit 0", (long long)mask_d, 0x0001);
+    }
+    if ((mask_c ^ mask_d) != 0x0001u) {
+        fail_int("a threshold-sensitive change flips exactly one bit",
+                 (long long)(mask_c ^ mask_d), 1);
+    }
+
+    movie_kind_get_stats(&after);
+    if (after.total_classified != 4) {
+        fail_int("the seam produced four verdicts", (long long)after.total_classified, 4);
+    }
+    if (after.failures != 0) {
+        fail_int("no seam verdict counted a failure", (long long)after.failures, 0);
+    }
+    if (seam_provider_calls != 4) {
+        fail_int("every verdict came through the embedding provider", seam_provider_calls, 4);
+    }
+
+    /* (b) The bug signature, in the pure head math: an all-zero embedding
+     * answers the same constant mask for every name. This is what the phone
+     * stored for all 500 sampled movies. */
+    {
+        jevhead head;
+        char err[256];
+        float zeros[SEAM_HIDDEN];
+        uint32_t zero_mask = 0;
+        uint32_t zero_count = 0;
+
+        if (jevhead_load(path, &head, err, sizeof(err)) != JEVHEAD_OK) {
+            fail("the seam head loads for the pure-math check", err);
+            return;
+        }
+        memset(zeros, 0, sizeof(zeros));
+        if (jevhead_predict(&head, zeros, &zero_mask, &zero_count) != JEVHEAD_OK) {
+            fail("the pure head math answers for an all-zero vector", "jevhead_predict");
+        } else if (zero_mask != SEAM_ZERO_MASK) {
+            fail_int("an all-zero embedding yields the documented constant mask",
+                     (long long)zero_mask, (long long)SEAM_ZERO_MASK);
+        }
+        jevhead_free(&head);
+    }
+
+    /* (b) ... and the guarded classify path refuses that same vector instead of
+     * storing the degenerate mask: a failure, no mask, `failures` counted. */
+    memset(seam_embedding, 0, sizeof(seam_embedding));
+    movie_kind_get_stats(&before);
+    mask = 0xFFFFu;
+    if (movie_kind_classify("Some.2024.1080p.mkv", &mask) != 1) {
+        fail("an all-zero embedding is a classify failure, not a verdict", "classify");
+    }
+    if (mask != 0xFFFFu) {
+        fail("a failed classify leaves the mask untouched", "classify");
+    }
+    movie_kind_get_stats(&after);
+    if (after.failures != before.failures + 1) {
+        fail_int("the zero-embedding guard counts one classify failure",
+                 (long long)(after.failures - before.failures), 1);
+    }
+    if (after.total_classified != before.total_classified) {
+        fail("a guarded failure is not counted as a classification", "total_classified");
+    }
+
+    /* (c) No provider at all: disabled, and never a verdict. */
+    movie_kind_test_set_embedding_provider(NULL, NULL);
+    if (movie_kind_enabled() != 0) {
+        fail("a NULL provider leaves the module disabled", "enabled");
+    }
+    mask = 0xFFFFu;
+    if (movie_kind_classify("Some.2024.1080p.mkv", &mask) != 1) {
+        fail("a NULL provider declines every classify", "classify");
+    }
+    if (mask != 0xFFFFu) {
+        fail("a declined classify leaves the mask untouched", "classify");
+    }
+
+    printf("  case 7 ok: embedding seam - varied masks, threshold flip, zero guard, "
+           "NULL provider\n");
+}
+
 int main(void) {
     mkdir(SCRATCH_DIR, 0755);
 
@@ -597,6 +849,7 @@ int main(void) {
     case_threshold_boundary();
     case_manifest_ok();
     case_refusals();
+    case_embedding_seam();
 #ifdef MK_ENABLED
     case_nfc();
 #else

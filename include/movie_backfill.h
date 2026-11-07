@@ -49,6 +49,12 @@
  * generation". Same discipline as classifier_meta.clf_ver. */
 #define MOVIE_BACKFILL_VER_KEY "movie_kind_clf_ver"
 
+/* Lowest generation `--reset` clears. Generation 9 is the pass that shipped the
+ * constant-mask bug (the wrong pooling accessor), so every row carrying 9 is a
+ * poisoned label. Older generations were never written by this pipeline and a
+ * newer one cannot be poisoned by that bug, hence ">=" and not "= 9". */
+#define MOVIE_BACKFILL_RESET_MIN_GENERATION 9
+
 /* State of a pass. The names are fixed - /stats and the acceptance criteria
  * quote them - and there is no "failed" state: a pass that ends early on a stop
  * request and a pass that dies on a SQL error both publish "stopped", and only
@@ -74,6 +80,9 @@ typedef struct {
     long long limit_rows;     /* stop after this many rows; <= 0 -> unlimited */
     int thermal_backoff_c;    /* pause at/above this CPU temperature;
                                * <= 0 disables the thermal gate */
+    int dump_masks;           /* print "<mask> <hex(name)>" per labelled row
+                               * (the `--dump-masks` observation mode; a row
+                               * whose classify failed prints nothing) */
 } movie_backfill_opts_t;
 
 typedef struct {
@@ -149,6 +158,37 @@ void movie_backfill_get_progress(movie_backfill_progress_t *out);
  *         no encoder in this build: nothing is printed), -1 on an I/O error.
  */
 int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_masks);
+
+/*
+ * `--movie-kind-backfill <db> --reset` one-shot: clear the movie-kind columns of
+ * every row the poisoned generation-9 pass labelled, so a corrected pass can
+ * re-label them.
+ *
+ *     UPDATE torrent_class SET movie_kind_mask = NULL, movie_kind_clf_ver = NULL
+ *       WHERE movie_kind_clf_ver >= MOVIE_BACKFILL_RESET_MIN_GENERATION
+ *
+ * plus the resume-key tombstone (classifier_meta.movie_backfill_last_id = "")
+ * and a defensive delete of the completion key
+ * (classifier_meta.movie_kind_clf_ver), in one transaction. Only those two
+ * nullable torrent_class columns are ever written: no fastText column is
+ * touched, so the v6 classifier's view of the database is unchanged.
+ *
+ * The resume-key tombstone is not cosmetic. A stopped pass leaves
+ * "<generation>:<id>", and a restarted pass would start after that id and
+ * silently skip every row this reset just cleared.
+ *
+ * No row count is assumed: whatever the predicate matches is reported back.
+ *
+ * IDEMPOTENT WHILE THE PASS IS STOPPED, DESTRUCTIVE IF RUN AFTER A GOOD PASS
+ * (it would wipe correct generation-9 labels). Run it only while the pass is
+ * stopped - on the phone that means the app force-stopped.
+ *
+ * @param db_path    database to open read-write
+ * @param rows_reset optional out: the number of torrent_class rows cleared
+ * @return 0 on success (the count is logged and printed), -1 on an I/O or SQL
+ *         error that survived the busy retries.
+ */
+int movie_backfill_reset(const char *db_path, long long *rows_reset);
 
 #ifdef MOVIE_BACKFILL_TEST
 /*

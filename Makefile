@@ -154,6 +154,10 @@ BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/l
 MOVIE_KIND_TEST_SRCS = tests/test_movie_kind.c src/movie_kind.c src/jevhead.c \
                        src/classifier.c lib/cJSON/cJSON.c tests/stub_log.c
 MOVIE_KIND_TEST_BIN = $(BUILD_DIR)/test_movie_kind
+# The embedding-provider seam (include/movie_kind.h): lets the host test drive
+# the real guarded classify path with synthetic 768-float vectors instead of a
+# 152.8 MiB GGUF. The daemon build defines nothing here and exports no seam.
+MOVIE_KIND_TEST_CFLAGS = -DMOVIE_KIND_TEST
 # src/classifier.c is here for clf_sha256_file() alone (include/clf_sha256.h): the
 # manifest gate and the fastText loader must verify with the same code. It links
 # inert on the host (no CLF_ENABLED), so no ftc/tparse is needed.
@@ -210,7 +214,7 @@ tests-backfill-daemon: libbloom
 
 tests-movie-kind:
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
 	./$(MOVIE_KIND_TEST_BIN)
 
 tests-movie-backfill: libbloom
@@ -236,6 +240,9 @@ tests-asan-backfill-daemon:
 	$(MAKE) tests-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
 # Scoped sanitizer gates for the two movie-kind backfill test binaries.
+tests-asan-movie-kind:
+	$(MAKE) tests-movie-kind TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
 tests-asan-movie-backfill:
 	$(MAKE) tests-movie-backfill TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 

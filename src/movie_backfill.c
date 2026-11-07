@@ -100,6 +100,11 @@ typedef void (*mb_pause_fn)(void);
 
 static int mb_thermal_max_c_real(void);
 static void mb_sleep_real(long long ms);
+/* Defined with the bench, but the `--dump-masks` observation mode of the real
+ * pass prints through the same two helpers (and the same skip-on-failure rule)
+ * from mb_classify_one() above them. */
+static void mb_print_mask_line(uint16_t mask, const char *name);
+static int mb_should_print_mask(int classify_rc);
 
 static mb_classify_fn mb_classify = movie_kind_classify;
 static mb_flag_fn mb_enabled = movie_kind_enabled;
@@ -165,6 +170,7 @@ typedef struct {
     sqlite3_stmt *meta_stmt;
     mb_pending_t *batch;
     int batch_count;
+    int dump_masks; /* opts.dump_masks: echo every labelled row's mask */
     movie_backfill_progress_t *prog;
 } mb_ctx_t;
 
@@ -443,6 +449,13 @@ static int mb_classify_one(mb_ctx_t *c, const mb_candidate_t *cand) {
     int rc;
 
     rc = mb_classify(cand->name, &mask);
+    /* `--dump-masks` on the real pass: the same "<mask> <hex(name)>" line the
+     * bench prints, and the same Stage-9 rule - a row whose classify failed is
+     * skipped, because a printed 0 would be indistinguishable from a genuine
+     * `none` verdict. */
+    if (c->dump_masks && mb_should_print_mask(rc)) {
+        mb_print_mask_line(mask, cand->name);
+    }
     if (rc != 0) {
         /* No verdict (feature off, model unusable, encode failure): leave the
          * stored columns exactly as they are rather than invent a label. */
@@ -784,6 +797,7 @@ int movie_backfill_run(database_t *db, const movie_backfill_opts_t *opts,
     ctx.thermal_resume_c = ctx.thermal_backoff_c > MB_THERMAL_RESUME_MARGIN_C
                                ? ctx.thermal_backoff_c - MB_THERMAL_RESUME_MARGIN_C
                                : 0;
+    ctx.dump_masks = (opts && opts->dump_masks) ? 1 : 0;
     ctx.prog = &progress;
 
     progress.target_clf_ver = target;
@@ -1260,4 +1274,148 @@ done:
     }
     free(samples);
     return result;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Poisoned-row reset (--movie-kind-backfill <db> --reset)
+ *
+ * See include/movie_backfill.h: the one-shot that undoes a pass that labelled
+ * rows with a broken encoder. It writes the two movie columns, the resume-key
+ * tombstone and the completion-key delete in ONE transaction, so a busy writer
+ * can only make it retry - never leave the database half reset.
+ * ------------------------------------------------------------------------ */
+
+/* One attempt at the whole reset. Returns a SQLite result code. */
+static int mb_reset_once(sqlite3 *db, long long *rows_reset) {
+    char update_sql[256];
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    snprintf(update_sql, sizeof update_sql,
+             "UPDATE torrent_class SET movie_kind_mask = NULL, movie_kind_clf_ver = NULL "
+             "WHERE movie_kind_clf_ver >= %d",
+             MOVIE_BACKFILL_RESET_MIN_GENERATION);
+
+    rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        return rc;
+    }
+    rc = sqlite3_exec(db, update_sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return rc;
+    }
+    *rows_reset = (long long)sqlite3_changes(db);
+
+    /* Tombstone the resume key. The poisoned pass left "<generation>:<id>", and
+     * a restarted pass honours that id - it would start after it and silently
+     * skip exactly the rows this reset just cleared. */
+    rc = sqlite3_prepare_v2(db,
+                            "INSERT OR REPLACE INTO classifier_meta (key, value) VALUES (?, ?)",
+                            -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return rc;
+    }
+    sqlite3_bind_text(stmt, 1, MOVIE_BACKFILL_RESUME_KEY, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, "", -1, SQLITE_STATIC);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return rc;
+    }
+
+    /* Defensive: the poisoned pass never completed, so the completion key should
+     * be absent. Delete it anyway so a stale generation cannot make the engine
+     * believe the whole pass already sits at that generation. */
+    rc = sqlite3_exec(db,
+                      "DELETE FROM classifier_meta WHERE key = '" MOVIE_BACKFILL_VER_KEY "'",
+                      NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return rc;
+    }
+
+    return sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+}
+
+int movie_backfill_reset(const char *db_path, long long *rows_reset) {
+    sqlite3 *db = NULL;
+    long long cleared = 0;
+    int attempt;
+    int rc;
+
+    if (rows_reset) {
+        *rows_reset = 0;
+    }
+    if (!db_path) {
+        log_msg(LOG_ERROR, "movie-kind-reset: no database path");
+        return -1;
+    }
+
+    rc = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "movie-kind-reset: cannot open %s: %s", db_path,
+                db ? sqlite3_errmsg(db) : sqlite3_errstr(rc));
+        if (db) {
+            sqlite3_close(db);
+        }
+        return -1;
+    }
+    sqlite3_busy_timeout(db, MB_BUSY_TIMEOUT_MS);
+
+    /* Loud on stdout *and* in the log: run after a good pass this wipes correct
+     * labels, so it must never look like a routine maintenance step. */
+    printf("movie-kind-reset: WARNING: destructive reset of movie_kind_mask/movie_kind_clf_ver "
+           "for every row at generation >= %d.\n"
+           "movie-kind-reset: WARNING: run only while the movie-kind pass is stopped.\n",
+           MOVIE_BACKFILL_RESET_MIN_GENERATION);
+    fflush(stdout);
+    log_msg(LOG_WARN,
+            "movie-kind-reset: WARNING: destructive reset of movie_kind_mask/movie_kind_clf_ver "
+            "for every row at generation >= %d; run only while the pass is stopped",
+            MOVIE_BACKFILL_RESET_MIN_GENERATION);
+
+    /* The engine's busy-retry discipline: sqlite3_busy_timeout() already waits
+     * per statement, these attempts cover a writer that holds the lock longer. */
+    for (attempt = 0; attempt < MB_BUSY_ATTEMPTS; attempt++) {
+        cleared = 0;
+        rc = mb_reset_once(db, &cleared);
+        if (rc == SQLITE_OK) {
+            break;
+        }
+        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            log_msg(LOG_ERROR, "movie-kind-reset: reset of %s failed (%d: %s)", db_path, rc,
+                    sqlite3_errmsg(db));
+            sqlite3_close(db);
+            return -1;
+        }
+        log_msg(LOG_WARN, "movie-kind-reset: database busy (attempt %d/%d), retrying",
+                attempt + 1, MB_BUSY_ATTEMPTS);
+        mb_sleep_real(MB_BUSY_SLEEP_MS);
+    }
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "movie-kind-reset: %s still busy after %d attempts", db_path,
+                MB_BUSY_ATTEMPTS);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_close(db);
+
+    /* The count is the point of the one-shot, so it goes to stdout as well. No
+     * row count is assumed: whatever the predicate matched is what is printed. */
+    printf("movie-kind-reset: cleared %lld row(s) at generation >= %d; resume key tombstoned, "
+           "completion key cleared\n",
+           cleared, MOVIE_BACKFILL_RESET_MIN_GENERATION);
+    fflush(stdout);
+    log_msg(LOG_INFO,
+            "movie-kind-reset: cleared %lld row(s) at generation >= %d; resume key tombstoned, "
+            "completion key cleared",
+            cleared, MOVIE_BACKFILL_RESET_MIN_GENERATION);
+
+    if (rows_reset) {
+        *rows_reset = cleared;
+    }
+    return 0;
 }
