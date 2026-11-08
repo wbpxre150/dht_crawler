@@ -1,0 +1,431 @@
+--- a/src/http_api.c
++++ b/src/http_api.c
+@@ -64,6 +64,18 @@
+ };
+ #define CLS_NUM_TV_KINDS ((int)(sizeof(CLS_TV_KIND_NAMES) / sizeof(CLS_TV_KIND_NAMES[0])))
+ 
++/* Stage 8: movie_kind genre names; the array index IS the bit index in
++ * torrent_class.movie_kind_mask, in v9 manifest order
++ * (dht_crawler-android/models/v9/manifest.json). Mirrored by hand, like the
++ * taxonomy above, so this file keeps compiling for the crawler's own host make
++ * without the model headers or model files. */
++static const char *const CLS_MOVIE_KIND_NAMES[] = {
++    "action", "comedy", "drama", "horror", "thriller", "scifi", "fantasy",
++    "animation", "documentary", "romance", "crime", "adventure", "family",
++    "mystery", "war", "western"
++};
++#define CLS_NUM_MOVIE_KINDS ((int)(sizeof(CLS_MOVIE_KIND_NAMES) / sizeof(CLS_MOVIE_KIND_NAMES[0])))
++
+ typedef enum {
+     CLS_ADULT_HIDE,  /* classified non-adult rows only: c.adult = 0 */
+     CLS_ADULT_SHOW,  /* no adult condition at all */
+@@ -80,11 +92,17 @@
+     int tv_kind;            /* tp_tv_kind_t */
+     int has_min_conf;
+     double min_conf;
++    /* Stage 8: movie_kind_mask facet. movie_genre_bits is the OR of 1<<j for
++     * every selected CLS_MOVIE_KIND_NAMES entry; movie_none covers the rows
++     * with no genre verdict (mask SQL NULL or 0). The two OR together. */
++    int has_movie_kind;
++    int movie_genre_bits;
++    int movie_none;
+ } cls_filter_t;
+ 
+ /* Bind parameters a fully populated filter consumes; see
+  * append_class_conditions() and bind_class_filter(). */
+-#define CLS_FILTER_MAX_BINDS 3
++#define CLS_FILTER_MAX_BINDS 4
+ 
+ /* Forward declarations */
+ static int search_handler(struct mg_connection *conn, void *cbdata);
+@@ -150,6 +168,16 @@
+     return CLS_TV_KIND_NAMES[tv_kind];
+ }
+ 
++/* Stage 8: bit index of a movie_kind genre name, or -1 when it is not one of
++ * them. The names are the v9 manifest genres, so the filter tokens and the
++ * JSON badges cannot drift. */
++static int class_movie_kind_from_name(const char *name) {
++    for (int i = 0; i < CLS_NUM_MOVIE_KINDS; i++) {
++        if (strcmp(name, CLS_MOVIE_KIND_NAMES[i]) == 0) return i;
++    }
++    return -1;
++}
++
+ /* Strict integer parse: the whole string has to be one integer in [min, max].
+  * Overflow saturates to LONG_MAX/LONG_MIN and is rejected by the range check,
+  * so errno does not have to be consulted. */
+@@ -191,6 +219,9 @@
+     const char *qs = query_string ? query_string : "";
+     size_t qs_len = strlen(qs);
+     char buf[64];
++    /* movie_kind is a comma-separated list (all 17 tokens fit), which does not
++     * belong in the single-value buffer above. */
++    char movie_buf[256];
+     int n;
+     long value;
+ 
+@@ -237,6 +268,40 @@
+         out->tv_kind = (int)value;
+     }
+ 
++    n = mg_get_var(qs, qs_len, "movie_kind", movie_buf, sizeof(movie_buf));
++    if (n >= 0) {
++        int bits = 0;
++        int none = 0;
++        out->present = 1;
++        /* Comma-separated tokens with OR semantics: "none" selects the rows
++         * with no genre verdict (mask NULL or 0), every other token a genre
++         * bit. Unknown tokens are a 400. */
++        char *tok = movie_buf;
++        while (*tok) {
++            char *comma = strchr(tok, ',');
++            if (comma) *comma = '\0';
++            if (strcmp(tok, "none") == 0) {
++                none = 1;
++            } else {
++                int bit = class_movie_kind_from_name(tok);
++                if (bit < 0) {
++                    if (bad_param) *bad_param = "movie_kind";
++                    return -1;
++                }
++                bits |= 1 << bit;
++            }
++            if (!comma) break;
++            tok = comma + 1;
++        }
++        /* "movie_kind=" selects nothing: leave the filter unrestricted, so the
++         * class join cannot silently drop the unclassified rows. */
++        if (bits != 0 || none) {
++            out->has_movie_kind = 1;
++            out->movie_genre_bits = bits;
++            out->movie_none = none;
++        }
++    }
++
+     n = mg_get_var(qs, qs_len, "min_conf", buf, sizeof(buf));
+     if (n >= 0) {
+         out->present = 1;
+@@ -255,7 +320,8 @@
+  * condition, leave the legacy behaviour (unclassified rows included) alone. */
+ static int class_filter_needs_join(const cls_filter_t *f) {
+     if (!f) return 0;
+-    return f->adult != CLS_ADULT_SHOW || f->has_category || f->has_tv_kind || f->has_min_conf;
++    return f->adult != CLS_ADULT_SHOW || f->has_category || f->has_tv_kind ||
++           f->has_min_conf || f->has_movie_kind;
+ }
+ 
+ /* Append the conditions of *f* as " AND ..." fragments, numbering bind
+@@ -302,6 +368,26 @@
+         if (rc == 0) binds++;
+     }
+ 
++    /* Stage 8: movie_kind_mask. SQLite's & is a plain INTEGER bit test and a
++     * NULL mask makes it NULL (never true), so "none" needs its own explicit
++     * IS NULL arm. Only the genre-mask form consumes a bind. */
++    if (rc == 0 && f->has_movie_kind) {
++        if (f->movie_genre_bits != 0 && f->movie_none) {
++            rc = sb_append(buf, bufsize, &sp,
++                           " AND ((c.movie_kind_mask & ?%d) <> 0"
++                           " OR c.movie_kind_mask IS NULL OR c.movie_kind_mask = 0)",
++                           first_bind + binds);
++            if (rc == 0) binds++;
++        } else if (f->movie_genre_bits != 0) {
++            rc = sb_append(buf, bufsize, &sp, " AND (c.movie_kind_mask & ?%d) <> 0",
++                           first_bind + binds);
++            if (rc == 0) binds++;
++        } else {
++            rc = sb_append(buf, bufsize, &sp,
++                           " AND (c.movie_kind_mask IS NULL OR c.movie_kind_mask = 0)");
++        }
++    }
++
+     *pos = (int)sp;
+     return rc == 0 ? binds : 0;
+ }
+@@ -319,6 +405,11 @@
+     if (f->has_min_conf) {
+         sqlite3_bind_double(stmt, idx++, f->min_conf);
+     }
++    /* Stage 8: only the genre-mask form has a bind (see
++     * append_class_conditions()); "none" alone is pure SQL. */
++    if (f->has_movie_kind && f->movie_genre_bits != 0) {
++        sqlite3_bind_int(stmt, idx++, f->movie_genre_bits);
++    }
+ }
+ 
+ /* Write a {"error":"..."} response with the given HTTP status. */
+@@ -356,6 +447,21 @@
+         cJSON_AddNullToObject(item, "tv_kind");
+     }
+ 
++    /* Stage 8: movie_kind genres, in manifest/bit order. A NULL mask (never
++     * classified) is JSON null, mask 0 a genuine "no genre" verdict is [].
++     * Emitted here, not in send_json_results(), so /search, /browse and /random
++     * all get it from their one shared call site. */
++    if (r->has_movie_kind) {
++        cJSON *genres = cJSON_AddArrayToObject(item, "movie_kind");
++        for (int j = 0; j < CLS_NUM_MOVIE_KINDS; j++) {
++            if (r->movie_kind_mask & (1 << j)) {
++                cJSON_AddItemToArray(genres, cJSON_CreateString(CLS_MOVIE_KIND_NAMES[j]));
++            }
++        }
++    } else {
++        cJSON_AddNullToObject(item, "movie_kind");
++    }
++
+     cJSON_AddNumberToObject(item, "adult", r->adult);
+ 
+     if (r->has_confidence) {
+@@ -1338,8 +1444,8 @@
+ }
+ 
+ /* General-purpose JSON /random handler: up to 50 random torrents with
+- * total_peers >= min_peers, optionally filtered by category/tv_kind/adult.
+- * Same JSON envelope as /search and /browse. */
++ * total_peers >= min_peers, optionally filtered by category/tv_kind/movie_kind/
++ * adult. Same JSON envelope as /search and /browse. */
+ static int random_handler(struct mg_connection *conn, void *cbdata) {
+     http_api_t *api = (http_api_t *)cbdata;
+ 
+@@ -1382,6 +1488,34 @@
+         filter.has_tv_kind = 1;
+     }
+ 
++    if (mg_get_var(qs, qs_len, "movie_kind", buf, sizeof(buf)) > 0) {
++        int bits = 0;
++        int none = 0;
++        /* Same rules as parse_class_filter(): comma-separated genre names or
++         * "none", OR semantics, unknown token = 400. */
++        char *tok = buf;
++        while (*tok) {
++            char *comma = strchr(tok, ',');
++            if (comma) *comma = '\0';
++            if (strcmp(tok, "none") == 0) {
++                none = 1;
++            } else {
++                int bit = class_movie_kind_from_name(tok);
++                if (bit < 0) {
++                    return send_json_error(conn, 400, "Invalid value for 'movie_kind'");
++                }
++                bits |= 1 << bit;
++            }
++            if (!comma) break;
++            tok = comma + 1;
++        }
++        if (bits != 0 || none) {
++            filter.has_movie_kind = 1;
++            filter.movie_genre_bits = bits;
++            filter.movie_none = none;
++        }
++    }
++
+     if (mg_get_var(qs, qs_len, "adult", buf, sizeof(buf)) > 0) {
+         if (strcmp(buf, "hide") == 0) {
+             filter.adult = CLS_ADULT_HIDE;
+@@ -1770,10 +1904,12 @@
+     if (!key) return NULL;
+ 
+     if (filter) {
+-        (void)snprintf(key, need, "f|%d|%d|%d|%d|%d|%d|%.17g|%s",
++        (void)snprintf(key, need, "f|%d|%d|%d|%d|%d|%d|%d|%d|%d|%.17g|%s",
+                        (int)filter->adult,
+                        filter->has_category, filter->category,
+                        filter->has_tv_kind, filter->tv_kind,
++                       filter->has_movie_kind, filter->movie_genre_bits,
++                       filter->movie_none,
+                        filter->has_min_conf, filter->min_conf, query);
+     } else {
+         (void)snprintf(key, need, "nofilter|%s", query);
+@@ -2121,7 +2257,7 @@
+     (void)snprintf(main_sql, sizeof(main_sql),
+         "SELECT DISTINCT t.info_hash, t.name, t.size_bytes, t.total_peers, "
+         "       t.added_timestamp, "
+-        "       c.category, c.tv_kind, c.adult, c.confidence "
++        "       c.category, c.tv_kind, c.adult, c.confidence, c.movie_kind_mask "
+         "FROM torrents t "
+         "%s "
+         "WHERE t.id IN (SELECT id FROM %s) "
+@@ -2366,7 +2502,9 @@
+ 
+         /* Stage 7: torrent_class columns 5..8, filled when the torrent has a
+          * class row. c.category is NOT NULL in the table, so it doubles as the
+-         * "has a class row" flag; tv_kind and confidence are nullable. */
++         * "has a class row" flag; tv_kind and confidence are nullable.
++         * Stage 8: movie_kind_mask rides along as the appended column 9 (also
++         * nullable), so no existing index moved. */
+         if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
+             res[i].has_class = 1;
+             res[i].category = sqlite3_column_int(stmt, 5);
+@@ -2379,6 +2517,10 @@
+                 res[i].has_confidence = 1;
+                 res[i].confidence = sqlite3_column_double(stmt, 8);
+             }
++            if (sqlite3_column_type(stmt, 9) != SQLITE_NULL) {
++                res[i].has_movie_kind = 1;
++                res[i].movie_kind_mask = sqlite3_column_int(stmt, 9);
++            }
+         }
+ 
+         /* num_files for this row only. The statement is finalized on every
+@@ -2498,7 +2640,7 @@
+     pos = snprintf(main_sql, sizeof(main_sql),
+         "SELECT t.info_hash, t.name, t.size_bytes, t.total_peers, t.added_timestamp, "
+         "       (SELECT COUNT(*) FROM torrent_files f WHERE f.torrent_id = t.id), "
+-        "       c.category, c.tv_kind, c.adult, c.confidence "
++        "       c.category, c.tv_kind, c.adult, c.confidence, c.movie_kind_mask "
+         "FROM torrent_class c "
+         "JOIN torrents t ON t.id = c.torrent_id "
+         "WHERE 1");
+@@ -2548,7 +2690,8 @@
+         res[i].num_files = sqlite3_column_int(stmt, 5);
+ 
+         /* Every row comes from torrent_class, so the class fields are always
+-         * present here (tv_kind and confidence can still be NULL). */
++         * present here (tv_kind, confidence and movie_kind_mask can still be
++         * NULL). */
+         res[i].has_class = 1;
+         res[i].category = sqlite3_column_int(stmt, 6);
+         if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+@@ -2560,6 +2703,10 @@
+             res[i].has_confidence = 1;
+             res[i].confidence = sqlite3_column_double(stmt, 9);
+         }
++        if (sqlite3_column_type(stmt, 10) != SQLITE_NULL) {
++            res[i].has_movie_kind = 1;
++            res[i].movie_kind_mask = sqlite3_column_int(stmt, 10);
++        }
+ 
+         if (res[i].num_files > 0) {
+             fetch_result_files(db, &res[i]);
+@@ -2634,9 +2781,10 @@
+     return send_json_results(conn, results, count, total_count, page);
+ }
+ 
+-/* Stage 7: torrent_class probe for the /random candidate loop. tv_kind is
+- * nullable (NULL when the torrent has no tv/anime kind). */
+-#define RANDOM_CLASS_SQL_EX "SELECT category, tv_kind, adult FROM torrent_class WHERE torrent_id = ?"
++/* Stage 7: torrent_class probe for the /random candidate loop. tv_kind and
++ * movie_kind_mask are nullable (NULL when the torrent has no tv/anime kind, and
++ * NULL when it has never had a movie genre verdict). */
++#define RANDOM_CLASS_SQL_EX "SELECT category, tv_kind, adult, movie_kind_mask FROM torrent_class WHERE torrent_id = ?"
+ 
+ /* Class-first candidate test for /random. A torrent with a class row is judged
+  * by that row alone (adult per adult_mode, then category / tv_kind equality).
+@@ -2645,15 +2793,20 @@
+  * heuristics are intentionally not applied — the phone DB is fully classified.
+  *
+  * want_category == -1 => any; want_tv_kind == -1 => any (incl. NULL),
+- * 0 => require NULL, >0 => equality. The probed class row is written back via
+- * the out-params so the caller can populate the JSON class fields.
++ * 0 => require NULL, >0 => equality. want_movie_bits is the OR of the selected
++ * movie_kind genre bits (0 => no genre constraint) and want_movie_none selects
++ * the rows without a genre verdict (mask NULL or 0); the two OR together, like
++ * append_class_conditions() does for SQL. The probed class row is written back
++ * via the out-params so the caller can populate the JSON class fields.
+  * CALLER must hold database_read_lock. */
+ static int random_candidate_eligible_ex(database_t *db, sqlite3_stmt *class_stmt,
+                                         int64_t torrent_id, const char *name,
+                                         int want_category, int want_tv_kind,
++                                        int want_movie_bits, int want_movie_none,
+                                         int adult_mode,
+                                         int *has_class, int *category,
+                                         int *has_tv_kind, int *tv_kind,
++                                        int *has_movie_kind, int *movie_kind_mask,
+                                         int *adult) {
+     (void)db;
+     (void)name;
+@@ -2664,6 +2817,8 @@
+     *category = 0;
+     *has_tv_kind = 0;
+     *tv_kind = 0;
++    *has_movie_kind = 0;
++    *movie_kind_mask = 0;
+     *adult = 0;
+ 
+     if (sqlite3_step(class_stmt) == SQLITE_ROW) {
+@@ -2674,6 +2829,10 @@
+             *tv_kind = sqlite3_column_int(class_stmt, 1);
+         }
+         *adult = sqlite3_column_int(class_stmt, 2);
++        if (sqlite3_column_type(class_stmt, 3) != SQLITE_NULL) {
++            *has_movie_kind = 1;
++            *movie_kind_mask = sqlite3_column_int(class_stmt, 3);
++        }
+     }
+     sqlite3_reset(class_stmt);
+ 
+@@ -2689,10 +2848,22 @@
+             if (!*has_tv_kind || *tv_kind != want_tv_kind) return 0;
+         }
+ 
++        /* Stage 8: movie_kind — OR of the selected genre bits and/or "none"
++         * (mask NULL or 0), the same criteria append_class_conditions() puts in
++         * SQL. */
++        if (want_movie_bits != 0 || want_movie_none) {
++            int genre_hit = (*has_movie_kind && (want_movie_bits & *movie_kind_mask) != 0);
++            int none_hit = (!*has_movie_kind || *movie_kind_mask == 0);
++            if (!genre_hit && !(want_movie_none && none_hit)) return 0;
++        }
++
+         return 1;
+     }
+ 
+-    return (adult_mode == CLS_ADULT_SHOW && want_category == -1 && want_tv_kind == -1);
++    /* No class row. movie_kind=none on its own is not a real filter here: an
++     * unclassified torrent has no mask, which is exactly what "none" selects. */
++    return (adult_mode == CLS_ADULT_SHOW && want_category == -1 && want_tv_kind == -1 &&
++            want_movie_bits == 0);
+ }
+ 
+ /* Generic random sampler: up to HTTP_API_MAX_RESULTS torrents with
+@@ -2716,6 +2887,8 @@
+ 
+     int want_category = filter->has_category ? filter->category : -1;
+     int want_tv_kind = filter->has_tv_kind ? filter->tv_kind : -1;
++    int want_movie_bits = filter->has_movie_kind ? filter->movie_genre_bits : 0;
++    int want_movie_none = filter->has_movie_kind ? filter->movie_none : 0;
+     int adult_mode = filter->adult;
+ 
+     database_read_lock(db);
+@@ -2803,11 +2976,14 @@
+ 
+             int passes = 0;
+             int has_class = 0, category = 0, has_tv_kind = 0, tv_kind = 0, adult = 0;
++            int has_movie_kind = 0, movie_kind_mask = 0;
+             if (!is_duplicate) {
+                 passes = random_candidate_eligible_ex(
+                     db, class_stmt, torrent_id, name,
+-                    want_category, want_tv_kind, adult_mode,
+-                    &has_class, &category, &has_tv_kind, &tv_kind, &adult);
++                    want_category, want_tv_kind, want_movie_bits, want_movie_none,
++                    adult_mode,
++                    &has_class, &category, &has_tv_kind, &tv_kind,
++                    &has_movie_kind, &movie_kind_mask, &adult);
+             }
+ 
+             if (passes) {
+@@ -2822,6 +2998,8 @@
+                 res[found].category = category;
+                 res[found].has_tv_kind = has_tv_kind;
+                 res[found].tv_kind = tv_kind;
++                res[found].has_movie_kind = has_movie_kind;
++                res[found].movie_kind_mask = movie_kind_mask;
+                 res[found].adult = adult;
+                 /* has_confidence stays 0 => JSON "confidence": null */
+ 
+--- a/include/http_api.h
++++ b/include/http_api.h
+@@ -51,6 +51,12 @@
+     int adult;
+     int has_confidence;
+     double confidence;
++    /* Stage 8: torrent_class.movie_kind_mask of this torrent's class row (see
++     * movie_kind.h). has_movie_kind 0 means the column is SQL NULL (never
++     * classified); has_movie_kind 1 with mask 0 is a genuine "no genre"
++     * verdict, so the two cases have to stay distinguishable in the JSON. */
++    int has_movie_kind;
++    int movie_kind_mask;
+ } search_result_t;
+ 
+ /* Function declarations */
