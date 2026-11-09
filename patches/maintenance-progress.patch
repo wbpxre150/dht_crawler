@@ -1,0 +1,586 @@
+--- /dev/null
++++ b/include/maintenance_progress.h
+@@ -0,0 +1,154 @@
++#ifndef MAINTENANCE_PROGRESS_H
++#define MAINTENANCE_PROGRESS_H
++
++/*
++ * Machine-readable maintenance progress ([MPROG]).
++ *
++ * Every maintenance one-shot (--check-database, --recover-database,
++ * --rebuild-bloom-filter, --clear-failure-filter, --movie-kind-bench) reports
++ * its progress on ONE line shape:
++ *
++ *   [MPROG] action=<route> phase=<slug> [done=<n> total=<n> pct=<n>] [k=v ...]
++ *
++ * The app parses it (MaintenanceProgress.kt), so the rules below are a
++ * contract, not a preference:
++ *
++ *  - `action` is the flag name without "--", matching MaintenanceAction.route;
++ *  - the literal [MPROG] token sits mid-line, behind log_msg()'s
++ *    "[YYYY-MM-DD HH:MM:SS] [INFO] " prefix;
++ *  - done/total are omitted when unknown, and pct is omitted ENTIRELY when
++ *    there is no denominator (never pct=-1): a phase-only action reports a
++ *    phase and nothing else;
++ *  - the LAST line an action emits is "phase=done rc=<n>" or
++ *    "phase=failed rc=<n>", so the UI can finalise without waiting for the
++ *    process exit code.
++ *
++ * Channel: log_msg(LOG_INFO, ...) only. It is the one stream that is flushed
++ * per line (log_msg() fflush()es stderr unconditionally) and the one the
++ * one-shot runner reads. Bare printf() is forbidden here: stdout is fully
++ * buffered when it is a pipe, so progress would arrive in 8 KiB bursts.
++ *
++ * Throttle: at most one line per 1 % AND per 1 second, whichever is later. The
++ * app keeps only a 2000-line console ring buffer, and an unthrottled
++ * --recover-database (286.7M torrent_files rows) would emit ~2,860 lines and
++ * evict everything printed before it.
++ *
++ * Header-only on purpose: src/main.c, src/database.c and src/movie_backfill.c
++ * all need the emitters, and a new .c file would have to be added to the host
++ * Makefile's explicit per-test source lists (and would only reach the Android
++ * build through a CMake re-glob). static inline keeps one definition with no
++ * build-system change; unused static inline functions do not warn.
++ */
++
++#include <time.h>
++
++#include "dht_crawler.h"
++
++/* Per-phase throttle state. Zero-initialised means "nothing emitted yet", so
++ * the first call always emits: a phase that finishes quickly must still show
++ * up instead of vanishing behind its own throttle. */
++typedef struct {
++    int have_last;
++    long long last_done;
++    int last_pct;
++    time_t last_time;
++} mprog_throttle_t;
++
++/* Arm a throttle so the next call always emits. */
++static inline void mprog_throttle_init(mprog_throttle_t *t) {
++    t->have_last = 0;
++    t->last_done = 0;
++    t->last_pct = -1;
++    t->last_time = 0;
++}
++
++/* done/total as 0..100, clamped; 0 when there is no denominator. */
++static inline int mprog_pct(long long done, long long total) {
++    long long pct;
++
++    if (total <= 0 || done <= 0) {
++        return 0;
++    }
++    pct = (done * 100) / total;
++    if (pct > 100) {
++        pct = 100;
++    }
++    return (int)pct;
++}
++
++/* Emit one [MPROG] line. done < 0 omits the counts; total <= 0 means "no
++ * denominator", which also omits pct. extra_kvs is a preformatted "k=v k=v"
++ * tail (or NULL) appended verbatim. One snprintf plus one log_msg keeps the
++ * line atomic: log_msg() takes no lock, so a second call could interleave. */
++static inline void mprog_emit(const char *action, const char *phase,
++                              long long done, long long total,
++                              const char *extra_kvs) {
++    char line[256];
++    int len;
++
++    if (done >= 0 && total > 0) {
++        len = snprintf(line, sizeof(line),
++                       "[MPROG] action=%s phase=%s done=%lld total=%lld pct=%d",
++                       action, phase, done, total, mprog_pct(done, total));
++    } else if (done >= 0) {
++        len = snprintf(line, sizeof(line), "[MPROG] action=%s phase=%s done=%lld",
++                       action, phase, done);
++    } else {
++        len = snprintf(line, sizeof(line), "[MPROG] action=%s phase=%s",
++                       action, phase);
++    }
++    if (extra_kvs && extra_kvs[0] && len > 0 && (size_t)len < sizeof(line)) {
++        snprintf(line + len, sizeof(line) - (size_t)len, " %s", extra_kvs);
++    }
++    log_msg(LOG_INFO, "%s", line);
++}
++
++/* The throttle gate: 1 when a line is due (and records the emission). A done
++ * that went backwards means the work restarted - the bench repeats its pass
++ * until it has run long enough - which re-arms the gate instead of freezing it
++ * at the last percentage. */
++static inline int mprog_due(mprog_throttle_t *t, long long done, long long total) {
++    int pct = mprog_pct(done, total);
++    time_t now = time(NULL);
++
++    if (t->have_last && done < t->last_done) {
++        t->have_last = 0;
++    }
++    if (t->have_last) {
++        if (now <= t->last_time) {
++            return 0; /* less than a second since the last line */
++        }
++        if (total > 0 && pct <= t->last_pct) {
++            return 0; /* less than 1 % since the last line */
++        }
++    }
++    t->have_last = 1;
++    t->last_done = done;
++    t->last_pct = pct;
++    t->last_time = now;
++    return 1;
++}
++
++/* Gate plus emit in one call: all a loop body needs. */
++static inline void mprog_progress(mprog_throttle_t *t, const char *action,
++                                  const char *phase, long long done,
++                                  long long total, const char *extra_kvs) {
++    if (mprog_due(t, done, total)) {
++        mprog_emit(action, phase, done, total, extra_kvs);
++    }
++}
++
++/* The one terminal line every action must end with, on every return path. */
++static inline void mprog_terminal(const char *action, int ok, int rc,
++                                  const char *extra_kvs) {
++    char extra[192];
++
++    if (extra_kvs && extra_kvs[0]) {
++        snprintf(extra, sizeof(extra), "rc=%d %s", rc, extra_kvs);
++    } else {
++        snprintf(extra, sizeof(extra), "rc=%d", rc);
++    }
++    mprog_emit(action, ok ? "done" : "failed", -1, 0, extra);
++}
++
++#endif /* MAINTENANCE_PROGRESS_H */
+--- a/include/database.h
++++ b/include/database.h
+@@ -164,6 +164,11 @@
+  * Returns the number of hashes added, or -1 on error. */
+ int database_rebuild_bloom(const char *db_path, struct bloom_filter *bloom);
+ 
++/* Row count of the torrents table in db_path, or -1 when it cannot be read.
++ * The denominator for maintenance progress ([MPROG]); COUNT(*) on a rowid
++ * table is an index-only scan, so it costs milliseconds, not minutes. */
++long long database_count_torrents(const char *db_path);
++
+ /* Backfill the schema-v2 torrent-level word index (torrent_docs) of an existing
+  * db_path database from its base tables, in bounded id chunks. Idempotent (a
+  * re-run replaces each chunk's rowid range); the WAL is checkpointed and
+--- a/src/database.c
++++ b/src/database.c
+@@ -1,6 +1,7 @@
+ #include "database.h"
+ #include "dht_crawler.h"
+ #include "bloom_filter.h"
++#include "maintenance_progress.h"
+ #include <time.h>   /* Stage 7: CLOCK_MONOTONIC for the read-connection open timing */
+ #include <stdio.h>
+ #include <string.h>
+@@ -1389,6 +1390,45 @@
+     return 0;
+ }
+ 
++/* COUNT(*) of `table` over an already-open connection, or -1 when it cannot be
++ * read. A corrupt source must degrade a progress report to phase-only, never
++ * abort the action, so every failure here returns -1 instead of propagating. */
++static long long count_table_rows(sqlite3 *db, const char *table) {
++    char sql[128];
++    sqlite3_stmt *stmt = NULL;
++    long long total = -1;
++
++    if (!db || !table) {
++        return -1;
++    }
++    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s", table);
++    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
++        sqlite3_step(stmt) == SQLITE_ROW) {
++        total = sqlite3_column_int64(stmt, 0);
++    }
++    sqlite3_finalize(stmt);
++    return total;
++}
++
++/* Row count of the torrents table in db_path, or -1 when it cannot be read.
++ * Cheap enough to serve as a maintenance-progress denominator: COUNT(*) on a
++ * rowid table is an index-only scan (~ms over the 6.1M rows on the phone). */
++long long database_count_torrents(const char *db_path) {
++    sqlite3 *db = NULL;
++    long long total;
++
++    if (!db_path) {
++        return -1;
++    }
++    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
++        sqlite3_close(db);
++        return -1;
++    }
++    total = count_table_rows(db, "torrents");
++    sqlite3_close(db);
++    return total;
++}
++
+ /* Rebuild bloom filter from all infohashes in the database.
+  * Opens the database read-only, iterates every info_hash in torrents,
+  * and adds each to the provided bloom filter.
+@@ -1416,7 +1456,14 @@
+         return -1;
+     }
+ 
++    /* Denominator for the [MPROG] percent - the same COUNT(*) main.c reports as
++     * its "count" phase. -1 (unreadable) degrades the scan to done-only. */
++    long long total = database_count_torrents(db_path);
++    mprog_throttle_t scan_prog;
++    mprog_throttle_init(&scan_prog);
++
+     int count = 0;
++    mprog_progress(&scan_prog, "rebuild-bloom-filter", "scan", 0, total, NULL);
+     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+         const void *blob = sqlite3_column_blob(stmt, 0);
+         int blob_len = sqlite3_column_bytes(stmt, 0);
+@@ -1426,6 +1473,7 @@
+             if (count % 100000 == 0) {
+                 log_msg(LOG_INFO, "rebuild_bloom: %d infohashes processed...", count);
+             }
++            mprog_progress(&scan_prog, "rebuild-bloom-filter", "scan", count, total, NULL);
+         }
+     }
+ 
+@@ -1550,6 +1598,10 @@
+ 
+     /* --- path_prefixes --- */
+     int prefix_count = 0;
++    long long prefix_total = count_table_rows(src, "path_prefixes");
++    mprog_throttle_t prefix_prog;
++    mprog_throttle_init(&prefix_prog);
++    mprog_progress(&prefix_prog, "recover-database", "path_prefixes", 0, prefix_total, NULL);
+     rc = sqlite3_prepare_v2(src, "SELECT id, prefix FROM path_prefixes", -1, &sel, NULL);
+     if (rc == SQLITE_OK) {
+         sqlite3_prepare_v2(dst,
+@@ -1563,6 +1615,8 @@
+             if (sqlite3_step(ins) == SQLITE_DONE) prefix_count++;
+             else skipped++;
+             sqlite3_reset(ins);
++            mprog_progress(&prefix_prog, "recover-database", "path_prefixes",
++                           prefix_count, prefix_total, NULL);
+         }
+         if (rc != SQLITE_DONE)
+             log_msg(LOG_WARN, "recover: path_prefixes scan ended early: %s", sqlite3_errmsg(src));
+@@ -1573,6 +1627,10 @@
+ 
+     /* --- torrents --- */
+     int torrent_count = 0;
++    long long torrent_total = count_table_rows(src, "torrents");
++    mprog_throttle_t torrent_prog;
++    mprog_throttle_init(&torrent_prog);
++    mprog_progress(&torrent_prog, "recover-database", "torrents", 0, torrent_total, NULL);
+     rc = sqlite3_prepare_v2(src,
+         "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp FROM torrents",
+         -1, &sel, NULL);
+@@ -1601,6 +1659,8 @@
+ 
+             if (torrent_count % 100000 == 0 && torrent_count > 0)
+                 log_msg(LOG_INFO, "recover: %d torrents copied...", torrent_count);
++            mprog_progress(&torrent_prog, "recover-database", "torrents",
++                           torrent_count, torrent_total, NULL);
+         }
+         if (rc != SQLITE_DONE)
+             log_msg(LOG_WARN, "recover: torrents scan ended early: %s", sqlite3_errmsg(src));
+@@ -1610,6 +1670,12 @@
+ 
+     /* --- torrent_files --- */
+     int file_count = 0;
++    /* Done-only: COUNT(*) over 286.7M torrent_files rows is an unmeasured full
++     * scan on a possibly-corrupt source, so this phase reports a count and no
++     * percent rather than paying for a denominator it does not need. */
++    mprog_throttle_t file_prog;
++    mprog_throttle_init(&file_prog);
++    mprog_progress(&file_prog, "recover-database", "torrent_files", 0, 0, NULL);
+     rc = sqlite3_prepare_v2(src,
+         "SELECT id, torrent_id, prefix_id, filename, size_bytes, file_index FROM torrent_files",
+         -1, &sel, NULL);
+@@ -1636,6 +1702,8 @@
+             if (sqlite3_step(ins) == SQLITE_DONE) file_count++;
+             else skipped++;
+             sqlite3_reset(ins);
++            mprog_progress(&file_prog, "recover-database", "torrent_files",
++                           file_count, 0, NULL);
+         }
+         if (rc != SQLITE_DONE)
+             log_msg(LOG_WARN, "recover: torrent_files scan ended early: %s", sqlite3_errmsg(src));
+--- a/src/main.c
++++ b/src/main.c
+@@ -18,6 +18,7 @@
+ #include "movie_kind.h"
+ #include "movie_backfill.h"
+ #include "movie_backfill_daemon.h"
++#include "maintenance_progress.h"
+ #include <signal.h>
+ #include <unistd.h>
+ #include <stdarg.h>
+@@ -442,14 +443,17 @@
+     if (rebuild_bloom) {
+         if (!config.bloom_enabled) {
+             log_msg(LOG_ERROR, "--rebuild-bloom-filter: bloom filter is disabled in config.ini");
++            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
+             return 1;
+         }
+         if (!config.bloom_persist) {
+             log_msg(LOG_ERROR, "--rebuild-bloom-filter: bloom filter persistence is disabled in config.ini (bloom_persist=0)");
++            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
+             return 1;
+         }
+         if (ensure_parent_directory_exists(config.bloom_path) != 0) {
+             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to create bloom filter directory");
++            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
+             return 1;
+         }
+ 
+@@ -457,26 +461,41 @@
+         bloom_filter_t *bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
+         if (!bloom) {
+             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to allocate bloom filter");
++            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
+             return 1;
+         }
+ 
++        /* Count first, so the very first [MPROG] line already carries the percent
++         * base; database_rebuild_bloom counts the same rows again for its own
++         * scan phase (an index-only COUNT(*), milliseconds either way). */
++        long long bloom_total = database_count_torrents(g_app_ctx.db_path);
++        mprog_emit("rebuild-bloom-filter", "count", 0, bloom_total, NULL);
++
+         int added = database_rebuild_bloom(g_app_ctx.db_path, bloom);
+         if (added < 0) {
+             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to read database");
+             bloom_filter_cleanup(bloom);
++            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
+             return 1;
+         }
+ 
+         log_msg(LOG_INFO, "Added %d infohashes to bloom filter", added);
+ 
++        mprog_emit("rebuild-bloom-filter", "save", -1, 0, NULL);
+         if (bloom_filter_save(bloom, config.bloom_path) != 0) {
+             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to save bloom filter to %s", config.bloom_path);
+             bloom_filter_cleanup(bloom);
++            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
+             return 1;
+         }
+ 
+         bloom_filter_cleanup(bloom);
+         log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s.", config.bloom_path);
++        {
++            char bloom_extra[64];
++            snprintf(bloom_extra, sizeof(bloom_extra), "added=%d", added);
++            mprog_terminal("rebuild-bloom-filter", 1, 0, bloom_extra);
++        }
+         return 0;
+     }
+ 
+@@ -484,15 +503,21 @@
+      * metadata fetch (and were suppressed from retry) become eligible again.
+      * The crawler re-creates an empty filter on its next start. */
+     if (clear_failure_filter) {
++        /* Phase-only by nature: one unlink(), so there is no denominator to
++         * report - the outcome rides on the terminal line as removed=1|0. */
++        mprog_emit("clear-failure-filter", "unlink", -1, 0, NULL);
+         if (unlink("data/failure_bloom.dat") == 0) {
+             log_msg(LOG_INFO, "--clear-failure-filter: removed data/failure_bloom.dat");
++            mprog_terminal("clear-failure-filter", 1, 0, "removed=1");
+             return 0;
+         }
+         if (errno == ENOENT) {
+             log_msg(LOG_INFO, "--clear-failure-filter: data/failure_bloom.dat not present; nothing to remove");
++            mprog_terminal("clear-failure-filter", 1, 0, "removed=0");
+             return 0;
+         }
+         log_msg(LOG_ERROR, "--clear-failure-filter: failed to remove data/failure_bloom.dat: %s", strerror(errno));
++        mprog_terminal("clear-failure-filter", 0, 1, "removed=0");
+         return 1;
+     }
+ 
+@@ -501,17 +526,27 @@
+      *******************************************************************/
+     if (check_db) {
+         log_msg(LOG_INFO, "Checking database integrity: %s", g_app_ctx.db_path);
++        /* Phase-only: PRAGMA integrity_check reports a verdict at the end and
++         * nothing incremental, so there is no honest denominator to show. */
++        mprog_emit("check-database", "integrity_check", -1, 0, NULL);
+         int nerrors = database_integrity_check(g_app_ctx.db_path);
+         cleanup_app_context(&g_app_ctx);
+         if (nerrors < 0) {
+             log_msg(LOG_ERROR, "--check-database: failed to open or query database.");
++            mprog_terminal("check-database", 0, 1, NULL);
+             return 1;
+         }
+         if (nerrors == 0) {
+             log_msg(LOG_INFO, "--check-database: database is clean.");
++            mprog_terminal("check-database", 1, 0, "errors=0");
+             return 0;
+         }
+         log_msg(LOG_ERROR, "--check-database: %d integrity error(s) found.", nerrors);
++        {
++            char check_extra[64];
++            snprintf(check_extra, sizeof(check_extra), "errors=%d", nerrors);
++            mprog_terminal("check-database", 0, 1, check_extra);
++        }
+         return 1;
+     }
+ 
+@@ -525,12 +560,14 @@
+ 
+         if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
+             cleanup_app_context(&g_app_ctx);
++            mprog_terminal("recover-database", 0, 1, NULL);
+             return 1;
+         }
+ 
+         unlink(tmp_path);
+ 
+         log_msg(LOG_INFO, "Recovering database %s into %s ...", g_app_ctx.db_path, tmp_path);
++        /* The three copy phases emit their own lines from database_recover(). */
+         int nrows = database_recover(g_app_ctx.db_path, tmp_path);
+ 
+         cleanup_app_context(&g_app_ctx);
+@@ -538,13 +575,20 @@
+         if (nrows < 0) {
+             log_msg(LOG_ERROR, "--recover-database: recovery failed; original database unchanged.");
+             unlink(tmp_path);
++            mprog_terminal("recover-database", 0, 1, NULL);
+             return 1;
+         }
+ 
++        mprog_emit("recover-database", "verify", -1, 0, NULL);
+         int chk = database_integrity_check(tmp_path);
+         if (chk != 0) {
+             log_msg(LOG_ERROR, "--recover-database: recovered database failed integrity check (%d errors); aborting.", chk);
+             unlink(tmp_path);
++            {
++                char recover_extra[64];
++                snprintf(recover_extra, sizeof(recover_extra), "errors=%d", chk);
++                mprog_terminal("recover-database", 0, 1, recover_extra);
++            }
+             return 1;
+         }
+ 
+@@ -555,9 +599,11 @@
+         unlink(wal_path);
+         unlink(shm_path);
+ 
++        mprog_emit("recover-database", "rename", -1, 0, NULL);
+         if (rename(tmp_path, g_app_ctx.db_path) != 0) {
+             log_msg(LOG_ERROR, "--recover-database: failed to replace database: %s", strerror(errno));
+             log_msg(LOG_ERROR, "Recovered copy left at %s", tmp_path);
++            mprog_terminal("recover-database", 0, 1, NULL);
+             return 1;
+         }
+ 
+@@ -569,6 +615,11 @@
+         unlink(tmp_shm);
+ 
+         log_msg(LOG_INFO, "--recover-database: complete. %d torrents recovered.", nrows);
++        {
++            char recover_extra[64];
++            snprintf(recover_extra, sizeof(recover_extra), "torrents=%d", nrows);
++            mprog_terminal("recover-database", 1, 0, recover_extra);
++        }
+         return 0;
+     }
+ 
+--- a/src/movie_backfill.c
++++ b/src/movie_backfill.c
+@@ -30,6 +30,7 @@
+ 
+ #include "dht_crawler.h"
+ #include "movie_kind.h"
++#include "maintenance_progress.h"
+ 
+ #include <pthread.h>
+ #include <signal.h>
+@@ -1102,6 +1103,7 @@
+ 
+     if (!db_path) {
+         log_msg(LOG_ERROR, "movie-kind-bench: no database path");
++        mprog_terminal("movie-kind-bench", 0, 1, NULL);
+         return -1;
+     }
+     if (rows <= 0) {
+@@ -1123,6 +1125,7 @@
+         log_msg(LOG_ERROR,
+                 "movie-kind-bench: the movie-kind module is disabled (no verified v9 "
+                 "manifest, or this build has no encoder); nothing measured");
++        mprog_terminal("movie-kind-bench", 0, 1, NULL);
+         return 1;
+     }
+ 
+@@ -1135,9 +1138,11 @@
+         if (db) {
+             sqlite3_close(db);
+         }
++        mprog_terminal("movie-kind-bench", 0, 1, NULL);
+         return -1;
+     }
+     sqlite3_busy_timeout(db, MB_BUSY_TIMEOUT_MS);
++    mprog_emit("movie-kind-bench", "load", -1, 0, NULL);
+ 
+     rc = sqlite3_prepare_v2(db,
+                             "SELECT t.name FROM torrents t "
+@@ -1202,6 +1207,18 @@
+         (void)mb_classify(names[0], &warm_mask);
+     }
+ 
++    /* [MPROG] encode phase. done is the index inside the CURRENT pass, not the
++     * cumulative sample count: the sustained loop repeats the pass until it has
++     * run MB_BENCH_MIN_SECONDS, so a cumulative done would pass total (n) and
++     * the app drops a denominator it cannot trust. The cumulative numbers ride
++     * along as samples=/failures=, and the throttle re-arms on the wrap back to
++     * 0 so each pass reports its own 0-100 % instead of freezing at 100 %.
++     * Gate: one line per 1 % AND per second - the same rule as everywhere else,
++     * which is what keeps a fast bench from evicting the 2000-line console. */
++    mprog_throttle_t bench_prog;
++    mprog_throttle_init(&bench_prog);
++    mprog_emit("movie-kind-bench", "encode", 0, n, NULL);
++
+     started = mb_now_seconds();
+     for (;;) {
+         for (i = 0; i < n; i++) {
+@@ -1226,6 +1243,13 @@
+             if (temp_c > max_temp_c) {
+                 max_temp_c = temp_c;
+             }
++            {
++                char bench_extra[64];
++                snprintf(bench_extra, sizeof(bench_extra), "samples=%lld failures=%lld",
++                         samples_n, failures);
++                mprog_progress(&bench_prog, "movie-kind-bench", "encode", i + 1, n,
++                               bench_extra);
++            }
+         }
+         elapsed = mb_now_seconds() - started;
+         if (dump_masks || elapsed >= MB_BENCH_MIN_SECONDS || samples_n <= 0) {
+@@ -1236,6 +1260,7 @@
+         }
+     }
+     elapsed = mb_now_seconds() - started;
++    mprog_emit("movie-kind-bench", "report", -1, 0, NULL);
+ 
+     /* Only the retained samples are sorted; `samples` reports how many names
+      * were actually measured, so a run longer than the sample cap is honest
+@@ -1260,8 +1285,14 @@
+         fflush(stdout);
+     }
+     result = 0;
++    mprog_terminal("movie-kind-bench", 1, 0, NULL);
+ 
+ done:
++    if (result != 0) {
++        /* Every goto done path (candidate query, OOM) exits without a terminal
++         * otherwise, and the app would wait for a phase that never arrives. */
++        mprog_terminal("movie-kind-bench", 0, 1, NULL);
++    }
+     sqlite3_finalize(stmt);
+     if (db) {
+         sqlite3_close(db);
