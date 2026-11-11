@@ -256,19 +256,31 @@ index 5a525d9..4cffe76 100644
      log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
      log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
 diff --git i/src/movie_kind.c w/src/movie_kind.c
-index bf242e8..80dc324 100644
+index bf242e8..dca8919 100644
 --- i/src/movie_kind.c
 +++ w/src/movie_kind.c
-@@ -128,7 +128,7 @@ static int mk_ensure_locked(void);
+@@ -9,7 +9,7 @@
+  *     pinned-size + sha256 verification, the stats block — is plain C99 with
+  *     cJSON and OpenSSL, so the crawler's own host `make` build compiles it
+  *     and tests/test_movie_kind.c exercises the *real* refusal paths;
+- *   - the encoder — llama.cpp model/context and `llama_encode` — is
++ *   - the encoder — llama.cpp model/context and `llama_encode`/`llama_decode` — is
+  *     `MK_ENABLED`-gated, with an inert `#else` that answers "no verdict"
+  *     exactly like classifier.c's host stubs, so a plain CMake configure and
+  *     the host Makefile stay llama-free;
+@@ -127,8 +127,9 @@ static void mk_update_enabled_locked(void);
+ static int mk_ensure_locked(void);
  
  #ifdef MK_ENABLED
- /* The llama.cpp embedding provider (render -> tokenise -> llama_encode -> read
+-/* The llama.cpp embedding provider (render -> tokenise -> llama_encode -> read
 - * the pooled CLS vector) and the backbone/context load behind it. */
-+ * the pooled last-token vector) and the backbone/context load behind it. */
++/* The llama.cpp embedding provider (render -> tokenise -> llama_encode for an
++ * encoder backbone / llama_decode for a decoder one -> read the pooled
++ * last-token vector) and the backbone/context load behind it. */
  static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden);
  static int mk_model_ensure_locked(void);
  #endif
-@@ -513,7 +513,7 @@ static int mk_model_ensure_locked(void) {
+@@ -513,7 +514,7 @@ static int mk_model_ensure_locked(void) {
      snprintf(path, sizeof(path), "%s/%s", mk.model_dir, mk.backbone_file);
      struct llama_model_params model_params = llama_model_default_params();
      /* CPU-only on the phone; mmap is the default load mode and is what keeps
@@ -277,7 +289,7 @@ index bf242e8..80dc324 100644
      model_params.n_gpu_layers = 0;
      mk.model = llama_model_load_from_file(path, model_params);
      if (!mk.model) {
-@@ -543,7 +543,9 @@ static int mk_model_ensure_locked(void) {
+@@ -543,7 +544,9 @@ static int mk_model_ensure_locked(void) {
      context_params.n_seq_max = 1;
      context_params.n_threads = mk.threads;
      context_params.n_threads_batch = mk.threads;
@@ -288,12 +300,20 @@ index bf242e8..80dc324 100644
      context_params.embeddings = true;
      mk.context = llama_init_from_model(mk.model, context_params);
      if (!mk.context) {
-@@ -563,16 +565,19 @@ static int mk_model_ensure_locked(void) {
+@@ -562,17 +565,26 @@ static int mk_model_ensure_locked(void) {
+ }
  
  /* The llama.cpp embedding provider: tokenise the serving text with the GGUF's
-  * own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, encode one row, read the pooled
+- * own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, encode one row, read the pooled
 - * CLS vector. Called with `mutex` held and the model resident.
-+ * last-token vector. Called with `mutex` held and the model resident.
++ * own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, run one row through the entry
++ * point the backbone demands, read the pooled last-token vector. Called with
++ * `mutex` held and the model resident.
++ *
++ * The entry point is a property of the model, not a habit: llama_encode runs
++ * the encoder graph and llama_decode the decoder graph. A decoder backbone
++ * (v10's qwen35) faults inside build_inp_mem_hybrid when handed the encoder
++ * graph, so the choice below is load-bearing, not stylistic.
   *
   * The read is llama_get_embeddings_seq(ctx, 0) - the *pooled* accessor. The
 - * context is always built with LLAMA_POOLING_TYPE_CLS, and llama_get_embeddings()
@@ -316,23 +336,61 @@ index bf242e8..80dc324 100644
  static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden) {
      (void)userdata;
      /* The serving text comes from the ungated renderer (src/movie_kind_render.c),
-@@ -621,11 +626,12 @@ static int mk_llama_embed(void *userdata, const char *name, float *out, int hidd
+@@ -613,19 +625,45 @@ static int mk_llama_embed(void *userdata, const char *name, float *out, int hidd
+ 
+     int32_t n_tokens = got;
+     if (n_tokens > MOVIE_KIND_MAX_TOKENS) n_tokens = MOVIE_KIND_MAX_TOKENS;
+-    struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
+-    int32_t encoded = llama_encode(mk.context, batch);
+-    free(tokens);
+-    if (encoded != 0) {
+-        log_msg(LOG_WARN, "MovieKind: llama_encode failed (%d)", encoded);
++    /* Entry point by model: an encoder backbone (v9's modern-bert) needs
++     * llama_encode, a decoder backbone (v10's qwen35) needs llama_decode.
++     * Handing a hybrid decoder the encoder graph makes build_inp_mem_hybrid
++     * read a null recurrent-memory context and SIGSEGV on the first movie row.
++     * Encoder-decoder models are refused loudly, as llama.cpp's own embedding
++     * example does: this module has no use for the cross-attention half. */
++    const int has_encoder = llama_model_has_encoder(mk.model) ? 1 : 0;
++    const int has_decoder = llama_model_has_decoder(mk.model) ? 1 : 0;
++    if (has_encoder && has_decoder) {
++        log_msg(LOG_WARN, "MovieKind: the backbone is an encoder-decoder model; movie-kind "
++                          "needs a pure encoder or a pure decoder backbone");
++        free(tokens);
          return -1;
      }
  
 -    /* Pooling is CLS and the head was fitted on *unnormalised* states: do not
 -     * L2-normalise here, whatever an embedding example does. */
++    struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
++    int32_t ran;
++    if (has_encoder) {
++        /* llama_encode does not use the KV cache, so it needs no memory clear. */
++        ran = llama_encode(mk.context, batch);
++    } else {
++        /* Decode *does* carry memory across calls: without the per-call clear
++         * every name after the first would start from the previous name's
++         * final recurrent/KV state and pool the wrong vector. */
++        llama_memory_clear(llama_get_memory(mk.context), true);
++        ran = llama_decode(mk.context, batch);
++    }
++    free(tokens);
++    if (ran != 0) {
++        log_msg(LOG_WARN, "MovieKind: llama_encode/llama_decode failed (%d)", ran);
++        return -1;
++    }
++
 +    /* Pooling is LAST (the final token of the single unpadded sequence) and the
 +     * head was fitted on *unnormalised* states: do not L2-normalise here,
 +     * whatever an embedding example does. */
      const float *embedding = llama_get_embeddings_seq(mk.context, 0);
      if (!embedding) {
 -        log_msg(LOG_WARN, "MovieKind: llama_encode produced no pooled CLS embedding (seq 0)");
-+        log_msg(LOG_WARN, "MovieKind: llama_encode produced no pooled last-token embedding (seq 0)");
++        log_msg(LOG_WARN, "MovieKind: the model produced no pooled last-token embedding (seq 0)");
          return -1;
      }
      memcpy(out, embedding, (size_t)hidden * sizeof(float));
-@@ -734,10 +740,11 @@ static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
+@@ -734,10 +772,11 @@ static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
      }
  
      /* Zero-embedding guard: an all-zero vector is a broken read path, not an
