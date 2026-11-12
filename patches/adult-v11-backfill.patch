@@ -1,5 +1,5 @@
 diff --git i/Makefile w/Makefile
-index 7fcbd9d..951ce5c 100644
+index 7fcbd9d..45b08d5 100644
 --- i/Makefile
 +++ w/Makefile
 @@ -138,8 +138,8 @@ BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom
@@ -13,17 +13,19 @@ index 7fcbd9d..951ce5c 100644
  BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_classify_backfill_daemon
  BACKFILL_DAEMON_TEST_CFLAGS = -DCLF_BACKFILL_DAEMON_TEST
  BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
-@@ -209,6 +209,19 @@ MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
+@@ -209,6 +209,21 @@ MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
  MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
  MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
  
 +# The adult-backfill engine test links the real src/adult_backfill.c and drives
-+# it with -DADULT_BACKFILL_TEST, which exposes the verdict seam. The token gate
-+# needs tparse, which this build does not have, so the gate answers "nothing
-+# gated out" and the test exercises the SQL, the UPDATE and the watermark path
-+# with canned verdicts - exactly what the model-free host build can verify. It
-+# defines its own classifier symbols instead of linking src/classifier.c, which
-+# compiles inert on the host (same trick tests-backfill plays).
++# it with -DADULT_BACKFILL_TEST, which exposes the verdict seam AND the gate
++# seam. The token gate needs tparse, which this build does not have, so the real
++# gate answers "nothing gated out"; the test installs its own gate instead and
++# drives the SQL, the gate, the UPDATE and the watermark path with canned
++# verdicts - exactly what the model-free host build can verify (the real gate is
++# covered by the clf-backfill smoke run and by G1's parser parity). It defines
++# its own classifier symbols instead of linking src/classifier.c, which compiles
++# inert on the host (same trick tests-backfill plays).
 +ADULT_BACKFILL_TEST_SRCS = tests/test_adult_backfill.c src/adult_backfill.c \
 +                           src/database.c src/bloom_filter.c tests/stub_log.c
 +ADULT_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_adult_backfill
@@ -33,7 +35,7 @@ index 7fcbd9d..951ce5c 100644
  # The movie-kind filter test compiles src/http_api.c INTO its translation unit
  # (#include "../src/http_api.c"): cls_filter_t, append_class_conditions() and
  # bind_class_filter() are file-local there, and going through the real fragment
-@@ -223,9 +236,9 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
+@@ -223,9 +238,9 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
  MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
  MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
  
@@ -46,7 +48,7 @@ index 7fcbd9d..951ce5c 100644
  
  tests-search:
  	@mkdir -p $(BUILD_DIR)
-@@ -274,6 +287,11 @@ tests-movie-kind-filter: libbloom
+@@ -274,6 +289,11 @@ tests-movie-kind-filter: libbloom
  	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_FILTER_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_FILTER_TEST_SRCS) -o $(MOVIE_KIND_FILTER_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_FILTER_TEST_LDFLAGS)
  	./$(MOVIE_KIND_FILTER_TEST_BIN)
  
@@ -58,7 +60,7 @@ index 7fcbd9d..951ce5c 100644
  tests-asan:
  	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
  
-@@ -322,4 +340,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
+@@ -322,4 +342,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
  
  clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
  
@@ -66,10 +68,10 @@ index 7fcbd9d..951ce5c 100644
 +.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
 diff --git i/include/adult_backfill.h w/include/adult_backfill.h
 new file mode 100644
-index 0000000..3ef54da
+index 0000000..1202976
 --- /dev/null
 +++ w/include/adult_backfill.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,138 @@
 +#ifndef ADULT_BACKFILL_H
 +#define ADULT_BACKFILL_H
 +
@@ -195,6 +197,16 @@ index 0000000..3ef54da
 +typedef int (*adult_backfill_verdict_fn)(const torrent_metadata_t *meta, int *adult,
 +                                         double *adult_p);
 +void adult_backfill_set_verdict_hook(adult_backfill_verdict_fn fn);
++
++/*
++ * The same seam for the token gate. The model-free host build has no tparse, so
++ * ab_gate_text() answers "pass" for every row and nothing can be gated out;
++ * a test that has to prove the DRY RUN walks the gate needs a gate it can
++ * steer. Only compiled into the tests-adult-backfill build.
++ */
++typedef int (*adult_backfill_gate_fn)(const char *name, const file_info_t *files,
++                                      int num_files, long long size_bytes);
++void adult_backfill_set_gate_hook(adult_backfill_gate_fn fn);
 +#endif /* ADULT_BACKFILL_TEST */
 +
 +#endif /* ADULT_BACKFILL_H */
@@ -319,10 +331,10 @@ index 4b00a14..2eda443 100644
       * pins the manifest whose sha256s gate the load; the thermal ceiling is read
 diff --git i/src/adult_backfill.c w/src/adult_backfill.c
 new file mode 100644
-index 0000000..ab6c444
+index 0000000..013dd62
 --- /dev/null
 +++ w/src/adult_backfill.c
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,1046 @@
 +#ifndef _DEFAULT_SOURCE
 +#define _DEFAULT_SOURCE  /* For usleep */
 +#endif
@@ -577,6 +589,21 @@ index 0000000..ab6c444
 +    return 1;
 +#endif
 +}
++
++/* Test seam for the gate, mirroring the verdict hook: the model-free host build
++ * has no tparse, so ab_gate_text() passes every row and a test could never see
++ * a gate-out. This lets one drive the gate and prove the DRY RUN walks it.
++ * Only compiled into the tests-adult-backfill build. */
++typedef int (*ab_gate_fn)(const char *name, const file_info_t *files, int num_files,
++                          long long size_bytes);
++
++static ab_gate_fn ab_gate = ab_gate_text;
++
++#ifdef ADULT_BACKFILL_TEST
++void adult_backfill_set_gate_hook(ab_gate_fn fn) {
++    ab_gate = fn ? fn : ab_gate_text;
++}
++#endif /* ADULT_BACKFILL_TEST */
 +
 +/* ------------------------------------------------------------------------ *
 + * Read helpers (no mutex: the pass reads on the shared handle and only takes
@@ -919,34 +946,68 @@ index 0000000..ab6c444
 +    return 0;
 +}
 +
-+/* Gate one candidate, score it, and queue its UPDATE. Returns 0 when the
-+ * candidate was handled (gated out, scored or counted as failed), -1 on a
-+ * SQL/memory error. */
-+static int ab_score_one(ab_ctx_t *c, const ab_candidate_t *cand) {
++/* The two-stage token gate, shared verbatim by the dry run and the write pass.
++ *
++ * Stage 1 renders the name alone - the cheap gate that decides whether the
++ * 287 M-row file table is worth touching. Stage 2 re-renders the full text with
++ * the file list, which also carries the file-derived tokens. A row that fails
++ * either stage is counted in rows_gated_out and never reaches the student.
++ *
++ * Returns 1 when the candidate passed (the caller owns *out_files / *out_num),
++ * 0 when it was gated out, -1 on a SQL/memory error.
++ *
++ * Both modes call this one function, which is what makes `rows_total -
++ * rows_gated_out` the exact set the write pass would score: the dry run cannot
++ * drift from the write pass if there is only one gate. */
++static int ab_gate_candidate(ab_ctx_t *c, const ab_candidate_t *cand, file_info_t **out_files,
++                             int *out_num) {
++    *out_files = NULL;
++    *out_num = 0;
++
++    if (!ab_gate(cand->name, NULL, 0, cand->size_bytes)) {
++        c->prog->rows_gated_out++;
++        return 0;
++    }
++
++    if (ab_load_files(c, cand->id, out_files, out_num) != 0) {
++        return -1;
++    }
++
++    if (!ab_gate(cand->name, *out_files, *out_num, cand->size_bytes)) {
++        ab_free_files(*out_files, *out_num);
++        *out_files = NULL;
++        *out_num = 0;
++        c->prog->rows_gated_out++;
++        return 0;
++    }
++
++    return 1;
++}
++
++/* Handle one candidate: gate it, then either count it as gated-in (dry run) or
++ * score it and queue its UPDATE (write pass). Returns 0 when the candidate was
++ * handled (gated out, gated in, scored or counted as failed), -1 on a SQL or
++ * memory error. */
++static int ab_handle_one(ab_ctx_t *c, const ab_candidate_t *cand, int dry_run) {
 +    file_info_t *files = NULL;
 +    torrent_metadata_t meta;
 +    ab_pending_t *slot;
 +    int num_files = 0;
 +    int adult = 0;
 +    double adult_p = 0.0;
++    int gated;
 +    int rc;
 +
-+    /* Gate, stage 1: the name alone. Rows that fail here never touch the file
-+     * table, which is the whole point of the gate. */
-+    if (!ab_gate_text(cand->name, NULL, 0, cand->size_bytes)) {
-+        c->prog->rows_gated_out++;
-+        return 0;
++    gated = ab_gate_candidate(c, cand, &files, &num_files);
++    if (gated <= 0) {
++        return gated; /* gated out (0), or a load error (-1) */
 +    }
 +
-+    if (ab_load_files(c, cand->id, &files, &num_files) != 0) {
-+        return -1;
-+    }
-+
-+    /* Gate, stage 2: the full text, which also carries the file-derived
-+     * tokens. */
-+    if (!ab_gate_text(cand->name, files, num_files, cand->size_bytes)) {
++    /* Dry run: the gate is the whole job. No student, no UPDATE, no commit -
++     * and nothing extra to count, because the gated-in set is
++     * rows_total - rows_gated_out. */
++    if (dry_run) {
 +        ab_free_files(files, num_files);
-+        c->prog->rows_gated_out++;
 +        return 0;
 +    }
 +
@@ -1067,6 +1128,13 @@ index 0000000..ab6c444
 +    pthread_mutex_unlock(&g_progress_mutex);
 +}
 +
++/* Rows a pass has dealt with, by its own mode's definition: a write pass is
++ * capped by the rows it scored, a dry run (which scores nothing) by the
++ * candidates it gated. Used only for --adult-backfill-limit. */
++static long long ab_rows_done(const adult_backfill_progress_t *p, int dry_run) {
++    return dry_run ? p->rows_gated_out + p->rows_scored + p->rows_failed : p->rows_scored;
++}
++
 +/* The final summary line the CLI prints and the log carries. */
 +static void ab_log_summary(const adult_backfill_progress_t *p) {
 +    log_msg(LOG_INFO,
@@ -1143,23 +1211,23 @@ index 0000000..ab6c444
 +    }
 +    progress.rows_total = rows_total;
 +
++    /* Both modes walk the same windows in the same order from here on. The dry
++     * run stops after the token gate - no student, no UPDATE, no commit, no
++     * completion tombstone - so `rows_total - rows_gated_out` is exactly the set
++     * the write pass would score. That is the number G3 is judged on, and it can
++     * only mean that if the two paths share one gate. */
 +    if (dry_run) {
 +        log_msg(LOG_INFO,
 +                "adult-backfill: dry run, %lld candidate(s) at generation %lld, "
-+                "nothing written",
++                "walking the token gate; nothing written",
 +                rows_total, target);
-+        mprog_emit("adult-backfill", "count", 0, rows_total, "dry_run=1");
-+        progress.state = ADULT_BACKFILL_DONE;
-+        ab_log_summary(&progress);
-+        ab_report(&progress, out);
-+        return 0;
 +    }
 +
 +    /* The pass is live from here on: publish RUNNING with the counters it just
 +     * resolved, so a poller sees the work start before the first batch. */
 +    progress.state = ADULT_BACKFILL_RUNNING;
 +    ab_report(&progress, NULL);
-+    mprog_emit("adult-backfill", "count", 0, rows_total, NULL);
++    mprog_emit("adult-backfill", "count", 0, rows_total, dry_run ? "dry_run=1" : NULL);
 +
 +    ctx.batch = malloc((size_t)ctx.batch_rows * sizeof(*ctx.batch));
 +    if (!ctx.batch) {
@@ -1196,11 +1264,11 @@ index 0000000..ab6c444
 +        }
 +
 +        for (i = 0; i < num_cands; i++) {
-+            if (ctx.limit_rows > 0 && progress.rows_scored >= ctx.limit_rows) {
++            if (ctx.limit_rows > 0 && ab_rows_done(&progress, dry_run) >= ctx.limit_rows) {
 +                stopped = 1;
 +                break;
 +            }
-+            if (ab_score_one(&ctx, &cands[i]) != 0) {
++            if (ab_handle_one(&ctx, &cands[i], dry_run) != 0) {
 +                ab_free_candidates(cands, num_cands);
 +                progress.state = ADULT_BACKFILL_FAILED;
 +                goto cleanup;
@@ -1219,7 +1287,8 @@ index 0000000..ab6c444
 +                    stopped = 1;
 +                    break;
 +                }
-+                if (ctx.limit_rows > 0 && progress.rows_scored >= ctx.limit_rows) {
++                if (ctx.limit_rows > 0 &&
++                    ab_rows_done(&progress, dry_run) >= ctx.limit_rows) {
 +                    stopped = 1;
 +                    break;
 +                }
@@ -1251,8 +1320,20 @@ index 0000000..ab6c444
 +
 +    if (stopped) {
 +        progress.state = ADULT_BACKFILL_RUNNING;
-+        log_msg(LOG_INFO, "adult-backfill: stopped at %lld row(s), resuming after id %lld",
-+                progress.rows_scored, progress.last_id);
++        if (dry_run) {
++            /* Nothing was committed, so there is no resume key to continue from:
++             * this dry run simply did not finish its walk. */
++            log_msg(LOG_INFO, "adult-backfill: dry run stopped after %lld row(s)",
++                    ab_rows_done(&progress, dry_run));
++        } else {
++            log_msg(LOG_INFO, "adult-backfill: stopped at %lld row(s), resuming after id %lld",
++                    progress.rows_scored, progress.last_id);
++        }
++        result = 0;
++    } else if (dry_run) {
++        /* The walk finished and nothing was written: no batch to commit and no
++         * completion tombstone to write. */
++        progress.state = ADULT_BACKFILL_DONE;
 +        result = 0;
 +    } else if (ab_run_locked(&ctx, ab_finish_locked, "completion metadata") != 0) {
 +        progress.state = ADULT_BACKFILL_FAILED;
@@ -1970,7 +2051,7 @@ index 1411500..e18917f 100644
       * can tell "no data yet" from "not built in". Independent of the fastText
       * objects above, which this pass never touches. */
 diff --git i/src/main.c w/src/main.c
-index 6187d82..4c6f62c 100644
+index 6187d82..371b51e 100644
 --- i/src/main.c
 +++ w/src/main.c
 @@ -13,6 +13,7 @@
@@ -2019,7 +2100,7 @@ index 6187d82..4c6f62c 100644
          } else if (strcmp(argv[i], "--write") == 0) {
              classify_backfill_write = true;
          } else if (strcmp(argv[i], "--movie-kind-backfill") == 0) {
-@@ -864,6 +889,85 @@ int main(int argc, char *argv[]) {
+@@ -864,6 +889,88 @@ int main(int argc, char *argv[]) {
          return (bf_rc == 0) ? 0 : 1;
      }
  
@@ -2028,8 +2109,11 @@ index 6187d82..4c6f62c 100644
 +     * exactly the reasons --classify-backfill is (after classifier_init(), so
 +     * the adult student is loaded; before database_init(), so the configured
 +     * daemon database is never opened). Dry run by default: without --write it
-+     * only counts the candidates and commits nothing. The token gate lives in
-+     * the engine, so the count this prints IS the gated-in candidate set. */
++     * runs the SAME two-stage token gate the write pass runs - no student, no
++     * UPDATE, no commit - and reports the predicate count (total) plus how many
++     * of those rows the gate rejected (gated_out). The gated-in candidate set,
++     * i.e. the rows the write pass would score, is total - gated_out; `total`
++     * alone is NOT that number. */
 +    if (adult_backfill_db) {
 +        adult_backfill_opts_t ab_opts = {
 +            .target_adult_clf_ver = 0, /* whatever the loaded manifest describes */
@@ -2105,7 +2189,7 @@ index 6187d82..4c6f62c 100644
      /* --movie-kind-backfill <db> --reset: the stage-10 one-shot that clears the
       * movie columns of every row a broken pass labelled, plus the resume and
       * completion meta keys (include/movie_backfill.h). Dispatched before the
-@@ -1308,6 +1412,9 @@ int main(int argc, char *argv[]) {
+@@ -1308,6 +1415,9 @@ int main(int argc, char *argv[]) {
      /* Start the classify-backfill thread: the DB, the classifier and the HTTP
       * API are all up by now, so /stats can serve its object from the first
       * request. Non-blocking - the thread takes its own first decision. */
@@ -2117,10 +2201,10 @@ index 6187d82..4c6f62c 100644
      /* The movie-kind backfill thread is deliberately NOT started: production
 diff --git i/tests/test_adult_backfill.c w/tests/test_adult_backfill.c
 new file mode 100644
-index 0000000..0c4d389
+index 0000000..424ee17
 --- /dev/null
 +++ w/tests/test_adult_backfill.c
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,741 @@
 +/**
 + * Host unit test for the token-gated adult backfill engine
 + * (include/adult_backfill.h, src/adult_backfill.c).
@@ -2134,7 +2218,12 @@ index 0000000..0c4d389
 + *     target / already at the target);
 + *   - the UPDATE and the watermark: one pass marks the candidates with the
 + *     target generation, and the next pass selects nothing;
-+ *   - the dry run, which counts the candidates and commits nothing.
++ *   - the dry run, which walks the SAME two-stage token gate the write pass
++ *     walks, reports the gated-in count as `total - gated_out`, and commits
++ *     nothing - and the write pass on that same fixture then scores exactly
++ *     that many rows;
++ *   - resume after a stop: a pass interrupted after its first committed batch
++ *     resumes from the watermark and never scores a row twice.
 + *
 + * The token gate needs tparse, which this build does not have: without
 + * CLF_ENABLED the gate answers "nothing gated out" and every run is DISABLED
@@ -2149,10 +2238,16 @@ index 0000000..0c4d389
 + * deliberately NOT the fixture's 6 - so a passing run proves the engine labels
 + * rows with whatever generation it is told and never hardcodes one.
 + *
-+ * Fixture (/tmp/adult-backfill-test.db, removed before and after the run):
-+ *   torrent 1 "alpha.jav.uncensored"  class row at clf_ver=6
-+ *   torrent 2 "beta-site-rip"         class row at clf_ver=6
-+ *   torrent 3 "gamma-control"         class row at clf_ver=6
++ * Fixture (/tmp/adult-backfill-test.db, removed before and after the run),
++ * one row per gate outcome - the names carry the three parser token families
++ * (__adult_jav, __adult_site, __adult_set) plus three gate negatives, so the
++ * gated-in count is neither zero nor everything:
++ *   torrent 1 "alpha.jav.uncensored"       clf_ver=6  jav   -> gated in
++ *   torrent 2 "beta-site-rip"              clf_ver=6  site  -> gated in
++ *   torrent 3 "gamma-control"              clf_ver=6  none  -> gated out
++ *   torrent 4 "delta.uncensored.set.720p"  clf_ver=6  set   -> gated in
++ *   torrent 5 "epsilon-documentary"        clf_ver=6  none  -> gated out
++ *   torrent 6 "zeta-lecture-notes"         clf_ver=6  none  -> gated out
 + * The torrent_class table is created WITHOUT adult_clf_ver, i.e. the shape the
 + * app shipped before patch 16; database_create_schema() must widen it.
 + *
@@ -2186,7 +2281,13 @@ index 0000000..0c4d389
 +#define TORRENT_A 1
 +#define TORRENT_B 2
 +#define TORRENT_C 3
-+#define FIXTURE_TORRENTS 3
++#define TORRENT_D 4
++#define TORRENT_E 5
++#define TORRENT_F 6
++#define FIXTURE_TORRENTS 6
++/* Of those six, three names fire an __adult_* family and three do not. */
++#define FIXTURE_GATED_IN 3
++#define FIXTURE_GATED_OUT (FIXTURE_TORRENTS - FIXTURE_GATED_IN)
 +
 +/* database_init() stores the pointer, so this has to outlive every fixture. */
 +static app_context_t test_app_ctx;
@@ -2269,6 +2370,9 @@ index 0000000..0c4d389
 +        "alpha.jav.uncensored",
 +        "beta-site-rip",
 +        "gamma-control",
++        "delta.uncensored.set.720p",
++        "epsilon-documentary",
++        "zeta-lecture-notes",
 +    };
 +    int i;
 +
@@ -2409,6 +2513,49 @@ index 0000000..0c4d389
 +    return 0;
 +}
 +
++/* Same canned verdict, but it asks the pass to stop once it has produced
++ * `stop_after_verdicts` verdicts - the cooperative cancel the engine honours
++ * between committed batches. */
++static int stop_after_verdicts;
++
++static int stopping_verdict(const torrent_metadata_t *meta, int *adult, double *adult_p) {
++    int rc = fake_verdict(meta, adult, adult_p);
++    if (stop_after_verdicts > 0 && fake_verdict_calls >= stop_after_verdicts) {
++        adult_backfill_request_stop();
++    }
++    return rc;
++}
++
++/* Canned gate (the -DADULT_BACKFILL_TEST gate seam). The model-free host build
++ * has no tparse, so the real gate passes every row and a test could never see a
++ * gate-out; this stands in for it with the same contract and the same three
++ * token families the parser emits, read off the fixture's names. Stage 1 sees
++ * the name alone; stage 2 also sees the file paths. */
++static int gate_calls;
++
++static int family_hit(const char *text) {
++    return text != NULL &&
++           (strstr(text, "jav") != NULL || strstr(text, "site") != NULL ||
++            strstr(text, "set") != NULL);
++}
++
++static int fake_gate(const char *name, const file_info_t *files, int num_files,
++                     long long size_bytes) {
++    int i;
++
++    (void)size_bytes;
++    gate_calls++;
++    if (family_hit(name)) {
++        return 1;
++    }
++    for (i = 0; i < num_files; i++) {
++        if (family_hit(files[i].path)) {
++            return 1;
++        }
++    }
++    return 0;
++}
++
 +/* ------------------------------------------------------------------------- *
 + * Tests
 + * ------------------------------------------------------------------------- */
@@ -2477,7 +2624,7 @@ index 0000000..0c4d389
 +
 +    needed = adult_backfill_needed(&db, 0, &rows_left);
 +    check(needed == 1, "pass is needed while candidates exist", NULL);
-+    check_ll(rows_left, 2, "candidate count = NULL row + stale row");
++    check_ll(rows_left, FIXTURE_TORRENTS - 1, "candidate count = NULL rows + stale row");
 +
 +    adult_backfill_set_verdict_hook(fake_verdict);
 +    fake_verdict_calls = 0;
@@ -2485,14 +2632,15 @@ index 0000000..0c4d389
 +    memset(&opts, 0, sizeof opts);
 +    memset(&progress, 0, sizeof progress);
 +    check(adult_backfill_run(&db, &opts, &progress) == 0, "write pass returns 0", NULL);
-+    check_ll(progress.rows_total, 2, "write pass counted 2 candidates");
-+    check_ll(progress.rows_scored, 2, "write pass scored 2 rows");
++    check_ll(progress.rows_total, FIXTURE_TORRENTS - 1, "write pass counted 5 candidates");
++    check_ll(progress.rows_scored, FIXTURE_TORRENTS - 1, "write pass scored 5 rows");
 +    check_ll(progress.rows_gated_out, 0, "no gate in the model-free host build");
-+    check_ll(progress.rows_updated, 2, "write pass updated 2 rows");
++    check_ll(progress.rows_updated, FIXTURE_TORRENTS - 1, "write pass updated 5 rows");
 +    check_ll(progress.rows_failed, 0, "write pass failed no row");
 +    check_ll(progress.target_adult_clf_ver, STUB_TARGET,
 +             "target comes from the classifier, never a literal");
-+    check_ll(fake_verdict_calls, 2, "the verdict hook ran once per candidate");
++    check_ll(fake_verdict_calls, FIXTURE_TORRENTS - 1,
++             "the verdict hook ran once per candidate");
 +
 +    /* The UPDATE wrote the adult verdict and the pass generation - and nothing
 +     * else. clf_ver must be untouched: this pass never re-classifies. */
@@ -2532,9 +2680,124 @@ index 0000000..0c4d389
 +    remove_db();
 +}
 +
-+/* A dry run counts the gated-in set and commits nothing - that is the number
-+ * the G3 band is judged on, before any write. */
++/* The dry run walks the SAME two-stage token gate the write pass walks and
++ * commits nothing - that is what makes `total - gated_out` the gated-in
++ * candidate set the G3 band is judged on, before any write. */
 +static void test_dry_run_writes_nothing(void) {
++    database_t db;
++    adult_backfill_opts_t opts;
++    adult_backfill_progress_t progress;
++    int is_null = 0;
++    long long value = 0;
++    int i;
++
++    create_old_shape_fixture();
++    if (open_fixture(&db) != 0) {
++        return;
++    }
++
++    adult_backfill_set_verdict_hook(fake_verdict);
++    adult_backfill_set_gate_hook(fake_gate);
++    fake_verdict_calls = 0;
++    gate_calls = 0;
++
++    memset(&opts, 0, sizeof opts);
++    opts.dry_run = 1;
++    memset(&progress, 0, sizeof progress);
++
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "dry run returns 0", NULL);
++    check_ll(progress.state, ADULT_BACKFILL_DONE, "dry run reports done");
++    check_ll(progress.rows_total, FIXTURE_TORRENTS,
++             "dry run counts every predicate candidate");
++    check_ll(progress.rows_gated_out, FIXTURE_GATED_OUT,
++             "dry run gates out the three __adult_-free names");
++    check_ll(progress.rows_total - progress.rows_gated_out, FIXTURE_GATED_IN,
++             "total - gated_out is the gated-in candidate set");
++    check_ll(progress.rows_scored, 0, "dry run scores nothing");
++    check_ll(progress.rows_updated, 0, "dry run updates nothing");
++    check_ll(progress.rows_failed, 0, "dry run fails nothing");
++    check_ll(fake_verdict_calls, 0, "dry run runs no inference");
++    /* Two gate stages for every row that passes stage 1, one for every row that
++     * fails it: proof the dry run walks the full gate and short-circuits it. */
++    check_ll(gate_calls, FIXTURE_GATED_IN * 2 + FIXTURE_GATED_OUT,
++             "dry run runs both gate stages for passers only");
++
++    /* And the table is untouched: every row is still a candidate. */
++    for (i = 1; i <= FIXTURE_TORRENTS; i++) {
++        read_class_row(db.db, i, &is_null, &value, NULL, NULL, NULL);
++        check(is_null == 1, "dry run left every row a candidate", NULL);
++    }
++
++    adult_backfill_set_gate_hook(NULL);
++
++    database_cleanup(&db);
++    remove_db();
++}
++
++/* The other half of the G3 claim: on the same fixture the write pass scores
++ * exactly the gated-in count the dry run reported, and stamps exactly those
++ * rows. If the two numbers could differ the gate would be worthless. */
++static void test_write_scores_the_dry_runs_gated_in_set(void) {
++    database_t db;
++    adult_backfill_opts_t opts;
++    adult_backfill_progress_t progress;
++    long long dry_gated_in;
++    int is_null = 0;
++    long long value = 0;
++
++    create_old_shape_fixture();
++    if (open_fixture(&db) != 0) {
++        return;
++    }
++
++    adult_backfill_set_verdict_hook(fake_verdict);
++    adult_backfill_set_gate_hook(fake_gate);
++
++    /* Dry run first: record what the gate lets through. */
++    memset(&opts, 0, sizeof opts);
++    opts.dry_run = 1;
++    memset(&progress, 0, sizeof progress);
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "dry run returns 0", NULL);
++    dry_gated_in = progress.rows_total - progress.rows_gated_out;
++    check_ll(dry_gated_in, FIXTURE_GATED_IN, "dry run reports the gated-in set");
++
++    /* Then the write pass on the same fixture. */
++    fake_verdict_calls = 0;
++    memset(&opts, 0, sizeof opts);
++    memset(&progress, 0, sizeof progress);
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "write pass returns 0", NULL);
++    check_ll(progress.state, ADULT_BACKFILL_DONE, "write pass reports done");
++    check_ll(progress.rows_total, FIXTURE_TORRENTS, "write pass sees the same candidates");
++    check_ll(progress.rows_gated_out, FIXTURE_GATED_OUT, "write pass gates out the same rows");
++    check_ll(progress.rows_scored, dry_gated_in,
++             "write pass scores exactly the dry run's gated-in count");
++    check_ll(progress.rows_updated, dry_gated_in, "write pass updates exactly those rows");
++    check_ll(fake_verdict_calls, dry_gated_in, "one verdict per gated-in row");
++
++    /* Exactly the gated-in rows carry the pass target; the rest stay candidates. */
++    read_class_row(db.db, TORRENT_A, &is_null, &value, NULL, NULL, NULL);
++    check_ll(value, STUB_TARGET, "row A (jav) was stamped");
++    read_class_row(db.db, TORRENT_B, &is_null, &value, NULL, NULL, NULL);
++    check_ll(value, STUB_TARGET, "row B (site) was stamped");
++    read_class_row(db.db, TORRENT_C, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "row C (control) was not stamped", NULL);
++    read_class_row(db.db, TORRENT_D, &is_null, &value, NULL, NULL, NULL);
++    check_ll(value, STUB_TARGET, "row D (set) was stamped");
++    read_class_row(db.db, TORRENT_E, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "row E (control) was not stamped", NULL);
++    read_class_row(db.db, TORRENT_F, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "row F (control) was not stamped", NULL);
++
++    adult_backfill_set_gate_hook(NULL);
++
++    database_cleanup(&db);
++    remove_db();
++}
++
++/* Stop after the first committed batch, then resume: the watermark must make the
++ * second run pick up after the last committed id, so no row is scored twice and
++ * the final row set is the one an uninterrupted pass produces. */
++static void test_resume_after_stop(void) {
 +    database_t db;
 +    adult_backfill_opts_t opts;
 +    adult_backfill_progress_t progress;
@@ -2546,19 +2809,59 @@ index 0000000..0c4d389
 +        return;
 +    }
 +
++    adult_backfill_set_verdict_hook(stopping_verdict);
++    adult_backfill_set_gate_hook(fake_gate);
++    fake_verdict_calls = 0;
++    gate_calls = 0;
++    stop_after_verdicts = 1;
++
 +    memset(&opts, 0, sizeof opts);
-+    opts.dry_run = 1;
++    opts.batch_rows = 1; /* one scored row per committed batch */
 +    memset(&progress, 0, sizeof progress);
 +
-+    check(adult_backfill_run(&db, &opts, &progress) == 0, "dry run returns 0", NULL);
-+    check_ll(progress.state, ADULT_BACKFILL_DONE, "dry run reports done");
-+    check_ll(progress.rows_total, FIXTURE_TORRENTS, "dry run counts every candidate");
-+    check_ll(progress.rows_updated, 0, "dry run updates nothing");
-+    check_ll(progress.rows_scored, 0, "dry run scores nothing");
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "stopped pass returns 0", NULL);
++    check_ll(progress.state, ADULT_BACKFILL_RUNNING, "stopped pass stays RUNNING");
++    check_ll(progress.rows_scored, 1, "the stop landed after the first committed batch");
++    check_ll(progress.rows_updated, 1, "that batch was committed");
++    check_ll(progress.last_id, TORRENT_A, "the watermark is the last committed id");
++    check_ll(fake_verdict_calls, 1, "one row was scored before the stop");
 +
-+    /* And the table is untouched: still all candidates. */
 +    read_class_row(db.db, TORRENT_A, &is_null, &value, NULL, NULL, NULL);
-+    check(is_null == 1, "dry run left row A untouched", NULL);
++    check_ll(value, STUB_TARGET, "the committed batch was written");
++    read_class_row(db.db, TORRENT_B, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "the row after the stop was not written", NULL);
++
++    /* Resume, no stop this time. */
++    stop_after_verdicts = 0;
++    memset(&progress, 0, sizeof progress);
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "resumed pass returns 0", NULL);
++    check_ll(progress.state, ADULT_BACKFILL_DONE, "resumed pass completes");
++    check_ll(progress.rows_total, FIXTURE_TORRENTS - 1,
++             "the resumed pass only counts rows after the watermark");
++    check_ll(progress.rows_scored, FIXTURE_GATED_IN - 1,
++             "the resumed pass scores the remaining gated-in rows");
++    check_ll(progress.rows_updated, FIXTURE_GATED_IN - 1, "and updates them");
++    check_ll(progress.last_id, TORRENT_D, "the watermark ends at the last stamped id");
++    /* No row was scored twice: the verdict calls across both runs add up to the
++     * gated-in count of one uninterrupted pass. */
++    check_ll(fake_verdict_calls, FIXTURE_GATED_IN,
++             "no row was scored twice across the stop and the resume");
++
++    /* Final row set identical to an uninterrupted run. */
++    read_class_row(db.db, TORRENT_A, &is_null, &value, NULL, NULL, NULL);
++    check_ll(value, STUB_TARGET, "row A stamped");
++    read_class_row(db.db, TORRENT_B, &is_null, &value, NULL, NULL, NULL);
++    check_ll(value, STUB_TARGET, "row B stamped by the resumed pass");
++    read_class_row(db.db, TORRENT_C, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "row C (control) never stamped", NULL);
++    read_class_row(db.db, TORRENT_D, &is_null, &value, NULL, NULL, NULL);
++    check_ll(value, STUB_TARGET, "row D stamped by the resumed pass");
++    read_class_row(db.db, TORRENT_E, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "row E (control) never stamped", NULL);
++    read_class_row(db.db, TORRENT_F, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "row F (control) never stamped", NULL);
++
++    adult_backfill_set_gate_hook(NULL);
 +
 +    database_cleanup(&db);
 +    remove_db();
@@ -2630,6 +2933,8 @@ index 0000000..0c4d389
 +    test_additive_migration();
 +    test_write_and_watermark();
 +    test_dry_run_writes_nothing();
++    test_write_scores_the_dry_runs_gated_in_set();
++    test_resume_after_stop();
 +    test_disabled_without_models();
 +
 +    remove_db();
