@@ -1,0 +1,2664 @@
+diff --git i/Makefile w/Makefile
+index 7fcbd9d..951ce5c 100644
+--- i/Makefile
++++ w/Makefile
+@@ -138,8 +138,8 @@ BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom
+ # stubs, exactly like the backfill test above.
+ BACKFILL_DAEMON_TEST_SRCS = tests/test_classify_backfill_daemon.c \
+                             src/classify_backfill_daemon.c \
+-                            src/classify_backfill.c src/database.c \
+-                            src/bloom_filter.c tests/stub_log.c
++                            src/classify_backfill.c src/adult_backfill.c \
++                            src/database.c src/bloom_filter.c tests/stub_log.c
+ BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_classify_backfill_daemon
+ BACKFILL_DAEMON_TEST_CFLAGS = -DCLF_BACKFILL_DAEMON_TEST
+ BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+@@ -209,6 +209,19 @@ MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
+ MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
+ MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
+ 
++# The adult-backfill engine test links the real src/adult_backfill.c and drives
++# it with -DADULT_BACKFILL_TEST, which exposes the verdict seam. The token gate
++# needs tparse, which this build does not have, so the gate answers "nothing
++# gated out" and the test exercises the SQL, the UPDATE and the watermark path
++# with canned verdicts - exactly what the model-free host build can verify. It
++# defines its own classifier symbols instead of linking src/classifier.c, which
++# compiles inert on the host (same trick tests-backfill plays).
++ADULT_BACKFILL_TEST_SRCS = tests/test_adult_backfill.c src/adult_backfill.c \
++                           src/database.c src/bloom_filter.c tests/stub_log.c
++ADULT_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_adult_backfill
++ADULT_BACKFILL_TEST_CFLAGS = -DADULT_BACKFILL_TEST
++ADULT_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
++
+ # The movie-kind filter test compiles src/http_api.c INTO its translation unit
+ # (#include "../src/http_api.c"): cls_filter_t, append_class_conditions() and
+ # bind_class_filter() are file-local there, and going through the real fragment
+@@ -223,9 +236,9 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
+ MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
+ MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+ 
+-tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind \
+-       tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon \
+-       tests-movie-kind-filter
++tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill \
++       tests-movie-kind tests-movie-kind-render tests-movie-backfill \
++       tests-movie-backfill-daemon tests-movie-kind-filter
+ 
+ tests-search:
+ 	@mkdir -p $(BUILD_DIR)
+@@ -274,6 +287,11 @@ tests-movie-kind-filter: libbloom
+ 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_FILTER_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_FILTER_TEST_SRCS) -o $(MOVIE_KIND_FILTER_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_FILTER_TEST_LDFLAGS)
+ 	./$(MOVIE_KIND_FILTER_TEST_BIN)
+ 
++tests-adult-backfill: libbloom
++	@mkdir -p $(BUILD_DIR)
++	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(ADULT_BACKFILL_TEST_CFLAGS) $(INCLUDES) $(ADULT_BACKFILL_TEST_SRCS) -o $(ADULT_BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(ADULT_BACKFILL_TEST_LDFLAGS)
++	./$(ADULT_BACKFILL_TEST_BIN)
++
+ tests-asan:
+ 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+ 
+@@ -322,4 +340,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
+ 
+ clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
+ 
+-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
++.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+diff --git i/include/adult_backfill.h w/include/adult_backfill.h
+new file mode 100644
+index 0000000..3ef54da
+--- /dev/null
++++ w/include/adult_backfill.h
+@@ -0,0 +1,128 @@
++#ifndef ADULT_BACKFILL_H
++#define ADULT_BACKFILL_H
++
++#include "database.h"
++
++/*
++ * Token-gated, resumable adult re-scoring of existing torrent_class rows.
++ *
++ * The generic engine (include/classify_backfill.h) relabels every row below the
++ * loaded generation with all three students. That is the wrong tool for a
++ * targeted adult refresh: the adult model is only worth running on rows whose
++ * text actually carries one of the parser's adult tokens (`__adult_jav`,
++ * `__adult_site`, `__adult_set`), which is a fraction of a percent of the
++ * table, and the pass must never rewrite a category or a tv_kind verdict.
++ *
++ * So this engine:
++ *   - selects rows whose adult_clf_ver is NULL or below the target generation
++ *     (the column is both the candidate predicate and the watermark);
++ *   - gates each row on the name-only feature text BEFORE any inference, and
++ *     loads the (287 M-row) file table only for rows that pass - then re-checks
++ *     on the full text. A row whose `__adult_set` fires only through file paths
++ *     is a documented miss: a recall trade-off, never a correctness issue,
++ *     because fresh ingest classifies everything;
++ *   - scores the gated rows with the adult student alone
++ *     (classifier_classify_adult), so the pass pays no category cost and does
++ *     not depend on the category model having loaded;
++ *   - writes only adult, adult_p and adult_clf_ver, inside one BEGIN ... COMMIT
++ *     per batch, and never deletes: in adult_mode=drop a backfilled adult row is
++ *     TAGGED, exactly as the ingest path tags it. Deletion stays an ingest-only,
++ *     operator-visible decision.
++ *
++ * Gating mirrors the other engines: this module never calls classifier_init()
++ * (the caller owns init and shutdown) and only asks classifier_models_loaded()
++ * and classifier_current_version(). A build without CLF_ENABLED - the crawler's
++ * own host `make` - has no models and no tparse, so every run reports DISABLED
++ * before it can reach the gate.
++ *
++ * Threading: one pass per database at a time. database_t.mutex is taken around
++ * each BEGIN ... COMMIT batch only, never while parsing or inferring.
++ */
++
++/* State of a pass. RUNNING after a stopped pass means "resumable". */
++typedef enum {
++    ADULT_BACKFILL_IDLE = 0,  /* never ran */
++    ADULT_BACKFILL_RUNNING,   /* walking, or stopped early and resumable */
++    ADULT_BACKFILL_DONE,      /* every candidate sits at the target generation */
++    ADULT_BACKFILL_FAILED,    /* SQL error that survived the busy retries */
++    ADULT_BACKFILL_DISABLED   /* no models loaded / no resolvable target */
++} adult_backfill_state_t;
++
++/* Short lowercase name for /stats and log lines ("idle", "running", "done",
++ * "failed", "disabled"; "unknown" for anything else). */
++const char *adult_backfill_state_name(int state);
++
++typedef struct {
++    long long target_adult_clf_ver; /* target generation; <= 0 takes the loaded
++                                     * manifest's version */
++    int chunk_ids;                  /* torrents per id window; <= 0 -> 10000 */
++    int batch_rows;                 /* rows per transaction; <= 0 -> 500 */
++    int dry_run;                    /* count the candidates, write nothing */
++    long long limit_rows;           /* stop after this many scored rows; <= 0 ->
++                                     * unlimited */
++} adult_backfill_opts_t;
++
++typedef struct {
++    int state;                      /* adult_backfill_state_t */
++    long long target_adult_clf_ver; /* generation this pass writes */
++    long long rows_total;           /* candidates counted at run start */
++    long long rows_gated_out;       /* candidates the token gate rejected */
++    long long rows_scored;          /* candidates the adult student scored */
++    long long rows_updated;         /* committed UPDATEs that changed a row */
++    long long rows_failed;          /* no verdict available: stored row untouched */
++    long long last_id;              /* highest committed torrent id */
++} adult_backfill_progress_t;
++
++/*
++ * Run (or resume) one adult backfill pass over `db`.
++ *
++ * @param db   open database; the caller owns schema creation and cleanup
++ * @param opts knobs; NULL means "all defaults, write mode, unlimited"
++ * @param out  progress snapshot, always filled when non-NULL
++ * @return 0  finished: state DONE, or RUNNING when stopped early (resumable);
++ *         1  DISABLED: models not loaded or no resolvable target - logged,
++ *            nothing written;
++ *        -1  FAILED: a SQL error that survived the busy retries.
++ */
++int adult_backfill_run(database_t *db, const adult_backfill_opts_t *opts,
++                       adult_backfill_progress_t *out);
++
++/*
++ * 1 when a pass is worth starting: models are loaded, the target generation
++ * resolves, and at least one torrent_class row is below it. *rows_left
++ * (optional) receives that count in both directions, so a caller can report
++ * either state. Purely the row predicate - there is no meta key to consult, so
++ * a finished pass answers 0 and a re-run is a no-op by construction.
++ */
++int adult_backfill_needed(database_t *db, long long target_adult_clf_ver,
++                          long long *rows_left);
++
++/*
++ * Ask a running pass to stop. Cooperative and checked between batches: the
++ * batch in flight always commits, the state is left RUNNING and the resume key
++ * makes the next run continue where this one stopped.
++ */
++void adult_backfill_request_stop(void);
++
++/*
++ * Last published progress of the most recent pass, for anything that has to
++ * watch a pass it did not start (/stats, a supervising thread, a test). Safe to
++ * call from any thread at any time: it copies the module-global snapshot under
++ * its own mutex, so reading progress never requires database_t.mutex and never
++ * blocks the pass. *out may be NULL (no-op).
++ */
++void adult_backfill_get_progress(adult_backfill_progress_t *out);
++
++#ifdef ADULT_BACKFILL_TEST
++/*
++ * Test-only seam (the tests-adult-backfill Makefile target). The engine calls
++ * the adult student through a file-static pointer; this replaces it so a
++ * model-free host test can drive the gate, the UPDATE and the watermark path
++ * with canned verdicts. The daemon build exports none of this.
++ */
++typedef int (*adult_backfill_verdict_fn)(const torrent_metadata_t *meta, int *adult,
++                                         double *adult_p);
++void adult_backfill_set_verdict_hook(adult_backfill_verdict_fn fn);
++#endif /* ADULT_BACKFILL_TEST */
++
++#endif /* ADULT_BACKFILL_H */
+diff --git i/include/classifier.h w/include/classifier.h
+index 845fce1..7c60ba5 100644
+--- i/include/classifier.h
++++ w/include/classifier.h
+@@ -60,6 +60,15 @@ typedef struct {
+     uint64_t hard_block_dropped;   /* rows dropped by the hard block list */
+     uint64_t tv_kind_model_used;   /* items where the tv_kind student was consulted */
+     uint64_t by_category[CLASSIFIER_NUM_CATEGORIES]; /* per category, all items */
++    /* Provenance the dashboard reads back (exit criteria 2/3). These are
++     * module state rather than counters, but /stats renders them beside the
++     * threshold it already takes from here, so they ride the same snapshot.
++     * 0.0 / "" mean "the manifest named nothing" (and, for the inert host
++     * build, "no manifest was ever read"). */
++    double adult_drop_threshold; /* manifest thresholds.adult_drop_threshold */
++    char model_sha256_adult[65]; /* manifest models.adult, lowercase hex */
++    char model_sha256_category[65];
++    char model_sha256_tv_kind[65];
+ } classifier_stats_t;
+ 
+ /*
+@@ -101,6 +110,26 @@ void classifier_init(const char *model_dir, double adult_hide_threshold);
+  */
+ int classifier_classify(const torrent_metadata_t *meta, classification_t *out);
+ 
++/*
++ * Score ONLY the adult student for one torrent.
++ *
++ * The token-gated adult backfill needs the adult verdict of a row it has
++ * already established is worth scoring, and nothing else: running the full
++ * classifier_classify() would pay for the category student on every gated row
++ * and would couple the pass to a category model that may have failed to load.
++ * The feature text is rendered once (tparse), then predicted with the adult
++ * model alone; the returned verdict uses the same rule as the ingest path
++ * (adult = adult_p >= the effective adult hide threshold) so a backfilled row
++ * and a freshly ingested one can never disagree about the boundary.
++ *
++ * @return 0 and both out-parameters filled on success; 1 when no verdict is
++ *         available (feature off, built without CLF_ENABLED, adult model not
++ *         loaded, tparse rejected the name, or the student predicted nothing),
++ *         in which case the caller must leave the stored row untouched rather
++ *         than downgrade a good one. Either out-parameter may be NULL.
++ */
++int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p);
++
+ /* Copy the current counters into *out (zeroed when classification is off). */
+ void classifier_get_stats(classifier_stats_t *out);
+ 
+diff --git i/include/classify_backfill_daemon.h w/include/classify_backfill_daemon.h
+index 2c47d6f..5c6f432 100644
+--- i/include/classify_backfill_daemon.h
++++ w/include/classify_backfill_daemon.h
+@@ -60,6 +60,50 @@ typedef struct {
+  */
+ void classify_backfill_daemon_start(app_context_t *ctx, database_t *db);
+ 
++/*
++ * Select which pass the thread runs: "all" (the historical full re-classify,
++ * also the default when this is never called), "adult" (the token-gated adult
++ * pass only) or "off" (never touch the database; publish the disabled state).
++ *
++ * Call once from main.c before start(); the value is copied, so the caller's
++ * buffer need not outlive the call. Anything unrecognised keeps the current
++ * mode, mirroring how the config layer keeps the previous value on a bad
++ * classify_backfill_mode. Race-free by contract for the same reason as
++ * classifier_set_adult_mode(): it runs before the thread exists.
++ */
++void classify_backfill_daemon_set_mode(const char *mode);
++
++/*
++ * Adult-pass surface: the same shape as classify_backfill_daemon_stats_t, but
++ * for the token-gated adult engine. Separate because the two passes report
++ * different counters (gated_out/scored/updated instead of
++ * processed/inserted/skipped) and /stats renders both objects independently.
++ * Zero counters plus state "idle" mean the adult pass never ran in this
++ * process, which is what the release expects while classify_backfill_mode is
++ * pinned to "off".
++ */
++typedef struct {
++    char state[16];                  /* adult_backfill_state_name() */
++    long long target_adult_clf_ver;  /* generation the adult pass writes; 0 = unknown */
++    long long rows_total;            /* candidates counted at pass start */
++    long long rows_gated_out;        /* candidates the token gate rejected */
++    long long rows_scored;           /* candidates the adult student scored */
++    long long rows_updated;          /* committed UPDATEs that changed a row */
++    long long rows_failed;           /* no verdict available: row left untouched */
++    long long last_id;               /* highest committed torrent id */
++    long long started_at;            /* epoch secs of the last adult pass, 0 = never */
++    long long finished_at;           /* epoch secs it ended, 0 = not finished */
++    char last_error[256];            /* "" normally, non-empty after a failure */
++} classify_backfill_daemon_adult_stats_t;
++
++/*
++ * Copy the current adult-pass snapshot into *out; *out may be NULL (no-op).
++ * Safe from any thread at any time, including while a pass runs: it merges the
++ * module's mutex-guarded stats with the engine's own live snapshot, so the
++ * returned struct is always internally consistent.
++ */
++void classify_backfill_daemon_get_adult_stats(classify_backfill_daemon_adult_stats_t *out);
++
+ /*
+  * Ask the thread to stop: sets its stop flag (it is out of the sliced sleep
+  * within 250 ms) and, when a pass is in flight, asks the engine to stop after
+diff --git i/include/config.h w/include/config.h
+index 4b00a14..2eda443 100644
+--- i/include/config.h
++++ w/include/config.h
+@@ -94,6 +94,12 @@ typedef struct {
+     char adult_mode[8];                 /* "tag" (default) or "drop" at ingest */
+     double adult_hide_threshold;        /* Classifier adult tag threshold; 0 = take it from the manifest */
+     char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
++    /* Which pass the classify-backfill daemon runs. "all" (default) keeps the
++     * historical full re-classify, "adult" runs only the token-gated adult
++     * pass, "off" makes the daemon never touch the database. The app pins
++     * this to "off" for the v11 release so the deliberate write is driven by
++     * the adult-backfill maintenance action instead of by launch. */
++    char classify_backfill_mode[8];
+ 
+     /* Movie-kind (genre mask) settings — movie-kind Stage B. The model directory
+      * pins the manifest whose sha256s gate the load; the thermal ceiling is read
+diff --git i/src/adult_backfill.c w/src/adult_backfill.c
+new file mode 100644
+index 0000000..ab6c444
+--- /dev/null
++++ w/src/adult_backfill.c
+@@ -0,0 +1,977 @@
++#ifndef _DEFAULT_SOURCE
++#define _DEFAULT_SOURCE  /* For usleep */
++#endif
++
++#include "adult_backfill.h"
++#include "classifier.h"
++#include "dht_crawler.h"
++#include "maintenance_progress.h"
++
++#include <pthread.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#ifdef CLF_ENABLED
++#include "tparse.h"
++#endif
++
++/* ------------------------------------------------------------------------ *
++ * Tunables
++ * ------------------------------------------------------------------------ */
++
++#define AB_CHUNK_IDS_DEFAULT 10000
++#define AB_BATCH_ROWS_DEFAULT 500
++
++/* classifier_meta key holding "<generation>:<last committed torrent id>".
++ * Generation-scoped on purpose: a value left behind by an older generation can
++ * never make a newer pass skip rows. A completed pass tombstones the value. */
++#define AB_RESUME_KEY "adult_backfill_last_id"
++
++/* A busy writer is retried; the UPDATEs are idempotent, so replaying a whole
++ * batch is safe. sqlite3_busy_timeout() already waits per statement; the
++ * retries cover a writer that holds the lock longer than that. */
++#define AB_BUSY_TIMEOUT_MS 30000
++#define AB_BUSY_ATTEMPTS 5
++#define AB_BUSY_SLEEP_US 50000
++
++/* The token family the parser emits for the adult stage (tparse.c
++ * put_adult_tokens): __adult_jav, __adult_site and the name-side __adult_set.
++ * One prefix covers all three. */
++#define AB_TOKEN "__adult_"
++
++/* Same cap classifier.c uses for the feature text (its CLF_FEATURE_CAP is
++ * private to that translation unit). Keep them equal: a different cap would
++ * truncate a different number of characters and the gate would judge a
++ * different string than the student scores. */
++#define AB_FEATURE_CAP 8192
++
++/* Cooperative cancel: set by adult_backfill_request_stop(), cleared at the
++ * start of every pass, read between batches (never inside one). */
++static volatile sig_atomic_t ab_stop_requested = 0;
++
++/* ------------------------------------------------------------------------ *
++ * Types
++ * ------------------------------------------------------------------------ */
++
++/* One candidate of the current id window. The window is read into memory
++ * before the first write of the window: the LEFT JOIN that produced these rows
++ * must not still be stepping while the batch UPDATEs torrent_class. */
++typedef struct {
++    long long id;
++    char *name; /* owned copy of torrents.name */
++    long long size_bytes;
++} ab_candidate_t;
++
++/* One scored row waiting for the next batch transaction. */
++typedef struct {
++    long long torrent_id;
++    int adult;
++    double adult_p;
++} ab_pending_t;
++
++typedef struct {
++    database_t *db;
++    long long target;
++    int chunk_ids;
++    int batch_rows;
++    long long limit_rows;
++    sqlite3_stmt *hi_stmt;
++    sqlite3_stmt *cand_stmt;
++    sqlite3_stmt *files_stmt;
++    sqlite3_stmt *update_stmt;
++    sqlite3_stmt *meta_stmt;
++    ab_pending_t *batch;
++    int batch_count;
++    int batch_changed; /* UPDATEs of the pending batch that touched a row */
++    adult_backfill_progress_t *prog;
++} ab_ctx_t;
++
++/* A batch body that must run with db->mutex held and returns a SQLite code. */
++typedef int (*ab_locked_fn_t)(ab_ctx_t *c);
++
++/* ------------------------------------------------------------------------ *
++ * Test seam
++ *
++ * The adult student is reached through a file-static pointer that defaults to
++ * the real entry point, so a model-free host test can drive the gate, the
++ * UPDATE and the watermark path with canned verdicts. The setter only exists
++ * in the test build (-DADULT_BACKFILL_TEST, set by tests-adult-backfill).
++ * ------------------------------------------------------------------------ */
++
++typedef int (*ab_verdict_fn)(const torrent_metadata_t *meta, int *adult, double *adult_p);
++
++static ab_verdict_fn ab_verdict = classifier_classify_adult;
++
++#ifdef ADULT_BACKFILL_TEST
++void adult_backfill_set_verdict_hook(ab_verdict_fn fn) {
++    if (fn) {
++        ab_verdict = fn;
++    }
++}
++#endif /* ADULT_BACKFILL_TEST */
++
++/* ------------------------------------------------------------------------ *
++ * Small helpers
++ * ------------------------------------------------------------------------ */
++
++const char *adult_backfill_state_name(int state) {
++    switch (state) {
++    case ADULT_BACKFILL_IDLE:
++        return "idle";
++    case ADULT_BACKFILL_RUNNING:
++        return "running";
++    case ADULT_BACKFILL_DONE:
++        return "done";
++    case ADULT_BACKFILL_FAILED:
++        return "failed";
++    case ADULT_BACKFILL_DISABLED:
++        return "disabled";
++    default:
++        return "unknown";
++    }
++}
++
++/* Copy a TEXT column byte-exactly. The snapshot has filenames that are not
++ * valid UTF-8; re-encoding them would change what tparse sees on the predict
++ * path, so the bytes are passed through untouched. */
++static char *ab_dup_column_text(sqlite3_stmt *stmt, int col) {
++    const unsigned char *text = sqlite3_column_text(stmt, col);
++    int bytes = sqlite3_column_bytes(stmt, col);
++    char *copy;
++
++    if (!text) {
++        return strdup("");
++    }
++    copy = malloc((size_t)bytes + 1);
++    if (!copy) {
++        return NULL;
++    }
++    memcpy(copy, text, (size_t)bytes);
++    copy[bytes] = '\0';
++    return copy;
++}
++
++static void ab_free_files(file_info_t *files, int num_files) {
++    int i;
++    if (!files) {
++        return;
++    }
++    for (i = 0; i < num_files; i++) {
++        free(files[i].path);
++    }
++    free(files);
++}
++
++static void ab_free_candidates(ab_candidate_t *cands, int count) {
++    int i;
++    if (!cands) {
++        return;
++    }
++    for (i = 0; i < count; i++) {
++        free(cands[i].name);
++    }
++    free(cands);
++}
++
++/* INSERT OR REPLACE one classifier_meta row; returns the SQLite result code. */
++static int ab_meta_put(sqlite3_stmt *stmt, const char *key, const char *value) {
++    int rc;
++
++    sqlite3_reset(stmt);
++    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
++    sqlite3_bind_text(stmt, 2, value, -1, SQLITE_STATIC);
++    rc = sqlite3_step(stmt);
++    sqlite3_reset(stmt);
++    return rc;
++}
++
++/* ------------------------------------------------------------------------ *
++ * The token gate
++ * ------------------------------------------------------------------------ */
++
++/* 1 when the rendered feature text carries an __adult_ token.
++ *
++ * The first call passes the name alone (files == NULL, num_files == 0): that is
++ * the cheap gate that decides whether the 287 M-row file table is worth
++ * touching. The second call passes the real file list and re-checks the full
++ * text, which also carries the file-derived tokens.
++ *
++ * Without CLF_ENABLED there is no tparse, so there is no gate to apply - and
++ * every run is DISABLED before it can get here. Answering 1 ("nothing gated
++ * out") is what lets the model-free host tests drive the SQL and watermark path
++ * with a stubbed verdict instead of a parser. */
++static int ab_gate_text(const char *name, const file_info_t *files, int num_files,
++                        long long size_bytes) {
++#ifdef CLF_ENABLED
++    tp_file_t *tp_files = NULL;
++    tp_result_t parsed;
++    char feature[AB_FEATURE_CAP];
++    size_t need;
++    size_t cap;
++    int hit;
++
++    if (num_files > 0) {
++        tp_files = (tp_file_t *)malloc((size_t)num_files * sizeof(tp_file_t));
++        if (!tp_files) {
++            log_msg(LOG_WARN, "adult-backfill: out of memory for %d files; gating out",
++                    num_files);
++            return 0;
++        }
++        for (int i = 0; i < num_files; i++) {
++            tp_files[i].path = files[i].path ? files[i].path : "";
++            tp_files[i].size = files[i].size_bytes;
++        }
++    }
++
++    memset(&parsed, 0, sizeof(parsed));
++    if (tp_parse(name ? name : "", tp_files, num_files, size_bytes, &parsed) != TP_OK) {
++        /* An unparsable name cannot fire a token, and it must not fail the pass:
++         * the row simply is not a candidate. */
++        free(tp_files);
++        return 0;
++    }
++
++    need = tp_feature_text(name ? name : "", tp_files, num_files, &parsed, NULL, 0);
++    cap = sizeof(feature);
++    if (need + 1 < cap) cap = need + 1;
++    tp_feature_text(name ? name : "", tp_files, num_files, &parsed, feature, cap);
++    feature[cap - 1] = '\0';
++    free(tp_files);
++
++    hit = (strstr(feature, AB_TOKEN) != NULL) ? 1 : 0;
++    return hit;
++#else
++    (void)name;
++    (void)files;
++    (void)num_files;
++    (void)size_bytes;
++    return 1;
++#endif
++}
++
++/* ------------------------------------------------------------------------ *
++ * Read helpers (no mutex: the pass reads on the shared handle and only takes
++ * db->mutex around each BEGIN ... COMMIT batch)
++ * ------------------------------------------------------------------------ */
++
++/* Resume point for this generation, or 0 when there is none to honour. */
++static long long ab_resume_last_id(database_t *db, long long target) {
++    sqlite3_stmt *stmt = NULL;
++    long long last_id = 0;
++
++    if (sqlite3_prepare_v2(db->db,
++                           "SELECT value FROM classifier_meta WHERE key = ?",
++                           -1, &stmt, NULL) != SQLITE_OK) {
++        log_msg(LOG_DEBUG, "adult-backfill: resume key unavailable: %s",
++                sqlite3_errmsg(db->db));
++        return 0;
++    }
++    sqlite3_bind_text(stmt, 1, AB_RESUME_KEY, -1, SQLITE_STATIC);
++    if (sqlite3_step(stmt) == SQLITE_ROW) {
++        const unsigned char *value = sqlite3_column_text(stmt, 0);
++        if (value) {
++            const char *sep = strchr((const char *)value, ':');
++            if (sep) {
++                long long generation = strtoll((const char *)value, NULL, 10);
++                long long stored_id = strtoll(sep + 1, NULL, 10);
++                /* Only this generation's key may skip rows; a tombstoned or
++                 * foreign value parses to nothing usable and is ignored. */
++                if (generation == target && stored_id > 0) {
++                    last_id = stored_id;
++                }
++            }
++        }
++    }
++    sqlite3_reset(stmt);
++    sqlite3_finalize(stmt);
++    return last_id;
++}
++
++/* Number of candidates a pass starting after `start_id` would visit: no class
++ * row at all, or one whose adult generation is below the target. */
++static int ab_count_candidates(database_t *db, long long start_id, long long target,
++                               long long *count_out) {
++    sqlite3_stmt *stmt = NULL;
++    long long count = 0;
++    int rc;
++
++    rc = sqlite3_prepare_v2(db->db,
++                            "SELECT COUNT(*) FROM torrents t "
++                            "LEFT JOIN torrent_class tc ON tc.torrent_id = t.id "
++                            "WHERE t.id > ? AND "
++                            "(tc.adult_clf_ver IS NULL OR tc.adult_clf_ver < ?)",
++                            -1, &stmt, NULL);
++    if (rc != SQLITE_OK) {
++        log_msg(LOG_ERROR, "adult-backfill: candidate count failed (%d: %s)", rc,
++                sqlite3_errstr(rc));
++        return -1;
++    }
++    sqlite3_bind_int64(stmt, 1, start_id);
++    sqlite3_bind_int64(stmt, 2, target);
++    rc = sqlite3_step(stmt);
++    if (rc != SQLITE_ROW) {
++        log_msg(LOG_ERROR, "adult-backfill: candidate count step failed (%d: %s)", rc,
++                sqlite3_errstr(rc));
++        sqlite3_reset(stmt);
++        sqlite3_finalize(stmt);
++        return -1;
++    }
++    count = sqlite3_column_int64(stmt, 0);
++    sqlite3_reset(stmt);
++    sqlite3_finalize(stmt);
++
++    *count_out = count;
++    return 0;
++}
++
++/* Highest torrent id of the next chunk_ids window after `lo`; 0 when the walk
++ * is over. Same shape as the other engines' window bound. */
++static int ab_next_hi(ab_ctx_t *c, long long lo, long long *hi_out) {
++    sqlite3_stmt *stmt = c->hi_stmt;
++    int rc;
++
++    *hi_out = 0;
++    sqlite3_reset(stmt);
++    sqlite3_bind_int64(stmt, 1, lo);
++    sqlite3_bind_int(stmt, 2, c->chunk_ids);
++    rc = sqlite3_step(stmt);
++    if (rc == SQLITE_ROW) {
++        if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
++            *hi_out = sqlite3_column_int64(stmt, 0);
++        }
++    } else if (rc != SQLITE_DONE) {
++        sqlite3_reset(stmt);
++        log_msg(LOG_ERROR, "adult-backfill: window bound failed (%d: %s)", rc,
++                sqlite3_errstr(rc));
++        return -1;
++    }
++    sqlite3_reset(stmt);
++    return 0;
++}
++
++/* Rebuild one torrent's full file paths: path_prefixes.prefix plus the leaf
++ * filename, byte-exact and in torrent_files rowid order (not file_index, which
++ * wraps past 32767). Returns 0 with *out_files NULL when the torrent has no
++ * file rows. */
++static int ab_load_files(ab_ctx_t *c, long long torrent_id, file_info_t **out_files,
++                         int *out_num) {
++    sqlite3_stmt *stmt = c->files_stmt;
++    file_info_t *files = NULL;
++    int num = 0;
++    int cap = 0;
++    int rc;
++
++    *out_files = NULL;
++    *out_num = 0;
++
++    sqlite3_reset(stmt);
++    sqlite3_bind_int64(stmt, 1, torrent_id);
++    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
++        if (num == cap) {
++            int new_cap = cap > 0 ? cap * 2 : 16;
++            file_info_t *grown = realloc(files, (size_t)new_cap * sizeof(*grown));
++            if (!grown) {
++                sqlite3_reset(stmt);
++                ab_free_files(files, num);
++                log_msg(LOG_ERROR, "adult-backfill: out of memory loading files of %lld",
++                        torrent_id);
++                return -1;
++            }
++            files = grown;
++            cap = new_cap;
++        }
++        files[num].path = ab_dup_column_text(stmt, 0);
++        if (!files[num].path) {
++            sqlite3_reset(stmt);
++            ab_free_files(files, num);
++            log_msg(LOG_ERROR, "adult-backfill: out of memory loading files of %lld",
++                    torrent_id);
++            return -1;
++        }
++        files[num].size_bytes = sqlite3_column_int64(stmt, 1);
++        files[num].file_index = (int16_t)num; /* ignored on the predict path */
++        num++;
++    }
++    sqlite3_reset(stmt);
++    if (rc != SQLITE_DONE) {
++        ab_free_files(files, num);
++        log_msg(LOG_ERROR, "adult-backfill: file load of %lld failed (%d: %s)", torrent_id,
++                rc, sqlite3_errstr(rc));
++        return -1;
++    }
++    *out_files = files;
++    *out_num = num;
++    return 0;
++}
++
++/* ------------------------------------------------------------------------ *
++ * Batch transactions
++ * ------------------------------------------------------------------------ */
++
++/* Run `fn` with db->mutex held, retrying on a busy/locked database. */
++static int ab_run_locked(ab_ctx_t *c, ab_locked_fn_t fn, const char *what) {
++    int attempt;
++
++    for (attempt = 0; attempt < AB_BUSY_ATTEMPTS; attempt++) {
++        int rc;
++        uv_mutex_lock(&c->db->mutex);
++        rc = fn(c);
++        uv_mutex_unlock(&c->db->mutex);
++        if (rc == SQLITE_OK) {
++            return 0;
++        }
++        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
++            log_msg(LOG_ERROR, "adult-backfill: %s failed (%d: %s)", what, rc,
++                    sqlite3_errstr(rc));
++            return -1;
++        }
++        log_msg(LOG_WARN, "adult-backfill: %s busy (attempt %d/%d), retrying", what,
++                attempt + 1, AB_BUSY_ATTEMPTS);
++        usleep(AB_BUSY_SLEEP_US);
++    }
++    log_msg(LOG_ERROR, "adult-backfill: %s still busy after %d attempts", what,
++            AB_BUSY_ATTEMPTS);
++    return -1;
++}
++
++/* One attempt at the pending batch. Called with db->mutex held. */
++static int ab_flush_locked(ab_ctx_t *c) {
++    sqlite3 *db = c->db->db;
++    sqlite3_stmt *stmt = c->update_stmt;
++    char resume[64];
++    int changed = 0;
++    int rc;
++    int i;
++
++    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        return rc;
++    }
++
++    for (i = 0; i < c->batch_count; i++) {
++        const ab_pending_t *p = &c->batch[i];
++
++        sqlite3_reset(stmt);
++        sqlite3_bind_int(stmt, 1, p->adult);
++        sqlite3_bind_double(stmt, 2, p->adult_p);
++        /* The generation this pass resolved, never the model's own field: the
++         * selection predicate and the stored value must be the same number. */
++        sqlite3_bind_int64(stmt, 3, c->target);
++        sqlite3_bind_int64(stmt, 4, p->torrent_id);
++        rc = sqlite3_step(stmt);
++        sqlite3_reset(stmt);
++        if (rc != SQLITE_DONE) {
++            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
++            return rc;
++        }
++        /* A candidate can have no torrent_class row at all (the LEFT JOIN makes
++         * those adult_clf_ver IS NULL). There is nothing to update for them and
++         * inventing a class row here would fabricate a category; they stay
++         * candidates and are counted as scored-but-not-updated. */
++        if (sqlite3_changes(db) > 0) {
++            changed++;
++        }
++    }
++
++    /* Committed ids and the resume key are written by the same transaction, so
++     * a crash can only lose a batch, never skip one. */
++    snprintf(resume, sizeof(resume), "%lld:%lld", c->target,
++             c->batch[c->batch_count - 1].torrent_id);
++    rc = ab_meta_put(c->meta_stmt, AB_RESUME_KEY, resume);
++    if (rc != SQLITE_DONE) {
++        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
++        return rc;
++    }
++
++    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
++        return rc;
++    }
++    c->batch_changed = changed;
++    return SQLITE_OK;
++}
++
++/* One attempt at the completion bookkeeping: tombstone the resume key so the
++ * next generation starts from the beginning. Deliberately does NOT call
++ * classifier_write_meta(): this pass changes adult labels only, and rewriting
++ * the fastText provenance from it would claim a full re-classification that
++ * never happened. Called with db->mutex held. */
++static int ab_finish_locked(ab_ctx_t *c) {
++    sqlite3 *db = c->db->db;
++    int rc;
++
++    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        return rc;
++    }
++    rc = ab_meta_put(c->meta_stmt, AB_RESUME_KEY, "");
++    if (rc != SQLITE_DONE) {
++        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
++        return rc;
++    }
++    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
++        return rc;
++    }
++    return SQLITE_OK;
++}
++
++static int ab_flush(ab_ctx_t *c) {
++    if (c->batch_count == 0) {
++        return 0;
++    }
++    if (ab_run_locked(c, ab_flush_locked, "batch commit") != 0) {
++        return -1;
++    }
++    c->prog->rows_updated += c->batch_changed;
++    c->prog->last_id = c->batch[c->batch_count - 1].torrent_id;
++    c->batch_count = 0;
++    c->batch_changed = 0;
++    return 0;
++}
++
++/* ------------------------------------------------------------------------ *
++ * Window walk
++ * ------------------------------------------------------------------------ */
++
++/* Read the candidates of one id window (lo, hi] into memory. */
++static int ab_load_window(ab_ctx_t *c, long long lo, long long hi, ab_candidate_t **out,
++                          int *out_count) {
++    sqlite3_stmt *stmt = c->cand_stmt;
++    ab_candidate_t *cands = NULL;
++    int count = 0;
++    int cap = 0;
++    int rc;
++
++    *out = NULL;
++    *out_count = 0;
++
++    sqlite3_reset(stmt);
++    sqlite3_bind_int64(stmt, 1, lo);
++    sqlite3_bind_int64(stmt, 2, hi);
++    sqlite3_bind_int64(stmt, 3, c->target);
++    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
++        if (count == cap) {
++            int new_cap = cap > 0 ? cap * 2 : 64;
++            ab_candidate_t *grown = realloc(cands, (size_t)new_cap * sizeof(*grown));
++            if (!grown) {
++                sqlite3_reset(stmt);
++                ab_free_candidates(cands, count);
++                log_msg(LOG_ERROR, "adult-backfill: out of memory loading window (%lld, %lld]",
++                        lo, hi);
++                return -1;
++            }
++            cands = grown;
++            cap = new_cap;
++        }
++        cands[count].name = ab_dup_column_text(stmt, 1);
++        if (!cands[count].name) {
++            sqlite3_reset(stmt);
++            ab_free_candidates(cands, count);
++            log_msg(LOG_ERROR, "adult-backfill: out of memory loading window (%lld, %lld]",
++                    lo, hi);
++            return -1;
++        }
++        cands[count].id = sqlite3_column_int64(stmt, 0);
++        cands[count].size_bytes = sqlite3_column_int64(stmt, 2);
++        count++;
++    }
++    sqlite3_reset(stmt);
++    if (rc != SQLITE_DONE) {
++        ab_free_candidates(cands, count);
++        log_msg(LOG_ERROR, "adult-backfill: window (%lld, %lld] failed (%d: %s)", lo, hi, rc,
++                sqlite3_errstr(rc));
++        return -1;
++    }
++    *out = cands;
++    *out_count = count;
++    return 0;
++}
++
++/* Gate one candidate, score it, and queue its UPDATE. Returns 0 when the
++ * candidate was handled (gated out, scored or counted as failed), -1 on a
++ * SQL/memory error. */
++static int ab_score_one(ab_ctx_t *c, const ab_candidate_t *cand) {
++    file_info_t *files = NULL;
++    torrent_metadata_t meta;
++    ab_pending_t *slot;
++    int num_files = 0;
++    int adult = 0;
++    double adult_p = 0.0;
++    int rc;
++
++    /* Gate, stage 1: the name alone. Rows that fail here never touch the file
++     * table, which is the whole point of the gate. */
++    if (!ab_gate_text(cand->name, NULL, 0, cand->size_bytes)) {
++        c->prog->rows_gated_out++;
++        return 0;
++    }
++
++    if (ab_load_files(c, cand->id, &files, &num_files) != 0) {
++        return -1;
++    }
++
++    /* Gate, stage 2: the full text, which also carries the file-derived
++     * tokens. */
++    if (!ab_gate_text(cand->name, files, num_files, cand->size_bytes)) {
++        ab_free_files(files, num_files);
++        c->prog->rows_gated_out++;
++        return 0;
++    }
++
++    memset(&meta, 0, sizeof(meta));
++    meta.name = cand->name;
++    meta.size_bytes = cand->size_bytes;
++    meta.files = files;
++    meta.num_files = num_files;
++
++    rc = ab_verdict(&meta, &adult, &adult_p);
++    ab_free_files(files, num_files);
++
++    if (rc != 0) {
++        /* No verdict (no adult model, parser-only fallback): leave the stored
++         * row exactly as it is rather than downgrade a good one. */
++        c->prog->rows_failed++;
++        return 0;
++    }
++
++    slot = &c->batch[c->batch_count++];
++    slot->torrent_id = cand->id;
++    slot->adult = adult;
++    slot->adult_p = adult_p;
++    c->prog->rows_scored++;
++    return 0;
++}
++
++/* ------------------------------------------------------------------------ *
++ * Statement lifecycle
++ * ------------------------------------------------------------------------ */
++
++static void ab_finalize_statements(ab_ctx_t *c) {
++    sqlite3_finalize(c->hi_stmt);
++    sqlite3_finalize(c->cand_stmt);
++    sqlite3_finalize(c->files_stmt);
++    sqlite3_finalize(c->update_stmt);
++    sqlite3_finalize(c->meta_stmt);
++    c->hi_stmt = NULL;
++    c->cand_stmt = NULL;
++    c->files_stmt = NULL;
++    c->update_stmt = NULL;
++    c->meta_stmt = NULL;
++}
++
++static int ab_prepare_statements(ab_ctx_t *c) {
++    static const char *const sql_hi =
++        "SELECT MAX(id) FROM (SELECT id FROM torrents WHERE id > ? ORDER BY id LIMIT ?)";
++    static const char *const sql_cand =
++        "SELECT t.id, t.name, t.size_bytes FROM torrents t "
++        "LEFT JOIN torrent_class tc ON tc.torrent_id = t.id "
++        "WHERE t.id > ? AND t.id <= ? "
++        "AND (tc.adult_clf_ver IS NULL OR tc.adult_clf_ver < ?) "
++        "ORDER BY t.id";
++    static const char *const sql_files =
++        "SELECT COALESCE(pp.prefix || '/' || tf.filename, tf.filename), tf.size_bytes "
++        "FROM torrent_files tf LEFT JOIN path_prefixes pp ON tf.prefix_id = pp.id "
++        "WHERE tf.torrent_id = ? ORDER BY tf.id";
++    /* adult_clf_ver is the watermark AND the candidate predicate, so it is
++     * bound to the pass target, never to the model's own field. */
++    static const char *const sql_update =
++        "UPDATE torrent_class SET adult = ?, adult_p = ?, adult_clf_ver = ? "
++        "WHERE torrent_id = ?";
++    static const char *const sql_meta =
++        "INSERT OR REPLACE INTO classifier_meta (key, value) VALUES (?, ?)";
++    sqlite3 *db = c->db->db;
++    int rc;
++
++    rc = sqlite3_prepare_v2(db, sql_hi, -1, &c->hi_stmt, NULL);
++    if (rc == SQLITE_OK) {
++        rc = sqlite3_prepare_v2(db, sql_cand, -1, &c->cand_stmt, NULL);
++    }
++    if (rc == SQLITE_OK) {
++        rc = sqlite3_prepare_v2(db, sql_files, -1, &c->files_stmt, NULL);
++    }
++    if (rc == SQLITE_OK) {
++        rc = sqlite3_prepare_v2(db, sql_update, -1, &c->update_stmt, NULL);
++    }
++    if (rc == SQLITE_OK) {
++        rc = sqlite3_prepare_v2(db, sql_meta, -1, &c->meta_stmt, NULL);
++    }
++    if (rc != SQLITE_OK) {
++        log_msg(LOG_ERROR, "adult-backfill: statement preparation failed (%d: %s)", rc,
++                sqlite3_errstr(rc));
++        ab_finalize_statements(c);
++        return -1;
++    }
++    return 0;
++}
++
++/* ------------------------------------------------------------------------ *
++ * Live progress snapshot
++ * ------------------------------------------------------------------------ */
++
++/* run() keeps its counters in a function-local struct, so without this channel
++ * nothing could see a pass in flight: the caller's *out was filled once, at
++ * return. g_progress is the pollable copy - the engine republishes it at every
++ * observable step (run start, each committed batch, each window, each exit
++ * path) and any thread may read the last one through
++ * adult_backfill_get_progress(). */
++static pthread_mutex_t g_progress_mutex = PTHREAD_MUTEX_INITIALIZER;
++static adult_backfill_progress_t g_progress = { .state = ADULT_BACKFILL_IDLE };
++
++static void ab_report(const adult_backfill_progress_t *p, adult_backfill_progress_t *out) {
++    pthread_mutex_lock(&g_progress_mutex);
++    g_progress = *p;
++    pthread_mutex_unlock(&g_progress_mutex);
++    if (out) {
++        *out = *p;
++    }
++}
++
++void adult_backfill_get_progress(adult_backfill_progress_t *out) {
++    if (!out) {
++        return;
++    }
++    pthread_mutex_lock(&g_progress_mutex);
++    *out = g_progress;
++    pthread_mutex_unlock(&g_progress_mutex);
++}
++
++/* The final summary line the CLI prints and the log carries. */
++static void ab_log_summary(const adult_backfill_progress_t *p) {
++    log_msg(LOG_INFO,
++            "adult-backfill: done state=%s target=%lld total=%lld gated_out=%lld "
++            "scored=%lld updated=%lld failed=%lld last_id=%lld",
++            adult_backfill_state_name(p->state), p->target_adult_clf_ver, p->rows_total,
++            p->rows_gated_out, p->rows_scored, p->rows_updated, p->rows_failed, p->last_id);
++}
++
++/* ------------------------------------------------------------------------ *
++ * Public API
++ * ------------------------------------------------------------------------ */
++
++int adult_backfill_run(database_t *db, const adult_backfill_opts_t *opts,
++                       adult_backfill_progress_t *out) {
++    adult_backfill_progress_t progress;
++    ab_ctx_t ctx;
++    long long target;
++    long long start_id;
++    long long rows_total;
++    long long lo;
++    int dry_run;
++    int stopped = 0;
++    int result = -1;
++    mprog_throttle_t scan_prog;
++
++    memset(&progress, 0, sizeof(progress));
++    progress.state = ADULT_BACKFILL_IDLE;
++    memset(&ctx, 0, sizeof(ctx));
++    mprog_throttle_init(&scan_prog);
++
++    if (!db || !db->db) {
++        log_msg(LOG_ERROR, "adult-backfill: no database connection");
++        progress.state = ADULT_BACKFILL_FAILED;
++        ab_report(&progress, out);
++        return -1;
++    }
++
++    /* The caller owns classifier_init(); the engine only reads what it
++     * resolved. A build without CLF_ENABLED has no models and lands here. */
++    ab_stop_requested = 0;
++    target = (opts && opts->target_adult_clf_ver > 0) ? opts->target_adult_clf_ver
++                                                     : classifier_current_version();
++    if (!classifier_models_loaded() || target <= 0) {
++        log_msg(LOG_WARN,
++                "adult-backfill: disabled (models_loaded=%d, target generation=%lld); "
++                "nothing written",
++                classifier_models_loaded(), target);
++        progress.state = ADULT_BACKFILL_DISABLED;
++        progress.target_adult_clf_ver = target;
++        ab_log_summary(&progress);
++        ab_report(&progress, out);
++        return 1;
++    }
++
++    ctx.db = db;
++    ctx.target = target;
++    ctx.chunk_ids = (opts && opts->chunk_ids > 0) ? opts->chunk_ids : AB_CHUNK_IDS_DEFAULT;
++    ctx.batch_rows = (opts && opts->batch_rows > 0) ? opts->batch_rows : AB_BATCH_ROWS_DEFAULT;
++    ctx.limit_rows = (opts && opts->limit_rows > 0) ? opts->limit_rows : 0;
++    ctx.prog = &progress;
++    dry_run = (opts && opts->dry_run) ? 1 : 0;
++
++    progress.target_adult_clf_ver = target;
++    sqlite3_busy_timeout(db->db, AB_BUSY_TIMEOUT_MS);
++
++    start_id = ab_resume_last_id(db, target);
++    progress.last_id = start_id;
++    if (ab_count_candidates(db, start_id, target, &rows_total) != 0) {
++        progress.state = ADULT_BACKFILL_FAILED;
++        ab_log_summary(&progress);
++        ab_report(&progress, out);
++        return -1;
++    }
++    progress.rows_total = rows_total;
++
++    if (dry_run) {
++        log_msg(LOG_INFO,
++                "adult-backfill: dry run, %lld candidate(s) at generation %lld, "
++                "nothing written",
++                rows_total, target);
++        mprog_emit("adult-backfill", "count", 0, rows_total, "dry_run=1");
++        progress.state = ADULT_BACKFILL_DONE;
++        ab_log_summary(&progress);
++        ab_report(&progress, out);
++        return 0;
++    }
++
++    /* The pass is live from here on: publish RUNNING with the counters it just
++     * resolved, so a poller sees the work start before the first batch. */
++    progress.state = ADULT_BACKFILL_RUNNING;
++    ab_report(&progress, NULL);
++    mprog_emit("adult-backfill", "count", 0, rows_total, NULL);
++
++    ctx.batch = malloc((size_t)ctx.batch_rows * sizeof(*ctx.batch));
++    if (!ctx.batch) {
++        log_msg(LOG_ERROR, "adult-backfill: out of memory for the batch buffer");
++        progress.state = ADULT_BACKFILL_FAILED;
++        goto cleanup;
++    }
++    if (ab_prepare_statements(&ctx) != 0) {
++        progress.state = ADULT_BACKFILL_FAILED;
++        goto cleanup;
++    }
++
++    lo = start_id;
++    for (;;) {
++        long long hi = 0;
++        ab_candidate_t *cands = NULL;
++        int num_cands = 0;
++        int i;
++
++        if (ab_stop_requested) {
++            stopped = 1;
++            break;
++        }
++        if (ab_next_hi(&ctx, lo, &hi) != 0) {
++            progress.state = ADULT_BACKFILL_FAILED;
++            goto cleanup;
++        }
++        if (hi <= 0) {
++            break; /* nothing left to visit */
++        }
++        if (ab_load_window(&ctx, lo, hi, &cands, &num_cands) != 0) {
++            progress.state = ADULT_BACKFILL_FAILED;
++            goto cleanup;
++        }
++
++        for (i = 0; i < num_cands; i++) {
++            if (ctx.limit_rows > 0 && progress.rows_scored >= ctx.limit_rows) {
++                stopped = 1;
++                break;
++            }
++            if (ab_score_one(&ctx, &cands[i]) != 0) {
++                ab_free_candidates(cands, num_cands);
++                progress.state = ADULT_BACKFILL_FAILED;
++                goto cleanup;
++            }
++            if (ctx.batch_count >= ctx.batch_rows) {
++                if (ab_flush(&ctx) != 0) {
++                    ab_free_candidates(cands, num_cands);
++                    progress.state = ADULT_BACKFILL_FAILED;
++                    goto cleanup;
++                }
++                /* One committed batch: republish so a poller sees the counters
++                 * move while the pass walks. */
++                ab_report(&progress, NULL);
++                /* The batch in flight always commits before a stop is seen. */
++                if (ab_stop_requested) {
++                    stopped = 1;
++                    break;
++                }
++                if (ctx.limit_rows > 0 && progress.rows_scored >= ctx.limit_rows) {
++                    stopped = 1;
++                    break;
++                }
++            }
++        }
++        ab_free_candidates(cands, num_cands);
++
++        if (ctx.batch_count > 0 && ab_flush(&ctx) != 0) {
++            progress.state = ADULT_BACKFILL_FAILED;
++            goto cleanup;
++        }
++
++        log_msg(LOG_INFO,
++                "adult-backfill: %lld/%lld gated_out=%lld scored=%lld updated=%lld "
++                "failed=%lld last_id=%lld",
++                progress.rows_gated_out + progress.rows_scored + progress.rows_failed,
++                progress.rows_total, progress.rows_gated_out, progress.rows_scored,
++                progress.rows_updated, progress.rows_failed, progress.last_id);
++        ab_report(&progress, NULL);
++        mprog_progress(&scan_prog, "adult-backfill", "scan",
++                       progress.rows_gated_out + progress.rows_scored + progress.rows_failed,
++                       progress.rows_total, NULL);
++
++        if (stopped) {
++            break;
++        }
++        lo = hi;
++    }
++
++    if (stopped) {
++        progress.state = ADULT_BACKFILL_RUNNING;
++        log_msg(LOG_INFO, "adult-backfill: stopped at %lld row(s), resuming after id %lld",
++                progress.rows_scored, progress.last_id);
++        result = 0;
++    } else if (ab_run_locked(&ctx, ab_finish_locked, "completion metadata") != 0) {
++        progress.state = ADULT_BACKFILL_FAILED;
++        goto cleanup;
++    } else {
++        progress.state = ADULT_BACKFILL_DONE;
++        result = 0;
++    }
++
++cleanup:
++    ab_finalize_statements(&ctx);
++    free(ctx.batch);
++    ctx.batch = NULL;
++    ab_log_summary(&progress);
++    ab_report(&progress, out);
++    return result;
++}
++
++int adult_backfill_needed(database_t *db, long long target_adult_clf_ver,
++                          long long *rows_left) {
++    long long target;
++    long long left = 0;
++
++    if (rows_left) {
++        *rows_left = 0;
++    }
++    if (!db || !db->db || !classifier_models_loaded()) {
++        return 0;
++    }
++    target = (target_adult_clf_ver > 0) ? target_adult_clf_ver : classifier_current_version();
++    if (target <= 0) {
++        return 0;
++    }
++    if (ab_count_candidates(db, 0, target, &left) != 0) {
++        left = 0;
++    }
++    if (rows_left) {
++        *rows_left = left;
++    }
++    /* The row predicate is the whole answer: there is no meta key to fall
++     * behind, so a finished pass reports 0 and a re-run writes nothing. */
++    return left > 0 ? 1 : 0;
++}
++
++void adult_backfill_request_stop(void) {
++    ab_stop_requested = 1;
++}
+diff --git i/src/batch_writer.c w/src/batch_writer.c
+index ac0a0c3..25047e8 100644
+--- i/src/batch_writer.c
++++ w/src/batch_writer.c
+@@ -808,7 +808,11 @@ static void do_backup(batch_writer_t *writer) {
+          * without it the INSERT ... SELECT * copies of torrent_class fail on a
+          * column-count mismatch. */
+         "  clf_ver INTEGER NOT NULL,"
+-        "  movie_kind_mask INTEGER, movie_kind_clf_ver INTEGER);"
++        /* The adult-only generation rides last, in the same order the live DDL
++         * declares it, because the copies below are INSERT ... SELECT *: any
++         * other order silently writes adult_clf_ver into the wrong column. */
++        "  movie_kind_mask INTEGER, movie_kind_clf_ver INTEGER,"
++        "  adult_clf_ver INTEGER);"
+         "CREATE INDEX IF NOT EXISTS idx_class_cat"
+         "  ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
+         "CREATE INDEX IF NOT EXISTS idx_class_ver"
+@@ -838,7 +842,8 @@ static void do_backup(batch_writer_t *writer) {
+     /* Widen a backup file created before the movie-kind columns existed, so the
+      * INSERT ... SELECT * copies below keep matching the live schema. */
+     if (backup_ensure_column(bak, "torrent_class", "movie_kind_mask", "INTEGER") != 0 ||
+-        backup_ensure_column(bak, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0) {
++        backup_ensure_column(bak, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0 ||
++        backup_ensure_column(bak, "torrent_class", "adult_clf_ver", "INTEGER") != 0) {
+         sqlite3_close(bak);
+         goto done_fail;
+     }
+diff --git i/src/classifier.c w/src/classifier.c
+index 96314d9..6e89bf5 100644
+--- i/src/classifier.c
++++ w/src/classifier.c
+@@ -112,6 +112,7 @@ static struct {
+     long long clf_ver;           /* model version string of the manifest */
+     double adult_hide_threshold; /* effective tag threshold: config > manifest > default */
+     double cfg_hide_threshold;   /* config adult_hide_threshold; 0 = config supplied none */
++    double adult_drop_threshold; /* manifest thresholds.adult_drop_threshold; 0 = not pinned */
+     char model_dir[CLF_PATH_CAP];
+     char adult_sha[CLF_SHA_HEX_LEN + 1];
+     char category_sha[CLF_SHA_HEX_LEN + 1];
+@@ -248,6 +249,18 @@ static void clf_load_manifest(void) {
+                 clf.adult_hide_threshold);
+     }
+ 
++    /* The calibrated drop threshold. It is deliberately NOT the tag boundary
++     * (that stays adult_hide_threshold): it is the number the operator reads
++     * back from /stats to confirm which generation's calibration is live. A
++     * manifest that omits it leaves 0.0, i.e. "not pinned", rather than
++     * inventing a second boundary. */
++    const cJSON *drop = thresholds
++                            ? cJSON_GetObjectItemCaseSensitive(thresholds, "adult_drop_threshold")
++                            : NULL;
++    if (cJSON_IsNumber(drop) && drop->valuedouble > 0.0 && drop->valuedouble <= 1.0) {
++        clf.adult_drop_threshold = drop->valuedouble;
++    }
++
+     const cJSON *models = clf_json_object(root, "models");
+     clf_manifest_sha(models, "adult", clf.adult_sha, sizeof(clf.adult_sha));
+     clf_manifest_sha(models, "category", clf.category_sha, sizeof(clf.category_sha));
+@@ -341,6 +354,16 @@ void classifier_init(const char *model_dir, double adult_hide_threshold) {
+      * on, so /stats has to publish it rather than the config literal. */
+     pthread_mutex_lock(&clf.stats_mutex);
+     clf.stats.adult_hide_threshold = clf.adult_hide_threshold;
++    /* Provenance: what /stats reports as the live generation and the bytes it
++     * was produced from. Copied here, not read live, so a reader never sees a
++     * half-populated snapshot. */
++    clf.stats.adult_drop_threshold = clf.adult_drop_threshold;
++    snprintf(clf.stats.model_sha256_adult, sizeof clf.stats.model_sha256_adult, "%s",
++             clf.adult_sha);
++    snprintf(clf.stats.model_sha256_category, sizeof clf.stats.model_sha256_category, "%s",
++             clf.category_sha);
++    snprintf(clf.stats.model_sha256_tv_kind, sizeof clf.stats.model_sha256_tv_kind, "%s",
++             clf.tv_kind_sha);
+     pthread_mutex_unlock(&clf.stats_mutex);
+     if (!clf.manifest_ok) {
+         /* Counted once: without the manifest none of the three models can be
+@@ -487,6 +510,67 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
+     return 0;
+ }
+ 
++/* Adult-only scoring, the token-gated backfill's entry point. The feature text
++ * is rendered exactly as classifier_classify() renders it (same buffer, same
++ * cap, same sizing call), so a backfilled verdict and an ingest verdict are
++ * produced from byte-identical input; only the students differ. */
++int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
++    if (adult) *adult = 0;
++    if (adult_p) *adult_p = 0.0;
++    if (!clf.enabled || !meta) return 1;
++    if (!clf.adult_model) return 1; /* no model: no verdict, leave the row alone */
++
++    int n_files = (meta->files && meta->num_files > 0) ? meta->num_files : 0;
++    tp_file_t *files = NULL;
++    if (n_files > 0) {
++        files = (tp_file_t *)malloc((size_t)n_files * sizeof(tp_file_t));
++        if (!files) {
++            log_msg(LOG_WARN, "Classifier: out of memory for %d files; no adult verdict",
++                    n_files);
++            return 1;
++        }
++        for (int i = 0; i < n_files; i++) {
++            files[i].path = meta->files[i].path ? meta->files[i].path : "";
++            files[i].size = meta->files[i].size_bytes;
++        }
++    }
++
++    const char *name = meta->name ? meta->name : "";
++    tp_result_t parsed;
++    memset(&parsed, 0, sizeof(parsed));
++    if (tp_parse(name, files, n_files, meta->size_bytes, &parsed) != TP_OK) {
++        log_msg(LOG_WARN, "Classifier: tparse rejected '%s'; no adult verdict", name);
++        free(files);
++        return 1;
++    }
++
++    char feature[CLF_FEATURE_CAP];
++    size_t need = tp_feature_text(name, files, n_files, &parsed, NULL, 0);
++    size_t cap = sizeof(feature);
++    if (need + 1 < cap) cap = need + 1;
++    tp_feature_text(name, files, n_files, &parsed, feature, cap);
++    feature[cap - 1] = '\0';
++    free(files);
++
++    /* 0/1 softmax, identical to the ingest path: P(1) is the winning
++     * probability for label 1 and its complement when label 0 wins. */
++    int label = -1;
++    float prob = 0.0f;
++    if (ftc_predict(clf.adult_model, feature, 1, &label, &prob) <= 0) {
++        /* No prediction at all: report "no verdict" rather than a fabricated
++         * adult = 0, which would silently rewrite a good stored row. */
++        return 1;
++    }
++    double p = (label == 1) ? (double)prob : 1.0 - (double)prob;
++    if (p < 0.0) p = 0.0;
++    if (p > 1.0) p = 1.0;
++    if (adult_p) *adult_p = p;
++    if (adult) *adult = (p >= clf.adult_hide_threshold) ? 1 : 0;
++    /* Deliberately no stats bump: these are backfill rows, not ingest rows, and
++     * folding them into total_classified would distort mean_us_per_item (which
++     * measures the full three-student call). */
++    return 0;
++}
+ void classifier_set_adult_mode(const char *adult_mode) {
+     /* Race-free by contract: main.c calls this once, before any worker thread
+      * exists. The stats mutex keeps it on the same publish/copy path as every
+@@ -621,6 +705,14 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
+     return 1;
+ }
+ 
++/* This flavour has no models and no tparse, so it never produces an adult
++ * verdict; every adult-backfill run reports DISABLED before it gets here. */
++int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
++    (void)meta;
++    if (adult) *adult = 0;
++    if (adult_p) *adult_p = 0.0;
++    return 1;
++}
+ void classifier_set_adult_mode(const char *adult_mode) {
+     /* Race-free by contract: main.c calls this once, before any worker thread
+      * exists. The stats mutex keeps it on the same publish/copy path as every
+diff --git i/src/classify_backfill_daemon.c w/src/classify_backfill_daemon.c
+index 81027c0..ee38209 100644
+--- i/src/classify_backfill_daemon.c
++++ w/src/classify_backfill_daemon.c
+@@ -19,6 +19,7 @@
+  */
+ #include "classify_backfill_daemon.h"
+ 
++#include "adult_backfill.h"
+ #include "classifier.h"
+ #include "classify_backfill.h"
+ 
+@@ -52,6 +53,9 @@
+  * FAILED pass gets this text (last_error is never empty after a failure). */
+ #define CB_ERROR_TEXT "classify backfill failed"
+ 
++/* Same for the adult engine. */
++#define CBD_ADULT_ERROR_TEXT "adult backfill failed"
++
+ /* ------------------------------------------------------------------------ *
+  * Test seams
+  *
+@@ -75,8 +79,19 @@ typedef void (*cbd_sleep_fn)(long long ms);
+ 
+ static void cbd_sleep_real(long long ms);
+ 
++typedef int (*cbd_adult_needed_fn)(database_t *db, long long target_adult_clf_ver,
++                                  long long *rows_left);
++typedef int (*cbd_adult_run_fn)(database_t *db, const adult_backfill_opts_t *opts,
++                               adult_backfill_progress_t *out);
++typedef void (*cbd_adult_stop_fn)(void);
++typedef void (*cbd_adult_get_progress_fn)(adult_backfill_progress_t *out);
++
+ static cbd_needed_fn cbd_needed = classify_backfill_needed;
+ static cbd_run_fn cbd_run = classify_backfill_run;
++static cbd_adult_needed_fn cbd_adult_needed = adult_backfill_needed;
++static cbd_adult_run_fn cbd_adult_run = adult_backfill_run;
++static cbd_adult_stop_fn cbd_adult_request_stop = adult_backfill_request_stop;
++static cbd_adult_get_progress_fn cbd_adult_get_progress = adult_backfill_get_progress;
+ static cbd_request_stop_fn cbd_request_stop = classify_backfill_request_stop;
+ static cbd_get_progress_fn cbd_get_progress = classify_backfill_get_progress;
+ static cbd_flag_fn cbd_enabled = classifier_enabled;
+@@ -129,7 +144,8 @@ typedef enum {
+     CBD_DECISION_RAN = 1,
+     CBD_DECISION_DISABLED_FEATURE = 2,
+     CBD_DECISION_DISABLED_NO_MODELS = 3,
+-    CBD_DECISION_DISABLED_NO_TARGET = 4
++    CBD_DECISION_DISABLED_NO_TARGET = 4,
++    CBD_DECISION_DISABLED_MODE = 5
+ } cbd_decision_t;
+ 
+ /* cbd_stats is the module-owned half of the published snapshot (timestamps,
+@@ -143,8 +159,20 @@ static int cbd_started;          /* guarded by cbd_mutex */
+ static database_t *cbd_db;       /* not owned; outlives the thread by contract */
+ static atomic_bool cbd_stop;     /* request_shutdown() sets it, the loop reads it */
+ static atomic_bool cbd_pass_active; /* 1 while cbd_run() is in flight */
++static atomic_bool cbd_adult_active; /* 1 while cbd_adult_run() is in flight */
+ static cbd_decision_t cbd_last_decision = CBD_DECISION_NONE;
+ 
++/* Which pass this process runs: "all" | "adult" | "off". Written once by
++ * classify_backfill_daemon_set_mode() before the thread exists, then read-only,
++ * so no lock is needed - the same contract as classifier_set_adult_mode(). */
++static char cbd_mode[8] = "all";
++
++/* cbd_adult_stats is the module-owned half of the adult surface (timestamps,
++ * error text, the last engine outcome); every read and write of it happens
++ * under cbd_mutex, and the engine's live counters are merged in by
++ * classify_backfill_daemon_get_adult_stats(). */
++static classify_backfill_daemon_adult_stats_t cbd_adult_stats = { .state = "idle" };
++
+ /* ------------------------------------------------------------------------ *
+  * Small helpers
+  * ------------------------------------------------------------------------ */
+@@ -165,6 +193,11 @@ static void cbd_set_state(classify_backfill_daemon_stats_t *stats, int state) {
+     snprintf(stats->state, sizeof stats->state, "%s", classify_backfill_state_name(state));
+ }
+ 
++/* The adult surface has its own state vocabulary. */
++static void cbd_set_adult_state(classify_backfill_daemon_adult_stats_t *stats, int state) {
++    snprintf(stats->state, sizeof stats->state, "%s", adult_backfill_state_name(state));
++}
++
+ /* rows_total is always "what this pass handled plus what is left", so a reader
+  * never sees a snapshot whose parts disagree (a pass that was stopped early
+  * reports its remaining candidates as rows_left). */
+@@ -280,6 +313,64 @@ static void cbd_run_pass(long long rows_left, long long target_clf_ver) {
+             progress.rows_total - progress.rows_done, finished_at - started_at);
+ }
+ 
++/* Run one adult-engine pass and publish its outcome. The sibling of
++ * cbd_run_pass(): same announce-before-enter / publish-after-return shape, so a
++ * /stats reader merges the engine's live counters from the first committed
++ * batch on and never sees the previous pass's outcome while this one runs. */
++static void cbd_run_adult_pass(long long rows_left, long long target_adult_clf_ver) {
++    adult_backfill_opts_t opts;
++    adult_backfill_progress_t progress;
++    long long started_at = (long long)time(NULL);
++    long long finished_at;
++    int rc;
++
++    memset(&opts, 0, sizeof opts);
++    opts.target_adult_clf_ver = 0; /* whatever the loaded manifest describes */
++    opts.chunk_ids = CB_CHUNK_IDS;
++    opts.batch_rows = CB_BATCH_ROWS;
++    opts.dry_run = 0;
++    opts.limit_rows = 0;
++
++    pthread_mutex_lock(&cbd_mutex);
++    cbd_set_adult_state(&cbd_adult_stats, ADULT_BACKFILL_RUNNING);
++    cbd_adult_stats.target_adult_clf_ver = target_adult_clf_ver;
++    cbd_adult_stats.rows_total = rows_left;
++    cbd_adult_stats.started_at = started_at;
++    cbd_adult_stats.finished_at = 0;
++    cbd_adult_stats.last_error[0] = '\0';
++    pthread_mutex_unlock(&cbd_mutex);
++    atomic_store(&cbd_adult_active, true);
++
++    memset(&progress, 0, sizeof progress);
++    rc = cbd_adult_run(cbd_db, &opts, &progress);
++
++    finished_at = (long long)time(NULL);
++    pthread_mutex_lock(&cbd_mutex);
++    cbd_set_adult_state(&cbd_adult_stats, progress.state);
++    if (progress.target_adult_clf_ver > 0) {
++        cbd_adult_stats.target_adult_clf_ver = progress.target_adult_clf_ver;
++    }
++    cbd_adult_stats.rows_total = progress.rows_total;
++    cbd_adult_stats.rows_gated_out = progress.rows_gated_out;
++    cbd_adult_stats.rows_scored = progress.rows_scored;
++    cbd_adult_stats.rows_updated = progress.rows_updated;
++    cbd_adult_stats.rows_failed = progress.rows_failed;
++    cbd_adult_stats.last_id = progress.last_id;
++    cbd_adult_stats.finished_at = finished_at;
++    if (rc < 0) {
++        snprintf(cbd_adult_stats.last_error, sizeof cbd_adult_stats.last_error, "%s",
++                 CBD_ADULT_ERROR_TEXT);
++    }
++    pthread_mutex_unlock(&cbd_mutex);
++    atomic_store(&cbd_adult_active, false);
++
++    log_msg(rc < 0 ? LOG_ERROR : (rc > 0 ? LOG_WARN : LOG_INFO),
++            "adult-backfill: pass finished state=%s target=%lld scored=%lld updated=%lld "
++            "failed=%lld elapsed=%llds",
++            adult_backfill_state_name(progress.state), progress.target_adult_clf_ver,
++            progress.rows_scored, progress.rows_updated, progress.rows_failed,
++            finished_at - started_at);
++}
+ /* ------------------------------------------------------------------------ *
+  * One poll
+  * ------------------------------------------------------------------------ */
+@@ -304,6 +395,17 @@ static void cbd_poll_once(void) {
+         cbd_publish_disabled(0);
+         return;
+     }
++    /* classify_backfill_mode=off: the operator (the app pins it) wants nothing
++     * automatic. Reported as disabled rather than idle, because "idle" would
++     * claim the database is up to date and this process never looked. */
++    if (strcmp(cbd_mode, "off") == 0) {
++        cbd_log_decision(CBD_DECISION_DISABLED_MODE, LOG_INFO,
++                         "classify-backfill: disabled (classify_backfill_mode=off); not "
++                         "polling the database (rows_left=%lld target_clf_ver=%lld)",
++                         0, 0);
++        cbd_publish_disabled(0);
++        return;
++    }
+     if (!cbd_models_loaded()) {
+         cbd_log_decision(CBD_DECISION_DISABLED_NO_MODELS, LOG_WARN,
+                          "classify-backfill: disabled (no classifier models loaded); not "
+@@ -323,6 +425,43 @@ static void cbd_poll_once(void) {
+         return;
+     }
+ 
++    /* classify_backfill_mode=adult: skip the full re-classify entirely and run
++     * the token-gated adult engine in-process instead. Both passes use the same
++     * target (the loaded manifest's generation) and the same thread, so only
++     * one of them can ever be in flight. */
++    if (strcmp(cbd_mode, "adult") == 0) {
++        long long adult_left = 0;
++        int adult_needed = cbd_adult_needed(cbd_db, 0, &adult_left);
++        if (adult_left < 0) {
++            adult_left = 0;
++        }
++        if (!adult_needed || adult_left <= 0) {
++            cbd_log_decision(CBD_DECISION_IDLE, LOG_INFO,
++                             "classify-backfill: adult pass not needed (rows_left=%lld "
++                             "target_clf_ver=%lld)",
++                             adult_left, target_clf_ver);
++            /* Keep the adult surface truthful: a process that never ran a pass
++             * reports idle at the resolved target, not a stale one. */
++            pthread_mutex_lock(&cbd_mutex);
++            if (cbd_adult_stats.started_at == 0) {
++                cbd_set_adult_state(&cbd_adult_stats, ADULT_BACKFILL_IDLE);
++                cbd_adult_stats.target_adult_clf_ver = target_clf_ver;
++            }
++            pthread_mutex_unlock(&cbd_mutex);
++            cbd_publish_no_work(adult_left, target_clf_ver);
++            return;
++        }
++        if (atomic_load(&cbd_stop)) {
++            return; /* shutdown arrived between the decision and the pass */
++        }
++        cbd_log_decision(CBD_DECISION_RAN, LOG_INFO,
++                         "classify-backfill: adult pass needed (rows_left=%lld "
++                         "target_clf_ver=%lld); starting a background pass",
++                         adult_left, target_clf_ver);
++        cbd_run_adult_pass(adult_left, target_clf_ver);
++        return;
++    }
++
+     /* target 0 = "take the generation from the loaded manifest", the same
+      * semantics the engine's own opts use. */
+     needed = cbd_needed(cbd_db, 0, &rows_left);
+@@ -383,6 +522,23 @@ static void *cbd_thread_main(void *arg) {
+  * Public API
+  * ------------------------------------------------------------------------ */
+ 
++void classify_backfill_daemon_set_mode(const char *mode) {
++    if (!mode) {
++        return;
++    }
++    /* Copied before the thread exists, so the loop reads it lock-free. An
++     * unrecognised value keeps the current mode, exactly like the config
++     * layer's warn-and-keep on a bad classify_backfill_mode. */
++    if (strcmp(mode, "all") == 0 || strcmp(mode, "adult") == 0 || strcmp(mode, "off") == 0) {
++        snprintf(cbd_mode, sizeof cbd_mode, "%s", mode);
++    } else {
++        log_msg(LOG_WARN,
++                "classify-backfill: unknown mode '%s' (expected all|adult|off); keeping "
++                "'%s'",
++                mode, cbd_mode);
++    }
++}
++
+ void classify_backfill_daemon_start(app_context_t *ctx, database_t *db) {
+     (void)ctx; /* kept in the signature for symmetry with the other supervisors */
+ 
+@@ -421,10 +577,14 @@ void classify_backfill_daemon_start(app_context_t *ctx, database_t *db) {
+ void classify_backfill_daemon_request_shutdown(void) {
+     atomic_store(&cbd_stop, true);
+     /* Cooperative: an in-flight pass returns after the batch it is in commits,
+-     * and the thread is out of its sliced sleep within CB_SLEEP_SLICE_MS. */
++     * and the thread is out of its sliced sleep within CB_SLEEP_SLICE_MS. Both
++     * engines are asked: at most one of them can be in flight. */
+     if (atomic_load(&cbd_pass_active)) {
+         cbd_request_stop();
+     }
++    if (atomic_load(&cbd_adult_active)) {
++        cbd_adult_request_stop();
++    }
+ }
+ 
+ void classify_backfill_daemon_destroy(void) {
+@@ -443,6 +603,9 @@ void classify_backfill_daemon_destroy(void) {
+     if (atomic_load(&cbd_pass_active)) {
+         cbd_request_stop();
+     }
++    if (atomic_load(&cbd_adult_active)) {
++        cbd_adult_request_stop();
++    }
+     pthread_join(cbd_thread, NULL);
+     log_msg(LOG_INFO, "classify-backfill: background thread joined");
+ }
+@@ -479,3 +642,43 @@ void classify_backfill_daemon_get_stats(classify_backfill_daemon_stats_t *out) {
+         cbd_set_counters(out, progress.rows_done, progress.rows_total - progress.rows_done);
+     }
+ }
++
++void classify_backfill_daemon_get_adult_stats(classify_backfill_daemon_adult_stats_t *out) {
++    adult_backfill_progress_t progress;
++    int live = 0;
++
++    if (!out) {
++        return;
++    }
++
++    /* Same merge rule as the full-pass accessor: an adult pass in flight is not
++     * visible in cbd_adult_stats (the thread is blocked inside the engine), so
++     * take the engine's own live snapshot. Both are read outside the module
++     * mutex; the engine's accessor has its own lock and never touches
++     * database_t.mutex, so this cannot deadlock against the pass. */
++    if (atomic_load(&cbd_adult_active)) {
++        memset(&progress, 0, sizeof progress);
++        cbd_adult_get_progress(&progress);
++        live = (progress.state == ADULT_BACKFILL_RUNNING);
++    }
++
++    pthread_mutex_lock(&cbd_mutex);
++    *out = cbd_adult_stats;
++    pthread_mutex_unlock(&cbd_mutex);
++
++    if (out->state[0] == '\0') {
++        snprintf(out->state, sizeof out->state, "%s",
++                 adult_backfill_state_name(ADULT_BACKFILL_IDLE));
++    }
++
++    if (live) {
++        cbd_set_adult_state(out, progress.state);
++        out->target_adult_clf_ver = progress.target_adult_clf_ver;
++        out->rows_total = progress.rows_total;
++        out->rows_gated_out = progress.rows_gated_out;
++        out->rows_scored = progress.rows_scored;
++        out->rows_updated = progress.rows_updated;
++        out->rows_failed = progress.rows_failed;
++        out->last_id = progress.last_id;
++    }
++}
+diff --git i/src/config.c w/src/config.c
+index 6c330cc..c5a59de 100644
+--- i/src/config.c
++++ w/src/config.c
+@@ -122,6 +122,10 @@ void config_init_defaults(crawler_config_t *config) {
+     strncpy(config->adult_mode, "tag", sizeof(config->adult_mode) - 1);
+     config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
+     strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
++    /* The C default stays "all": a direct binary user sees the historical
++     * behaviour. The Android app pins "off" and drives the adult pass from
++     * the maintenance action. */
++    strncpy(config->classify_backfill_mode, "all", sizeof(config->classify_backfill_mode) - 1);
+ 
+     /* Movie-kind defaults (movie-kind Stage B): v10 ships in models/v10, 4 threads
+      * is the measured steady state, and 82 °C is the backfill engine's pause
+@@ -407,6 +411,19 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
+             if (threshold < 0.0) threshold = 0.0;
+             if (threshold > 1.0) threshold = 1.0;
+             config->adult_hide_threshold = threshold;
++        } else if (strcmp(key, "classify_backfill_mode") == 0) {
++            /* Same shape as adult_mode: enum string, case-sensitive, invalid
++             * values warn and keep the previous one. */
++            if (strcmp(value, "all") == 0 || strcmp(value, "adult") == 0 ||
++                strcmp(value, "off") == 0) {
++                strncpy(config->classify_backfill_mode, value,
++                        sizeof(config->classify_backfill_mode) - 1);
++            } else {
++                log_msg(LOG_WARN,
++                        "Invalid classify_backfill_mode '%s' (expected all|adult|off); "
++                        "keeping '%s'",
++                        value, config->classify_backfill_mode);
++            }
+         } else if (strcmp(key, "hard_block_file") == 0) {
+             strncpy(config->hard_block_file, value, sizeof(config->hard_block_file) - 1);
+         /* "Categories to save": comma-separated taxonomy names/indices; an
+@@ -660,13 +677,14 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
+         {"log-level",   required_argument, 0, 'l'},
+         {"config",      required_argument, 0, 'c'},
+         {"help",        no_argument,       0, '?'},
++        {"classify-backfill-mode", required_argument, 0, 'B'},
+         {0, 0, 0, 0}
+     };
+ 
+     int opt;
+     int option_index = 0;
+ 
+-    while ((opt = getopt_long(argc, argv, "p:d:l:c?", long_options, &option_index)) != -1) {
++    while ((opt = getopt_long(argc, argv, "p:d:l:c?B:", long_options, &option_index)) != -1) {
+         switch (opt) {
+             case 'p':
+                 config->dht_port = atoi(optarg);
+@@ -690,6 +708,20 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
+             case 'c':
+                 /* Config file is loaded separately */
+                 break;
++            case 'B':
++                /* Same validation as the config-file key, so the CLI can
++                 * neither widen the enum nor silently ignore a typo. */
++                if (strcmp(optarg, "all") == 0 || strcmp(optarg, "adult") == 0 ||
++                    strcmp(optarg, "off") == 0) {
++                    strncpy(config->classify_backfill_mode, optarg,
++                            sizeof(config->classify_backfill_mode) - 1);
++                } else {
++                    fprintf(stderr,
++                            "--classify-backfill-mode takes all|adult|off, got '%s'\n",
++                            optarg);
++                    return -1;
++                }
++                break;
+             case '?':
+             default:
+                 fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
+@@ -698,6 +730,7 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
+                 fprintf(stderr, "  -d, --db-path PATH       Database path (default: data/torrents.db)\n");
+                 fprintf(stderr, "  -l, --log-level LEVEL    Log level: DEBUG|INFO|WARN|ERROR (default: INFO)\n");
+                 fprintf(stderr, "  -c, --config FILE        Config file path (default: config.ini)\n");
++                fprintf(stderr, "      --classify-backfill-mode MODE  all|adult|off (default: all)\n");
+                 fprintf(stderr, "  -?, --help               Show this help message\n");
+                 return -1;
+         }
+@@ -724,6 +757,9 @@ void config_print(const crawler_config_t *config) {
+     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
+     log_msg(LOG_DEBUG, "Logging:");
+     log_msg(LOG_DEBUG, "  Level: %s", log_levels[config->log_level]);
++    log_msg(LOG_DEBUG, "Classifier Settings:");
++    log_msg(LOG_DEBUG, "  classify_backfill_mode: %s",
++            config->classify_backfill_mode[0] ? config->classify_backfill_mode : "all");
+     log_msg(LOG_DEBUG, "Bloom persist interval: %d sec", config->bloom_persist_interval_sec);
+ }
+ 
+diff --git i/src/database.c w/src/database.c
+index 513b9aa..e6daf80 100644
+--- i/src/database.c
++++ w/src/database.c
+@@ -65,7 +65,17 @@ static const char *CREATE_TABLES_SQL =
+      * mask of 0 is a valid `none` verdict, never a marker). Deliberately no
+      * index: the candidate walk reuses idx_class_cat below. */
+     "    movie_kind_mask INTEGER,"
+-    "    movie_kind_clf_ver INTEGER"
++    "    movie_kind_clf_ver INTEGER,"
++    /* Adult-only generation (v11): the generation that produced the adult and
++     * adult_p values of this row. Appended after the movie-kind pair on
++     * purpose - the ingest binds 13/14 and the backup's INSERT ... SELECT *
++     * copy both key off this order. NULL means "never adult-scored by the
++     * token-gated pass", which is exactly the backfill engine's candidate
++     * predicate. Additive and nullable: a database that predates the column
++     * simply has no row marked, and a mask-style 0 verdict does not exist
++     * here (adult is 0/1), so the generation - never the label - is the
++     * watermark. */
++    "    adult_clf_ver INTEGER"
+     ");"
+     ""
+     "CREATE INDEX IF NOT EXISTS idx_class_cat ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
+@@ -505,7 +515,8 @@ int database_create_schema(database_t *db) {
+     /* Additive migration for a database created before the movie-kind columns
+      * existed. Idempotent and metadata-only, so it runs on every start. */
+     if (database_ensure_column(db->db, "torrent_class", "movie_kind_mask", "INTEGER") != 0 ||
+-        database_ensure_column(db->db, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0) {
++        database_ensure_column(db->db, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0 ||
++        database_ensure_column(db->db, "torrent_class", "adult_clf_ver", "INTEGER") != 0) {
+         return -1;
+     }
+ 
+@@ -581,8 +592,8 @@ int database_create_schema(database_t *db) {
+         "INSERT OR IGNORE INTO torrent_class "
+         "(torrent_id, category, tv_kind, adult, adult_p, season_lo, season_hi, "
+         " episode_lo, episode_hi, resolution, confidence, clf_ver, "
+-        " movie_kind_mask, movie_kind_clf_ver) "
+-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
++        " movie_kind_mask, movie_kind_clf_ver, adult_clf_ver) "
++        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+ 
+     rc = sqlite3_prepare_v2(db->db, insert_class_sql, -1, &db->insert_class_stmt, NULL);
+     if (rc != SQLITE_OK) {
+@@ -1054,6 +1065,13 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
+             sqlite3_bind_null(db->insert_class_stmt, 13);
+             sqlite3_bind_null(db->insert_class_stmt, 14);
+         }
++        /* Bind 15: the adult-only generation. A fresh row's adult verdict comes
++         * from the same classify() call as its category, so the adult
++         * generation IS clf_ver - no second struct field, no new
++         * torrent_metadata_t member. Appending the column (rather than
++         * inserting it beside clf_ver) keeps the movie-kind binds above and
++         * the backup's INSERT ... SELECT * column order intact. */
++        sqlite3_bind_int64(db->insert_class_stmt, 15, c->clf_ver);
+ 
+         rc = sqlite3_step(db->insert_class_stmt);
+         sqlite3_reset(db->insert_class_stmt);
+diff --git i/src/http_api.c w/src/http_api.c
+index 1411500..e18917f 100644
+--- i/src/http_api.c
++++ w/src/http_api.c
+@@ -791,6 +791,20 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
+                                 clf_stats.adult_mode[0] ? clf_stats.adult_mode : "tag");
+         cJSON_AddNumberToObject(classifier, "adult_hide_threshold",
+                                 clf_stats.adult_hide_threshold);
++        /* Provenance of the live generation: the version the loaded manifest
++         * names, the calibrated drop threshold it carries, and the three model
++         * sha256s the loader verified. Without these a reader cannot tell which
++         * generation produced the rows it is looking at. */
++        cJSON_AddNumberToObject(classifier, "clf_ver",
++                                (double)classifier_current_version());
++        cJSON_AddNumberToObject(classifier, "adult_drop_threshold",
++                                clf_stats.adult_drop_threshold);
++        cJSON_AddStringToObject(classifier, "model_sha256_adult",
++                                clf_stats.model_sha256_adult);
++        cJSON_AddStringToObject(classifier, "model_sha256_category",
++                                clf_stats.model_sha256_category);
++        cJSON_AddStringToObject(classifier, "model_sha256_tv_kind",
++                                clf_stats.model_sha256_tv_kind);
+         cJSON_AddNumberToObject(classifier, "total_classified", (double)clf_stats.total_classified);
+ 
+         double mean_us = 0.0;
+@@ -842,6 +856,31 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
+         cJSON_AddItemToObject(root, "classifier_backfill", classifier_backfill);
+     }
+ 
++    /* Adult backfill: the token-gated pass. Its own object because it reports
++     * its own counters (gated_out/scored/updated) and because "off" - the
++     * shipped classify_backfill_mode - must be visible as such rather than as a
++     * full re-classify that never happened. */
++    {
++        classify_backfill_daemon_adult_stats_t ab_stats;
++        classify_backfill_daemon_get_adult_stats(&ab_stats);
++
++        cJSON *adult_backfill = cJSON_CreateObject();
++        cJSON_AddStringToObject(adult_backfill, "state", ab_stats.state);
++        cJSON_AddNumberToObject(adult_backfill, "target_adult_clf_ver",
++                                (double)ab_stats.target_adult_clf_ver);
++        cJSON_AddNumberToObject(adult_backfill, "rows_total", (double)ab_stats.rows_total);
++        cJSON_AddNumberToObject(adult_backfill, "rows_gated_out",
++                                (double)ab_stats.rows_gated_out);
++        cJSON_AddNumberToObject(adult_backfill, "rows_scored", (double)ab_stats.rows_scored);
++        cJSON_AddNumberToObject(adult_backfill, "rows_updated", (double)ab_stats.rows_updated);
++        cJSON_AddNumberToObject(adult_backfill, "rows_failed", (double)ab_stats.rows_failed);
++        cJSON_AddNumberToObject(adult_backfill, "last_id", (double)ab_stats.last_id);
++        cJSON_AddNumberToObject(adult_backfill, "started_at", (double)ab_stats.started_at);
++        cJSON_AddNumberToObject(adult_backfill, "finished_at", (double)ab_stats.finished_at);
++        cJSON_AddStringToObject(adult_backfill, "last_error", ab_stats.last_error);
++        cJSON_AddItemToObject(root, "adult_backfill", adult_backfill);
++    }
++
+     /* Movie-kind (v9 JEV head): counters, present even at zero, so a dashboard
+      * can tell "no data yet" from "not built in". Independent of the fastText
+      * objects above, which this pass never touches. */
+diff --git i/src/main.c w/src/main.c
+index 6187d82..4c6f62c 100644
+--- i/src/main.c
++++ w/src/main.c
+@@ -13,6 +13,7 @@
+ #include "batch_writer.h"
+ #include "refresh_thread.h"
+ #include "refresh_query.h"
++#include "adult_backfill.h"
+ #include "classify_backfill.h"
+ #include "classify_backfill_daemon.h"
+ #include "movie_kind.h"
+@@ -278,6 +279,8 @@ int main(int argc, char *argv[]) {
+     const char *classify_backfill_db = NULL;
+     long long classify_backfill_limit = 0;
+     bool classify_backfill_write = false;
++    const char *adult_backfill_db = NULL;
++    long long adult_backfill_limit = 0;
+     const char *movie_backfill_db = NULL;
+     long long movie_backfill_limit = 0;
+     bool movie_backfill_dry_run = false;
+@@ -315,6 +318,28 @@ int main(int argc, char *argv[]) {
+                 return 1;
+             }
+             classify_backfill_limit = limit_rows;
++        } else if (strcmp(argv[i], "--adult-backfill") == 0) {
++            if (i + 1 >= argc) {
++                log_msg(LOG_ERROR, "--adult-backfill requires a <database> argument");
++                return 1;
++            }
++            adult_backfill_db = argv[++i];
++        } else if (strcmp(argv[i], "--adult-backfill-limit") == 0) {
++            if (i + 1 >= argc) {
++                log_msg(LOG_ERROR, "--adult-backfill-limit requires a <rows> argument");
++                return 1;
++            }
++            const char *limit_arg = argv[++i];
++            char *limit_end = NULL;
++            errno = 0;
++            long long limit_rows = strtoll(limit_arg, &limit_end, 10);
++            if (errno != 0 || limit_end == limit_arg || *limit_end != '\0' || limit_rows < 0) {
++                log_msg(LOG_ERROR,
++                        "--adult-backfill-limit requires a non-negative integer, got '%s'",
++                        limit_arg);
++                return 1;
++            }
++            adult_backfill_limit = limit_rows;
+         } else if (strcmp(argv[i], "--write") == 0) {
+             classify_backfill_write = true;
+         } else if (strcmp(argv[i], "--movie-kind-backfill") == 0) {
+@@ -864,6 +889,85 @@ int main(int argc, char *argv[]) {
+         return (bf_rc == 0) ? 0 : 1;
+     }
+ 
++    /* --adult-backfill <db> [--write] [--adult-backfill-limit <n>]: one-shot
++     * maintenance over the database named on the command line, dispatched for
++     * exactly the reasons --classify-backfill is (after classifier_init(), so
++     * the adult student is loaded; before database_init(), so the configured
++     * daemon database is never opened). Dry run by default: without --write it
++     * only counts the candidates and commits nothing. The token gate lives in
++     * the engine, so the count this prints IS the gated-in candidate set. */
++    if (adult_backfill_db) {
++        adult_backfill_opts_t ab_opts = {
++            .target_adult_clf_ver = 0, /* whatever the loaded manifest describes */
++            .chunk_ids = 0,            /* engine defaults */
++            .batch_rows = 0,
++            .dry_run = classify_backfill_write ? 0 : 1,
++            .limit_rows = adult_backfill_limit,
++        };
++        adult_backfill_progress_t ab_progress;
++        database_t ab_db;
++
++        memset(&ab_progress, 0, sizeof(ab_progress));
++        log_msg(LOG_INFO, "adult-backfill: %s %s ...",
++                classify_backfill_write ? "write pass on" : "dry run on", adult_backfill_db);
++
++        rc = database_init(&ab_db, adult_backfill_db, &g_app_ctx);
++        if (rc != 0) {
++            log_msg(LOG_ERROR, "adult-backfill: cannot open %s: %d", adult_backfill_db, rc);
++            mprog_terminal("adult-backfill", 0, 1, NULL);
++            hard_block_cleanup();
++            language_filter_cleanup();
++            bloom_filter_cleanup(g_bloom);
++            cleanup_app_context(&g_app_ctx);
++            return 1;
++        }
++
++        rc = database_create_schema(&ab_db);
++        if (rc != 0) {
++            log_msg(LOG_ERROR, "adult-backfill: cannot create the schema of %s: %d",
++                    adult_backfill_db, rc);
++            mprog_terminal("adult-backfill", 0, 1, NULL);
++            database_cleanup(&ab_db);
++            hard_block_cleanup();
++            language_filter_cleanup();
++            bloom_filter_cleanup(g_bloom);
++            cleanup_app_context(&g_app_ctx);
++            return 1;
++        }
++
++        int ab_rc = adult_backfill_run(&ab_db, &ab_opts, &ab_progress);
++        log_msg(ab_rc == 0 ? LOG_INFO : LOG_ERROR,
++                "adult-backfill: state=%s target=%lld total=%lld gated_out=%lld "
++                "scored=%lld updated=%lld failed=%lld last_id=%lld",
++                adult_backfill_state_name(ab_progress.state),
++                ab_progress.target_adult_clf_ver, ab_progress.rows_total,
++                ab_progress.rows_gated_out, ab_progress.rows_scored,
++                ab_progress.rows_updated, ab_progress.rows_failed, ab_progress.last_id);
++
++        /* Terminal [MPROG] line, so the app's maintenance status finalises from
++         * the same stream as every other one-shot (the counters ride the
++         * extra k=v tail; parseMaintenanceProgress keeps unknown keys as
++         * extras). */
++        {
++            char ab_extra[192];
++            snprintf(ab_extra, sizeof ab_extra,
++                     "total=%lld gated_out=%lld scored=%lld updated=%lld failed=%lld",
++                     ab_progress.rows_total, ab_progress.rows_gated_out,
++                     ab_progress.rows_scored, ab_progress.rows_updated,
++                     ab_progress.rows_failed);
++            mprog_terminal("adult-backfill", ab_rc == 0, ab_rc == 0 ? 0 : 1, ab_extra);
++        }
++
++        database_cleanup(&ab_db);
++        hard_block_cleanup();
++        language_filter_cleanup();
++        bloom_filter_cleanup(g_bloom);
++        cleanup_app_context(&g_app_ctx);
++        /* DISABLED and FAILED must both fail loudly: a backfill that cannot run
++         * must never look like a success. */
++        return (ab_rc == 0) ? 0 : 1;
++    }
++
+     /* --movie-kind-backfill <db> --reset: the stage-10 one-shot that clears the
+      * movie columns of every row a broken pass labelled, plus the resume and
+      * completion meta keys (include/movie_backfill.h). Dispatched before the
+@@ -1308,6 +1412,9 @@ int main(int argc, char *argv[]) {
+     /* Start the classify-backfill thread: the DB, the classifier and the HTTP
+      * API are all up by now, so /stats can serve its object from the first
+      * request. Non-blocking - the thread takes its own first decision. */
++    /* Which pass that thread runs is a config decision, read once here so the
++     * thread never has to look at the config. */
++    classify_backfill_daemon_set_mode(config.classify_backfill_mode);
+     classify_backfill_daemon_start(&g_app_ctx, &g_database);
+ 
+     /* The movie-kind backfill thread is deliberately NOT started: production
+diff --git i/tests/test_adult_backfill.c w/tests/test_adult_backfill.c
+new file mode 100644
+index 0000000..0c4d389
+--- /dev/null
++++ w/tests/test_adult_backfill.c
+@@ -0,0 +1,520 @@
++/**
++ * Host unit test for the token-gated adult backfill engine
++ * (include/adult_backfill.h, src/adult_backfill.c).
++ *
++ * Exercises the real product code, not a copy of it:
++ *   - the additive migration that puts adult_clf_ver on a database created
++ *     before the column existed (database_create_schema() + its
++ *     database_ensure_column() ALTER), including the "existing rows survive"
++ *     half - the device DB is 7.55 GiB and the ALTER runs on every start;
++ *   - the engine's own candidate predicate (adult_clf_ver NULL / older than the
++ *     target / already at the target);
++ *   - the UPDATE and the watermark: one pass marks the candidates with the
++ *     target generation, and the next pass selects nothing;
++ *   - the dry run, which counts the candidates and commits nothing.
++ *
++ * The token gate needs tparse, which this build does not have: without
++ * CLF_ENABLED the gate answers "nothing gated out" and every run is DISABLED
++ * before it could reach the gate anyway. That is exactly what lets this test
++ * drive the SQL/UPDATE/watermark path with a canned verdict through the
++ * -DADULT_BACKFILL_TEST seam.
++ *
++ * The three classifier symbols the engine references are defined at the bottom
++ * of this file instead of linking src/classifier.c: the host build compiles
++ * that module without CLF_ENABLED, i.e. as inert stubs that can never produce a
++ * verdict (same trick tests-backfill plays). The stub reports generation 11 -
++ * deliberately NOT the fixture's 6 - so a passing run proves the engine labels
++ * rows with whatever generation it is told and never hardcodes one.
++ *
++ * Fixture (/tmp/adult-backfill-test.db, removed before and after the run):
++ *   torrent 1 "alpha.jav.uncensored"  class row at clf_ver=6
++ *   torrent 2 "beta-site-rip"         class row at clf_ver=6
++ *   torrent 3 "gamma-control"         class row at clf_ver=6
++ * The torrent_class table is created WITHOUT adult_clf_ver, i.e. the shape the
++ * app shipped before patch 16; database_create_schema() must widen it.
++ *
++ * Standalone: no test framework, no dependency on the daemon build (the test
++ * links src/adult_backfill.c, src/database.c and src/bloom_filter.c directly,
++ * with tests/stub_log.c for log_msg()).
++ *
++ *     make tests        # or: make tests-adult-backfill
++ */
++#include <sqlite3.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "adult_backfill.h"
++#include "classifier.h"
++#include "database.h"
++#include "dht_crawler.h"
++
++#define TEST_DB "/tmp/adult-backfill-test.db"
++
++/* Generation the stub classifier reports. NOT the fixture's 6 on purpose: see
++ * the header. */
++#define STUB_TARGET 11
++/* Generation the fixture's pre-existing rows were labelled with. */
++#define OLD_CLF_VER 6
++/* A generation between the fixture's and the target: still a candidate. */
++#define STALE_ADULT_VER 4
++
++#define TORRENT_A 1
++#define TORRENT_B 2
++#define TORRENT_C 3
++#define FIXTURE_TORRENTS 3
++
++/* database_init() stores the pointer, so this has to outlive every fixture. */
++static app_context_t test_app_ctx;
++
++static int failures;
++
++static void check(int condition, const char *what, const char *detail) {
++    if (condition) {
++        return;
++    }
++    fprintf(stderr, "FAIL: %s%s%s\n", what, detail ? " - " : "", detail ? detail : "");
++    failures++;
++}
++
++static void check_ll(long long got, long long want, const char *what) {
++    if (got == want) {
++        return;
++    }
++    fprintf(stderr, "FAIL: %s (got %lld, want %lld)\n", what, got, want);
++    failures++;
++}
++
++/* ------------------------------------------------------------------------- *
++ * Fixture
++ * ------------------------------------------------------------------------- */
++
++static void remove_db(void) {
++    unlink(TEST_DB);
++    unlink(TEST_DB "-wal");
++    unlink(TEST_DB "-shm");
++}
++
++/* The DDL of the app BEFORE adult_clf_ver: the live torrents table, a
++ * torrent_class that stops at the movie-kind columns, and classifier_meta. */
++static const char *OLD_SHAPE_DDL =
++    "CREATE TABLE torrents ("
++    "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
++    "    info_hash BLOB(20) NOT NULL UNIQUE,"
++    "    name TEXT NOT NULL,"
++    "    size_bytes INTEGER NOT NULL,"
++    "    total_peers INTEGER DEFAULT 0,"
++    "    added_timestamp INTEGER NOT NULL);"
++    "CREATE TABLE torrent_class ("
++    "    torrent_id INTEGER PRIMARY KEY REFERENCES torrents(id) ON DELETE CASCADE,"
++    "    category INTEGER NOT NULL,"
++    "    tv_kind INTEGER,"
++    "    adult INTEGER NOT NULL DEFAULT 0,"
++    "    adult_p REAL,"
++    "    season_lo INTEGER, season_hi INTEGER,"
++    "    episode_lo INTEGER, episode_hi INTEGER,"
++    "    resolution INTEGER,"
++    "    confidence REAL,"
++    "    clf_ver INTEGER NOT NULL,"
++    "    movie_kind_mask INTEGER, movie_kind_clf_ver INTEGER);"
++    "CREATE TABLE classifier_meta (key TEXT PRIMARY KEY, value TEXT);";
++
++static void exec_sql(sqlite3 *db, const char *sql) {
++    char *err = NULL;
++    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
++        fprintf(stderr, "FAIL: sql failed: %s\n  %s\n", err ? err : "?", sql);
++        if (err) {
++            sqlite3_free(err);
++        }
++        failures++;
++    }
++}
++
++/* Build the pre-patch-16 database: three torrents, three class rows at the old
++ * generation, and NO adult_clf_ver column anywhere. */
++static void create_old_shape_fixture(void) {
++    sqlite3 *db = NULL;
++    sqlite3_stmt *stmt = NULL;
++    static const char *insert_torrent =
++        "INSERT INTO torrents (id, info_hash, name, size_bytes, total_peers, added_timestamp)"
++        " VALUES (?, ?, ?, ?, 0, 0)";
++    static const char *insert_class =
++        "INSERT INTO torrent_class (torrent_id, category, tv_kind, adult, adult_p, clf_ver)"
++        " VALUES (?, 1, NULL, 0, 0.0, ?)";
++    static const char *names[FIXTURE_TORRENTS] = {
++        "alpha.jav.uncensored",
++        "beta-site-rip",
++        "gamma-control",
++    };
++    int i;
++
++    remove_db();
++    if (sqlite3_open(TEST_DB, &db) != SQLITE_OK) {
++        fprintf(stderr, "FAIL: cannot create %s\n", TEST_DB);
++        failures++;
++        if (db) {
++            sqlite3_close(db);
++        }
++        return;
++    }
++    exec_sql(db, OLD_SHAPE_DDL);
++
++    if (sqlite3_prepare_v2(db, insert_torrent, -1, &stmt, NULL) == SQLITE_OK) {
++        for (i = 0; i < FIXTURE_TORRENTS; i++) {
++            unsigned char hash[20];
++            memset(hash, (int)(0xA0 + i), sizeof hash);
++            sqlite3_reset(stmt);
++            sqlite3_bind_int64(stmt, 1, i + 1);
++            sqlite3_bind_blob(stmt, 2, hash, (int)sizeof hash, SQLITE_STATIC);
++            sqlite3_bind_text(stmt, 3, names[i], -1, SQLITE_STATIC);
++            sqlite3_bind_int64(stmt, 4, 1000 + i);
++            if (sqlite3_step(stmt) != SQLITE_DONE) {
++                fprintf(stderr, "FAIL: seeding torrents (%s)\n", sqlite3_errmsg(db));
++                failures++;
++            }
++        }
++        sqlite3_finalize(stmt);
++    } else {
++        fprintf(stderr, "FAIL: prepare insert torrent\n");
++        failures++;
++    }
++
++    if (sqlite3_prepare_v2(db, insert_class, -1, &stmt, NULL) == SQLITE_OK) {
++        for (i = 0; i < FIXTURE_TORRENTS; i++) {
++            sqlite3_reset(stmt);
++            sqlite3_bind_int64(stmt, 1, i + 1);
++            sqlite3_bind_int64(stmt, 2, OLD_CLF_VER);
++            if (sqlite3_step(stmt) != SQLITE_DONE) {
++                fprintf(stderr, "FAIL: seeding torrent_class (%s)\n", sqlite3_errmsg(db));
++                failures++;
++            }
++        }
++        sqlite3_finalize(stmt);
++    } else {
++        fprintf(stderr, "FAIL: prepare insert class\n");
++        failures++;
++    }
++
++    sqlite3_close(db);
++}
++
++/* Open the fixture through the product's own open + schema path. */
++static int open_fixture(database_t *db) {
++    if (database_init(db, TEST_DB, &test_app_ctx) != 0) {
++        fprintf(stderr, "FAIL: database_init(%s)\n", TEST_DB);
++        failures++;
++        return -1;
++    }
++    if (database_create_schema(db) != 0) {
++        fprintf(stderr, "FAIL: database_create_schema(%s)\n", TEST_DB);
++        failures++;
++        return -1;
++    }
++    return 0;
++}
++
++static int column_exists(sqlite3 *db, const char *table, const char *column) {
++    sqlite3_stmt *stmt = NULL;
++    char sql[128];
++    int found = 0;
++
++    snprintf(sql, sizeof sql, "PRAGMA table_info(%s)", table);
++    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
++        return 0;
++    }
++    while (sqlite3_step(stmt) == SQLITE_ROW) {
++        const unsigned char *name = sqlite3_column_text(stmt, 1);
++        if (name && strcmp((const char *)name, column) == 0) {
++            found = 1;
++            break;
++        }
++    }
++    sqlite3_finalize(stmt);
++    return found;
++}
++
++/* Read one torrent_class row: is adult_clf_ver NULL, and what is it worth. */
++static void read_class_row(sqlite3 *db, long long id, int *is_null, long long *value,
++                           int *adult, double *adult_p, long long *clf_ver) {
++    sqlite3_stmt *stmt = NULL;
++    static const char *sql =
++        "SELECT adult_clf_ver, adult, adult_p, clf_ver FROM torrent_class WHERE torrent_id = ?";
++
++    *is_null = 1;
++    *value = 0;
++    if (adult) *adult = 0;
++    if (adult_p) *adult_p = 0.0;
++    if (clf_ver) *clf_ver = 0;
++
++    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
++        fprintf(stderr, "FAIL: prepare class row read (%s)\n", sqlite3_errmsg(db));
++        failures++;
++        return;
++    }
++    sqlite3_bind_int64(stmt, 1, id);
++    if (sqlite3_step(stmt) == SQLITE_ROW) {
++        if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
++            *is_null = 0;
++            *value = sqlite3_column_int64(stmt, 0);
++        }
++        if (adult) *adult = sqlite3_column_int(stmt, 1);
++        if (adult_p) *adult_p = sqlite3_column_double(stmt, 2);
++        if (clf_ver) *clf_ver = sqlite3_column_int64(stmt, 3);
++    } else {
++        fprintf(stderr, "FAIL: torrent_class row %lld missing\n", id);
++        failures++;
++    }
++    sqlite3_reset(stmt);
++    sqlite3_finalize(stmt);
++}
++
++/* ------------------------------------------------------------------------- *
++ * Canned verdict (the -DADULT_BACKFILL_TEST seam)
++ * ------------------------------------------------------------------------- */
++
++#define FAKE_ADULT 1
++#define FAKE_ADULT_P 0.9375
++
++static int fake_verdict_calls;
++
++static int fake_verdict(const torrent_metadata_t *meta, int *adult, double *adult_p) {
++    (void)meta;
++    fake_verdict_calls++;
++    if (adult) *adult = FAKE_ADULT;
++    if (adult_p) *adult_p = FAKE_ADULT_P;
++    return 0;
++}
++
++/* ------------------------------------------------------------------------- *
++ * Tests
++ * ------------------------------------------------------------------------- */
++
++/* The migration half: database_create_schema() must widen a torrent_class that
++ * predates adult_clf_ver, and must not disturb the rows already in it. */
++static void test_additive_migration(void) {
++    database_t db;
++    int is_null = 0;
++    long long value = 0;
++    int adult = 0;
++    double adult_p = 0.0;
++    long long clf_ver = 0;
++
++    create_old_shape_fixture();
++    if (open_fixture(&db) != 0) {
++        return;
++    }
++
++    check(column_exists(db.db, "torrent_class", "adult_clf_ver"),
++          "migration adds torrent_class.adult_clf_ver", NULL);
++    /* Idempotent: a second run on the widened table must be a no-op. */
++    check(database_create_schema(&db) == 0, "migration is idempotent", NULL);
++
++    /* Every pre-existing row survives untouched, and starts as a candidate. */
++    read_class_row(db.db, TORRENT_A, &is_null, &value, &adult, &adult_p, &clf_ver);
++    check(is_null == 1, "pre-existing row has adult_clf_ver NULL", NULL);
++    check_ll(clf_ver, OLD_CLF_VER, "pre-existing row keeps its clf_ver");
++    check_ll(adult, 0, "pre-existing row keeps its adult flag");
++    check_ll((long long)(adult_p * 1000.0), 0, "pre-existing row keeps its adult_p");
++
++    database_cleanup(&db);
++    remove_db();
++}
++
++/* Predicate + UPDATE + watermark, on one fixture: two of the three rows are
++ * candidates (NULL and stale), one is already at the target. */
++static void test_write_and_watermark(void) {
++    database_t db;
++    adult_backfill_opts_t opts;
++    adult_backfill_progress_t progress;
++    long long rows_left = -1;
++    int needed;
++    int is_null = 0;
++    long long value = 0;
++    int adult = 0;
++    double adult_p = 0.0;
++    long long clf_ver = 0;
++    char detail[128];
++
++    create_old_shape_fixture();
++    if (open_fixture(&db) != 0) {
++        return;
++    }
++
++    /* Row A stays NULL (never adult-scored); row B carries a stale adult
++     * generation; row C is already at the target and must be left alone. */
++    snprintf(detail, sizeof detail,
++             "UPDATE torrent_class SET adult_clf_ver = %d WHERE torrent_id = %d",
++             STALE_ADULT_VER, TORRENT_B);
++    exec_sql(db.db, detail);
++    snprintf(detail, sizeof detail,
++             "UPDATE torrent_class SET adult_clf_ver = %d WHERE torrent_id = %d",
++             STUB_TARGET, TORRENT_C);
++    exec_sql(db.db, detail);
++
++    needed = adult_backfill_needed(&db, 0, &rows_left);
++    check(needed == 1, "pass is needed while candidates exist", NULL);
++    check_ll(rows_left, 2, "candidate count = NULL row + stale row");
++
++    adult_backfill_set_verdict_hook(fake_verdict);
++    fake_verdict_calls = 0;
++
++    memset(&opts, 0, sizeof opts);
++    memset(&progress, 0, sizeof progress);
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "write pass returns 0", NULL);
++    check_ll(progress.rows_total, 2, "write pass counted 2 candidates");
++    check_ll(progress.rows_scored, 2, "write pass scored 2 rows");
++    check_ll(progress.rows_gated_out, 0, "no gate in the model-free host build");
++    check_ll(progress.rows_updated, 2, "write pass updated 2 rows");
++    check_ll(progress.rows_failed, 0, "write pass failed no row");
++    check_ll(progress.target_adult_clf_ver, STUB_TARGET,
++             "target comes from the classifier, never a literal");
++    check_ll(fake_verdict_calls, 2, "the verdict hook ran once per candidate");
++
++    /* The UPDATE wrote the adult verdict and the pass generation - and nothing
++     * else. clf_ver must be untouched: this pass never re-classifies. */
++    read_class_row(db.db, TORRENT_A, &is_null, &value, &adult, &adult_p, &clf_ver);
++    check(is_null == 0, "row A is no longer a candidate", NULL);
++    check_ll(value, STUB_TARGET, "row A stamped with the pass target");
++    check_ll(adult, FAKE_ADULT, "row A carries the adult verdict");
++    check_ll((long long)(adult_p * 10000.0), (long long)(FAKE_ADULT_P * 10000.0),
++             "row A carries the adult probability");
++    check_ll(clf_ver, OLD_CLF_VER, "row A keeps its category generation");
++
++    read_class_row(db.db, TORRENT_B, &is_null, &value, &adult, &adult_p, &clf_ver);
++    check_ll(value, STUB_TARGET, "row B (stale) is stamped with the pass target");
++
++    /* Row C was already at the target: it must not even be visited. */
++    read_class_row(db.db, TORRENT_C, &is_null, &value, &adult, &adult_p, &clf_ver);
++    check_ll(value, STUB_TARGET, "row C keeps its generation");
++    check_ll(adult, 0, "row C was not re-scored");
++
++    /* Watermark: nothing is left, so a second run selects nothing. */
++    needed = adult_backfill_needed(&db, 0, &rows_left);
++    check(needed == 0, "second pass is not needed", NULL);
++    check_ll(rows_left, 0, "second pass has no candidates");
++
++    memset(&progress, 0, sizeof progress);
++    fake_verdict_calls = 0;
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "second pass returns 0", NULL);
++    check_ll(progress.rows_total, 0, "second pass counts nothing");
++    check_ll(progress.rows_updated, 0, "second pass updates nothing");
++    check_ll(fake_verdict_calls, 0, "second pass scores nothing");
++
++    /* The completion path tombstones the resume key, so a later generation
++     * starts from the beginning rather than from a stale id. */
++    check_ll(progress.state, ADULT_BACKFILL_DONE, "second pass reports done");
++
++    database_cleanup(&db);
++    remove_db();
++}
++
++/* A dry run counts the gated-in set and commits nothing - that is the number
++ * the G3 band is judged on, before any write. */
++static void test_dry_run_writes_nothing(void) {
++    database_t db;
++    adult_backfill_opts_t opts;
++    adult_backfill_progress_t progress;
++    int is_null = 0;
++    long long value = 0;
++
++    create_old_shape_fixture();
++    if (open_fixture(&db) != 0) {
++        return;
++    }
++
++    memset(&opts, 0, sizeof opts);
++    opts.dry_run = 1;
++    memset(&progress, 0, sizeof progress);
++
++    check(adult_backfill_run(&db, &opts, &progress) == 0, "dry run returns 0", NULL);
++    check_ll(progress.state, ADULT_BACKFILL_DONE, "dry run reports done");
++    check_ll(progress.rows_total, FIXTURE_TORRENTS, "dry run counts every candidate");
++    check_ll(progress.rows_updated, 0, "dry run updates nothing");
++    check_ll(progress.rows_scored, 0, "dry run scores nothing");
++
++    /* And the table is untouched: still all candidates. */
++    read_class_row(db.db, TORRENT_A, &is_null, &value, NULL, NULL, NULL);
++    check(is_null == 1, "dry run left row A untouched", NULL);
++
++    database_cleanup(&db);
++    remove_db();
++}
++
++/* The engine declines before touching the database when no models are loaded:
++ * a backfill that cannot run must never look like a success. */
++static void test_disabled_without_models(void) {
++    database_t db;
++    adult_backfill_progress_t progress;
++    long long rows_left = -1;
++
++    create_old_shape_fixture();
++    if (open_fixture(&db) != 0) {
++        return;
++    }
++
++    /* Rebuild the fixture so the DB handle is real but the classifier is off:
++     * the stub answers models_loaded from this flag. */
++    extern int test_models_loaded;
++    test_models_loaded = 0;
++    check(adult_backfill_needed(&db, 0, &rows_left) == 0, "needed is 0 without models", NULL);
++
++    memset(&progress, 0, sizeof progress);
++    check(adult_backfill_run(&db, NULL, &progress) == 1, "run reports DISABLED (1)", NULL);
++    check_ll(progress.state, ADULT_BACKFILL_DISABLED, "state is disabled");
++    check_ll(progress.rows_updated, 0, "disabled run writes nothing");
++    test_models_loaded = 1;
++
++    database_cleanup(&db);
++    remove_db();
++}
++
++/* ------------------------------------------------------------------------- *
++ * Classifier symbols: src/adult_backfill.c references these. They answer from
++ * the fakes, so nothing here needs model files.
++ * ------------------------------------------------------------------------- */
++
++int test_models_loaded = 1;
++
++int classifier_models_loaded(void) {
++    return test_models_loaded;
++}
++
++int classifier_enabled(void) {
++    return test_models_loaded;
++}
++
++long long classifier_current_version(void) {
++    return STUB_TARGET;
++}
++
++void classifier_write_meta(sqlite3 *db) {
++    (void)db;
++}
++
++int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
++    /* Reached only when the test has not installed the hook; the engine must
++     * then leave the stored row alone rather than fabricate a verdict. */
++    (void)meta;
++    if (adult) *adult = 0;
++    if (adult_p) *adult_p = 0.0;
++    return 1;
++}
++
++int main(void) {
++    memset(&test_app_ctx, 0, sizeof test_app_ctx);
++
++    test_additive_migration();
++    test_write_and_watermark();
++    test_dry_run_writes_nothing();
++    test_disabled_without_models();
++
++    remove_db();
++
++    if (failures != 0) {
++        fprintf(stderr, "adult-backfill test: %d failure(s)\n", failures);
++        return 1;
++    }
++    printf("adult-backfill test: all checks passed\n");
++    return 0;
++}
+diff --git i/tests/test_classify_backfill_daemon.c w/tests/test_classify_backfill_daemon.c
+index 7779182..4a2ddc6 100644
+--- i/tests/test_classify_backfill_daemon.c
++++ w/tests/test_classify_backfill_daemon.c
+@@ -209,6 +209,16 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
+     return 1; /* no verdict: this test never classifies anything */
+ }
+ 
++/* src/adult_backfill.c is linked too (the daemon's adult mode calls it), and it
++ * defaults its verdict pointer to this symbol. No verdict, for the same reason
++ * as classifier_classify above. */
++int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
++    (void)meta;
++    if (adult) *adult = 0;
++    if (adult_p) *adult_p = 0.0;
++    return 1;
++}
++
+ /* ------------------------------------------------------------------------- *
+  * Helpers
+  * ------------------------------------------------------------------------- */
