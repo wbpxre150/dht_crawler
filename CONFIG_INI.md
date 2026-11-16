@@ -1,48 +1,87 @@
 # config.ini — get_peers & metadata-fetch tuning (patch 19)
 
 Scope: this page documents the `config.ini` keys that crawler **patch 19**
-(`patches/getpeers-metadata-tuning.patch`) added or changed, with their defaults, accepted ranges and
-semantics. It is not a full `config.ini` reference — for the complete key inventory read
+(`patches/getpeers-metadata-tuning.patch`) added or changed, with their shipped defaults, accepted ranges
+and semantics. It is not a full `config.ini` reference — for the complete key inventory read
 `src/config.c` (`config_load_file`) and the sanitized app-side template
-`app/src/main/assets/dht_crawler/config.ini.default`, which carries these five keys with comments.
+`app/src/main/assets/dht_crawler/config.ini.default`, which carries these seven keys with comments.
 
-All values are parsed with `atoi`, so `= true` parses as `0`. For the three new keys, **`0` means
-"disabled / pre-patch behaviour"**; every one of them is fail-open to the old code path.
+All values are parsed with `atoi`, so `= true` parses as `0`. **Every one of these keys ships at its legacy
+value — the tuning is opt-in.** Five of the seven treat `0` as "disabled / pre-patch behaviour"; all of them
+are fail-open to the old code path. The shipped defaults are the measured result: five 30-minute on-device
+windows showed the tuning to be net-negative (TUNED vs LEGACY on the same build in the same hour: lookups/s
+−1.5 %, yield −3.4 pp, packets/lookup +6 %, metadata/s −13 %), while the instrumentation that produced that
+finding is what patch 19 actually ships enabled. See the run report `measurements.md` for the numbers.
 
-| key | default | accepted | effect |
+| key | shipped default | accepted | effect |
 |---|---:|---|---|
-| `tree_get_peers_round_idle_ms` | `1500` | `0`, or `250..6000` | end a get_peers round after this much silence since the last answer |
-| `tree_get_peers_penalize_misses` | `1` | `0`/`1` (any non-zero value is coerced to `1`) | charge unanswered round slots against the silent node |
-| `tree_metadata_piece_idle_ms` | `15000` | `0`, or `3000..60000` | evict a metadata connection that copies no new piece for this long |
-| `tree_parallel_peers` | `4` (was `2`) | `1..4` (was `1..10`) | parallel peer connections per infohash |
-| `tree_metadata_timeout_ms` | `30000` (was `60000`) | `5000..600000` (unchanged) | per-tree metadata fetch deadline |
+| `tree_get_peers_round_idle_ms` | `0` (off) | `0`, or `250..6000` | end a get_peers round after this much silence since the last answer |
+| `tree_get_peers_penalize_misses` | `0` (off) | `0`/`1` (any non-zero value is coerced to `1`) | charge unanswered round slots against the silent node |
+| `tree_get_peers_slot_budget_ms` | `0` (off) | `0`, or `500..6000` | stop waiting on a slot once its own answer budget has run out |
+| `tree_get_peers_finish_on_peers` | `0` (off) | `0`/`1` (any non-zero value is coerced to `1`) | end a lookup as soon as it has peers |
+| `tree_metadata_piece_idle_ms` | `0` (off) | `0`, or `3000..60000` | evict a metadata connection that copies no new piece for this long |
+| `tree_parallel_peers` | `2` (legacy) | `1..4` (clamp narrowed from `1..10`) | parallel peer connections per infohash |
+| `tree_metadata_timeout_ms` | `60000` (legacy) | `5000..600000` (unchanged) | per-tree metadata fetch deadline |
 
 The clamps live in `src/config.c` (`config_load_file`); out-of-range values are clamped and logged at
-`LOG_WARN` rather than rejected.
+`LOG_WARN` rather than rejected. The `tree_parallel_peers` clamp was narrowed to `1..4` as a **correctness
+fix** — `MAX_PARALLEL_PEERS` in `src/tree_metadata.c` silently clamped deeper in the fetcher, so the accepted
+value was not the effective one. That fix stays regardless of the default.
 
 ## tree_get_peers_round_idle_ms
 
 Per-round silence cap for `tree_lookup_peers()` (`src/thread_tree.c`). The timer starts with the fan-out
 and is refreshed by **every matched answer**, so it measures silence since the last answer, not the age of
 the round: a round that is still producing responses is never cut short. When a round ends on this cap
-with **zero** answers, the whole lookup terminates instead of walking the remaining candidate set — dead
-lookups stop burning the full `tree_get_peers_deadline_ms` (default 6000 ms) and stop spending further
-packets.
+with **zero** answers, the whole lookup terminates instead of walking the remaining candidate set.
 
-- `0` disables it: a round is bounded only by the per-infohash deadline (pre-patch behaviour).
+- `0` (shipped) disables it: a round is bounded only by the per-infohash deadline (pre-patch behaviour).
 - Any other value is clamped into `250..6000` (a negative value becomes `0`).
 - Echoed by `/stats` as `supervisor.get_peers.round_idle_ms` and `trees[].get_peers.round_idle_ms`.
+- Measured on device: with `1500` the mechanism was **inert** — 245 idle exits against 246,380 deadline
+  exits over a full window, because answers trickle in faster than 1.5 s. This is why it ships off.
 
 ## tree_get_peers_penalize_misses
 
 When enabled, the round-end sweep charges every unanswered fan-out slot against its node through
 `tree_routing_mark_failed()` (`src/tree_routing.c`): the node's `fail_count` is incremented and the node is
 evicted at `MAX_FAIL_COUNT` (`3`). Silent nodes therefore stop being re-selected, and the find_node workers
-refill the routing table. Answered slots are zeroed in the drain loop and failed sends never receive a
+refill the routing table. The slot carries the queried node's 20-byte id captured at send time (not a
+candidate-array index), so a same-round merge cannot misdirect the penalty. A matched answer re-adds the node
+via `tree_routing_add_node()`, which resets `fail_count` — with the knob on, eviction means "repeatedly
+silent and never answering". Answered slots are zeroed in the drain loop and failed sends never receive a
 transaction ID, so only genuinely unanswered queries are charged.
 
-- `0` disables the penalty (pre-patch behaviour); any positive value is coerced to `1`.
+- `0` (shipped) disables the penalty (pre-patch behaviour); any positive value is coerced to `1`.
 - Echoed by `/stats` as `supervisor.get_peers.penalize_misses` and `trees[].get_peers.penalize_misses`.
+- Measured on device: at `1` the ~1,000 penalties/s recycled the routing tables several times per window and
+  yield fell **10.8 pp** (36.9 % → 26.1 %) without collapsing the tables. Hence the shipped `0`.
+
+## tree_get_peers_slot_budget_ms
+
+Per-slot answer budget in `tree_lookup_peers()`. Every sent slot records its own `sent_us`; the drain loop
+stops once no remaining slot is still inside its budget (all answered or all expired), which ends the round
+even when another slot keeps trickling answers. If the round ends with zero answers the lookup terminates.
+The sweep counts the expired slots into `gp_slot_expired_total`, a subset of `gp_unanswered_slots_total`, so
+`slot_expired_total ≤ unanswered_slots_total` always holds.
+
+- `0` (shipped) disables it: slots are bounded only by the per-infohash deadline (pre-patch behaviour).
+- Any other value is clamped into `500..6000` (a negative value becomes `0`).
+- Echoed by `/stats` as `supervisor.get_peers.slot_budget_ms` and `trees[].get_peers.slot_budget_ms`;
+  `slot_expired_total` is published per tree and aggregated by the supervisor.
+- Built to replace the falsified round-idle premise; measured net-negative at `2000` (TUNED vs LEGACY), so it
+  ships off.
+
+## tree_get_peers_finish_on_peers
+
+When on, a lookup that already has peers drains the packets already queued (timeout-0 pops, so concurrent
+answers are not lost) and ends instead of waiting for every fan-out slot or the full deadline.
+`gp_early_finish_total` counts the lookups terminated this way.
+
+- `0` (shipped) keeps the legacy wait-for-all behaviour; any positive value is coerced to `1`.
+- Echoed by `/stats` as `supervisor.get_peers.finish_on_peers` and `trees[].get_peers.finish_on_peers`.
+- The trade-off is real and was measured: an entry then carries one responder's peer list instead of up to
+  eight, which costs peer-list width for latency. Ships off.
 
 ## tree_metadata_piece_idle_ms
 
@@ -53,27 +92,30 @@ without new data. The pre-existing 10 s total-silence watchdog (`CONN_SILENCE_CL
 fully silent peers and fires first, so no event is counted twice; the refill loop then advances the fetch
 window to the next untried peer.
 
-- `0` disables the eviction (pre-patch behaviour).
+- `0` (shipped) disables the eviction (pre-patch behaviour).
 - Any non-zero value is clamped into `3000..60000`; a negative value therefore becomes `3000`, not `0`.
 - Echoed by `/stats` as `supervisor.metadata.piece_idle_ms`.
+- Measured: `stall_total` is 0.8 % of the metadata failure mass and `deadline_total` 0.1–0.2 % across every
+  window, i.e. this knob addresses ≤1 % of the failures. Ships off.
 
 ## Changed defaults
 
-`tree_parallel_peers` now defaults to **4** and its clamp narrowed from `1..10` to **`1..4`**, matching
-`MAX_PARALLEL_PEERS` in `src/tree_metadata.c` — the accepted value is now the effective one instead of being
-silently clamped deeper in the fetcher. This adds TCP connections inside the existing metadata workers'
-single poll loop; it does **not** add threads.
+The two pre-existing keys keep their **legacy** values in the shipped patch, and their clamps are unchanged
+except for the `tree_parallel_peers` correctness fix noted above:
 
-`tree_metadata_timeout_ms` now defaults to **30000** (was `60000`). With piece-idle eviction in place the
-global deadline is a backstop rather than the common exit; `/stats` `supervisor.metadata_failures.deadline_total`
-shows how often it actually fires.
+- `tree_parallel_peers` ships at **2**. The `4` experiment was never A/B'd against `2` and showed no measured
+  benefit, so it is not worth carrying as a default. The `1..4` clamp stays (accepted == effective).
+- `tree_metadata_timeout_ms` ships at **60000**. The `30000` experiment was confounded with the get_peers
+  knobs in the only contemporaneous comparison, and the deadline accounts for ≤0.2 % of the failure mass, so
+  it is not justified by measurement either.
 
-Both changed defaults govern fresh installs and absent keys only: `config.ini` is written by the app's
-settings form, and an existing file keeps whatever it already pins.
+Both govern fresh installs and absent keys only: `config.ini` is written by the app's settings form, and an
+existing file keeps whatever it already pins. Any of these seven keys can be re-enabled as an advanced
+override in the app's crawler settings (they are on the Kotlin allow-list) — re-measure, do not assume.
 
 ## Where these show up in `/stats`
 
 `supervisor.metadata` echoes the effective metadata knobs of the first live tree — `parallel_peers`,
 `metadata_timeout_ms`, `metadata_workers`, `tcp_connect_timeout_ms`, `fresh_peer_retries`, `piece_idle_ms` —
 so a snapshot always carries the settings it was measured under. The get_peers knobs are echoed per tree
-(`trees[].get_peers.deadline_ms/fanout/max_queries/round_idle_ms/penalize_misses`).
+(`trees[].get_peers.deadline_ms/fanout/max_queries/round_idle_ms/penalize_misses/slot_budget_ms/finish_on_peers`).

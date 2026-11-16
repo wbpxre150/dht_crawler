@@ -62,39 +62,78 @@ Throttling: upstream stages pause (condition variable) when downstream queues ex
 
 ### get_peers / metadata tuning (patch 19)
 
-Four work-elimination changes, all fail-open: every one restores the pre-patch behaviour at `0` (or at the
-old default).
+Every mechanism below exists in the shipped patch and every one is **fail-open** at `0` (or at the old
+default). **They ship disabled**, because the measured result is negative: the compiled defaults are the
+legacy ones — `tree_get_peers_round_idle_ms` 0, `tree_get_peers_penalize_misses` 0,
+`tree_get_peers_slot_budget_ms` 0, `tree_get_peers_finish_on_peers` 0, `tree_metadata_piece_idle_ms` 0,
+`tree_parallel_peers` 2, `tree_metadata_timeout_ms` 60000. The **instrumentation** is what ships enabled
+(failure taxonomy + exit/slot counters + the `/stats` split); the behaviour knobs stay present, documented
+and opt-in.
 
-- **Round-idle get_peers exit** — `tree_get_peers_round_idle_ms` (default 1500, `0` = off),
+Two measured bounds explain the negative result. The only valid contemporaneous comparison is TUNED vs
+LEGACY on the same build in the same hour: lookups/s −1.5 %, yield −3.4 pp, packets/lookup +6 %,
+metadata/s −13 %. (The overnight baseline is not a control — LEGACY on the new build measured 33.1 % yield
+against the baseline's 36.9 %, i.e. the DHT thinned overnight.)
+
+- **get_peers is discovery-bound, not latency-bound.** Per-tree drain runs 2.5–3.0 lookups/s against a
+  BEP51 fill of 3.0–3.5/s, with `discovery_paused` 11–14 % in *every* configuration: the infohash queue is
+  the ceiling, so finishing a lookup sooner cannot create more lookups.
+- **Metadata is peer-liveness-bound.** Across all windows the failure mass is connect 82.8–84.1 %,
+  handshake 14.8–16.1 %, stall 0.8 %, deadline 0.1–0.2 %. Piece-idle eviction and the deadline knob address
+  ≤1 % of it, so neither is justified by measurement.
+- **The round-idle premise was falsified.** Answers trickle in faster than 1.5 s, so over a full window the
+  idle exit fired 245 times against 246,380 deadline exits — inert, not harmful. The per-slot budget and
+  finish-on-peers mechanisms were built to replace it and measured net-negative too.
+
+- **Round-idle get_peers exit** — `tree_get_peers_round_idle_ms` (default 0 = off, opt-in 250..6000),
   `thread_tree.c:tree_lookup_peers`. A round ends after that much silence **since the last answer** (the
   timer is refreshed by every matched answer, so a round still producing responses is never cut short), and
   a round that produced **zero** answers terminates the whole lookup instead of walking the remaining
-  candidate set. Dead lookups therefore stop burning the full `tree_get_peers_deadline_ms` (6 s) and stop
-  sending further rounds. The terminal cause is recorded as a `GP_EXIT_*` reason; only `GP_EXIT_IDLE` and
+  candidate set. The terminal cause is recorded as a `GP_EXIT_*` reason; only `GP_EXIT_IDLE` and
   `GP_EXIT_DEADLINE` have `/stats` counters.
-- **Silent-node penalties** — `tree_get_peers_penalize_misses` (default 1). The round-end sweep charges
-  every unanswered fan-out slot against its node through the pre-existing `tree_routing_mark_failed()`
-  (`tree_routing.c`), which bumps `fail_count` and evicts the node at `MAX_FAIL_COUNT` (3); silent nodes stop
-  being re-selected and the find_node workers refill the table. The sweep is the only place that charges
-  misses — answered slots are zeroed in the drain loop and failed sends never get a transaction ID.
-- **Piece-idle metadata eviction** — `tree_metadata_piece_idle_ms` (default 15000, `0` = off),
+- **Per-slot answer budget** — `tree_get_peers_slot_budget_ms` (default 0 = off, opt-in 500..6000). Each
+  sent slot carries its own `sent_us`; when every remaining slot has either answered or run out its budget
+  the drain breaks (`GP_EXIT_SLOT_BUDGET`), so one dead peer cannot pin the round through another slot's
+  trickled answers. The sweep counts the expired subset into `gp_slot_expired_total` (a subset of
+  `gp_unanswered_slots`).
+- **Finish-on-peers** — `tree_get_peers_finish_on_peers` (default 0 = off, 0/1). When on, a lookup that
+  already has peers drains the packets already queued (timeout-0 pops, so answers arriving together are not
+  lost) and ends, instead of waiting for all fan-out slots or the full deadline. `gp_early_finish_total`
+  counts the lookups terminated this way. The trade-off is real: entries then carry one responder's peer
+  list instead of up to eight.
+- **Silent-node penalties** — `tree_get_peers_penalize_misses` (default 0, opt-in 0/1). The round-end sweep
+  charges every unanswered fan-out slot against its node through the pre-existing
+  `tree_routing_mark_failed()` (`tree_routing.c`), which bumps `fail_count` and evicts the node at
+  `MAX_FAIL_COUNT` (3). The slot stores the queried node's **20-byte id**, captured at send time, so a
+  candidate-array merge cannot misdirect the penalty; a matched answer re-adds the node via
+  `tree_routing_add_node()`, resetting `fail_count` (eviction means "repeatedly silent and never answering").
+  Measured cost when enabled: ~1,000 penalties/s churned the tables and yield fell 10.8 pp, hence the
+  default of 0.
+- **Piece-idle metadata eviction** — `tree_metadata_piece_idle_ms` (default 0 = off, opt-in 3000..60000),
   `tree_metadata.c`. `last_piece_time` is refreshed **only** when a new metadata data piece is copied into
   the shared buffer, so a peer that keeps the socket warm with keep-alive/have/bitfield traffic but delivers
   no pieces is evicted instead of holding a fetch-window slot until the global deadline. The pre-existing
   10 s silence watchdog (`CONN_SILENCE_CLOSE_MS`) still catches fully silent peers and fires first, so no
-  event is counted twice; the refill loop then advances the window to the next untried peer. Window and
-  deadline defaults moved with it: `tree_parallel_peers` 2 → 4 (clamp narrowed to 1..4 so the accepted value
-  equals the effective `MAX_PARALLEL_PEERS`) and `tree_metadata_timeout_ms` 60000 → 30000 (the deadline is
-  now a backstop, not the common case).
+  event is counted twice; the refill loop then advances the window to the next untried peer.
+  `tree_parallel_peers` (default 2, clamp 1..4 = `MAX_PARALLEL_PEERS`, so the accepted value is the
+  effective one) and `tree_metadata_timeout_ms` (default 60000, 5000..600000) ship at their legacy values:
+  the wider window was never A/B'd against 2 and the shorter deadline was never justified by the measured
+  failure mass.
+- **Fan-out deadline check (always on — a defect fix, not tuning).** The fan-out send loop stops sending the
+  remaining picked slots once `now_us() >= deadline_us`, so `udp_rate_limit_acquire` sleeps (up to 50 ms
+  each, more when the bucket throttles) can no longer push `mean_lookup_ms` systematically above
+  `tree_get_peers_deadline_ms` (measured 7,044 ms against a 6,000 ms deadline before the fix). It applies at
+  legacy settings too, which is why it ships on.
 - **Failure-counter taxonomy** — `/stats` `supervisor.metadata_failures`. `connect`, `handshake`, `stall`,
   `ut_reject`, `size`, `hash` and `other` are **per-connection** outcome events, each counted exactly once at
   the site that first detects the failure; `deadline` is **one event per attempt**, taken at the
   global-timeout break where every live slot is abandoned together. That asymmetry is why
   Σ counters ≥ failed attempts — do not "fix" it. Never count in `parallel_conn_close()`, in the
   post-process close (that reason was already counted inside `parallel_conn_process`) or in the final cleanup
-  loop, or a single failure is counted twice. The four get_peers exit/sweep counters
-  (`idle_exits`, `deadline_exits`, `unanswered_slots`, `miss_penalties`) are per-tree atomics folded into the
-  supervisor at respawn like the other `gp_*` counters and published as `*_total`.
+  loop, or a single failure is counted twice. The get_peers exit/sweep counters
+  (`idle_exits`, `deadline_exits`, `unanswered_slots`, `miss_penalties`, `slot_expired`, `early_finish`) are
+  per-tree atomics folded into the supervisor at respawn like the other `gp_*` counters and published as
+  `*_total`.
 
 ### Respawn Logic
 

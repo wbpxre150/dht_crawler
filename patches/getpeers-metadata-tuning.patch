@@ -1,24 +1,23 @@
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/config.c dht_crawler/src/config.c
 --- dht_crawler-baseline/src/config.c	2026-11-17 00:48:00.660423211 +0800
-+++ dht_crawler/src/config.c	2026-11-17 03:01:25.235304877 +0800
++++ dht_crawler/src/config.c	2026-11-17 04:34:52.842185432 +0800
 @@ -158,13 +158,18 @@
      config->tree_get_peers_deadline_ms = 6000;      /* 6s get_peers lookup deadline (500-8000) */
      config->tree_get_peers_fanout = 8;              /* 8 concurrent get_peers queries per round (2-12) */
      config->tree_get_peers_max_queries = 16;        /* 16 get_peers packets per infohash (8-32, >= fanout) */
-+    config->tree_get_peers_round_idle_ms = 1500;    /* abandon a round after 1.5s without an answer (0 = off, 250-6000) */
++    config->tree_get_peers_round_idle_ms = 0;       /* shipped off (opt-in): abandon a round after N ms without an answer (0 = off, 250-6000) */
 +    config->tree_get_peers_penalize_misses = 0;     /* charge unanswered round slots against the node (0-1; off by default, the churn cost 10.8 pp yield) */
-+    config->tree_get_peers_slot_budget_ms = 2000;   /* a slot stops pinning its round after 2s (0 = off, 500-6000) */
-+    config->tree_get_peers_finish_on_peers = 1;     /* end a lookup as soon as peers are found (0-1) */
++    config->tree_get_peers_slot_budget_ms = 0;      /* shipped off (opt-in): a slot stops pinning its round after N ms (0 = off, 500-6000) */
++    config->tree_get_peers_finish_on_peers = 0;     /* shipped off (opt-in): end a lookup as soon as peers are found (0-1) */
  
      /* Thread tree Stage 5 defaults (metadata) */
      config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
      config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
 -    config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash */
-+    config->tree_parallel_peers = 4;                /* 4 parallel peer connections per infohash (1-4) */
++    config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash (1-4) */
      config->tree_metadata_fresh_peer_retries = 1;   /* 1 fresh-peer re-lookup before a strike (0 = off) */
--    config->tree_metadata_timeout_ms = 60000;       /* 60s metadata fetch deadline */
-+    config->tree_metadata_timeout_ms = 30000;       /* 30s metadata fetch deadline */
-+    config->tree_metadata_piece_idle_ms = 15000;    /* evict a conn with no new piece after 15s (0 = off, 3000-60000) */
+     config->tree_metadata_timeout_ms = 60000;       /* 60s metadata fetch deadline */
++    config->tree_metadata_piece_idle_ms = 0;        /* shipped off (opt-in): evict a conn with no new piece after N ms (0 = off, 3000-60000) */
  
      /* Thread tree metadata rate-based respawn defaults */
      config->min_metadata_rate = 0.01;                  /* Floor for dynamic threshold */
@@ -117,7 +116,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/config.c dht_crawl
      log_msg(LOG_DEBUG, "Logging:");
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
 --- dht_crawler-baseline/src/http_api.c	2026-11-17 00:48:00.678588366 +0800
-+++ dht_crawler/src/http_api.c	2026-11-17 03:01:25.236200333 +0800
++++ dht_crawler/src/http_api.c	2026-11-17 03:05:50.346754114 +0800
 @@ -1052,8 +1052,117 @@
                  ((double)sup_gp_lookups + (double)sup_gp_rounds) / (double)sup_gp_lookups;
          }
@@ -324,7 +323,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
      }
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/main.c dht_crawler/src/main.c
 --- dht_crawler-baseline/src/main.c	2026-11-17 00:48:00.681129587 +0800
-+++ dht_crawler/src/main.c	2026-11-17 03:01:25.237984090 +0800
++++ dht_crawler/src/main.c	2026-11-17 03:05:50.348509973 +0800
 @@ -1287,11 +1287,16 @@
          .get_peers_deadline_ms = config.tree_get_peers_deadline_ms,
          .get_peers_fanout = config.tree_get_peers_fanout,
@@ -344,7 +343,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/main.c dht_crawler
          .dynamic_rate_margin = config.dynamic_rate_margin,
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_crawler/src/supervisor.c
 --- dht_crawler-baseline/src/supervisor.c	2026-11-17 00:48:00.682155872 +0800
-+++ dht_crawler/src/supervisor.c	2026-11-17 03:01:25.238964339 +0800
++++ dht_crawler/src/supervisor.c	2026-11-17 03:05:50.349657599 +0800
 @@ -111,11 +111,24 @@
      sup->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : 6000;
      sup->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : 8;
@@ -531,7 +530,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_c
          return 0;
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/thread_tree.c dht_crawler/src/thread_tree.c
 --- dht_crawler-baseline/src/thread_tree.c	2026-11-17 00:48:00.683366182 +0800
-+++ dht_crawler/src/thread_tree.c	2026-11-17 03:05:39.533491039 +0800
++++ dht_crawler/src/thread_tree.c	2026-11-17 03:05:50.350293073 +0800
 @@ -655,6 +655,21 @@
  #define GP_DEADLINE_MS 6000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
  #define GP_SEND_GAP_US 8000  /* space the fan-out burst so the UDP token bucket paces it instead of stalling it */
@@ -984,7 +983,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/thread_tree.c dht_
      atomic_store(&tree->bep51_nodes_cached, 0);
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/tree_metadata.c dht_crawler/src/tree_metadata.c
 --- dht_crawler-baseline/src/tree_metadata.c	2026-11-17 00:48:00.684431712 +0800
-+++ dht_crawler/src/tree_metadata.c	2026-11-17 03:01:25.241368663 +0800
++++ dht_crawler/src/tree_metadata.c	2026-11-17 03:05:50.352339153 +0800
 @@ -791,6 +791,7 @@
      int metadata_size;              /* Peer-advertised size (consistency check) */
      time_t connect_start;
@@ -1289,30 +1288,29 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/tree_metadata.c dh
  
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/config.h dht_crawler/include/config.h
 --- dht_crawler-baseline/include/config.h	2026-11-17 00:48:00.660047126 +0800
-+++ dht_crawler/include/config.h	2026-11-17 03:01:25.242634538 +0800
++++ dht_crawler/include/config.h	2026-11-17 04:35:14.263066850 +0800
 @@ -141,12 +141,17 @@
      int tree_get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
      int tree_get_peers_fanout;           /* concurrent get_peers queries per round (default: 8, 2-12) */
      int tree_get_peers_max_queries;      /* total get_peers packets per infohash (default: 16, 8-32) */
-+    int tree_get_peers_round_idle_ms;    /* per-round silence cap before the round is abandoned (default: 1500, 0 = off, 250-6000) */
++    int tree_get_peers_round_idle_ms;    /* per-round silence cap before the round is abandoned (default: 0 = off, 250-6000) */
 +    int tree_get_peers_penalize_misses;  /* 1 = charge an unanswered round slot against the node (default: 0, 0-1) */
-+    int tree_get_peers_slot_budget_ms;   /* per-slot answer budget before a round stops waiting on that slot (default: 2000, 0 = off, 500-6000) */
-+    int tree_get_peers_finish_on_peers;  /* 1 = end the lookup as soon as peers are found (default: 1, 0-1) */
++    int tree_get_peers_slot_budget_ms;   /* per-slot answer budget before a round stops waiting on that slot (default: 0 = off, 500-6000) */
++    int tree_get_peers_finish_on_peers;  /* 1 = end the lookup as soon as peers are found (default: 0, 0-1) */
      /* Thread tree Stage 5 settings (metadata) */
      int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
      int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
 -    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
-+    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 4, 1-4 = MAX_PARALLEL_PEERS) */
++    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2, 1-4 = MAX_PARALLEL_PEERS) */
      int tree_metadata_fresh_peer_retries;/* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
--    int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
-+    int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
-+    int tree_metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long (default: 15000, 0 = off, 3000-60000) */
+     int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int tree_metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long (default: 0 = off, 3000-60000) */
  
      /* Thread tree metadata rate-based respawn settings */
      double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/supervisor.h dht_crawler/include/supervisor.h
 --- dht_crawler-baseline/include/supervisor.h	2026-11-17 00:48:00.667619268 +0800
-+++ dht_crawler/include/supervisor.h	2026-11-17 03:01:25.243177331 +0800
++++ dht_crawler/include/supervisor.h	2026-11-17 03:05:50.353996190 +0800
 @@ -78,11 +78,16 @@
      int get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
      int get_peers_fanout;           /* get_peers queries per lookup (default: 8, 2-12) */
@@ -1403,24 +1401,23 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/supervisor.h d
   * @return Total active connections
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/thread_tree.h dht_crawler/include/thread_tree.h
 --- dht_crawler-baseline/include/thread_tree.h	2026-11-17 00:48:00.669113730 +0800
-+++ dht_crawler/include/thread_tree.h	2026-11-17 03:01:25.243684645 +0800
++++ dht_crawler/include/thread_tree.h	2026-11-17 04:35:14.332063315 +0800
 @@ -80,12 +80,17 @@
      int get_peers_deadline_ms;      /* Get_peers lookup deadline (default: 6000, 500-8000) */
      int get_peers_fanout;           /* Get_peers queries per lookup (default: 8, 2-12) */
      int get_peers_max_queries;      /* Get_peers query budget (default: 16, 8-32, >= fanout) */
-+    int get_peers_round_idle_ms;    /* Get_peers per-round silence cap (default: 1500, 0 = off, 250-6000) */
++    int get_peers_round_idle_ms;    /* Get_peers per-round silence cap (default: 0 = off, 250-6000) */
 +    int get_peers_penalize_misses;  /* 1 = charge an unanswered round slot against the node (default: 0) */
-+    int get_peers_slot_budget_ms;   /* Per-slot answer budget in ms (default: 2000, 0 = off, 500-6000) */
-+    int get_peers_finish_on_peers;  /* End the lookup as soon as peers are found (default: 1, 0-1) */
++    int get_peers_slot_budget_ms;   /* Per-slot answer budget in ms (default: 0 = off, 500-6000) */
++    int get_peers_finish_on_peers;  /* End the lookup as soon as peers are found (default: 0, 0-1) */
  
      /* Stage 5: Metadata fetcher settings */
      int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
 -    int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
-+    int parallel_peers;             /* Parallel peer connections per infohash (default: 4, 1-4) */
++    int parallel_peers;             /* Parallel peer connections per infohash (default: 2, 1-4) */
      int fresh_peer_retries;         /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
--    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
-+    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
-+    int metadata_piece_idle_ms;     /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
+     int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int metadata_piece_idle_ms;     /* Piece-progress eviction window in ms (default: 0 = off, 3000-60000) */
  
      /* Metadata rate-based respawn settings */
      double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
@@ -1477,18 +1474,15 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/thread_tree.h 
  
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/tree_metadata.h dht_crawler/include/tree_metadata.h
 --- dht_crawler-baseline/include/tree_metadata.h	2026-11-17 00:48:00.332734512 +0800
-+++ dht_crawler/include/tree_metadata.h	2026-11-17 03:01:25.244218881 +0800
-@@ -33,9 +33,11 @@
-  */
- typedef struct tree_metadata_config {
++++ dht_crawler/include/tree_metadata.h	2026-11-17 04:35:14.400059830 +0800
+@@ -35,7 +35,9 @@
      int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
--    int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 60000) */
-+    int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 30000) */
+     int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 60000) */
      int max_metadata_size;          /* Max metadata size in bytes (default: 10MB) */
 -    int parallel_peers;             /* Number of peers to connect in parallel (default: 2) */
-+    int parallel_peers;             /* Number of peers to connect in parallel (default: 4, max 4) */
++    int parallel_peers;             /* Number of peers to connect in parallel (default: 2, max 4) */
 +    int metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long
-+                                     * (default: 15000, 0 = disabled) */
++                                     * (default: 0 = disabled, 3000-60000) */
      struct thread_tree *tree;       /* Tree pointer for connection tracking (optional) */
  } tree_metadata_config_t;
  
