@@ -1,0 +1,59 @@
+diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
+--- dht_crawler-baseline/src/http_api.c	2026-11-17 00:48:00.678588366 +0800
++++ dht_crawler/src/http_api.c	2026-11-17 00:48:12.217693346 +0800
+@@ -1137,6 +1137,7 @@
+                 cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
+                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
+                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
++                cJSON_AddNumberToObject(tree_json, "metadata_attempts", (double)atomic_load(&tree->metadata_attempts));
+                 cJSON_AddNumberToObject(tree_json, "metadata_piece_reasks", (double)atomic_load(&tree->metadata_piece_reasks));
+                 cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
+                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
+@@ -1296,7 +1297,11 @@
+         int total_connections = supervisor_get_total_connections(api->supervisor);
+         cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
+ 
+-        /* Calculate metadata fetch success rate */
++        /* Metadata fetch success. The denominator is published beside the
++         * percentage (metadata_attempts_total = cumulative respawned trees + live
++         * trees) so the number is reproducible from the two counters printed with
++         * it. This replaces metadata_success_rate_percent, whose denominator was
++         * implicit: a reader could not tell what the percentage was a share of. */
+         uint64_t total_attempts = atomic_load(&api->supervisor->cumulative_metadata_attempts);
+         pthread_mutex_lock(&api->supervisor->trees_lock);
+         for (int i = 0; i < api->supervisor->max_trees; i++) {
+@@ -1306,11 +1311,31 @@
+         }
+         pthread_mutex_unlock(&api->supervisor->trees_lock);
+ 
+-        double success_rate = 0.0;
++        cJSON_AddNumberToObject(aggregate, "metadata_attempts_total", (double)total_attempts);
++
++        double metadata_fetch_success_percent = 0.0;
+         if (total_attempts > 0) {
+-            success_rate = (total_metadata * 100.0) / total_attempts;
++            metadata_fetch_success_percent = (total_metadata * 100.0) / (double)total_attempts;
++        }
++        cJSON_AddNumberToObject(aggregate, "metadata_fetch_success_percent",
++                                metadata_fetch_success_percent);
++
++        /* get_peers yield, same totals the supervisor block publishes, repeated at
++         * aggregate level with both counters beside the percentage. */
++        uint64_t agg_gp_lookups = 0;
++        uint64_t agg_gp_with_peers = 0;
++        supervisor_getpeers_stats(api->supervisor, &agg_gp_lookups, &agg_gp_with_peers,
++                                  NULL, NULL, NULL, NULL, NULL);
++
++        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_total", (double)agg_gp_lookups);
++        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_with_peers",
++                                (double)agg_gp_with_peers);
++
++        double get_peers_yield_percent = 0.0;
++        if (agg_gp_lookups > 0) {
++            get_peers_yield_percent = (agg_gp_with_peers * 100.0) / (double)agg_gp_lookups;
+         }
+-        cJSON_AddNumberToObject(aggregate, "metadata_success_rate_percent", success_rate);
++        cJSON_AddNumberToObject(aggregate, "get_peers_yield_percent", get_peers_yield_percent);
+ 
+         cJSON_AddItemToObject(root, "aggregate", aggregate);
+     }
