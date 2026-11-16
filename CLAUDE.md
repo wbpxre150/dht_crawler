@@ -60,6 +60,42 @@ Each tree runs these stages concurrently with independent worker thread pools:
 
 Throttling: upstream stages pause (condition variable) when downstream queues exceed configurable thresholds; resume when queues drain below a lower threshold.
 
+### get_peers / metadata tuning (patch 19)
+
+Four work-elimination changes, all fail-open: every one restores the pre-patch behaviour at `0` (or at the
+old default).
+
+- **Round-idle get_peers exit** — `tree_get_peers_round_idle_ms` (default 1500, `0` = off),
+  `thread_tree.c:tree_lookup_peers`. A round ends after that much silence **since the last answer** (the
+  timer is refreshed by every matched answer, so a round still producing responses is never cut short), and
+  a round that produced **zero** answers terminates the whole lookup instead of walking the remaining
+  candidate set. Dead lookups therefore stop burning the full `tree_get_peers_deadline_ms` (6 s) and stop
+  sending further rounds. The terminal cause is recorded as a `GP_EXIT_*` reason; only `GP_EXIT_IDLE` and
+  `GP_EXIT_DEADLINE` have `/stats` counters.
+- **Silent-node penalties** — `tree_get_peers_penalize_misses` (default 1). The round-end sweep charges
+  every unanswered fan-out slot against its node through the pre-existing `tree_routing_mark_failed()`
+  (`tree_routing.c`), which bumps `fail_count` and evicts the node at `MAX_FAIL_COUNT` (3); silent nodes stop
+  being re-selected and the find_node workers refill the table. The sweep is the only place that charges
+  misses — answered slots are zeroed in the drain loop and failed sends never get a transaction ID.
+- **Piece-idle metadata eviction** — `tree_metadata_piece_idle_ms` (default 15000, `0` = off),
+  `tree_metadata.c`. `last_piece_time` is refreshed **only** when a new metadata data piece is copied into
+  the shared buffer, so a peer that keeps the socket warm with keep-alive/have/bitfield traffic but delivers
+  no pieces is evicted instead of holding a fetch-window slot until the global deadline. The pre-existing
+  10 s silence watchdog (`CONN_SILENCE_CLOSE_MS`) still catches fully silent peers and fires first, so no
+  event is counted twice; the refill loop then advances the window to the next untried peer. Window and
+  deadline defaults moved with it: `tree_parallel_peers` 2 → 4 (clamp narrowed to 1..4 so the accepted value
+  equals the effective `MAX_PARALLEL_PEERS`) and `tree_metadata_timeout_ms` 60000 → 30000 (the deadline is
+  now a backstop, not the common case).
+- **Failure-counter taxonomy** — `/stats` `supervisor.metadata_failures`. `connect`, `handshake`, `stall`,
+  `ut_reject`, `size`, `hash` and `other` are **per-connection** outcome events, each counted exactly once at
+  the site that first detects the failure; `deadline` is **one event per attempt**, taken at the
+  global-timeout break where every live slot is abandoned together. That asymmetry is why
+  Σ counters ≥ failed attempts — do not "fix" it. Never count in `parallel_conn_close()`, in the
+  post-process close (that reason was already counted inside `parallel_conn_process`) or in the final cleanup
+  loop, or a single failure is counted twice. The four get_peers exit/sweep counters
+  (`idle_exits`, `deadline_exits`, `unanswered_slots`, `miss_penalties`) are per-tree atomics folded into the
+  supervisor at respawn like the other `gp_*` counters and published as `*_total`.
+
 ### Respawn Logic
 
 `supervisor.c:monitor_thread_func()` checks each tree's metadata rate (EMA-smoothed) every `rate_check_interval_sec`. Trees below `min_metadata_rate - dynamic_rate_margin` for longer than `rate_grace_period_sec` are respawned. During respawn, the old tree is moved to a "draining" list and destroyed once its active connections drop below `respawn_spawn_threshold` (or after `respawn_drain_timeout_sec`).
