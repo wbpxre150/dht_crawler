@@ -1,7 +1,81 @@
 diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
 --- dht_crawler-baseline/src/http_api.c	2026-11-17 00:48:00.678588366 +0800
-+++ dht_crawler/src/http_api.c	2026-11-17 00:48:12.217693346 +0800
-@@ -1137,6 +1137,7 @@
++++ dht_crawler/src/http_api.c	2026-11-17 00:58:42.069204775 +0800
+@@ -1054,6 +1054,73 @@
+         cJSON_AddNumberToObject(supervisor_get_peers, "mean_rounds_per_lookup", sup_gp_mean_rounds_per_lookup);
+         cJSON_AddItemToObject(supervisor_json, "get_peers", supervisor_get_peers);
+ 
++        /* Metadata failure attribution: cumulative respawned trees + live trees,
++         * the same sum supervisor_stats() publishes for first_strike_failures.
++         * Each failed connection is counted once, at the site that first detected
++         * it, so these eight turn the ~86 % failure mass into a distribution;
++         * deadline_total is per attempt (every live slot abandoned together). */
++        uint64_t mf_connect = 0, mf_handshake = 0, mf_stall = 0, mf_ut_reject = 0;
++        uint64_t mf_size = 0, mf_hash = 0, mf_deadline = 0, mf_other = 0;
++        int meta_parallel_peers = 0, meta_timeout_ms = 0, meta_workers = 0;
++        int meta_tcp_timeout_ms = 0, meta_fresh_retries = 0;
++        int metadata_cfg_seen = 0;
++
++        pthread_mutex_lock(&api->supervisor->trees_lock);
++        for (int i = 0; i < api->supervisor->max_trees; i++) {
++            thread_tree_t *mf_tree = api->supervisor->trees[i];
++            if (!mf_tree) continue;
++
++            mf_connect += atomic_load(&mf_tree->metadata_fail_connect);
++            mf_handshake += atomic_load(&mf_tree->metadata_fail_handshake);
++            mf_stall += atomic_load(&mf_tree->metadata_fail_stall);
++            mf_ut_reject += atomic_load(&mf_tree->metadata_fail_ut_reject);
++            mf_size += atomic_load(&mf_tree->metadata_fail_size);
++            mf_hash += atomic_load(&mf_tree->metadata_fail_hash);
++            mf_deadline += atomic_load(&mf_tree->metadata_fail_deadline);
++            mf_other += atomic_load(&mf_tree->metadata_fail_other);
++
++            /* Effective metadata knobs of the first live tree, beside the counters
++             * so every snapshot carries the settings it was measured under - the
++             * per-tree get_peers echo does the same for the get_peers knobs. */
++            if (!metadata_cfg_seen) {
++                meta_parallel_peers = mf_tree->parallel_peers;
++                meta_timeout_ms = mf_tree->metadata_timeout_ms;
++                meta_workers = mf_tree->num_metadata_workers;
++                meta_tcp_timeout_ms = mf_tree->tcp_connect_timeout_ms;
++                meta_fresh_retries = mf_tree->fresh_peer_retries;
++                metadata_cfg_seen = 1;
++            }
++        }
++        pthread_mutex_unlock(&api->supervisor->trees_lock);
++
++        mf_connect += atomic_load(&api->supervisor->cumulative_metadata_fail_connect);
++        mf_handshake += atomic_load(&api->supervisor->cumulative_metadata_fail_handshake);
++        mf_stall += atomic_load(&api->supervisor->cumulative_metadata_fail_stall);
++        mf_ut_reject += atomic_load(&api->supervisor->cumulative_metadata_fail_ut_reject);
++        mf_size += atomic_load(&api->supervisor->cumulative_metadata_fail_size);
++        mf_hash += atomic_load(&api->supervisor->cumulative_metadata_fail_hash);
++        mf_deadline += atomic_load(&api->supervisor->cumulative_metadata_fail_deadline);
++        mf_other += atomic_load(&api->supervisor->cumulative_metadata_fail_other);
++
++        cJSON *metadata_failures = cJSON_CreateObject();
++        cJSON_AddNumberToObject(metadata_failures, "connect_total", (double)mf_connect);
++        cJSON_AddNumberToObject(metadata_failures, "handshake_total", (double)mf_handshake);
++        cJSON_AddNumberToObject(metadata_failures, "stall_total", (double)mf_stall);
++        cJSON_AddNumberToObject(metadata_failures, "ut_reject_total", (double)mf_ut_reject);
++        cJSON_AddNumberToObject(metadata_failures, "size_total", (double)mf_size);
++        cJSON_AddNumberToObject(metadata_failures, "hash_total", (double)mf_hash);
++        cJSON_AddNumberToObject(metadata_failures, "deadline_total", (double)mf_deadline);
++        cJSON_AddNumberToObject(metadata_failures, "other_total", (double)mf_other);
++        cJSON_AddItemToObject(supervisor_json, "metadata_failures", metadata_failures);
++
++        cJSON *metadata_cfg = cJSON_CreateObject();
++        cJSON_AddNumberToObject(metadata_cfg, "parallel_peers", meta_parallel_peers);
++        cJSON_AddNumberToObject(metadata_cfg, "metadata_timeout_ms", meta_timeout_ms);
++        cJSON_AddNumberToObject(metadata_cfg, "metadata_workers", meta_workers);
++        cJSON_AddNumberToObject(metadata_cfg, "tcp_connect_timeout_ms", meta_tcp_timeout_ms);
++        cJSON_AddNumberToObject(metadata_cfg, "fresh_peer_retries", meta_fresh_retries);
++        cJSON_AddItemToObject(supervisor_json, "metadata", metadata_cfg);
++
+         /* UDP dispatcher counters. With a fixed dht_port every tree aliases the
+          * supervisor's shared dispatcher, so read it ONCE - summing per tree
+          * would multiply the counts by the tree count. Private dispatchers are
+@@ -1137,6 +1204,7 @@
                  cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
                  cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
                  cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
@@ -9,7 +83,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
                  cJSON_AddNumberToObject(tree_json, "metadata_piece_reasks", (double)atomic_load(&tree->metadata_piece_reasks));
                  cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
                  cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
-@@ -1296,7 +1297,11 @@
+@@ -1296,7 +1364,11 @@
          int total_connections = supervisor_get_total_connections(api->supervisor);
          cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
  
@@ -22,7 +96,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
          uint64_t total_attempts = atomic_load(&api->supervisor->cumulative_metadata_attempts);
          pthread_mutex_lock(&api->supervisor->trees_lock);
          for (int i = 0; i < api->supervisor->max_trees; i++) {
-@@ -1306,11 +1311,31 @@
+@@ -1306,11 +1378,31 @@
          }
          pthread_mutex_unlock(&api->supervisor->trees_lock);
  
@@ -57,3 +131,348 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
  
          cJSON_AddItemToObject(root, "aggregate", aggregate);
      }
+diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_crawler/src/supervisor.c
+--- dht_crawler-baseline/src/supervisor.c	2026-11-17 00:48:00.682155872 +0800
++++ dht_crawler/src/supervisor.c	2026-11-17 00:58:42.069204775 +0800
+@@ -147,6 +147,14 @@
+     atomic_init(&sup->cumulative_second_strike_failures, 0);
+     atomic_init(&sup->cumulative_filtered_count, 0);
+     atomic_init(&sup->cumulative_metadata_attempts, 0);
++    atomic_init(&sup->cumulative_metadata_fail_connect, 0);
++    atomic_init(&sup->cumulative_metadata_fail_handshake, 0);
++    atomic_init(&sup->cumulative_metadata_fail_stall, 0);
++    atomic_init(&sup->cumulative_metadata_fail_ut_reject, 0);
++    atomic_init(&sup->cumulative_metadata_fail_size, 0);
++    atomic_init(&sup->cumulative_metadata_fail_hash, 0);
++    atomic_init(&sup->cumulative_metadata_fail_deadline, 0);
++    atomic_init(&sup->cumulative_metadata_fail_other, 0);
+     atomic_init(&sup->cumulative_gp_lookups, 0);
+     atomic_init(&sup->cumulative_gp_lookups_with_peers, 0);
+     atomic_init(&sup->cumulative_gp_lookups_from_retry, 0);
+@@ -1181,6 +1189,14 @@
+                     uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
+                     uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
+                     uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
++                    uint64_t tree_fail_connect = atomic_load(&tree->metadata_fail_connect);
++                    uint64_t tree_fail_handshake = atomic_load(&tree->metadata_fail_handshake);
++                    uint64_t tree_fail_stall = atomic_load(&tree->metadata_fail_stall);
++                    uint64_t tree_fail_ut_reject = atomic_load(&tree->metadata_fail_ut_reject);
++                    uint64_t tree_fail_size = atomic_load(&tree->metadata_fail_size);
++                    uint64_t tree_fail_hash = atomic_load(&tree->metadata_fail_hash);
++                    uint64_t tree_fail_deadline = atomic_load(&tree->metadata_fail_deadline);
++                    uint64_t tree_fail_other = atomic_load(&tree->metadata_fail_other);
+                     uint64_t tree_fresh_relookups = atomic_load(&tree->fresh_peer_relookups);
+                     uint64_t tree_fresh_rescues = atomic_load(&tree->fresh_peer_rescues);
+                     uint64_t tree_piece_reasks = atomic_load(&tree->metadata_piece_reasks);
+@@ -1197,6 +1213,14 @@
+                     atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
+                     atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
+                     atomic_fetch_add(&sup->cumulative_metadata_attempts, tree_attempts);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_connect, tree_fail_connect);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_handshake, tree_fail_handshake);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_stall, tree_fail_stall);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_ut_reject, tree_fail_ut_reject);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_size, tree_fail_size);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_hash, tree_fail_hash);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_deadline, tree_fail_deadline);
++                    atomic_fetch_add(&sup->cumulative_metadata_fail_other, tree_fail_other);
+                     atomic_fetch_add(&sup->cumulative_fresh_peer_relookups, tree_fresh_relookups);
+                     atomic_fetch_add(&sup->cumulative_fresh_peer_rescues, tree_fresh_rescues);
+                     atomic_fetch_add(&sup->cumulative_metadata_piece_reasks, tree_piece_reasks);
+diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/thread_tree.c dht_crawler/src/thread_tree.c
+--- dht_crawler-baseline/src/thread_tree.c	2026-11-17 00:48:00.683366182 +0800
++++ dht_crawler/src/thread_tree.c	2026-11-17 00:58:42.069204775 +0800
+@@ -1357,6 +1357,15 @@
+     /* Initialize statistics */
+     atomic_store(&tree->metadata_count, 0);
+     atomic_store(&tree->metadata_attempts, 0);
++    /* Metadata connection-failure attribution (see thread_tree.h). */
++    atomic_store(&tree->metadata_fail_connect, 0);
++    atomic_store(&tree->metadata_fail_handshake, 0);
++    atomic_store(&tree->metadata_fail_stall, 0);
++    atomic_store(&tree->metadata_fail_ut_reject, 0);
++    atomic_store(&tree->metadata_fail_size, 0);
++    atomic_store(&tree->metadata_fail_hash, 0);
++    atomic_store(&tree->metadata_fail_deadline, 0);
++    atomic_store(&tree->metadata_fail_other, 0);
+     atomic_store(&tree->filtered_count, 0);
+     atomic_store(&tree->last_metadata_time, 0);
+     tree->metadata_rate = 0.0;
+diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/tree_metadata.c dht_crawler/src/tree_metadata.c
+--- dht_crawler-baseline/src/tree_metadata.c	2026-11-17 00:48:00.684431712 +0800
++++ dht_crawler/src/tree_metadata.c	2026-11-17 00:58:42.069204775 +0800
+@@ -818,6 +818,52 @@
+     metadata_fetch_state_t st;
+ } parallel_fetch_t;
+ 
++/* Which outcome killed a metadata connection. Every failed connection is counted
++ * exactly once, at the site that first detects it: the sites that know the
++ * outcome pass it explicitly, the generic poll-error / read-EOF closes classify
++ * by the state the connection had reached (meta_count_conn_fail). */
++typedef enum {
++    META_FAIL_CONNECT,
++    META_FAIL_HANDSHAKE,
++    META_FAIL_STALL,
++    META_FAIL_UT_REJECT,
++    META_FAIL_SIZE,
++    META_FAIL_HASH,
++    META_FAIL_DEADLINE,
++    META_FAIL_OTHER
++} meta_fail_kind_t;
++
++/* Bump the per-tree counter for one outcome. tree is NULL when the fetch ran
++ * without a tree (host tests) - then nothing is counted. */
++static void meta_count_fail(thread_tree_t *tree, meta_fail_kind_t kind) {
++    if (!tree) return;
++    switch (kind) {
++        case META_FAIL_CONNECT:   atomic_fetch_add(&tree->metadata_fail_connect, 1); break;
++        case META_FAIL_HANDSHAKE: atomic_fetch_add(&tree->metadata_fail_handshake, 1); break;
++        case META_FAIL_STALL:     atomic_fetch_add(&tree->metadata_fail_stall, 1); break;
++        case META_FAIL_UT_REJECT: atomic_fetch_add(&tree->metadata_fail_ut_reject, 1); break;
++        case META_FAIL_SIZE:      atomic_fetch_add(&tree->metadata_fail_size, 1); break;
++        case META_FAIL_HASH:      atomic_fetch_add(&tree->metadata_fail_hash, 1); break;
++        case META_FAIL_DEADLINE:  atomic_fetch_add(&tree->metadata_fail_deadline, 1); break;
++        case META_FAIL_OTHER:     atomic_fetch_add(&tree->metadata_fail_other, 1); break;
++    }
++}
++
++/* Generic close sites (POLLERR/POLLHUP/POLLNVAL, read EOF) know only the state
++ * the connection had reached: still connecting is a connect failure, still
++ * handshaking (BT or extended) a handshake failure, anything later is
++ * unattributed ("other"). */
++static void meta_count_conn_fail(thread_tree_t *tree, const parallel_conn_t *conn) {
++    meta_fail_kind_t kind = META_FAIL_OTHER;
++    if (conn->state == CONN_STATE_CONNECTING) {
++        kind = META_FAIL_CONNECT;
++    } else if (conn->state == CONN_STATE_HANDSHAKING ||
++               conn->state == CONN_STATE_EXTENDED_HANDSHAKE) {
++        kind = META_FAIL_HANDSHAKE;
++    }
++    meta_count_fail(tree, kind);
++}
++
+ /* Initialize a connection slot with a new peer */
+ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
+                                 const struct sockaddr_storage *peer,
+@@ -828,13 +874,17 @@
+ 
+     int family = peer->ss_family;
+     int fd = socket(family, SOCK_STREAM, 0);
+-    if (fd < 0) return -1;
++    if (fd < 0) {
++        meta_count_fail(tree, META_FAIL_CONNECT);
++        return -1;
++    }
+ 
+     if (tree) atomic_fetch_add(&tree->active_connections, 1);
+ 
+     if (set_nonblocking(fd) < 0) {
+         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+         close(fd);
++        meta_count_fail(tree, META_FAIL_CONNECT);
+         return -1;
+     }
+ 
+@@ -851,6 +901,7 @@
+         if (send_handshake(fd, infohash, peer_id) < 0) {
+             if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+             close(fd);
++            meta_count_fail(tree, META_FAIL_CONNECT);
+             return -1;
+         }
+         conn->state = CONN_STATE_HANDSHAKING;
+@@ -859,6 +910,7 @@
+     } else {
+         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
+         close(fd);
++        meta_count_fail(tree, META_FAIL_CONNECT);
+         return -1;
+     }
+ 
+@@ -951,6 +1003,7 @@
+ 
+         if (send_metadata_request(conn->fd, conn->ut_metadata_id, found) < 0) {
+             conn->state = CONN_STATE_ERROR;  /* caller closes + refills */
++            meta_count_fail(tree, META_FAIL_OTHER);
+             return;
+         }
+         if (found_was_outstanding && tree) {
+@@ -990,11 +1043,13 @@
+                 (conn->recv_buf[25] & 0x10) == 0 ||
+                 memcmp(conn->recv_buf + 28, infohash, 20) != 0) {
+                 conn->state = CONN_STATE_ERROR;
++                meta_count_fail(tree, META_FAIL_HANDSHAKE);
+                 return NULL;
+             }
+ 
+             if (send_extended_handshake(conn->fd) < 0) {
+                 conn->state = CONN_STATE_ERROR;
++                meta_count_fail(tree, META_FAIL_HANDSHAKE);
+                 return NULL;
+             }
+ 
+@@ -1018,6 +1073,7 @@
+ 
+         if (msg_len > 1024 * 1024) {
+             conn->state = CONN_STATE_ERROR;
++            meta_count_conn_fail(tree, conn);
+             return NULL;
+         }
+ 
+@@ -1038,12 +1094,14 @@
+                 if (parse_extended_handshake(conn->recv_buf + 6, msg_len - 2,
+                                              &conn->ut_metadata_id, &conn->metadata_size) < 0) {
+                     conn->state = CONN_STATE_ERROR;
++                    meta_count_fail(tree, META_FAIL_HANDSHAKE);
+                     goto shift;
+                 }
+ 
+                 if (conn->metadata_size > max_metadata) {
+                     /* Advertised size exceeds our cap: drop this peer. */
+                     conn->state = CONN_STATE_ERROR;
++                    meta_count_fail(tree, META_FAIL_SIZE);
+                     goto shift;
+                 }
+ 
+@@ -1063,6 +1121,7 @@
+                         free(st->outstanding); st->outstanding = NULL;
+                         free(st->last_request_ms); st->last_request_ms = NULL;
+                         conn->state = CONN_STATE_ERROR;
++                        meta_count_fail(tree, META_FAIL_OTHER);
+                         goto shift;
+                     }
+                     st->initialized = 1;
+@@ -1070,6 +1129,7 @@
+                     /* Peers disagree on size; at most one is right and the final
+                      * SHA-1 arbitrates. Close this conn and refill its slot. */
+                     conn->state = CONN_STATE_ERROR;
++                    meta_count_fail(tree, META_FAIL_SIZE);
+                     goto shift;
+                 }
+ 
+@@ -1087,6 +1147,7 @@
+ 
+                 if (piece_msg_type == UT_METADATA_REJECT) {
+                     conn->state = CONN_STATE_ERROR;
++                    meta_count_fail(tree, META_FAIL_UT_REJECT);
+                     goto shift;
+                 }
+ 
+@@ -1125,11 +1186,13 @@
+                                     /* Assembled bytes do not hash to the infohash:
+                                      * peers disagreed on content. Reset the piece
+                                      * bitfield once and re-request everything. */
++                                    meta_count_fail(tree, META_FAIL_HASH);
+                                     metadata_state_reset(fetch);
+                                 } else {
+                                     /* Wrong even after the one allowed reset: fail
+                                      * the entry so it falls to the normal path. */
+                                     conn->state = CONN_STATE_ERROR;
++                                    meta_count_fail(tree, META_FAIL_HASH);
+                                     goto shift;
+                                 }
+                             }
+@@ -1194,8 +1257,10 @@
+ 
+     /* Main poll loop */
+     while (active_count > 0 && !result) {
+-        /* Check global timeout */
++        /* Check global timeout. One deadline event per attempt, not per
++         * connection: every window slot still live here is abandoned together. */
+         if (difftime(time(NULL), global_start) > metadata_timeout / 1000) {
++            meta_count_fail(tree, META_FAIL_DEADLINE);
+             break;
+         }
+ 
+@@ -1238,6 +1303,7 @@
+                 /* Check per-connection timeout for connecting state */
+                 if (conn->state == CONN_STATE_CONNECTING &&
+                     difftime(time(NULL), conn->connect_start) > tcp_timeout / 1000) {
++                    meta_count_fail(tree, META_FAIL_CONNECT);
+                     parallel_conn_close(conn, tree, &fetch.st);
+                     active_count--;
+                 }
+@@ -1245,6 +1311,8 @@
+             }
+ 
+             if (pfds[p].revents & (POLLERR | POLLHUP | POLLNVAL)) {
++                /* Generic socket error: classify by the state it died in. */
++                meta_count_conn_fail(tree, conn);
+                 parallel_conn_close(conn, tree, &fetch.st);
+                 active_count--;
+                 continue;
+@@ -1255,6 +1323,7 @@
+                 int error;
+                 socklen_t len = sizeof(error);
+                 if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
++                    meta_count_fail(tree, META_FAIL_CONNECT);
+                     parallel_conn_close(conn, tree, &fetch.st);
+                     active_count--;
+                     continue;
+@@ -1264,6 +1333,7 @@
+                 uint8_t peer_id[20];
+                 generate_peer_id(peer_id);
+                 if (send_handshake(conn->fd, infohash, peer_id) < 0) {
++                    meta_count_fail(tree, META_FAIL_CONNECT);
+                     parallel_conn_close(conn, tree, &fetch.st);
+                     active_count--;
+                     continue;
+@@ -1277,6 +1347,9 @@
+                 ssize_t nread = read(conn->fd, conn->recv_buf + conn->recv_offset,
+                                      sizeof(conn->recv_buf) - conn->recv_offset);
+                 if (nread <= 0) {
++                    /* Peer closed the connection (or the read failed): classify by
++                     * the state it died in. */
++                    meta_count_conn_fail(tree, conn);
+                     parallel_conn_close(conn, tree, &fetch.st);
+                     active_count--;
+                     continue;
+@@ -1304,6 +1377,7 @@
+ 
+                 if (conn->state != CONN_STATE_CONNECTING &&
+                     difftime(now, conn->last_activity) > CONN_SILENCE_CLOSE_MS / 1000) {
++                    meta_count_fail(tree, META_FAIL_STALL);
+                     parallel_conn_close(conn, tree, &fetch.st);
+                     active_count--;
+                     continue;
+diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/supervisor.h dht_crawler/include/supervisor.h
+--- dht_crawler-baseline/include/supervisor.h	2026-11-17 00:48:00.667619268 +0800
++++ dht_crawler/include/supervisor.h	2026-11-17 00:57:07.360683210 +0800
+@@ -235,6 +235,15 @@
+     atomic_uint_fast64_t cumulative_second_strike_failures;
+     atomic_uint_fast64_t cumulative_filtered_count;
+     atomic_uint_fast64_t cumulative_metadata_attempts;
++    /* Metadata connection-failure attribution accumulated from respawned trees */
++    atomic_uint_fast64_t cumulative_metadata_fail_connect;
++    atomic_uint_fast64_t cumulative_metadata_fail_handshake;
++    atomic_uint_fast64_t cumulative_metadata_fail_stall;
++    atomic_uint_fast64_t cumulative_metadata_fail_ut_reject;
++    atomic_uint_fast64_t cumulative_metadata_fail_size;
++    atomic_uint_fast64_t cumulative_metadata_fail_hash;
++    atomic_uint_fast64_t cumulative_metadata_fail_deadline;
++    atomic_uint_fast64_t cumulative_metadata_fail_other;
+     /* get_peers lookup instrumentation accumulated from respawned trees */
+     atomic_uint_fast64_t cumulative_gp_lookups;
+     atomic_uint_fast64_t cumulative_gp_lookups_with_peers;
+diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/thread_tree.h dht_crawler/include/thread_tree.h
+--- dht_crawler-baseline/include/thread_tree.h	2026-11-17 00:48:00.669113730 +0800
++++ dht_crawler/include/thread_tree.h	2026-11-17 00:56:58.740730921 +0800
+@@ -202,6 +202,18 @@
+     /* Statistics */
+     atomic_uint_fast64_t metadata_count;
+     atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
++    /* Metadata connection-failure attribution. Each failed metadata connection is
++     * counted exactly once, under the outcome that first detected it, so a window
++     * of these partitions the failure mass that metadata_attempts - metadata_count
++     * only bounds. Per-attempt events (deadline) are counted once per attempt. */
++    atomic_uint_fast64_t metadata_fail_connect;    /* socket/nonblock/connect/send_handshake error */
++    atomic_uint_fast64_t metadata_fail_handshake;  /* bad BT handshake, extended-handshake failure, EOF while handshaking */
++    atomic_uint_fast64_t metadata_fail_stall;      /* silence watchdog (no readable data for CONN_SILENCE_CLOSE_MS) */
++    atomic_uint_fast64_t metadata_fail_ut_reject;  /* peer answered UT_METADATA_REJECT */
++    atomic_uint_fast64_t metadata_fail_size;       /* size over the cap, or peers disagreeing on size */
++    atomic_uint_fast64_t metadata_fail_hash;       /* SHA-1 mismatch event (incl. the one that triggers the reset) */
++    atomic_uint_fast64_t metadata_fail_deadline;   /* one per attempt that hit the global metadata deadline */
++    atomic_uint_fast64_t metadata_fail_other;      /* any other ERROR transition (bad message, EOF while requesting, ...) */
+     atomic_uint_fast64_t filtered_count;    /* Dropped by the ingest filters (hard block/language/adult) */
+     atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
+     atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
