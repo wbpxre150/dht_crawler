@@ -1,8 +1,83 @@
-diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/config.c dht_crawler/src/config.c
+--- dht_crawler-baseline/src/config.c	2026-11-17 00:48:00.660423211 +0800
++++ dht_crawler/src/config.c	2026-11-17 01:12:13.555766037 +0800
+@@ -158,6 +158,8 @@
+     config->tree_get_peers_deadline_ms = 6000;      /* 6s get_peers lookup deadline (500-8000) */
+     config->tree_get_peers_fanout = 8;              /* 8 concurrent get_peers queries per round (2-12) */
+     config->tree_get_peers_max_queries = 16;        /* 16 get_peers packets per infohash (8-32, >= fanout) */
++    config->tree_get_peers_round_idle_ms = 1500;    /* abandon a round after 1.5s without an answer (0 = off, 250-6000) */
++    config->tree_get_peers_penalize_misses = 1;     /* charge unanswered round slots against the node (0-1) */
+ 
+     /* Thread tree Stage 5 defaults (metadata) */
+     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
+@@ -524,6 +526,29 @@
+                         config->tree_get_peers_max_queries);
+                 config->tree_get_peers_max_queries = 32;
+             }
++        } else if (strcmp(key, "tree_get_peers_round_idle_ms") == 0) {
++            /* 0 keeps the pre-patch-19 behaviour exactly: a round is only bounded
++             * by the per-infohash deadline. Anything else is a per-round silence
++             * cap, clamped into 250-6000 ms so it can neither busy-loop the drain
++             * nor outlive the deadline itself. */
++            config->tree_get_peers_round_idle_ms = atoi(value);
++            if (config->tree_get_peers_round_idle_ms < 0) {
++                log_msg(LOG_WARN, "tree_get_peers_round_idle_ms %d out of range (0, 250-6000); clamping to 0",
++                        config->tree_get_peers_round_idle_ms);
++                config->tree_get_peers_round_idle_ms = 0;
++            }
++            if (config->tree_get_peers_round_idle_ms > 0 && config->tree_get_peers_round_idle_ms < 250) {
++                log_msg(LOG_WARN, "tree_get_peers_round_idle_ms %d out of range (0, 250-6000); clamping to 250",
++                        config->tree_get_peers_round_idle_ms);
++                config->tree_get_peers_round_idle_ms = 250;
++            }
++            if (config->tree_get_peers_round_idle_ms > 6000) {
++                log_msg(LOG_WARN, "tree_get_peers_round_idle_ms %d out of range (0, 250-6000); clamping to 6000",
++                        config->tree_get_peers_round_idle_ms);
++                config->tree_get_peers_round_idle_ms = 6000;
++            }
++        } else if (strcmp(key, "tree_get_peers_penalize_misses") == 0) {
++            config->tree_get_peers_penalize_misses = atoi(value) > 0 ? 1 : 0;
+         }
+         /* Thread tree Stage 5 settings (metadata) */
+         else if (strcmp(key, "tree_metadata_workers") == 0) {
+@@ -750,9 +775,10 @@
+     log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
+     log_msg(LOG_DEBUG, "DHT Settings:");
+     log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
+-    log_msg(LOG_DEBUG, "  get_peers: deadline_ms=%d fanout=%d max_queries=%d",
++    log_msg(LOG_DEBUG, "  get_peers: deadline_ms=%d fanout=%d max_queries=%d round_idle_ms=%d penalize_misses=%d",
+             config->tree_get_peers_deadline_ms, config->tree_get_peers_fanout,
+-            config->tree_get_peers_max_queries);
++            config->tree_get_peers_max_queries, config->tree_get_peers_round_idle_ms,
++            config->tree_get_peers_penalize_misses);
+     log_msg(LOG_DEBUG, "Database Settings:");
+     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
+     log_msg(LOG_DEBUG, "Logging:");
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
 --- dht_crawler-baseline/src/http_api.c	2026-11-17 00:48:00.678588366 +0800
-+++ dht_crawler/src/http_api.c	2026-11-17 00:58:42.069204775 +0800
-@@ -1054,6 +1054,73 @@
++++ dht_crawler/src/http_api.c	2026-11-17 01:12:13.555766037 +0800
+@@ -1052,8 +1052,93 @@
+                 ((double)sup_gp_lookups + (double)sup_gp_rounds) / (double)sup_gp_lookups;
+         }
          cJSON_AddNumberToObject(supervisor_get_peers, "mean_rounds_per_lookup", sup_gp_mean_rounds_per_lookup);
++
++        /* Exit-reason split + silent-node penalties: idle_exits_total counts
++         * lookups that ended on the round-idle cap (i.e. completed early),
++         * deadline_exits_total those that still burned the whole per-infohash
++         * deadline. unanswered_slots_total counts round slots that were queried
++         * and never answered; miss_penalties_total those charged against the
++         * node's fail_count. */
++        uint64_t sup_gp_idle_exits = 0;
++        uint64_t sup_gp_deadline_exits = 0;
++        uint64_t sup_gp_unanswered_slots = 0;
++        uint64_t sup_gp_miss_penalties = 0;
++        supervisor_getpeers_exit_stats(api->supervisor, &sup_gp_idle_exits,
++                                       &sup_gp_deadline_exits, &sup_gp_unanswered_slots,
++                                       &sup_gp_miss_penalties);
++        cJSON_AddNumberToObject(supervisor_get_peers, "idle_exits_total", (double)sup_gp_idle_exits);
++        cJSON_AddNumberToObject(supervisor_get_peers, "deadline_exits_total", (double)sup_gp_deadline_exits);
++        cJSON_AddNumberToObject(supervisor_get_peers, "unanswered_slots_total", (double)sup_gp_unanswered_slots);
++        cJSON_AddNumberToObject(supervisor_get_peers, "miss_penalties_total", (double)sup_gp_miss_penalties);
          cJSON_AddItemToObject(supervisor_json, "get_peers", supervisor_get_peers);
  
 +        /* Metadata failure attribution: cumulative respawned trees + live trees,
@@ -75,7 +150,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
          /* UDP dispatcher counters. With a fixed dht_port every tree aliases the
           * supervisor's shared dispatcher, so read it ONCE - summing per tree
           * would multiply the counts by the tree count. Private dispatchers are
-@@ -1137,6 +1204,7 @@
+@@ -1137,6 +1222,7 @@
                  cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
                  cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
                  cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
@@ -83,7 +158,31 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
                  cJSON_AddNumberToObject(tree_json, "metadata_piece_reasks", (double)atomic_load(&tree->metadata_piece_reasks));
                  cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
                  cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
-@@ -1296,7 +1364,11 @@
+@@ -1211,6 +1297,8 @@
+                 cJSON_AddNumberToObject(get_peers, "deadline_ms", (double)tree->get_peers_deadline_ms);
+                 cJSON_AddNumberToObject(get_peers, "fanout", (double)tree->get_peers_fanout);
+                 cJSON_AddNumberToObject(get_peers, "max_queries", (double)tree->get_peers_max_queries);
++                cJSON_AddNumberToObject(get_peers, "round_idle_ms", (double)tree->get_peers_round_idle_ms);
++                cJSON_AddNumberToObject(get_peers, "penalize_misses", (double)tree->get_peers_penalize_misses);
+                 cJSON_AddNumberToObject(get_peers, "lookups_total", (double)gp_lookups);
+                 cJSON_AddNumberToObject(get_peers, "lookups_with_peers", (double)gp_with_peers);
+ 
+@@ -1245,6 +1333,14 @@
+                         ((double)gp_lookups + (double)gp_rounds) / (double)gp_lookups;
+                 }
+                 cJSON_AddNumberToObject(get_peers, "mean_rounds_per_lookup", gp_mean_rounds_per_lookup);
++                cJSON_AddNumberToObject(get_peers, "idle_exits_total",
++                                        (double)atomic_load(&tree->gp_idle_exits));
++                cJSON_AddNumberToObject(get_peers, "deadline_exits_total",
++                                        (double)atomic_load(&tree->gp_deadline_exits));
++                cJSON_AddNumberToObject(get_peers, "unanswered_slots_total",
++                                        (double)atomic_load(&tree->gp_unanswered_slots));
++                cJSON_AddNumberToObject(get_peers, "miss_penalties_total",
++                                        (double)atomic_load(&tree->gp_miss_penalties));
+                 cJSON_AddItemToObject(tree_json, "get_peers", get_peers);
+                 cJSON_AddItemToArray(trees_array, tree_json);
+             }
+@@ -1296,7 +1392,11 @@
          int total_connections = supervisor_get_total_connections(api->supervisor);
          cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
  
@@ -96,7 +195,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
          uint64_t total_attempts = atomic_load(&api->supervisor->cumulative_metadata_attempts);
          pthread_mutex_lock(&api->supervisor->trees_lock);
          for (int i = 0; i < api->supervisor->max_trees; i++) {
-@@ -1306,11 +1378,31 @@
+@@ -1306,11 +1406,31 @@
          }
          pthread_mutex_unlock(&api->supervisor->trees_lock);
  
@@ -131,10 +230,33 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/http_api.c dht_cra
  
          cJSON_AddItemToObject(root, "aggregate", aggregate);
      }
-diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_crawler/src/supervisor.c
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/main.c dht_crawler/src/main.c
+--- dht_crawler-baseline/src/main.c	2026-11-17 00:48:00.681129587 +0800
++++ dht_crawler/src/main.c	2026-11-17 01:12:13.555766037 +0800
+@@ -1287,6 +1287,8 @@
+         .get_peers_deadline_ms = config.tree_get_peers_deadline_ms,
+         .get_peers_fanout = config.tree_get_peers_fanout,
+         .get_peers_max_queries = config.tree_get_peers_max_queries,
++        .get_peers_round_idle_ms = config.tree_get_peers_round_idle_ms,
++        .get_peers_penalize_misses = config.tree_get_peers_penalize_misses,
+         /* Stage 5 settings */
+         .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
+         .parallel_peers = config.tree_parallel_peers,
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/supervisor.c dht_crawler/src/supervisor.c
 --- dht_crawler-baseline/src/supervisor.c	2026-11-17 00:48:00.682155872 +0800
-+++ dht_crawler/src/supervisor.c	2026-11-17 00:58:42.069204775 +0800
-@@ -147,6 +147,14 @@
++++ dht_crawler/src/supervisor.c	2026-11-17 01:12:13.555766037 +0800
+@@ -111,6 +111,10 @@
+     sup->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : 6000;
+     sup->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : 8;
+     sup->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
++    /* 0 is a meaningful value here (round-idle exit disabled), so only a negative
++     * field falls back to the compiled default; config_init_defaults() sets 1500. */
++    sup->get_peers_round_idle_ms = config->get_peers_round_idle_ms >= 0 ? config->get_peers_round_idle_ms : 1500;
++    sup->get_peers_penalize_misses = config->get_peers_penalize_misses > 0 ? 1 : 0;
+     /* Stage 5 settings */
+     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
+     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
+@@ -147,6 +151,14 @@
      atomic_init(&sup->cumulative_second_strike_failures, 0);
      atomic_init(&sup->cumulative_filtered_count, 0);
      atomic_init(&sup->cumulative_metadata_attempts, 0);
@@ -149,7 +271,27 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_c
      atomic_init(&sup->cumulative_gp_lookups, 0);
      atomic_init(&sup->cumulative_gp_lookups_with_peers, 0);
      atomic_init(&sup->cumulative_gp_lookups_from_retry, 0);
-@@ -1181,6 +1189,14 @@
+@@ -154,6 +166,10 @@
+     atomic_init(&sup->cumulative_gp_answers, 0);
+     atomic_init(&sup->cumulative_gp_lookup_us_total, 0);
+     atomic_init(&sup->cumulative_gp_rounds_total, 0);
++    atomic_init(&sup->cumulative_gp_idle_exits, 0);
++    atomic_init(&sup->cumulative_gp_deadline_exits, 0);
++    atomic_init(&sup->cumulative_gp_unanswered_slots, 0);
++    atomic_init(&sup->cumulative_gp_miss_penalties, 0);
+ 
+     /* Initialize mutex */
+     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
+@@ -498,6 +514,8 @@
+         .get_peers_deadline_ms = sup->get_peers_deadline_ms,
+         .get_peers_fanout = sup->get_peers_fanout,
+         .get_peers_max_queries = sup->get_peers_max_queries,
++        .get_peers_round_idle_ms = sup->get_peers_round_idle_ms,
++        .get_peers_penalize_misses = sup->get_peers_penalize_misses,
+         /* Stage 5 settings */
+         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
+         .parallel_peers = sup->parallel_peers,
+@@ -1181,6 +1199,14 @@
                      uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
                      uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
                      uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
@@ -164,7 +306,17 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_c
                      uint64_t tree_fresh_relookups = atomic_load(&tree->fresh_peer_relookups);
                      uint64_t tree_fresh_rescues = atomic_load(&tree->fresh_peer_rescues);
                      uint64_t tree_piece_reasks = atomic_load(&tree->metadata_piece_reasks);
-@@ -1197,6 +1213,14 @@
+@@ -1191,12 +1217,24 @@
+                     uint64_t tree_gp_answers = atomic_load(&tree->gp_answers);
+                     uint64_t tree_gp_lookup_us_total = atomic_load(&tree->gp_lookup_us_total);
+                     uint64_t tree_gp_rounds_total = atomic_load(&tree->gp_rounds_total);
++                    uint64_t tree_gp_idle_exits = atomic_load(&tree->gp_idle_exits);
++                    uint64_t tree_gp_deadline_exits = atomic_load(&tree->gp_deadline_exits);
++                    uint64_t tree_gp_unanswered_slots = atomic_load(&tree->gp_unanswered_slots);
++                    uint64_t tree_gp_miss_penalties = atomic_load(&tree->gp_miss_penalties);
+ 
+                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
+                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
                      atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
                      atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
                      atomic_fetch_add(&sup->cumulative_metadata_attempts, tree_attempts);
@@ -179,10 +331,280 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/supervisor.c dht_c
                      atomic_fetch_add(&sup->cumulative_fresh_peer_relookups, tree_fresh_relookups);
                      atomic_fetch_add(&sup->cumulative_fresh_peer_rescues, tree_fresh_rescues);
                      atomic_fetch_add(&sup->cumulative_metadata_piece_reasks, tree_piece_reasks);
-diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/thread_tree.c dht_crawler/src/thread_tree.c
+@@ -1207,6 +1245,10 @@
+                     atomic_fetch_add(&sup->cumulative_gp_answers, tree_gp_answers);
+                     atomic_fetch_add(&sup->cumulative_gp_lookup_us_total, tree_gp_lookup_us_total);
+                     atomic_fetch_add(&sup->cumulative_gp_rounds_total, tree_gp_rounds_total);
++                    atomic_fetch_add(&sup->cumulative_gp_idle_exits, tree_gp_idle_exits);
++                    atomic_fetch_add(&sup->cumulative_gp_deadline_exits, tree_gp_deadline_exits);
++                    atomic_fetch_add(&sup->cumulative_gp_unanswered_slots, tree_gp_unanswered_slots);
++                    atomic_fetch_add(&sup->cumulative_gp_miss_penalties, tree_gp_miss_penalties);
+ 
+                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
+                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
+@@ -1500,6 +1542,44 @@
+     }
+ }
+ 
++void supervisor_getpeers_exit_stats(supervisor_t *sup, uint64_t *out_idle_exits,
++                                    uint64_t *out_deadline_exits,
++                                    uint64_t *out_unanswered_slots,
++                                    uint64_t *out_miss_penalties) {
++    uint64_t idle = 0, deadline = 0, unanswered = 0, penalties = 0;
++
++    if (sup) {
++        idle = atomic_load(&sup->cumulative_gp_idle_exits);
++        deadline = atomic_load(&sup->cumulative_gp_deadline_exits);
++        unanswered = atomic_load(&sup->cumulative_gp_unanswered_slots);
++        penalties = atomic_load(&sup->cumulative_gp_miss_penalties);
++
++        pthread_mutex_lock(&sup->trees_lock);
++        for (int i = 0; i < sup->max_trees; i++) {
++            if (sup->trees[i]) {
++                idle += atomic_load(&sup->trees[i]->gp_idle_exits);
++                deadline += atomic_load(&sup->trees[i]->gp_deadline_exits);
++                unanswered += atomic_load(&sup->trees[i]->gp_unanswered_slots);
++                penalties += atomic_load(&sup->trees[i]->gp_miss_penalties);
++            }
++        }
++        pthread_mutex_unlock(&sup->trees_lock);
++    }
++
++    if (out_idle_exits) {
++        *out_idle_exits = idle;
++    }
++    if (out_deadline_exits) {
++        *out_deadline_exits = deadline;
++    }
++    if (out_unanswered_slots) {
++        *out_unanswered_slots = unanswered;
++    }
++    if (out_miss_penalties) {
++        *out_miss_penalties = penalties;
++    }
++}
++
+ int supervisor_get_total_connections(supervisor_t *sup) {
+     if (!sup) {
+         return 0;
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/thread_tree.c dht_crawler/src/thread_tree.c
 --- dht_crawler-baseline/src/thread_tree.c	2026-11-17 00:48:00.683366182 +0800
-+++ dht_crawler/src/thread_tree.c	2026-11-17 00:58:42.069204775 +0800
-@@ -1357,6 +1357,15 @@
++++ dht_crawler/src/thread_tree.c	2026-11-17 01:12:13.555766037 +0800
+@@ -655,6 +655,18 @@
+ #define GP_DEADLINE_MS 6000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
+ #define GP_SEND_GAP_US 8000  /* space the fan-out burst so the UDP token bucket paces it instead of stalling it */
+ #define GP_MAX_CANDIDATES 32  /* candidate-set cap: responses repeat the same nodes heavily */
++#define GP_ROUND_IDLE_MS 1500  /* per-round silence cap when config does not say (0 = off) */
++/* Why a lookup ended. Only GP_EXIT_IDLE and GP_EXIT_DEADLINE have /stats
++ * counters (gp_idle_exits / gp_deadline_exits); the other causes are recorded
++ * so the terminal reason is explicit at every break instead of inferred. */
++typedef enum {
++    GP_EXIT_PEERS = 0,   /* peers found: the good case */
++    GP_EXIT_IDLE,        /* the round-idle cap fired with no answer in that round */
++    GP_EXIT_DEADLINE,    /* the per-infohash deadline */
++    GP_EXIT_EXHAUSTED,   /* packet budget spent, or no eligible candidate left */
++    GP_EXIT_SHUTDOWN,    /* the tree is going down */
++    GP_EXIT_NO_NODES     /* routing table empty: nothing to query */
++} gp_exit_t;
+ /* A node worth querying in a later round: learned from a response's closer-node
+  * list, ordered by XOR distance to the infohash. One set per lookup, never per
+  * round (~148 B each, ~4.8 KB for the set). */
+@@ -704,9 +716,18 @@
+  * being consumed by the next round. The n == 0 prologue exit happens before any
+  * registration, so it sweeps nothing.
+  *
+- * Instrumentation only: updates the tree's gp_* counters (gp_rounds_total counts
+- * completed rounds after the first) and adds the elapsed microseconds to
+- * gp_lookup_us_total; no behaviour change outside the lookup itself.
++ * Two behaviour knobs (both fail-open: 0 restores the pre-patch-19 behaviour):
++ * tree->get_peers_round_idle_ms caps how long a round waits for its FIRST or
++ * NEXT answer — silence, not round age — and a round that ends on that cap with
++ * no answer at all terminates the lookup instead of walking the remaining
++ * candidates; tree->get_peers_penalize_misses charges each unanswered round slot
++ * against its node via tree_routing_mark_failed() (eviction at MAX_FAIL_COUNT),
++ * so silent nodes stop being re-selected.
++ *
++ * Instrumentation: updates the tree's gp_* counters (gp_rounds_total counts
++ * completed rounds after the first, gp_idle_exits/gp_deadline_exits the terminal
++ * exit reason, gp_unanswered_slots/gp_miss_penalties the sweep) and adds the
++ * elapsed microseconds to gp_lookup_us_total.
+  *
+  * Returns the number of peers found (out->peer_count); 0 when the routing table
+  * is empty or no node returned peers. */
+@@ -727,11 +748,16 @@
+     memset(out, 0, sizeof(*out));
+     memcpy(out->infohash, infohash, 20);
+ 
++    /* Declared before the first goto done so every exit path can record why it
++     * left (see gp_exit_t); only the idle and deadline causes are counted. */
++    gp_exit_t exit_reason = GP_EXIT_EXHAUSTED;
++
+     /* Get closest nodes from routing table */
+     tree_node_t closest[GP_FANOUT_MAX];
+     int n = tree_routing_get_closest(rt, infohash, closest, GP_FANOUT_MAX);
+     if (n == 0) {
+         /* No nodes to query: no peers */
++        exit_reason = GP_EXIT_NO_NODES;
+         goto done;
+     }
+ 
+@@ -761,6 +787,7 @@
+         uint8_t tid[4];
+         int tid_len;
+         int sent;
++        int cand_idx;   /* index into cand[] of the node this slot queried */
+     } slot[GP_FANOUT_MAX];
+     int outstanding = 0;
+ 
+@@ -787,12 +814,15 @@
+             /* Later rounds are optional: stop rather than spend packets when the
+              * budget or the wall clock is gone, or the tree is going down. */
+             if (queries_sent >= tree->get_peers_max_queries) {
++                exit_reason = GP_EXIT_EXHAUSTED;
+                 break;
+             }
+             if (now_us() >= deadline_us) {
++                exit_reason = GP_EXIT_DEADLINE;
+                 break;
+             }
+             if (atomic_load(&tree->shutdown_requested)) {
++                exit_reason = GP_EXIT_SHUTDOWN;
+                 break;  /* pop's -1 conflates timeout and shutdown */
+             }
+         }
+@@ -831,6 +861,7 @@
+                 picked[picked_count++] = c;
+             }
+             if (picked_count == 0) {
++                exit_reason = GP_EXIT_EXHAUSTED;
+                 break;  /* nothing eligible left: the search is exhausted */
+             }
+         }
+@@ -842,6 +873,7 @@
+             if (k > 0) usleep(GP_SEND_GAP_US);  /* pace the burst (see GP_SEND_GAP_US) */
+             slot[k].tid_len = tree_protocol_gen_tid(slot[k].tid);
+             slot[k].sent = 0;
++            slot[k].cand_idx = picked[k];   /* for the miss penalty in the sweep */
+             c->queried = 1;
+ 
+             /* Register TID with dispatcher BEFORE sending */
+@@ -861,6 +893,15 @@
+             }
+         }
+ 
++        /* Round-idle bookkeeping. The timer starts with the fan-out and is
++         * refreshed by every matched answer, so it measures silence SINCE THE
++         * LAST ANSWER, not the age of the round: a round that is still producing
++         * responses is never cut short by it. get_peers_round_idle_ms == 0
++         * disables it entirely (legacy full-deadline behaviour). */
++        uint64_t last_answer_us = now_us();
++        int answers_this_round = 0;
++        int round_went_idle = 0;
++
+         /* Drain against the single deadline. pop() only ever gets a small RELATIVE
+          * slice, so its internal CLOCK_REALTIME wait never sees the lookup deadline
+          * and wall-clock jumps cannot extend or shorten the cap. */
+@@ -872,6 +913,16 @@
+             if (atomic_load(&tree->shutdown_requested)) {
+                 break;  /* pop's -1 conflates timeout and shutdown */
+             }
++            if (tree->get_peers_round_idle_ms > 0) {
++                uint64_t now = now_us();
++                uint64_t idle_us = (uint64_t)tree->get_peers_round_idle_ms * 1000;
++                /* now_us() returns 0 when clock_gettime() fails: fall back to the
++                 * deadline instead of declaring the round instantly idle. */
++                if (now >= last_answer_us && now - last_answer_us >= idle_us) {
++                    round_went_idle = 1;
++                    break;
++                }
++            }
+ 
+             int slice_ms = 250;
+             if (remaining_us / 1000 < slice_ms) {
+@@ -904,6 +955,8 @@
+             }
+ 
+             outstanding--;
++            answers_this_round++;
++            last_answer_us = now_us();
+             atomic_fetch_add(&tree->gp_answers, 1);
+             tree_dispatcher_unregister_tid(dispatcher, slot[s].tid, slot[s].tid_len);
+             slot[s].tid_len = 0;
+@@ -975,10 +1028,22 @@
+         }
+ 
+         /* Exactly one unregister per register: sweep whatever this round left
+-         * outstanding before the next round starts and before returning. */
++         * outstanding before the next round starts and before returning. Every
++         * slot still holding a TID was queried and never answered — answered and
++         * failed-send slots were zeroed above — so each one is counted, and
++         * (unless disabled) charged against that node's fail_count. A node that
++         * stays silent for MAX_FAIL_COUNT rounds is evicted from the routing
++         * table by tree_routing_mark_failed() and stops being re-selected; the
++         * find_node workers replenish the table. */
+         for (int i = 0; i < GP_FANOUT_MAX; i++) {
+             if (slot[i].tid_len > 0) {
+                 tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
++                atomic_fetch_add(&tree->gp_unanswered_slots, 1);
++                if (tree->get_peers_penalize_misses &&
++                    slot[i].cand_idx >= 0 && slot[i].cand_idx < cand_count) {
++                    tree_routing_mark_failed(rt, cand[slot[i].cand_idx].id);
++                    atomic_fetch_add(&tree->gp_miss_penalties, 1);
++                }
+             }
+         }
+ 
+@@ -990,14 +1055,36 @@
+         round_index++;
+ 
+         if (out->peer_count > 0) {
++            exit_reason = GP_EXIT_PEERS;
+             break;  /* peers found: no reason to spend more packets */
+         }
++        if (round_went_idle && answers_this_round == 0) {
++            /* The round ended on the idle cap and nothing came back at all:
++             * every further round would spend packets on the same silence, so
++             * end the lookup here instead of walking the rest of the candidate
++             * set. A round that answered at least once falls through to the
++             * existing budget/progress gates for the next round. */
++            exit_reason = GP_EXIT_IDLE;
++            break;
++        }
+     }
+ 
+ done:
+     if (out->peer_count > 0) {
+         atomic_fetch_add(&tree->gp_lookups_with_peers, 1);
+     }
++    /* Exit-reason split: an idle exit is a lookup that completed without
++     * burning the whole deadline, a deadline exit is one that did not. */
++    switch (exit_reason) {
++    case GP_EXIT_IDLE:
++        atomic_fetch_add(&tree->gp_idle_exits, 1);
++        break;
++    case GP_EXIT_DEADLINE:
++        atomic_fetch_add(&tree->gp_deadline_exits, 1);
++        break;
++    default:
++        break;
++    }
+     const uint64_t end_us = now_us();
+     if (end_us >= start_us) {
+         atomic_fetch_add(&tree->gp_lookup_us_total, end_us - start_us);
+@@ -1313,6 +1400,12 @@
+     tree->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : GP_DEADLINE_MS;
+     tree->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : GP_FANOUT;
+     tree->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
++    /* 0 disables the round-idle exit (legacy full-deadline behaviour); the compiled
++     * default 1500 lives in config_init_defaults() and arrives here via the supervisor. */
++    tree->get_peers_round_idle_ms = config->get_peers_round_idle_ms >= 0
++                                        ? config->get_peers_round_idle_ms
++                                        : GP_ROUND_IDLE_MS;
++    tree->get_peers_penalize_misses = config->get_peers_penalize_misses > 0 ? 1 : 0;
+ 
+     /* Stage 5 config */
+     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
+@@ -1357,6 +1450,15 @@
      /* Initialize statistics */
      atomic_store(&tree->metadata_count, 0);
      atomic_store(&tree->metadata_attempts, 0);
@@ -198,9 +620,20 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/thread_tree.c dht_
      atomic_store(&tree->filtered_count, 0);
      atomic_store(&tree->last_metadata_time, 0);
      tree->metadata_rate = 0.0;
-diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/tree_metadata.c dht_crawler/src/tree_metadata.c
+@@ -1370,6 +1472,10 @@
+     atomic_store(&tree->gp_answers, 0);
+     atomic_store(&tree->gp_lookup_us_total, 0);
+     atomic_store(&tree->gp_rounds_total, 0);
++    atomic_store(&tree->gp_idle_exits, 0);
++    atomic_store(&tree->gp_deadline_exits, 0);
++    atomic_store(&tree->gp_unanswered_slots, 0);
++    atomic_store(&tree->gp_miss_penalties, 0);
+ 
+     /* Initialize BEP51 cache statistics */
+     atomic_store(&tree->bep51_nodes_cached, 0);
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/tree_metadata.c dht_crawler/src/tree_metadata.c
 --- dht_crawler-baseline/src/tree_metadata.c	2026-11-17 00:48:00.684431712 +0800
-+++ dht_crawler/src/tree_metadata.c	2026-11-17 00:58:42.069204775 +0800
++++ dht_crawler/src/tree_metadata.c	2026-11-17 00:59:45.755781696 +0800
 @@ -818,6 +818,52 @@
      metadata_fetch_state_t st;
  } parallel_fetch_t;
@@ -435,10 +868,40 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/src/tree_metadata.c dh
                      parallel_conn_close(conn, tree, &fetch.st);
                      active_count--;
                      continue;
-diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/supervisor.h dht_crawler/include/supervisor.h
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/config.h dht_crawler/include/config.h
+--- dht_crawler-baseline/include/config.h	2026-11-17 00:48:00.660047126 +0800
++++ dht_crawler/include/config.h	2026-11-17 01:10:05.785537361 +0800
+@@ -141,6 +141,8 @@
+     int tree_get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
+     int tree_get_peers_fanout;           /* concurrent get_peers queries per round (default: 8, 2-12) */
+     int tree_get_peers_max_queries;      /* total get_peers packets per infohash (default: 16, 8-32) */
++    int tree_get_peers_round_idle_ms;    /* per-round silence cap before the round is abandoned (default: 1500, 0 = off, 250-6000) */
++    int tree_get_peers_penalize_misses;  /* 1 = charge an unanswered round slot against the node (default: 1, 0-1) */
+     /* Thread tree Stage 5 settings (metadata) */
+     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
+     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/supervisor.h dht_crawler/include/supervisor.h
 --- dht_crawler-baseline/include/supervisor.h	2026-11-17 00:48:00.667619268 +0800
-+++ dht_crawler/include/supervisor.h	2026-11-17 00:57:07.360683210 +0800
-@@ -235,6 +235,15 @@
++++ dht_crawler/include/supervisor.h	2026-11-17 01:10:36.017827265 +0800
+@@ -78,6 +78,8 @@
+     int get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
+     int get_peers_fanout;           /* get_peers queries per lookup (default: 8, 2-12) */
+     int get_peers_max_queries;      /* get_peers query budget (default: 16, 8-32, >= fanout) */
++    int get_peers_round_idle_ms;    /* per-round silence cap (default: 1500, 0 = off, 250-6000) */
++    int get_peers_penalize_misses;  /* 1 = charge unanswered round slots against the node (0-1) */
+     /* Stage 5 settings */
+     int tcp_connect_timeout_ms;
+     int parallel_peers;
+@@ -171,6 +173,8 @@
+     int get_peers_deadline_ms;
+     int get_peers_fanout;
+     int get_peers_max_queries;
++    int get_peers_round_idle_ms;     /* Per-round silence cap (default: 1500, 0 = off) */
++    int get_peers_penalize_misses;   /* Charge unanswered round slots against the node (default: 1) */
+     /* Stage 5 settings */
+     int tcp_connect_timeout_ms;
+     int parallel_peers;
+@@ -235,6 +239,15 @@
      atomic_uint_fast64_t cumulative_second_strike_failures;
      atomic_uint_fast64_t cumulative_filtered_count;
      atomic_uint_fast64_t cumulative_metadata_attempts;
@@ -454,10 +917,57 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/supervisor.h d
      /* get_peers lookup instrumentation accumulated from respawned trees */
      atomic_uint_fast64_t cumulative_gp_lookups;
      atomic_uint_fast64_t cumulative_gp_lookups_with_peers;
-diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/thread_tree.h dht_crawler/include/thread_tree.h
+@@ -243,6 +256,11 @@
+     atomic_uint_fast64_t cumulative_gp_answers;
+     atomic_uint_fast64_t cumulative_gp_lookup_us_total;
+     atomic_uint_fast64_t cumulative_gp_rounds_total;
++    /* get_peers lookup exit reasons and silent-node penalties */
++    atomic_uint_fast64_t cumulative_gp_idle_exits;
++    atomic_uint_fast64_t cumulative_gp_deadline_exits;
++    atomic_uint_fast64_t cumulative_gp_unanswered_slots;
++    atomic_uint_fast64_t cumulative_gp_miss_penalties;
+ 
+     /* Monitor thread */
+     pthread_t monitor_thread;
+@@ -311,6 +329,16 @@
+                                uint64_t *out_lookup_us, uint64_t *out_rounds);
+ 
+ /**
++ * Get the get_peers exit-reason and silent-node counters (cumulative respawned
++ * trees + live trees): idle exits, deadline exits, unanswered round slots and
++ * miss penalties. Any out pointer may be NULL.
++ */
++void supervisor_getpeers_exit_stats(supervisor_t *sup, uint64_t *out_idle_exits,
++                                    uint64_t *out_deadline_exits,
++                                    uint64_t *out_unanswered_slots,
++                                    uint64_t *out_miss_penalties);
++
++/**
+  * Get total active connections across all trees
+  * @param sup Supervisor instance
+  * @return Total active connections
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/thread_tree.h dht_crawler/include/thread_tree.h
 --- dht_crawler-baseline/include/thread_tree.h	2026-11-17 00:48:00.669113730 +0800
-+++ dht_crawler/include/thread_tree.h	2026-11-17 00:56:58.740730921 +0800
-@@ -202,6 +202,18 @@
++++ dht_crawler/include/thread_tree.h	2026-11-17 01:10:57.891335548 +0800
+@@ -80,6 +80,8 @@
+     int get_peers_deadline_ms;      /* Get_peers lookup deadline (default: 6000, 500-8000) */
+     int get_peers_fanout;           /* Get_peers queries per lookup (default: 8, 2-12) */
+     int get_peers_max_queries;      /* Get_peers query budget (default: 16, 8-32, >= fanout) */
++    int get_peers_round_idle_ms;    /* Get_peers per-round silence cap (default: 1500, 0 = off, 250-6000) */
++    int get_peers_penalize_misses;  /* 1 = charge an unanswered round slot against the node (default: 1) */
+ 
+     /* Stage 5: Metadata fetcher settings */
+     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+@@ -152,6 +154,8 @@
+     int get_peers_deadline_ms;
+     int get_peers_fanout;
+     int get_peers_max_queries;
++    int get_peers_round_idle_ms;    /* Per-round silence cap before the round is abandoned (0 = off) */
++    int get_peers_penalize_misses;  /* 1 = tree_routing_mark_failed() the nodes that left a slot unanswered */
+ 
+     /* Stage 5 config */
+     int tcp_connect_timeout_ms;
+@@ -202,6 +206,18 @@
      /* Statistics */
      atomic_uint_fast64_t metadata_count;
      atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
@@ -476,3 +986,14 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' dht_crawler-baseline/include/thread_tree.h 
      atomic_uint_fast64_t filtered_count;    /* Dropped by the ingest filters (hard block/language/adult) */
      atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
      atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
+@@ -217,6 +233,10 @@
+     atomic_uint_fast64_t gp_lookup_us_total;     /* Total microseconds spent inside tree_lookup_peers() */
+     atomic_uint_fast64_t last_metadata_time;
+     atomic_uint_fast64_t gp_rounds_total;       /* Completed rounds after the first, summed over lookups */
++    atomic_uint_fast64_t gp_idle_exits;          /* Lookups that ended on the round-idle cap, not the deadline */
++    atomic_uint_fast64_t gp_deadline_exits;      /* Lookups whose terminal cause was the per-infohash deadline */
++    atomic_uint_fast64_t gp_unanswered_slots;    /* Round slots queried and never answered (any exit) */
++    atomic_uint_fast64_t gp_miss_penalties;      /* Unanswered slots charged via tree_routing_mark_failed() */
+     double metadata_rate;
+     atomic_int active_connections;  /* Track active TCP connections */
+ 
