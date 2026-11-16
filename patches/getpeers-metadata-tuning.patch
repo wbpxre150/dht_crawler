@@ -1,7 +1,7 @@
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/config.c dht_crawler/src/config.c
 --- dht_crawler-baseline/src/config.c	2026-11-17 00:48:00.660423211 +0800
-+++ dht_crawler/src/config.c	2026-11-17 01:12:13.555766037 +0800
-@@ -158,6 +158,8 @@
++++ dht_crawler/src/config.c	2026-11-17 01:22:55.315754850 +0800
+@@ -158,13 +158,16 @@
      config->tree_get_peers_deadline_ms = 6000;      /* 6s get_peers lookup deadline (500-8000) */
      config->tree_get_peers_fanout = 8;              /* 8 concurrent get_peers queries per round (2-12) */
      config->tree_get_peers_max_queries = 16;        /* 16 get_peers packets per infohash (8-32, >= fanout) */
@@ -10,7 +10,17 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
      /* Thread tree Stage 5 defaults (metadata) */
      config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
-@@ -524,6 +526,29 @@
+     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
+-    config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash */
++    config->tree_parallel_peers = 4;                /* 4 parallel peer connections per infohash (1-4) */
+     config->tree_metadata_fresh_peer_retries = 1;   /* 1 fresh-peer re-lookup before a strike (0 = off) */
+-    config->tree_metadata_timeout_ms = 60000;       /* 60s metadata fetch deadline */
++    config->tree_metadata_timeout_ms = 30000;       /* 30s metadata fetch deadline */
++    config->tree_metadata_piece_idle_ms = 15000;    /* evict a conn with no new piece after 15s (0 = off, 3000-60000) */
+ 
+     /* Thread tree metadata rate-based respawn defaults */
+     config->min_metadata_rate = 0.01;                  /* Floor for dynamic threshold */
+@@ -524,6 +527,29 @@
                          config->tree_get_peers_max_queries);
                  config->tree_get_peers_max_queries = 32;
              }
@@ -40,7 +50,33 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          }
          /* Thread tree Stage 5 settings (metadata) */
          else if (strcmp(key, "tree_metadata_workers") == 0) {
-@@ -750,9 +775,10 @@
+@@ -535,7 +561,9 @@
+         } else if (strcmp(key, "tree_parallel_peers") == 0) {
+             config->tree_parallel_peers = atoi(value);
+             if (config->tree_parallel_peers < 1) config->tree_parallel_peers = 1;
+-            if (config->tree_parallel_peers > 10) config->tree_parallel_peers = 10;
++            /* The fetch window cannot exceed MAX_PARALLEL_PEERS (tree_metadata.c);
++             * clamping here keeps the accepted value and the effective one equal. */
++            if (config->tree_parallel_peers > 4) config->tree_parallel_peers = 4;
+         } else if (strcmp(key, "tree_metadata_fresh_peer_retries") == 0) {
+             config->tree_metadata_fresh_peer_retries = atoi(value);
+             if (config->tree_metadata_fresh_peer_retries < 0) config->tree_metadata_fresh_peer_retries = 0;
+@@ -544,6 +572,14 @@
+             config->tree_metadata_timeout_ms = atoi(value);
+             if (config->tree_metadata_timeout_ms < 5000) config->tree_metadata_timeout_ms = 5000;
+             if (config->tree_metadata_timeout_ms > 600000) config->tree_metadata_timeout_ms = 600000;
++        } else if (strcmp(key, "tree_metadata_piece_idle_ms") == 0) {
++            config->tree_metadata_piece_idle_ms = atoi(value);
++            /* 0 is meaningful (piece-idle eviction disabled), so only a non-zero
++             * value is clamped into 3000-60000. */
++            if (config->tree_metadata_piece_idle_ms != 0) {
++                if (config->tree_metadata_piece_idle_ms < 3000) config->tree_metadata_piece_idle_ms = 3000;
++                if (config->tree_metadata_piece_idle_ms > 60000) config->tree_metadata_piece_idle_ms = 60000;
++            }
+         }
+         /* Thread tree metadata rate-based respawn settings */
+         else if (strcmp(key, "min_metadata_rate") == 0) {
+@@ -750,9 +786,10 @@
      log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
      log_msg(LOG_DEBUG, "DHT Settings:");
      log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
@@ -55,8 +91,8 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      log_msg(LOG_DEBUG, "Logging:");
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
 --- dht_crawler-baseline/src/http_api.c	2026-11-17 00:48:00.678588366 +0800
-+++ dht_crawler/src/http_api.c	2026-11-17 01:12:13.555766037 +0800
-@@ -1052,8 +1052,93 @@
++++ dht_crawler/src/http_api.c	2026-11-17 01:23:51.287328813 +0800
+@@ -1052,8 +1052,96 @@
                  ((double)sup_gp_lookups + (double)sup_gp_rounds) / (double)sup_gp_lookups;
          }
          cJSON_AddNumberToObject(supervisor_get_peers, "mean_rounds_per_lookup", sup_gp_mean_rounds_per_lookup);
@@ -89,6 +125,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
 +        uint64_t mf_size = 0, mf_hash = 0, mf_deadline = 0, mf_other = 0;
 +        int meta_parallel_peers = 0, meta_timeout_ms = 0, meta_workers = 0;
 +        int meta_tcp_timeout_ms = 0, meta_fresh_retries = 0;
++        int meta_piece_idle_ms = 0;
 +        int metadata_cfg_seen = 0;
 +
 +        pthread_mutex_lock(&api->supervisor->trees_lock);
@@ -114,6 +151,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
 +                meta_workers = mf_tree->num_metadata_workers;
 +                meta_tcp_timeout_ms = mf_tree->tcp_connect_timeout_ms;
 +                meta_fresh_retries = mf_tree->fresh_peer_retries;
++                meta_piece_idle_ms = mf_tree->metadata_piece_idle_ms;
 +                metadata_cfg_seen = 1;
 +            }
 +        }
@@ -145,12 +183,13 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
 +        cJSON_AddNumberToObject(metadata_cfg, "metadata_workers", meta_workers);
 +        cJSON_AddNumberToObject(metadata_cfg, "tcp_connect_timeout_ms", meta_tcp_timeout_ms);
 +        cJSON_AddNumberToObject(metadata_cfg, "fresh_peer_retries", meta_fresh_retries);
++        cJSON_AddNumberToObject(metadata_cfg, "piece_idle_ms", meta_piece_idle_ms);
 +        cJSON_AddItemToObject(supervisor_json, "metadata", metadata_cfg);
 +
          /* UDP dispatcher counters. With a fixed dht_port every tree aliases the
           * supervisor's shared dispatcher, so read it ONCE - summing per tree
           * would multiply the counts by the tree count. Private dispatchers are
-@@ -1137,6 +1222,7 @@
+@@ -1137,6 +1225,7 @@
                  cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
                  cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
                  cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
@@ -158,7 +197,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                  cJSON_AddNumberToObject(tree_json, "metadata_piece_reasks", (double)atomic_load(&tree->metadata_piece_reasks));
                  cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
                  cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
-@@ -1211,6 +1297,8 @@
+@@ -1211,6 +1300,8 @@
                  cJSON_AddNumberToObject(get_peers, "deadline_ms", (double)tree->get_peers_deadline_ms);
                  cJSON_AddNumberToObject(get_peers, "fanout", (double)tree->get_peers_fanout);
                  cJSON_AddNumberToObject(get_peers, "max_queries", (double)tree->get_peers_max_queries);
@@ -167,7 +206,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                  cJSON_AddNumberToObject(get_peers, "lookups_total", (double)gp_lookups);
                  cJSON_AddNumberToObject(get_peers, "lookups_with_peers", (double)gp_with_peers);
  
-@@ -1245,6 +1333,14 @@
+@@ -1245,6 +1336,14 @@
                          ((double)gp_lookups + (double)gp_rounds) / (double)gp_lookups;
                  }
                  cJSON_AddNumberToObject(get_peers, "mean_rounds_per_lookup", gp_mean_rounds_per_lookup);
@@ -182,7 +221,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                  cJSON_AddItemToObject(tree_json, "get_peers", get_peers);
                  cJSON_AddItemToArray(trees_array, tree_json);
              }
-@@ -1296,7 +1392,11 @@
+@@ -1296,7 +1395,11 @@
          int total_connections = supervisor_get_total_connections(api->supervisor);
          cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
  
@@ -195,7 +234,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          uint64_t total_attempts = atomic_load(&api->supervisor->cumulative_metadata_attempts);
          pthread_mutex_lock(&api->supervisor->trees_lock);
          for (int i = 0; i < api->supervisor->max_trees; i++) {
-@@ -1306,11 +1406,31 @@
+@@ -1306,11 +1409,31 @@
          }
          pthread_mutex_unlock(&api->supervisor->trees_lock);
  
@@ -232,8 +271,8 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      }
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/main.c dht_crawler/src/main.c
 --- dht_crawler-baseline/src/main.c	2026-11-17 00:48:00.681129587 +0800
-+++ dht_crawler/src/main.c	2026-11-17 01:12:13.555766037 +0800
-@@ -1287,6 +1287,8 @@
++++ dht_crawler/src/main.c	2026-11-17 01:23:12.331622465 +0800
+@@ -1287,11 +1287,14 @@
          .get_peers_deadline_ms = config.tree_get_peers_deadline_ms,
          .get_peers_fanout = config.tree_get_peers_fanout,
          .get_peers_max_queries = config.tree_get_peers_max_queries,
@@ -242,10 +281,16 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          /* Stage 5 settings */
          .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
          .parallel_peers = config.tree_parallel_peers,
+         .fresh_peer_retries = config.tree_metadata_fresh_peer_retries,
+         .metadata_timeout_ms = config.tree_metadata_timeout_ms,
++        .metadata_piece_idle_ms = config.tree_metadata_piece_idle_ms,
+         /* Metadata rate-based respawn settings */
+         .min_metadata_rate = config.min_metadata_rate,
+         .dynamic_rate_margin = config.dynamic_rate_margin,
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/supervisor.c dht_crawler/src/supervisor.c
 --- dht_crawler-baseline/src/supervisor.c	2026-11-17 00:48:00.682155872 +0800
-+++ dht_crawler/src/supervisor.c	2026-11-17 01:12:13.555766037 +0800
-@@ -111,6 +111,10 @@
++++ dht_crawler/src/supervisor.c	2026-11-17 01:23:09.677642944 +0800
+@@ -111,11 +111,18 @@
      sup->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : 6000;
      sup->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : 8;
      sup->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
@@ -256,7 +301,16 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      /* Stage 5 settings */
      sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
      sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
-@@ -147,6 +151,14 @@
+     sup->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
+-    sup->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 60000;
++    sup->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 30000;
++    /* 0 disables piece-idle eviction, so only a negative field falls back to the
++     * compiled default; config_init_defaults() sets 15000. */
++    sup->metadata_piece_idle_ms = config->metadata_piece_idle_ms >= 0 ? config->metadata_piece_idle_ms : 15000;
+ 
+     /* Metadata rate-based respawn settings */
+     sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
+@@ -147,6 +154,14 @@
      atomic_init(&sup->cumulative_second_strike_failures, 0);
      atomic_init(&sup->cumulative_filtered_count, 0);
      atomic_init(&sup->cumulative_metadata_attempts, 0);
@@ -271,7 +325,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      atomic_init(&sup->cumulative_gp_lookups, 0);
      atomic_init(&sup->cumulative_gp_lookups_with_peers, 0);
      atomic_init(&sup->cumulative_gp_lookups_from_retry, 0);
-@@ -154,6 +166,10 @@
+@@ -154,6 +169,10 @@
      atomic_init(&sup->cumulative_gp_answers, 0);
      atomic_init(&sup->cumulative_gp_lookup_us_total, 0);
      atomic_init(&sup->cumulative_gp_rounds_total, 0);
@@ -282,7 +336,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
      /* Initialize mutex */
      if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
-@@ -498,6 +514,8 @@
+@@ -498,11 +517,14 @@
          .get_peers_deadline_ms = sup->get_peers_deadline_ms,
          .get_peers_fanout = sup->get_peers_fanout,
          .get_peers_max_queries = sup->get_peers_max_queries,
@@ -291,7 +345,13 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          /* Stage 5 settings */
          .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
          .parallel_peers = sup->parallel_peers,
-@@ -1181,6 +1199,14 @@
+         .fresh_peer_retries = sup->fresh_peer_retries,
+         .metadata_timeout_ms = sup->metadata_timeout_ms,
++        .metadata_piece_idle_ms = sup->metadata_piece_idle_ms,
+         /* Metadata rate-based respawn settings */
+         .min_metadata_rate = sup->min_metadata_rate,
+         .rate_check_interval_sec = sup->rate_check_interval_sec,
+@@ -1181,6 +1203,14 @@
                      uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
                      uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
                      uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
@@ -306,7 +366,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      uint64_t tree_fresh_relookups = atomic_load(&tree->fresh_peer_relookups);
                      uint64_t tree_fresh_rescues = atomic_load(&tree->fresh_peer_rescues);
                      uint64_t tree_piece_reasks = atomic_load(&tree->metadata_piece_reasks);
-@@ -1191,12 +1217,24 @@
+@@ -1191,12 +1221,24 @@
                      uint64_t tree_gp_answers = atomic_load(&tree->gp_answers);
                      uint64_t tree_gp_lookup_us_total = atomic_load(&tree->gp_lookup_us_total);
                      uint64_t tree_gp_rounds_total = atomic_load(&tree->gp_rounds_total);
@@ -331,7 +391,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      atomic_fetch_add(&sup->cumulative_fresh_peer_relookups, tree_fresh_relookups);
                      atomic_fetch_add(&sup->cumulative_fresh_peer_rescues, tree_fresh_rescues);
                      atomic_fetch_add(&sup->cumulative_metadata_piece_reasks, tree_piece_reasks);
-@@ -1207,6 +1245,10 @@
+@@ -1207,6 +1249,10 @@
                      atomic_fetch_add(&sup->cumulative_gp_answers, tree_gp_answers);
                      atomic_fetch_add(&sup->cumulative_gp_lookup_us_total, tree_gp_lookup_us_total);
                      atomic_fetch_add(&sup->cumulative_gp_rounds_total, tree_gp_rounds_total);
@@ -342,7 +402,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
                      log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                              tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
-@@ -1500,6 +1542,44 @@
+@@ -1500,6 +1546,44 @@
      }
  }
  
@@ -389,7 +449,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          return 0;
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/thread_tree.c dht_crawler/src/thread_tree.c
 --- dht_crawler-baseline/src/thread_tree.c	2026-11-17 00:48:00.683366182 +0800
-+++ dht_crawler/src/thread_tree.c	2026-11-17 01:12:13.555766037 +0800
++++ dht_crawler/src/thread_tree.c	2026-11-17 01:23:20.018563497 +0800
 @@ -655,6 +655,18 @@
  #define GP_DEADLINE_MS 6000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
  #define GP_SEND_GAP_US 8000  /* space the fan-out burst so the UDP token bucket paces it instead of stalling it */
@@ -591,7 +651,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      const uint64_t end_us = now_us();
      if (end_us >= start_us) {
          atomic_fetch_add(&tree->gp_lookup_us_total, end_us - start_us);
-@@ -1313,6 +1400,12 @@
+@@ -1313,12 +1400,23 @@
      tree->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : GP_DEADLINE_MS;
      tree->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : GP_FANOUT;
      tree->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
@@ -604,7 +664,20 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
      /* Stage 5 config */
      tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
-@@ -1357,6 +1450,15 @@
+-    tree->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
++    tree->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 4;
+     tree->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
+-    tree->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 60000;
++    tree->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 30000;
++    /* 0 disables piece-idle eviction (legacy behaviour); the compiled default
++     * 15000 lives in config_init_defaults() and arrives here via the supervisor. */
++    tree->metadata_piece_idle_ms = config->metadata_piece_idle_ms >= 0
++                                       ? config->metadata_piece_idle_ms
++                                       : 15000;
+     tree->shared_batch_writer = config->batch_writer;
+ 
+     /* Initialize thread counts from config */
+@@ -1357,6 +1455,15 @@
      /* Initialize statistics */
      atomic_store(&tree->metadata_count, 0);
      atomic_store(&tree->metadata_attempts, 0);
@@ -620,7 +693,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      atomic_store(&tree->filtered_count, 0);
      atomic_store(&tree->last_metadata_time, 0);
      tree->metadata_rate = 0.0;
-@@ -1370,6 +1472,10 @@
+@@ -1370,6 +1477,10 @@
      atomic_store(&tree->gp_answers, 0);
      atomic_store(&tree->gp_lookup_us_total, 0);
      atomic_store(&tree->gp_rounds_total, 0);
@@ -633,8 +706,16 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      atomic_store(&tree->bep51_nodes_cached, 0);
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/tree_metadata.c dht_crawler/src/tree_metadata.c
 --- dht_crawler-baseline/src/tree_metadata.c	2026-11-17 00:48:00.684431712 +0800
-+++ dht_crawler/src/tree_metadata.c	2026-11-17 00:59:45.755781696 +0800
-@@ -818,6 +818,52 @@
++++ dht_crawler/src/tree_metadata.c	2026-11-17 01:23:46.955360840 +0800
+@@ -791,6 +791,7 @@
+     int metadata_size;              /* Peer-advertised size (consistency check) */
+     time_t connect_start;
+     time_t last_activity;           /* Last readable data (silence watchdog) */
++    time_t last_piece_time;         /* Last NEW data piece copied (piece-idle eviction) */
+     int outstanding_count;          /* Currently in-flight piece requests */
+     int outstanding_pieces[METADATA_OUTSTANDING_PER_PEER];
+ } parallel_conn_t;
+@@ -818,6 +819,52 @@
      metadata_fetch_state_t st;
  } parallel_fetch_t;
  
@@ -687,7 +768,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  /* Initialize a connection slot with a new peer */
  static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
                                  const struct sockaddr_storage *peer,
-@@ -828,13 +874,17 @@
+@@ -828,13 +875,17 @@
  
      int family = peer->ss_family;
      int fd = socket(family, SOCK_STREAM, 0);
@@ -706,7 +787,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          return -1;
      }
  
-@@ -851,6 +901,7 @@
+@@ -851,6 +902,7 @@
          if (send_handshake(fd, infohash, peer_id) < 0) {
              if (tree) atomic_fetch_sub(&tree->active_connections, 1);
              close(fd);
@@ -714,7 +795,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
              return -1;
          }
          conn->state = CONN_STATE_HANDSHAKING;
-@@ -859,6 +910,7 @@
+@@ -859,12 +911,14 @@
      } else {
          if (tree) atomic_fetch_sub(&tree->active_connections, 1);
          close(fd);
@@ -722,7 +803,14 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
          return -1;
      }
  
-@@ -951,6 +1003,7 @@
+     conn->fd = fd;
+     conn->connect_start = time(NULL);
+     conn->last_activity = conn->connect_start;
++    conn->last_piece_time = conn->connect_start;
+     return 0;
+ }
+ 
+@@ -951,6 +1005,7 @@
  
          if (send_metadata_request(conn->fd, conn->ut_metadata_id, found) < 0) {
              conn->state = CONN_STATE_ERROR;  /* caller closes + refills */
@@ -730,7 +818,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
              return;
          }
          if (found_was_outstanding && tree) {
-@@ -990,11 +1043,13 @@
+@@ -990,11 +1045,13 @@
                  (conn->recv_buf[25] & 0x10) == 0 ||
                  memcmp(conn->recv_buf + 28, infohash, 20) != 0) {
                  conn->state = CONN_STATE_ERROR;
@@ -744,7 +832,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                  return NULL;
              }
  
-@@ -1018,6 +1073,7 @@
+@@ -1018,6 +1075,7 @@
  
          if (msg_len > 1024 * 1024) {
              conn->state = CONN_STATE_ERROR;
@@ -752,7 +840,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
              return NULL;
          }
  
-@@ -1038,12 +1094,14 @@
+@@ -1038,12 +1096,14 @@
                  if (parse_extended_handshake(conn->recv_buf + 6, msg_len - 2,
                                               &conn->ut_metadata_id, &conn->metadata_size) < 0) {
                      conn->state = CONN_STATE_ERROR;
@@ -767,7 +855,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      goto shift;
                  }
  
-@@ -1063,6 +1121,7 @@
+@@ -1063,6 +1123,7 @@
                          free(st->outstanding); st->outstanding = NULL;
                          free(st->last_request_ms); st->last_request_ms = NULL;
                          conn->state = CONN_STATE_ERROR;
@@ -775,7 +863,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                          goto shift;
                      }
                      st->initialized = 1;
-@@ -1070,6 +1129,7 @@
+@@ -1070,10 +1131,15 @@
                      /* Peers disagree on size; at most one is right and the final
                       * SHA-1 arbitrates. Close this conn and refill its slot. */
                      conn->state = CONN_STATE_ERROR;
@@ -783,7 +871,15 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      goto shift;
                  }
  
-@@ -1087,6 +1147,7 @@
+                 conn->state = CONN_STATE_REQUESTING_METADATA;
++                /* The piece-idle clock starts now, not at connect time: a peer
++                 * that spent a while handshaking must not be evicted on the
++                 * first tick after it became askable. */
++                conn->last_piece_time = time(NULL);
+                 metadata_schedule_conn(fetch, ci, tree);
+ 
+             } else if (ext_id == OUR_UT_METADATA_ID && conn->state == CONN_STATE_REQUESTING_METADATA) {
+@@ -1087,6 +1153,7 @@
  
                  if (piece_msg_type == UT_METADATA_REJECT) {
                      conn->state = CONN_STATE_ERROR;
@@ -791,7 +887,18 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      goto shift;
                  }
  
-@@ -1125,11 +1186,13 @@
+@@ -1111,6 +1178,10 @@
+                             memcpy(st->metadata_buffer + offset, piece_data, piece_len);
+                             st->pieces_bitmap[byte_idx] |= (1 << bit_idx);
+                             st->pieces_received++;
++                            /* Real progress: this is the ONLY refresh of the
++                             * piece-idle clock. Keep-alives, have/bitfield and
++                             * duplicate pieces refresh last_activity instead. */
++                            conn->last_piece_time = time(NULL);
+ 
+                             if (st->pieces_received >= st->total_pieces) {
+                                 uint8_t computed_hash[20];
+@@ -1125,11 +1196,13 @@
                                      /* Assembled bytes do not hash to the infohash:
                                       * peers disagreed on content. Reset the piece
                                       * bitfield once and re-request everything. */
@@ -805,7 +912,15 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                                      goto shift;
                                  }
                              }
-@@ -1194,8 +1257,10 @@
+@@ -1165,6 +1238,7 @@
+     int metadata_timeout = config ? config->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS;
+     int max_metadata = config ? config->max_metadata_size : MAX_METADATA_SIZE_DEFAULT;
+     int window_size = config ? config->parallel_peers : 2;
++    int piece_idle_ms = config ? config->metadata_piece_idle_ms : 0;
+     thread_tree_t *tree = config ? config->tree : NULL;
+ 
+     if (window_size < 1) window_size = 1;
+@@ -1194,8 +1268,10 @@
  
      /* Main poll loop */
      while (active_count > 0 && !result) {
@@ -817,7 +932,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
              break;
          }
  
-@@ -1238,6 +1303,7 @@
+@@ -1238,6 +1314,7 @@
                  /* Check per-connection timeout for connecting state */
                  if (conn->state == CONN_STATE_CONNECTING &&
                      difftime(time(NULL), conn->connect_start) > tcp_timeout / 1000) {
@@ -825,7 +940,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      parallel_conn_close(conn, tree, &fetch.st);
                      active_count--;
                  }
-@@ -1245,6 +1311,8 @@
+@@ -1245,6 +1322,8 @@
              }
  
              if (pfds[p].revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -834,7 +949,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                  parallel_conn_close(conn, tree, &fetch.st);
                  active_count--;
                  continue;
-@@ -1255,6 +1323,7 @@
+@@ -1255,6 +1334,7 @@
                  int error;
                  socklen_t len = sizeof(error);
                  if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
@@ -842,7 +957,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      parallel_conn_close(conn, tree, &fetch.st);
                      active_count--;
                      continue;
-@@ -1264,6 +1333,7 @@
+@@ -1264,6 +1344,7 @@
                  uint8_t peer_id[20];
                  generate_peer_id(peer_id);
                  if (send_handshake(conn->fd, infohash, peer_id) < 0) {
@@ -850,7 +965,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      parallel_conn_close(conn, tree, &fetch.st);
                      active_count--;
                      continue;
-@@ -1277,6 +1347,9 @@
+@@ -1277,6 +1358,9 @@
                  ssize_t nread = read(conn->fd, conn->recv_buf + conn->recv_offset,
                                       sizeof(conn->recv_buf) - conn->recv_offset);
                  if (nread <= 0) {
@@ -860,18 +975,44 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
                      parallel_conn_close(conn, tree, &fetch.st);
                      active_count--;
                      continue;
-@@ -1304,6 +1377,7 @@
+@@ -1304,6 +1388,25 @@
  
                  if (conn->state != CONN_STATE_CONNECTING &&
                      difftime(now, conn->last_activity) > CONN_SILENCE_CLOSE_MS / 1000) {
 +                    meta_count_fail(tree, META_FAIL_STALL);
++                    parallel_conn_close(conn, tree, &fetch.st);
++                    active_count--;
++                    continue;
++                }
++
++                /* Piece-progress eviction. The silence watchdog above only fires
++                 * when NOT ONE byte arrives; a peer that trickles keep-alive /
++                 * have / bitfield bytes refreshes last_activity forever without
++                 * ever delivering a data piece, so it would hold its window slot
++                 * for the whole global deadline. last_piece_time is refreshed
++                 * ONLY when a new data piece is copied into the shared buffer, so
++                 * this closes exactly that case and lets the refill loop below
++                 * advance the window to the next untried peer. 0 disables it
++                 * (legacy behaviour). */
++                if (piece_idle_ms > 0 &&
++                    conn->state == CONN_STATE_REQUESTING_METADATA &&
++                    difftime(now, conn->last_piece_time) > piece_idle_ms / 1000) {
++                    meta_count_fail(tree, META_FAIL_STALL);
                      parallel_conn_close(conn, tree, &fetch.st);
                      active_count--;
                      continue;
+@@ -1454,6 +1557,7 @@
+         .metadata_timeout_ms = tree->metadata_timeout_ms > 0 ? tree->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS,
+         .max_metadata_size = 10 * 1024 * 1024,
+         .parallel_peers = tree->parallel_peers,
++        .metadata_piece_idle_ms = tree->metadata_piece_idle_ms,
+         .tree = tree
+     };
+ 
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/config.h dht_crawler/include/config.h
 --- dht_crawler-baseline/include/config.h	2026-11-17 00:48:00.660047126 +0800
-+++ dht_crawler/include/config.h	2026-11-17 01:10:05.785537361 +0800
-@@ -141,6 +141,8 @@
++++ dht_crawler/include/config.h	2026-11-17 01:22:47.356817667 +0800
+@@ -141,12 +141,15 @@
      int tree_get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
      int tree_get_peers_fanout;           /* concurrent get_peers queries per round (default: 8, 2-12) */
      int tree_get_peers_max_queries;      /* total get_peers packets per infohash (default: 16, 8-32) */
@@ -880,10 +1021,19 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      /* Thread tree Stage 5 settings (metadata) */
      int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
      int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+-    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
++    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 4, 1-4 = MAX_PARALLEL_PEERS) */
+     int tree_metadata_fresh_peer_retries;/* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
+-    int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
++    int tree_metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long (default: 15000, 0 = off, 3000-60000) */
+ 
+     /* Thread tree metadata rate-based respawn settings */
+     double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/supervisor.h dht_crawler/include/supervisor.h
 --- dht_crawler-baseline/include/supervisor.h	2026-11-17 00:48:00.667619268 +0800
-+++ dht_crawler/include/supervisor.h	2026-11-17 01:10:36.017827265 +0800
-@@ -78,6 +78,8 @@
++++ dht_crawler/include/supervisor.h	2026-11-17 01:23:04.993679238 +0800
+@@ -78,11 +78,14 @@
      int get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
      int get_peers_fanout;           /* get_peers queries per lookup (default: 8, 2-12) */
      int get_peers_max_queries;      /* get_peers query budget (default: 16, 8-32, >= fanout) */
@@ -892,7 +1042,14 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      /* Stage 5 settings */
      int tcp_connect_timeout_ms;
      int parallel_peers;
-@@ -171,6 +173,8 @@
+     int fresh_peer_retries;          /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
+-    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
++    int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
+ 
+     /* Metadata rate-based respawn settings */
+     double min_metadata_rate;          /* Floor for dynamic threshold */
+@@ -171,11 +174,14 @@
      int get_peers_deadline_ms;
      int get_peers_fanout;
      int get_peers_max_queries;
@@ -901,7 +1058,14 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      /* Stage 5 settings */
      int tcp_connect_timeout_ms;
      int parallel_peers;
-@@ -235,6 +239,15 @@
+     int fresh_peer_retries;          /* Fresh-peer re-lookups before metadata failure strike (0-3) */
+-    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
++    int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
+ 
+     /* Metadata rate-based respawn settings */
+     double min_metadata_rate;          /* Floor for dynamic threshold */
+@@ -235,6 +241,15 @@
      atomic_uint_fast64_t cumulative_second_strike_failures;
      atomic_uint_fast64_t cumulative_filtered_count;
      atomic_uint_fast64_t cumulative_metadata_attempts;
@@ -917,7 +1081,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      /* get_peers lookup instrumentation accumulated from respawned trees */
      atomic_uint_fast64_t cumulative_gp_lookups;
      atomic_uint_fast64_t cumulative_gp_lookups_with_peers;
-@@ -243,6 +256,11 @@
+@@ -243,6 +258,11 @@
      atomic_uint_fast64_t cumulative_gp_answers;
      atomic_uint_fast64_t cumulative_gp_lookup_us_total;
      atomic_uint_fast64_t cumulative_gp_rounds_total;
@@ -929,7 +1093,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
      /* Monitor thread */
      pthread_t monitor_thread;
-@@ -311,6 +329,16 @@
+@@ -311,6 +331,16 @@
                                 uint64_t *out_lookup_us, uint64_t *out_rounds);
  
  /**
@@ -948,8 +1112,8 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
   * @return Total active connections
 diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/thread_tree.h dht_crawler/include/thread_tree.h
 --- dht_crawler-baseline/include/thread_tree.h	2026-11-17 00:48:00.669113730 +0800
-+++ dht_crawler/include/thread_tree.h	2026-11-17 01:10:57.891335548 +0800
-@@ -80,6 +80,8 @@
++++ dht_crawler/include/thread_tree.h	2026-11-17 01:23:00.192716642 +0800
+@@ -80,12 +80,15 @@
      int get_peers_deadline_ms;      /* Get_peers lookup deadline (default: 6000, 500-8000) */
      int get_peers_fanout;           /* Get_peers queries per lookup (default: 8, 2-12) */
      int get_peers_max_queries;      /* Get_peers query budget (default: 16, 8-32, >= fanout) */
@@ -958,7 +1122,16 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
      /* Stage 5: Metadata fetcher settings */
      int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-@@ -152,6 +154,8 @@
+-    int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
++    int parallel_peers;             /* Parallel peer connections per infohash (default: 4, 1-4) */
+     int fresh_peer_retries;         /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
+-    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
++    int metadata_piece_idle_ms;     /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
+ 
+     /* Metadata rate-based respawn settings */
+     double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
+@@ -152,12 +155,15 @@
      int get_peers_deadline_ms;
      int get_peers_fanout;
      int get_peers_max_queries;
@@ -967,7 +1140,15 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
  
      /* Stage 5 config */
      int tcp_connect_timeout_ms;
-@@ -202,6 +206,18 @@
+     int parallel_peers;
+     int fresh_peer_retries;         /* Fresh-peer re-lookups before a metadata failure strike (0-3) */
+-    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
++    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
++    int metadata_piece_idle_ms;     /* Evict a conn with no new data piece for this long (0 = off) */
+ 
+     /* Shared resources (from supervisor) */
+     struct batch_writer *shared_batch_writer;
+@@ -202,6 +208,18 @@
      /* Statistics */
      atomic_uint_fast64_t metadata_count;
      atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
@@ -986,7 +1167,7 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
      atomic_uint_fast64_t filtered_count;    /* Dropped by the ingest filters (hard block/language/adult) */
      atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
      atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
-@@ -217,6 +233,10 @@
+@@ -217,6 +235,10 @@
      atomic_uint_fast64_t gp_lookup_us_total;     /* Total microseconds spent inside tree_lookup_peers() */
      atomic_uint_fast64_t last_metadata_time;
      atomic_uint_fast64_t gp_rounds_total;       /* Completed rounds after the first, summed over lookups */
@@ -996,4 +1177,21 @@ diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline
 +    atomic_uint_fast64_t gp_miss_penalties;      /* Unanswered slots charged via tree_routing_mark_failed() */
      double metadata_rate;
      atomic_int active_connections;  /* Track active TCP connections */
+ 
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/tree_metadata.h dht_crawler/include/tree_metadata.h
+--- dht_crawler-baseline/include/tree_metadata.h	2026-11-17 00:48:00.332734512 +0800
++++ dht_crawler/include/tree_metadata.h	2026-11-17 01:23:25.214523929 +0800
+@@ -33,9 +33,11 @@
+  */
+ typedef struct tree_metadata_config {
+     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+-    int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 60000) */
++    int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 30000) */
+     int max_metadata_size;          /* Max metadata size in bytes (default: 10MB) */
+-    int parallel_peers;             /* Number of peers to connect in parallel (default: 2) */
++    int parallel_peers;             /* Number of peers to connect in parallel (default: 4, max 4) */
++    int metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long
++                                     * (default: 15000, 0 = disabled) */
+     struct thread_tree *tree;       /* Tree pointer for connection tracking (optional) */
+ } tree_metadata_config_t;
  
