@@ -6,6 +6,10 @@ and semantics. It is not a full `config.ini` reference — for the complete key 
 `src/config.c` (`config_load_file`) and the sanitized app-side template
 `app/src/main/assets/dht_crawler/config.ini.default`, which carries these seven keys with comments.
 
+Patch 21 (`patches/metadata-peer-fail-map.patch`) adds one key to this page,
+`tree_metadata_peer_blacklist_ttl_sec` — the per-address TCP connect-failure memory — under the same
+fail-open contract: `0` is the shipped value and restores legacy peer selection exactly.
+
 All values are parsed with `atoi`, so `= true` parses as `0`. **Every one of these keys ships at its legacy
 value — the tuning is opt-in.** Five of the seven treat `0` as "disabled / pre-patch behaviour"; all of them
 are fail-open to the old code path. The shipped defaults are the measured result: five 30-minute on-device
@@ -20,6 +24,7 @@ finding is what patch 19 actually ships enabled. See the run report `measurement
 | `tree_get_peers_slot_budget_ms` | `0` (off) | `0`, or `500..6000` | stop waiting on a slot once its own answer budget has run out |
 | `tree_get_peers_finish_on_peers` | `0` (off) | `0`/`1` (any non-zero value is coerced to `1`) | end a lookup as soon as it has peers |
 | `tree_metadata_piece_idle_ms` | `0` (off) | `0`, or `3000..60000` | evict a metadata connection that copies no new piece for this long |
+| `tree_metadata_peer_blacklist_ttl_sec` | `0` (off) | `0`, or `60..3600` | remember a peer address whose TCP connect failed and step over it when picking metadata peers (patch 21) |
 | `tree_parallel_peers` | `2` (legacy) | `1..4` (clamp narrowed from `1..10`) | parallel peer connections per infohash |
 | `tree_metadata_timeout_ms` | `60000` (legacy) | `5000..600000` (unchanged) | per-tree metadata fetch deadline |
 
@@ -98,6 +103,35 @@ window to the next untried peer.
 - Measured: `stall_total` is 0.8 % of the metadata failure mass and `deadline_total` 0.1–0.2 % across every
   window, i.e. this knob addresses ≤1 % of the failures. Ships off.
 
+## tree_metadata_peer_blacklist_ttl_sec
+
+Per-address TCP connect-failure memory for the BEP9/10 fetcher (patch 21,
+`patches/metadata-peer-fail-map.patch`). Measured baseline: ~83 % of the metadata failure mass is a TCP
+connect that never completes, and the peer list handed to a fetch is arrival-ordered with no dedup, so the
+same unreachable address is retried across infohashes and across trees. Every site that counts
+`metadata_failures.connect_total` also records the *address* into one supervisor-shared map
+(`src/meta_peer_fail.c`: 8192 slots × 32 B = 256 KiB, open addressing, one `pthread_mutex_t`, lazy TTL
+ageing, no thread). Window selection then steps over an address the map still remembers, counting each
+skipped **slot** in `metadata_peer_fail.metadata_peers_skipped_total` (peers are not deduplicated, so one
+address can be skipped several times per attempt).
+
+- `0` (shipped) does not even create the map: every lookup answers "do not skip" and every record is a
+  no-op, so peer selection is byte-identical to legacy. A creation failure is non-fatal and lands in the
+  same disabled state.
+- Any non-zero value is clamped into `60..3600` and logged at `LOG_WARN`; `0` is never clamped.
+- Only **connect** failures are remembered — handshake, stall, hash and deadline outcomes say nothing about
+  reachability, and the eight `metadata_failures` counters keep their exact count-once meaning (the record
+  is additive).
+- **Skip-to-empty guard (mandatory):** the selection cursor never passes the last candidate of an attempt,
+  and an attempt whose whole window was skipped refills once with the map ignored. A zero-connection
+  attempt would reach the irreversible infohash strike bloom and block the infohash because of a *peer
+  address's* history. With the map disabled the guard cannot fire.
+- Load-factor clear at 3/4 (≈6,100 live addresses) is fail-open: a cleared table means legacy selection.
+- Echoed by `/stats` as `metadata_peer_fail`: `enabled`, `capacity`, `held`, `ttl_sec`, `clears_total`,
+  `expired_total`, `metadata_peers_skipped_total`, `metadata_connect_fail_addresses_total` (the last one
+  counts NEW distinct addresses admitted, not events). A disabled map publishes `enabled: false`,
+  `ttl_sec: 0` and zero counters.
+
 ## Changed defaults
 
 The two pre-existing keys keep their **legacy** values in the shipped patch, and their clamps are unchanged
@@ -110,7 +144,7 @@ except for the `tree_parallel_peers` correctness fix noted above:
   it is not justified by measurement either.
 
 Both govern fresh installs and absent keys only: `config.ini` is written by the app's settings form, and an
-existing file keeps whatever it already pins. Any of these seven keys can be re-enabled as an advanced
+existing file keeps whatever it already pins. Any of these keys can be re-enabled as an advanced
 override in the app's crawler settings (they are on the Kotlin allow-list) — re-measure, do not assume.
 
 ## Where these show up in `/stats`

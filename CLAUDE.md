@@ -152,6 +152,39 @@ thread. `stats_interval_sec` is the *measured* elapsed time of the last complete
 eight `metadata_failures` counters are untouched; a respawn landing inside an interval can still make one
 window spike, which is exactly why the lifetime totals stay beside the windowed ones.
 
+### Per-address connect-failure memory (patch 21)
+
+Measured baseline: ~83 % of the metadata failure mass is a TCP connect that never completes, and the peer
+list handed to a fetch is arrival-ordered with **no address dedup**, so the same unreachable peer is
+retried across infohashes and across trees. Patch 21 adds `tree_metadata_peer_blacklist_ttl_sec`
+(default **0 = off**, opt-in clamp 60..3600) and `src/meta_peer_fail.c`
+(`include/meta_peer_fail.h`, host-tested by `make tests-meta-peer-fail`): ONE supervisor-shared map —
+8192 slots × 32 B = 256 KiB, open addressing with FNV-1a + linear probing, a single `pthread_mutex_t`, and
+lazy TTL ageing on the lookup/insert path only (no thread, no sweep; the load-factor clear at 3/4 is
+fail-open). It is deliberately the opposite of the infohash strike blooms: address-keyed, TTL-aged and
+consulted at *selection* rather than at *outcome*.
+
+- **Fail-open is absolute.** `ttl_sec = 0` never creates the map, so every lookup answers "do not skip" and
+  every record is a no-op — peer selection is byte-identical to legacy. A creation failure is non-fatal and
+  lands in the same disabled state. A cleared table is legacy selection too.
+- **Additive recording only.** Every site that counts `metadata_failures.connect_total` (the seven direct
+  `meta_count_fail(tree, META_FAIL_CONNECT)` sites plus `meta_count_conn_fail()` when it classifies CONNECT)
+  also records the address. Handshake/stall/hash/deadline outcomes are NOT recorded, and the eight counters,
+  the exit counters and the count-once discipline are untouched. `parallel_conn_t` carries the address
+  (`peer`) because the poll-loop sites have no other handle on it.
+- **Skip-to-empty guard (mandatory).** A zero-connection attempt returns NULL and feeds the irreversible
+  infohash strike bloom, which would block an infohash for a *peer address's* history. Two guards: the
+  selection cursor never passes the last candidate of an attempt, and an attempt whose whole window was
+  skipped refills once with the map ignored (the cursor is NOT reset — re-trying an address already failed
+  would inflate `connect_total` and make `R = connect_total/attempts` unreadable). With the map disabled
+  neither guard can fire.
+- **Counter units differ on purpose.** `metadata_peer_fail.metadata_peers_skipped_total` counts skipped
+  **slots** (peers are not deduplicated, so one address can be skipped several times per attempt);
+  `metadata_connect_fail_addresses_total` counts **NEW distinct addresses admitted**, not events.
+- `/stats` publishes `metadata_peer_fail` (sibling of `inflight`): `enabled`, `capacity`, `held`, `ttl_sec`,
+  `clears_total`, `expired_total` and the two counters. The map is supervisor-owned so it survives a tree
+  respawn — which fires exactly when the metadata rate is low, i.e. when the memory matters most.
+
 ### Respawn Logic
 
 `supervisor.c:monitor_thread_func()` checks each tree's metadata rate (EMA-smoothed) every `rate_check_interval_sec`. Trees below `min_metadata_rate - dynamic_rate_margin` for longer than `rate_grace_period_sec` are respawned. During respawn, the old tree is moved to a "draining" list and destroyed once its active connections drop below `respawn_spawn_threshold` (or after `respawn_drain_timeout_sec`).
