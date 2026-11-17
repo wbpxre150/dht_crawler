@@ -159,9 +159,12 @@ list handed to a fetch is arrival-ordered with **no address dedup**, so the same
 retried across infohashes and across trees. Patch 21 adds `tree_metadata_peer_blacklist_ttl_sec`
 (default **0 = off**, opt-in clamp 60..3600) and `src/meta_peer_fail.c`
 (`include/meta_peer_fail.h`, host-tested by `make tests-meta-peer-fail`): ONE supervisor-shared map —
-8192 slots × 32 B = 256 KiB, open addressing with FNV-1a + linear probing, a single `pthread_mutex_t`, and
-lazy TTL ageing on the lookup/insert path only (no thread, no sweep; the load-factor clear at 3/4 is
-fail-open). It is deliberately the opposite of the infohash strike blooms: address-keyed, TTL-aged and
+131,072 slots × 32 B = 4 MiB, open addressing with FNV-1a + linear probing, a single `pthread_mutex_t`, and
+lazy TTL ageing on the lookup/insert path only (no thread, no sweep; the load-factor clear at 3/4 = 98,304
+slots is fail-open). The capacity is sized by the TTL working set — 131,072 × 3/4 = 98,304 clear threshold >
+the ~66,000–79,800 entries a 600 s TTL accumulates at the measured ~110–133 NEW distinct fail addresses/s
+(~23 % margin) — because at 8192 slots the table was wiped every ~50–70 s and `expired_total` stayed 0, i.e.
+entries died by capacity clear and never by TTL (patch 22, `patches/meta-peer-fail-capacity.patch`). It is deliberately the opposite of the infohash strike blooms: address-keyed, TTL-aged and
 consulted at *selection* rather than at *outcome*.
 
 - **Fail-open is absolute.** `ttl_sec = 0` never creates the map, so every lookup answers "do not skip" and

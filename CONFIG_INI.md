@@ -110,7 +110,7 @@ Per-address TCP connect-failure memory for the BEP9/10 fetcher (patch 21,
 connect that never completes, and the peer list handed to a fetch is arrival-ordered with no dedup, so the
 same unreachable address is retried across infohashes and across trees. Every site that counts
 `metadata_failures.connect_total` also records the *address* into one supervisor-shared map
-(`src/meta_peer_fail.c`: 8192 slots × 32 B = 256 KiB, open addressing, one `pthread_mutex_t`, lazy TTL
+(`src/meta_peer_fail.c`: 131,072 slots × 32 B = 4 MiB, open addressing, one `pthread_mutex_t`, lazy TTL
 ageing, no thread). Window selection then steps over an address the map still remembers, counting each
 skipped **slot** in `metadata_peer_fail.metadata_peers_skipped_total` (peers are not deduplicated, so one
 address can be skipped several times per attempt).
@@ -126,7 +126,12 @@ address can be skipped several times per attempt).
   and an attempt whose whole window was skipped refills once with the map ignored. A zero-connection
   attempt would reach the irreversible infohash strike bloom and block the infohash because of a *peer
   address's* history. With the map disabled the guard cannot fire.
-- Load-factor clear at 3/4 (≈6,100 live addresses) is fail-open: a cleared table means legacy selection.
+- Load-factor clear at 3/4 (98,304 live addresses) is fail-open: a cleared table means legacy selection.
+  The capacity is sized so that threshold exceeds the whole 600 s TTL working set — measured ~110–133 NEW
+  distinct fail addresses/s × 600 s = 66,000–79,800 live entries, ~23 % under 98,304 — so entries age out by
+  TTL instead of by a table wipe. (The original 8192 slots cleared every ~50–70 s at that rate, leaving
+  `expired_total` at 0; see `reports/w3-sizing-blocker.md`.) 4 MiB is ~0.2 % of the measured 2.04 GB
+  crawler RSS.
 - Echoed by `/stats` as `metadata_peer_fail`: `enabled`, `capacity`, `held`, `ttl_sec`, `clears_total`,
   `expired_total`, `metadata_peers_skipped_total`, `metadata_connect_fail_addresses_total` (the last one
   counts NEW distinct addresses admitted, not events). A disabled map publishes `enabled: false`,
