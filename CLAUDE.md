@@ -135,6 +135,23 @@ against the baseline's 36.9 %, i.e. the DHT thinned overnight.)
   per-tree atomics folded into the supervisor at respawn like the other `gp_*` counters and published as
   `*_total`.
 
+### Last-interval (windowed) rates (patch 20)
+
+Every rate counter `/stats` publishes is cumulative since process start, so one snapshot cannot say how fast
+anything is happening right now. Patch 20 adds seven **additive** keys to `aggregate` — the six
+`*_last_interval` siblings of the lifetime counters plus `stats_interval_sec` — sampled by
+`monitor_thread_func()` on its existing hard-coded 10 s tick (no new config key). `src/stats_window.c` is a
+pure C99 module (`include/stats_window.h`, host-tested by `make tests-stats-window`) that keeps the previous
+sample and reports the saturating per-counter difference: the first tick only records the baseline, so a
+freshly started crawler publishes zeros with `stats_interval_sec` 0 instead of a spike, and a counter that
+moves backwards reports 0 for that counter rather than wrapping. The sampler folds the same totals
+`stats_handler()` publishes (cumulative respawn buckets + live trees) and publishes them through atomics on
+`supervisor_t` — do not copy the non-atomic per-tree `metadata_rate` double, which is written by another
+thread. `stats_interval_sec` is the *measured* elapsed time of the last completed interval, so
+`rate = value / stats_interval_sec`. Lifetime keys, their percentages, `supervisor.get_peers.*` and the
+eight `metadata_failures` counters are untouched; a respawn landing inside an interval can still make one
+window spike, which is exactly why the lifetime totals stay beside the windowed ones.
+
 ### Respawn Logic
 
 `supervisor.c:monitor_thread_func()` checks each tree's metadata rate (EMA-smoothed) every `rate_check_interval_sec`. Trees below `min_metadata_rate - dynamic_rate_margin` for longer than `rate_grace_period_sec` are respawned. During respawn, the old tree is moved to a "draining" list and destroyed once its active connections drop below `respawn_spawn_threshold` (or after `respawn_drain_timeout_sec`).

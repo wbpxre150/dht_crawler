@@ -1,0 +1,530 @@
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/http_api.c dht_crawler/src/http_api.c
+--- dht_crawler-baseline/src/http_api.c	2026-11-17 09:09:31.571106053 +0800
++++ dht_crawler/src/http_api.c	2026-11-17 09:11:56.521922894 +0800
+@@ -1445,6 +1445,31 @@
+         cJSON_AddNumberToObject(aggregate, "metadata_fetch_success_percent",
+                                 metadata_fetch_success_percent);
+ 
++        /* Last-interval (windowed) siblings of the lifetime numbers above
++         * (patch 20). Same numerators and denominators, but sampled by the
++         * supervisor monitor thread over its last completed 10 s tick, so one
++         * snapshot reports the current rate instead of a since-start average.
++         * stats_interval_sec is the elapsed time of that tick (measured, not
++         * assumed): rate = value / stats_interval_sec. Until the second tick
++         * has completed the counters are 0 and so is stats_interval_sec. */
++        uint64_t interval_attempts =
++            atomic_load(&api->supervisor->interval_metadata_attempts);
++        uint64_t interval_fetched =
++            atomic_load(&api->supervisor->interval_metadata_fetched);
++
++        cJSON_AddNumberToObject(aggregate, "metadata_attempts_last_interval",
++                                (double)interval_attempts);
++        cJSON_AddNumberToObject(aggregate, "metadata_fetched_last_interval",
++                                (double)interval_fetched);
++
++        double metadata_fetch_success_percent_last_interval = 0.0;
++        if (interval_attempts > 0) {
++            metadata_fetch_success_percent_last_interval =
++                (interval_fetched * 100.0) / (double)interval_attempts;
++        }
++        cJSON_AddNumberToObject(aggregate, "metadata_fetch_success_percent_last_interval",
++                                metadata_fetch_success_percent_last_interval);
++
+         /* get_peers yield, same totals the supervisor block publishes, repeated at
+          * aggregate level with both counters beside the percentage. */
+         uint64_t agg_gp_lookups = 0;
+@@ -1462,6 +1487,28 @@
+         }
+         cJSON_AddNumberToObject(aggregate, "get_peers_yield_percent", get_peers_yield_percent);
+ 
++        /* Last-interval get_peers siblings, same window as above. */
++        uint64_t interval_gp_lookups =
++            atomic_load(&api->supervisor->interval_gp_lookups);
++        uint64_t interval_gp_with_peers =
++            atomic_load(&api->supervisor->interval_gp_with_peers);
++
++        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_last_interval",
++                                (double)interval_gp_lookups);
++        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_with_peers_last_interval",
++                                (double)interval_gp_with_peers);
++
++        double get_peers_yield_percent_last_interval = 0.0;
++        if (interval_gp_lookups > 0) {
++            get_peers_yield_percent_last_interval =
++                (interval_gp_with_peers * 100.0) / (double)interval_gp_lookups;
++        }
++        cJSON_AddNumberToObject(aggregate, "get_peers_yield_percent_last_interval",
++                                get_peers_yield_percent_last_interval);
++
++        cJSON_AddNumberToObject(aggregate, "stats_interval_sec",
++                                atomic_load(&api->supervisor->interval_elapsed_sec));
++
+         cJSON_AddItemToObject(root, "aggregate", aggregate);
+     }
+ 
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/stats_window.c dht_crawler/src/stats_window.c
+--- dht_crawler-baseline/src/stats_window.c	1970-01-01 08:00:00.000000000 +0800
++++ dht_crawler/src/stats_window.c	2026-11-17 09:10:46.132572707 +0800
+@@ -0,0 +1,55 @@
++/**
++ * Last-interval ("windowed") deltas for the cumulative /stats counters.
++ *
++ * Pure arithmetic over four uint64_t counters: no locks, no clocks, no I/O, so
++ * the supervisor's 10 s monitor tick owns one stats_window_t and the host test
++ * (tests/test_stats_window.c) exercises every branch directly.
++ */
++#include "stats_window.h"
++
++/**
++ * Difference of two monotonic counters, saturating at 0.
++ *
++ * A counter that moved backwards is not a rate: reporting (now - last) on an
++ * unsigned type would wrap to ~1.8e19 and poison the published percentage. The
++ * honest value is "no progress observed", i.e. 0.
++ */
++static uint64_t window_delta(uint64_t now, uint64_t last) {
++    return now > last ? now - last : 0;
++}
++
++void stats_window_sample(stats_window_t *w, uint64_t attempts, uint64_t fetched,
++                         uint64_t lookups, uint64_t with_peers,
++                         uint64_t out_deltas[4]) {
++    uint64_t delta_attempts = 0;
++    uint64_t delta_fetched = 0;
++    uint64_t delta_lookups = 0;
++    uint64_t delta_with_peers = 0;
++
++    /* First sample: there is no previous snapshot, so every delta stays 0 and
++     * the values just sampled become the baseline. */
++    if (w && w->has_last) {
++        delta_attempts = window_delta(attempts, w->last_attempts);
++        delta_fetched = window_delta(fetched, w->last_fetched);
++        delta_lookups = window_delta(lookups, w->last_lookups);
++        delta_with_peers = window_delta(with_peers, w->last_with_peers);
++    }
++
++    /* Advance the snapshot unconditionally: after a backwards jump the next
++     * interval must be measured from the values sampled now, not from the old
++     * (higher) ones. */
++    if (w) {
++        w->has_last = 1;
++        w->last_attempts = attempts;
++        w->last_fetched = fetched;
++        w->last_lookups = lookups;
++        w->last_with_peers = with_peers;
++    }
++
++    if (out_deltas) {
++        out_deltas[0] = delta_attempts;
++        out_deltas[1] = delta_fetched;
++        out_deltas[2] = delta_lookups;
++        out_deltas[3] = delta_with_peers;
++    }
++}
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/src/supervisor.c dht_crawler/src/supervisor.c
+--- dht_crawler-baseline/src/supervisor.c	2026-11-17 09:09:31.574624340 +0800
++++ dht_crawler/src/supervisor.c	2026-11-17 09:11:45.700874284 +0800
+@@ -12,6 +12,7 @@
+ #include "tree_routing.h"
+ #include "keyspace.h"
+ #include "tree_infohash_queue.h"
++#include "stats_window.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+@@ -182,6 +183,13 @@
+     atomic_init(&sup->cumulative_gp_slot_expired_total, 0);
+     atomic_init(&sup->cumulative_gp_early_finish_total, 0);
+ 
++    /* Last-interval (windowed) rate publishing (patch 20) */
++    atomic_init(&sup->interval_metadata_attempts, 0);
++    atomic_init(&sup->interval_metadata_fetched, 0);
++    atomic_init(&sup->interval_gp_lookups, 0);
++    atomic_init(&sup->interval_gp_with_peers, 0);
++    atomic_init(&sup->interval_elapsed_sec, 0);
++
+     /* Initialize mutex */
+     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
+         log_msg(LOG_ERROR, "[supervisor] Failed to init mutex");
+@@ -1119,6 +1127,12 @@
+     /* Periodic BEP51 cache save; zero-initialized to mark "not yet recorded" */
+     struct timespec last_save_ts = {0, 0};
+ 
++    /* Last-interval rate sampler (patch 20): monitor-thread-private state, one
++     * sample per 10 s tick. Zero-initialized so the first tick only records the
++     * baseline (it publishes all-zero deltas and stats_interval_sec 0). */
++    stats_window_t window = {0};
++    struct timespec last_window_ts = {0, 0};
++
+     while (atomic_load(&sup->monitor_running)) {
+         /* Sleep in small chunks (1 second) to be responsive to shutdown */
+         for (int i = 0; i < 10 && atomic_load(&sup->monitor_running); i++) {
+@@ -1130,6 +1144,55 @@
+             break;
+         }
+ 
++        /* Publish last-interval (windowed) rates. The lifetime counters are
++         * cumulative since process start, so a reader cannot tell the current
++         * rate from one snapshot; this samples the same totals stats_handler()
++         * publishes (cumulative respawn buckets + live trees) and stores the
++         * delta since the previous tick. Deliberately NOT supervisor_stats():
++         * that folds six more counters this sampler does not need. The elapsed
++         * time is measured, not assumed, because the tick sleeps in 1 s chunks
++         * and can overshoot. */
++        {
++            uint64_t win_attempts = atomic_load(&sup->cumulative_metadata_attempts);
++            uint64_t win_fetched = atomic_load(&sup->cumulative_metadata_count);
++            uint64_t win_lookups = 0;
++            uint64_t win_with_peers = 0;
++            uint64_t win_deltas[4] = {0, 0, 0, 0};
++            struct timespec now_window_ts;
++            int interval_sec = 0;
++
++            pthread_mutex_lock(&sup->trees_lock);
++            for (int i = 0; i < sup->max_trees; i++) {
++                thread_tree_t *t = sup->trees[i];
++                if (!t) continue;
++                win_attempts += atomic_load(&t->metadata_attempts);
++                win_fetched += atomic_load(&t->metadata_count);
++            }
++            pthread_mutex_unlock(&sup->trees_lock);
++
++            /* Same cumulative+live fold /stats uses for the get_peers totals */
++            supervisor_getpeers_stats(sup, &win_lookups, &win_with_peers,
++                                      NULL, NULL, NULL, NULL, NULL);
++
++            stats_window_sample(&window, win_attempts, win_fetched,
++                                win_lookups, win_with_peers, win_deltas);
++
++            clock_gettime(CLOCK_MONOTONIC, &now_window_ts);
++            if (last_window_ts.tv_sec != 0 || last_window_ts.tv_nsec != 0) {
++                interval_sec = (int)(now_window_ts.tv_sec - last_window_ts.tv_sec);
++                if (interval_sec < 0) {
++                    interval_sec = 0;   /* monotonic clock: defensive only */
++                }
++            }
++            last_window_ts = now_window_ts;
++
++            atomic_store(&sup->interval_metadata_attempts, win_deltas[0]);
++            atomic_store(&sup->interval_metadata_fetched, win_deltas[1]);
++            atomic_store(&sup->interval_gp_lookups, win_deltas[2]);
++            atomic_store(&sup->interval_gp_with_peers, win_deltas[3]);
++            atomic_store(&sup->interval_elapsed_sec, interval_sec);
++        }
++
+         /* Check tree performance */
+         pthread_mutex_lock(&sup->trees_lock);
+ 
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/stats_window.h dht_crawler/include/stats_window.h
+--- dht_crawler-baseline/include/stats_window.h	1970-01-01 08:00:00.000000000 +0800
++++ dht_crawler/include/stats_window.h	2026-11-17 09:10:46.067572345 +0800
+@@ -0,0 +1,55 @@
++#ifndef STATS_WINDOW_H
++#define STATS_WINDOW_H
++
++#include <stdint.h>
++
++/**
++ * Last-interval ("windowed") deltas for the cumulative /stats counters.
++ *
++ * Every rate counter the crawler publishes is cumulative since process start,
++ * so a single /stats snapshot cannot say how fast anything is happening right
++ * now: a reader has to take two snapshots and difference them host-side. This
++ * sampler keeps that difference inside the process, so one snapshot carries the
++ * current window beside the lifetime total.
++ *
++ * The struct is deliberately plain data and the module is pure C99 with no
++ * dependency on the supervisor, civetweb, cJSON, a database or libuv, so it is
++ * unit-testable on the host (tests/test_stats_window.c). It is not thread-safe
++ * by itself: one owner thread (the supervisor monitor thread) calls
++ * stats_window_sample() and publishes the result through atomics.
++ *
++ * Contract:
++ *   - the first sample stores the snapshot and reports all-zero deltas (there
++ *     is no previous sample to subtract), so a freshly started crawler
++ *     publishes zeros rather than a spike;
++ *   - a later sample reports the saturating difference per counter: a counter
++ *     that moved backwards (a reset, a re-seeded total, a rebuilt fold) reports
++ *     0 for that counter only and never wraps to a huge value;
++ *   - the snapshot always advances to the values just sampled, including after
++ *     a backwards jump, so the next interval is measured from the new baseline.
++ */
++typedef struct {
++    int has_last;                  /* 0 until the first sample has been stored */
++    uint64_t last_attempts;        /* metadata attempts at the previous sample */
++    uint64_t last_fetched;         /* metadata fetches at the previous sample */
++    uint64_t last_lookups;         /* get_peers lookups at the previous sample */
++    uint64_t last_with_peers;      /* lookups that returned peers at the previous sample */
++} stats_window_t;
++
++/**
++ * Take one sample of the four cumulative counters.
++ *
++ * @param w          Sampler state. Zero-initialise it before the first call
++ *                   ({0}); NULL is a no-op (nothing to store, no deltas).
++ * @param attempts   Current cumulative metadata attempts
++ * @param fetched    Current cumulative metadata fetches
++ * @param lookups    Current cumulative get_peers lookups
++ * @param with_peers Current cumulative lookups that returned peers
++ * @param out_deltas Receives {attempts, fetched, lookups, with_peers} deltas in
++ *                   that order. All zeros on the first call. May be NULL.
++ */
++void stats_window_sample(stats_window_t *w, uint64_t attempts, uint64_t fetched,
++                         uint64_t lookups, uint64_t with_peers,
++                         uint64_t out_deltas[4]);
++
++#endif /* STATS_WINDOW_H */
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/include/supervisor.h dht_crawler/include/supervisor.h
+--- dht_crawler-baseline/include/supervisor.h	2026-11-17 09:09:31.579150952 +0800
++++ dht_crawler/include/supervisor.h	2026-11-17 09:11:10.112701240 +0800
+@@ -271,6 +271,20 @@
+     atomic_uint_fast64_t cumulative_gp_slot_expired_total;
+     atomic_uint_fast64_t cumulative_gp_early_finish_total;
+ 
++    /* Last-interval ("windowed") rate publishing (patch 20). Every counter
++     * above is cumulative since process start, so one /stats snapshot cannot
++     * say how fast anything is happening right now. The monitor thread samples
++     * the same cumulative+live folds every 10 s (src/stats_window.c) and stores
++     * the delta since its previous tick here; /stats publishes them beside the
++     * lifetime totals as *_last_interval. All zeros until the second tick.
++     * Atomic because the civetweb worker threads read them while the monitor
++     * thread writes them (unlike the non-atomic per-tree metadata_rate). */
++    atomic_uint_fast64_t interval_metadata_attempts;
++    atomic_uint_fast64_t interval_metadata_fetched;
++    atomic_uint_fast64_t interval_gp_lookups;
++    atomic_uint_fast64_t interval_gp_with_peers;
++    atomic_int interval_elapsed_sec;   /* seconds the last completed interval covered */
++
+     /* Monitor thread */
+     pthread_t monitor_thread;
+ 
+diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.orig' -x '*.rej' dht_crawler-baseline/tests/test_stats_window.c dht_crawler/tests/test_stats_window.c
+--- dht_crawler-baseline/tests/test_stats_window.c	1970-01-01 08:00:00.000000000 +0800
++++ dht_crawler/tests/test_stats_window.c	2026-11-17 09:11:03.072664530 +0800
+@@ -0,0 +1,180 @@
++/**
++ * Host unit tests for the last-interval stats sampler (include/stats_window.h).
++ *
++ * The sampler is what lets a single /stats snapshot report a window rate
++ * instead of only a lifetime total, so the invariants that matter are:
++ *
++ *   (a) the first sample stores a baseline and reports all-zero deltas (a
++ *       freshly started crawler must not publish a spike),
++ *   (b) later samples report the per-counter difference since the previous
++ *       sample,
++ *   (c) a counter that moved backwards reports 0 for THAT counter only and
++ *       never wraps (unsigned subtraction would report ~1.8e19),
++ *   (d) the snapshot always advances, including after a backwards jump, so the
++ *       next interval is measured from the new baseline,
++ *   (e) a NULL state / NULL output array is a no-op rather than a crash.
++ *
++ * Standalone: no test framework, no supervisor, no civetweb, no database.
++ *
++ *     make tests-stats-window
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "stats_window.h"
++
++static int failures = 0;
++
++#define CHECK(cond, ...) do {                                       \
++        if (!(cond)) {                                              \
++            printf("FAIL: ");                                       \
++            printf(__VA_ARGS__);                                    \
++            printf(" (%s:%d)\n", __FILE__, __LINE__);               \
++            failures++;                                             \
++        }                                                           \
++    } while (0)
++
++/* (a) The first sample is a baseline: zeros out, snapshot stored. */
++static void test_first_sample_is_zero(void) {
++    stats_window_t w;
++    memset(&w, 0, sizeof(w));
++
++    uint64_t deltas[4] = {7, 7, 7, 7};
++    stats_window_sample(&w, 100, 10, 1000, 250, deltas);
++
++    CHECK(w.has_last == 1, "first sample marks the window as primed");
++    CHECK(w.last_attempts == 100, "attempts baseline stored, got %llu",
++          (unsigned long long)w.last_attempts);
++    CHECK(w.last_fetched == 10, "fetched baseline stored, got %llu",
++          (unsigned long long)w.last_fetched);
++    CHECK(w.last_lookups == 1000, "lookups baseline stored, got %llu",
++          (unsigned long long)w.last_lookups);
++    CHECK(w.last_with_peers == 250, "with_peers baseline stored, got %llu",
++          (unsigned long long)w.last_with_peers);
++
++    CHECK(deltas[0] == 0 && deltas[1] == 0 && deltas[2] == 0 && deltas[3] == 0,
++          "first sample reports zeros, got %llu/%llu/%llu/%llu",
++          (unsigned long long)deltas[0], (unsigned long long)deltas[1],
++          (unsigned long long)deltas[2], (unsigned long long)deltas[3]);
++}
++
++/* (b) Monotonic counters produce plain differences, and the snapshot advances. */
++static void test_monotonic_deltas(void) {
++    stats_window_t w;
++    memset(&w, 0, sizeof(w));
++
++    uint64_t deltas[4];
++    stats_window_sample(&w, 100, 10, 1000, 250, deltas);
++    stats_window_sample(&w, 140, 12, 1300, 300, deltas);
++
++    CHECK(deltas[0] == 40, "attempts delta 40, got %llu", (unsigned long long)deltas[0]);
++    CHECK(deltas[1] == 2, "fetched delta 2, got %llu", (unsigned long long)deltas[1]);
++    CHECK(deltas[2] == 300, "lookups delta 300, got %llu", (unsigned long long)deltas[2]);
++    CHECK(deltas[3] == 50, "with_peers delta 50, got %llu", (unsigned long long)deltas[3]);
++    CHECK(w.last_attempts == 140 && w.last_fetched == 12 &&
++          w.last_lookups == 1300 && w.last_with_peers == 300,
++          "snapshot advanced to the second sample");
++
++    /* A third interval starts from the second sample, not from the first. */
++    stats_window_sample(&w, 150, 12, 1400, 300, deltas);
++    CHECK(deltas[0] == 10, "third-interval attempts delta 10, got %llu",
++          (unsigned long long)deltas[0]);
++    CHECK(deltas[1] == 0, "third-interval fetched delta 0, got %llu",
++          (unsigned long long)deltas[1]);
++    CHECK(deltas[2] == 100, "third-interval lookups delta 100, got %llu",
++          (unsigned long long)deltas[2]);
++    CHECK(deltas[3] == 0, "third-interval with_peers delta 0, got %llu",
++          (unsigned long long)deltas[3]);
++}
++
++/* (c) A backwards jump saturates at 0 per counter — no unsigned wrap. */
++static void test_backwards_jump_saturates(void) {
++    stats_window_t w;
++    memset(&w, 0, sizeof(w));
++
++    uint64_t deltas[4];
++    stats_window_sample(&w, 500, 50, 5000, 500, deltas);
++
++    /* Only the attempts counter moves backwards (e.g. a fold was rebuilt); the
++     * other three keep advancing and must still report their real deltas. */
++    stats_window_sample(&w, 400, 55, 5100, 520, deltas);
++    CHECK(deltas[0] == 0, "backwards attempts saturate at 0, got %llu",
++          (unsigned long long)deltas[0]);
++    CHECK(deltas[1] == 5, "forward fetched still reported, got %llu",
++          (unsigned long long)deltas[1]);
++    CHECK(deltas[2] == 100, "forward lookups still reported, got %llu",
++          (unsigned long long)deltas[2]);
++    CHECK(deltas[3] == 20, "forward with_peers still reported, got %llu",
++          (unsigned long long)deltas[3]);
++
++    /* Every counter backwards at once: all zeros, no wrap. */
++    stats_window_sample(&w, 1, 1, 1, 1, deltas);
++    CHECK(deltas[0] == 0 && deltas[1] == 0 && deltas[2] == 0 && deltas[3] == 0,
++          "all-backwards sample reports zeros, got %llu/%llu/%llu/%llu",
++          (unsigned long long)deltas[0], (unsigned long long)deltas[1],
++          (unsigned long long)deltas[2], (unsigned long long)deltas[3]);
++
++    /* And a counter that merely stays equal is 0, not a wrap of 0. */
++    stats_window_sample(&w, 1, 1, 1, 1, deltas);
++    CHECK(deltas[0] == 0 && deltas[1] == 0 && deltas[2] == 0 && deltas[3] == 0,
++          "unchanged counters report zeros");
++}
++
++/* (d) After a backwards jump the snapshot advances to the lower value. */
++static void test_snapshot_advances_after_backwards_jump(void) {
++    stats_window_t w;
++    memset(&w, 0, sizeof(w));
++
++    uint64_t deltas[4];
++    stats_window_sample(&w, 900, 90, 9000, 900, deltas);
++    stats_window_sample(&w, 100, 10, 1000, 100, deltas);   /* backwards */
++    CHECK(w.last_attempts == 100 && w.last_fetched == 10 &&
++          w.last_lookups == 1000 && w.last_with_peers == 100,
++          "snapshot advanced to the lower sample");
++
++    /* The next interval is measured from 100, not from 900. */
++    stats_window_sample(&w, 130, 11, 1100, 140, deltas);
++    CHECK(deltas[0] == 30, "post-jump attempts delta 30, got %llu",
++          (unsigned long long)deltas[0]);
++    CHECK(deltas[1] == 1, "post-jump fetched delta 1, got %llu",
++          (unsigned long long)deltas[1]);
++    CHECK(deltas[2] == 100, "post-jump lookups delta 100, got %llu",
++          (unsigned long long)deltas[2]);
++    CHECK(deltas[3] == 40, "post-jump with_peers delta 40, got %llu",
++          (unsigned long long)deltas[3]);
++}
++
++/* (e) NULL state and NULL output array are no-ops, not crashes. */
++static void test_null_inputs(void) {
++    uint64_t deltas[4] = {9, 9, 9, 9};
++
++    stats_window_sample(NULL, 1, 2, 3, 4, deltas);
++    CHECK(deltas[0] == 0 && deltas[1] == 0 && deltas[2] == 0 && deltas[3] == 0,
++          "NULL state still zeroes the output array");
++
++    stats_window_t w;
++    memset(&w, 0, sizeof(w));
++    stats_window_sample(&w, 10, 1, 100, 10, NULL);
++    CHECK(w.has_last == 1 && w.last_attempts == 10,
++          "NULL output array still advances the snapshot");
++}
++
++int main(void) {
++    printf("test_stats_window\n");
++
++    test_first_sample_is_zero();
++    test_monotonic_deltas();
++    test_backwards_jump_saturates();
++    test_snapshot_advances_after_backwards_jump();
++    test_null_inputs();
++
++    if (failures != 0) {
++        printf("%d check(s) FAILED\n", failures);
++        return 1;
++    }
++
++    printf("all checks passed\n");
++    return 0;
++}
+--- dht_crawler-baseline/Makefile	2026-11-17 09:09:31.556969041 +0800
++++ dht_crawler/Makefile	2026-11-17 09:12:05.956383120 +0800
+@@ -129,6 +129,16 @@
+ INFLIGHT_TEST_BIN = $(BUILD_DIR)/test_inflight_set
+ INFLIGHT_TEST_LDFLAGS = -luv -lpthread
+ 
++# The last-interval stats sampler is pure arithmetic over four counters: no
++# database, no bloom filter, no uv loop, no civetweb, no logging, so this test
++# needs only the module and the test itself. It covers the first-tick zeros, the
++# monotonic deltas, the saturating backwards jump per counter and the snapshot
++# advance.
++STATS_WINDOW_TEST_SRCS = tests/test_stats_window.c src/stats_window.c
++STATS_WINDOW_TEST_BIN = $(BUILD_DIR)/test_stats_window
++STATS_WINDOW_TEST_CFLAGS =
++STATS_WINDOW_TEST_LDFLAGS =
++
+ # The backfill test defines its own stub classifier symbols (models_loaded,
+ # current_version, write_meta, classify) so it never links src/classifier.c:
+ # the host build compiles that module inert, which could never insert a row.
+@@ -245,7 +255,7 @@
+ MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
+ MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+ 
+-tests: tests-search tests-docs tests-inflight tests-backfill tests-backfill-daemon tests-adult-backfill \
++tests: tests-search tests-docs tests-inflight tests-stats-window tests-backfill tests-backfill-daemon tests-adult-backfill \
+        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
+        tests-movie-backfill-daemon tests-movie-kind-filter
+ 
+@@ -259,6 +269,11 @@
+ 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(INFLIGHT_TEST_SRCS) -o $(INFLIGHT_TEST_BIN) $(TEST_LDFLAGS) $(INFLIGHT_TEST_LDFLAGS)
+ 	./$(INFLIGHT_TEST_BIN)
+ 
++tests-stats-window:
++	@mkdir -p $(BUILD_DIR)
++	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(STATS_WINDOW_TEST_CFLAGS) $(INCLUDES) $(STATS_WINDOW_TEST_SRCS) -o $(STATS_WINDOW_TEST_BIN) $(TEST_LDFLAGS) $(STATS_WINDOW_TEST_LDFLAGS)
++	./$(STATS_WINDOW_TEST_BIN)
++
+ tests-docs: libbloom
+ 	@mkdir -p $(BUILD_DIR)
+ 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(DOCS_TEST_SRCS) -o $(DOCS_TEST_BIN) $(TEST_LDFLAGS) $(DOCS_TEST_LDFLAGS)
+@@ -354,4 +369,4 @@
+ 
+ clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
+ 
+-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
++.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
