@@ -8,7 +8,10 @@ and semantics. It is not a full `config.ini` reference — for the complete key 
 
 Patch 21 (`patches/metadata-peer-fail-map.patch`) adds one key to this page,
 `tree_metadata_peer_blacklist_ttl_sec` — the per-address TCP connect-failure memory — under the same
-fail-open contract: `0` is the shipped value and restores legacy peer selection exactly.
+fail-open contract: `0` is the shipped value and restores legacy peer selection exactly. The two later
+patches of this run add **no key**: patch 22 (`patches/meta-peer-fail-capacity.patch`) only resizes that
+map's capacity, and patch 23 (`patches/bep51-funnel-stats.patch`) only adds `/stats` counters — see the
+last section for both.
 
 All values are parsed with `atoi`, so `= true` parses as `0`. **Every one of these keys ships at its legacy
 value — the tuning is opt-in.** Five of the seven treat `0` as "disabled / pre-patch behaviour"; all of them
@@ -142,8 +145,10 @@ address can be skipped several times per attempt).
 The two pre-existing keys keep their **legacy** values in the shipped patch, and their clamps are unchanged
 except for the `tree_parallel_peers` correctness fix noted above:
 
-- `tree_parallel_peers` ships at **2**. The `4` experiment was never A/B'd against `2` and showed no measured
-  benefit, so it is not worth carrying as a default. The `1..4` clamp stays (accepted == effective).
+- `tree_parallel_peers` ships at **2**, and that is now a **measured** choice, not an untested default: the
+  same-hour, same-build A/B (`plan/getpeers-metadata-results.md`, W0/W1) put pp=2 at 6.834 metadata/s against
+  pp=4 at 6.408 (−6.2 %, outside the <5 % tie band) with more connect events and more attempts for pp=4 and
+  no more fetches. The `1..4` clamp stays (accepted == effective).
 - `tree_metadata_timeout_ms` ships at **60000**. The `30000` experiment was confounded with the get_peers
   knobs in the only contemporaneous comparison, and the deadline accounts for ≤0.2 % of the failure mass, so
   it is not justified by measurement either.
@@ -158,3 +163,27 @@ override in the app's crawler settings (they are on the Kotlin allow-list) — r
 `metadata_timeout_ms`, `metadata_workers`, `tcp_connect_timeout_ms`, `fresh_peer_retries`, `piece_idle_ms` —
 so a snapshot always carries the settings it was measured under. The get_peers knobs are echoed per tree
 (`trees[].get_peers.deadline_ms/fanout/max_queries/round_idle_ms/penalize_misses/slot_budget_ms/finish_on_peers`).
+
+### `/stats` blocks from patches 20–23 (no config keys involved)
+
+**`aggregate.*_last_interval` (patch 20).** Seven additive keys beside the lifetime counters —
+`metadata_attempts_last_interval`, `metadata_fetched_last_interval`,
+`metadata_fetch_success_percent_last_interval`, `get_peers_lookups_last_interval`,
+`get_peers_lookups_with_peers_last_interval`, `get_peers_yield_percent_last_interval` and
+`stats_interval_sec` — sampled on the supervisor monitor thread's existing hard-coded 10 s tick (there is no
+config key). `stats_interval_sec` is the *measured* elapsed time of the last completed interval and is 0
+before the first sample, when every delta is also 0, so `rate = value / stats_interval_sec`. The lifetime
+keys and their percentages are untouched; a tree respawn landing inside an interval can still spike one
+window, which is exactly why both forms are published.
+
+**`metadata_peer_fail` (patches 21/22).** Sibling of `inflight`: `enabled`, `capacity`, `held`, `ttl_sec`,
+`clears_total`, `expired_total`, `metadata_peers_skipped_total`, `metadata_connect_fail_addresses_total`.
+`capacity` echoes the compiled constant (**131,072**), so patch 22's resize needed no schema change; a
+disabled map publishes `enabled: false`, `ttl_sec: 0` and zero counters.
+
+**`trees[].bep51` + `supervisor.bep51` (patch 23).** `queries_sent_total`, `responses_received_total`,
+`timeouts_total`, `samples_offered_total`, `bloom_rejected_total`, `inflight_refused_total`,
+`queue_full_total`, `samples_pushed_total`, per tree and summed. The four sample gates are mutually
+exclusive, so per window `offered = bloom_rejected + inflight_refused + queue_full + pushed` (±1 %);
+`tools/crawler/gp_probe.py` derives `queries/s/tree`, `offered/s/tree`, the accepted / bloom / in-flight /
+queue-full shares of offered and the identity gap from the two blocks.

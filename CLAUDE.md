@@ -75,9 +75,13 @@ LEGACY on the same build in the same hour: lookups/s −1.5 %, yield −3.4 pp, 
 metadata/s −13 %. (The overnight baseline is not a control — LEGACY on the new build measured 33.1 % yield
 against the baseline's 36.9 %, i.e. the DHT thinned overnight.)
 
-- **get_peers is discovery-bound, not latency-bound.** Per-tree drain runs 2.5–3.0 lookups/s against a
-  BEP51 fill of 3.0–3.5/s, with `discovery_paused` 11–14 % in *every* configuration: the infohash queue is
-  the ceiling, so finishing a lookup sooner cannot create more lookups.
+- **get_peers is latency-bound, not discovery-bound** — corrected by the seven-window run recorded in
+  `plan/getpeers-metadata-results.md`. Per-tree worker drain equals `1000 × tree_get_peers_workers /
+  mean_lookup_ms` to within 1.1 % in every one of the seven windows (98.9–99.6 %), `idle_exits_total` is 0,
+  and every lookup burns the 6 s deadline. The patch-19 reading (drain 2.5–3.0 lookups/s against a BEP51 fill
+  of 3.0–3.5/s, `discovery_paused` 11–14 %) was queue pressure, not a discovery cap: the same arithmetic with
+  patch-19's own `mean_lookup_ms` of 7,044 ms gives 1000 × 18 / 7044 = 2.56 /s, inside that band. W5 later
+  doubled fill (3.73 → 7.14 /s/tree) and the drain did not move (3.13 → 3.14).
 - **Metadata is peer-liveness-bound.** Across all windows the failure mass is connect 82.8–84.1 %,
   handshake 14.8–16.1 %, stall 0.8 %, deadline 0.1–0.2 %. Piece-idle eviction and the deadline knob address
   ≤1 % of it, so neither is justified by measurement.
@@ -117,8 +121,9 @@ against the baseline's 36.9 %, i.e. the DHT thinned overnight.)
   event is counted twice; the refill loop then advances the window to the next untried peer.
   `tree_parallel_peers` (default 2, clamp 1..4 = `MAX_PARALLEL_PEERS`, so the accepted value is the
   effective one) and `tree_metadata_timeout_ms` (default 60000, 5000..600000) ship at their legacy values:
-  the wider window was never A/B'd against 2 and the shorter deadline was never justified by the measured
-  failure mass.
+  the wider window was A/B'd against 2 in this run (same hour, same build: pp=2 6.834 vs pp=4 6.408
+  metadata/s, −6.2 %, with more connects and no more fetches at pp=4), which is why 2 ships; the shorter
+  deadline was never justified by the measured failure mass.
 - **Fan-out deadline check (always on — a defect fix, not tuning).** The fan-out send loop stops sending the
   remaining picked slots once `now_us() >= deadline_us`, so `udp_rate_limit_acquire` sleeps (up to 50 ms
   each, more when the bucket throttles) can no longer push `mean_lookup_ms` systematically above
@@ -187,6 +192,32 @@ consulted at *selection* rather than at *outcome*.
 - `/stats` publishes `metadata_peer_fail` (sibling of `inflight`): `enabled`, `capacity`, `held`, `ttl_sec`,
   `clears_total`, `expired_total` and the two counters. The map is supervisor-owned so it survives a tree
   respawn — which fires exactly when the metadata rate is low, i.e. when the memory matters most.
+
+### BEP51 query + dedup funnel (patch 23)
+
+Patch 23 (`patches/bep51-funnel-stats.patch`, last in the chain) is **instrumentation only** — no config
+key, no behaviour change. Eight per-tree atomics are published as `trees[].bep51.*` and summed as
+`supervisor.bep51.*` (cumulative-folded at respawn like the `gp_*` counters):
+`queries_sent_total` (the `sample_infohashes` send), `responses_received_total` and `timeouts_total` (the
+two branches of the 1000 ms response wait), and the four mutually exclusive gates every examined sample
+leaves through — `samples_offered_total`, `bloom_rejected_total` (shared-bloom hit), `inflight_refused_total`
+(`inflight_set_claim()` refusal), `queue_full_total` (`tree_infohash_queue_try_push()` refused, claim
+released) and `samples_pushed_total`. Per window
+`offered = bloom_rejected + inflight_refused + queue_full + pushed` (±1 % for in-flight boundary effects),
+which is the accounting identity to check first when reading a window: `tools/crawler/gp_probe.py` derives
+`queries/s/tree`, `offered/s/tree`, the accepted/bloom/in-flight/queue-full shares and the identity gap from
+both blocks. The three per-worker locals that used to hold these numbers are kept as log-throttle cursors,
+so the DEBUG log sequence is unchanged.
+
+Measured (`plan/getpeers-metadata-results.md`, W4/W5, same hour, one variable — `tree_bep51_workers` 3 vs
+12): queries/s/tree 3.51 → 5.04 (+44 %) and offered/s/tree 44.34 → 65.78 (+48 %), but pushed fell
+362,156 → 356,005 (−1.7 %) and lookups/s (249.1 → 246.4) and metadata/s (7.24 → 7.29) stayed flat, because
+the accepted share fell 7.1 % → 4.7 % — bloom 65.9 → 62.1 % and in-flight 27.0 → 33.1 % refuse the extra
+duplicates. Fill 3.73 → 7.14 /s/tree did not move the drain (3.13 → 3.14), so **BEP51 offer rate is not a
+lookups/s lever**; the ceiling is the deadline-dominated drain, and `discovery_paused` rises with fill as the
+90 %/33 % hysteresis predicts ((fill − drain)/fill ≈ 56 % predicted vs 68.1 % measured). The counters ship
+as the durable win; no host test exists for `thread_tree.c`/`http_api.c`, so the identity was validated on
+device.
 
 ### Respawn Logic
 
