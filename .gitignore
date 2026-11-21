@@ -60,5 +60,8 @@ data/
 # Compiled Binary
 dht_crawler
 
+# Make output (object files, libbloom archive)
+build/
+
 # Claude files
 .claude
