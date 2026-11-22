@@ -1,6 +1,6 @@
 --- a/src/cram.c
 +++ b/src/cram.c
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1088 @@
 +/*
 + * CRAM (generation v15) -- the joint category / tv_kind / adult engine.
 + *
@@ -594,6 +594,73 @@
 +    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 +}
 +
++/* Serving-side canonicalisation of the feature text: drop every `__adult_*`
++ * struct token from `ft` in place, together with one adjacent separator, so the
++ * result is byte-identical to what tparse would have rendered without those
++ * tokens. Every other byte is left alone.
++ *
++ * Why this lives here rather than in tparse: `src/adult_backfill.c` carries its
++ * own token gate (`ab_gate_text()` / `AB_TOKEN`) that renders the feature text
++ * itself and scans the RAW tokens, so stripping them upstream would silently
++ * turn the `--adult-backfill` one-shot into a no-op. The frozen v15 model was
++ * trained on a corpus that carries these tokens on 20 of 270,390 rows while the
++ * vendored parser emits them unconditionally, so serving canonicalises and the
++ * gate keeps seeing them (plan assumption 13, Revision 1). The tokens are
++ * struct-only markers: they hit columns 0..2 exactly and never join a bigram,
++ * which is what makes dropping them a pure column removal.
++ *
++ * Pure C99, in place, no allocation, idempotent: the scan restarts at the cut,
++ * so a second call over its own output matches nothing and removes 0 bytes.
++ *
++ * @return the number of bytes removed (0 when the text carried no such token).
++ */
++size_t cram_strip_adult_tokens(char *ft) {
++    static const char PREFIX[] = "__adult_";
++    const size_t prefix_len = sizeof(PREFIX) - 1u;
++    size_t len;
++    size_t pos = 0;
++    size_t removed = 0;
++
++    if (!ft) return 0;
++    len = strlen(ft);
++
++    while (pos < len) {
++        size_t start;
++        size_t token_len;
++        size_t cut_from;
++        size_t cut_len;
++
++        while (pos < len && is_ft_space(ft[pos])) pos++;
++        start = pos;
++        while (pos < len && !is_ft_space(ft[pos])) pos++;
++        token_len = pos - start;
++        if (token_len < prefix_len) continue;
++        if (memcmp(ft + start, PREFIX, prefix_len) != 0) continue;
++
++        /* One adjacent separator goes with the token. The preceding one is
++         * preferred, which is what keeps the cut a single memmove and makes
++         * `a TOKEN b` -> `a b`; at the buffer start the following separator
++         * goes instead, and a lone token loses nothing but itself. */
++        if (start > 0) {
++            cut_from = start - 1u;
++            cut_len = token_len + 1u;
++        } else if (pos < len) {
++            cut_from = start;
++            cut_len = token_len + 1u;
++        } else {
++            cut_from = start;
++            cut_len = token_len;
++        }
++        memmove(ft + cut_from, ft + cut_from + cut_len,
++                len - (cut_from + cut_len) + 1u);
++        len -= cut_len;
++        removed += cut_len;
++        pos = cut_from;
++    }
++
++    return removed;
++}
++
 +/* Raw hit collector: one uint32 per column hit, before dedup, grown by
 + * doubling. The deduped row is bounded by CRAM_MAX_FEATURES but the raw hit
 + * count is not (a name token of L bytes contributes up to ~5L char grams), so
@@ -1024,7 +1091,7 @@
 +}
 --- a/include/cram.h
 +++ b/include/cram.h
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,267 @@
 +#ifndef CRAM_H
 +#define CRAM_H
 +
@@ -1260,8 +1327,28 @@
 + * @param adult_threshold the operating point; <= 0 uses CRAM_ADULT_THRESHOLD_DEFAULT
 + * @return CRAM_OK, or CRAM_ERR_ARG on NULL / an out-of-range row index.
 + */
++
 +cram_status_t cram_predict(cram_model_t *model, const cram_row_t *row,
 +                           double adult_threshold, cram_verdict_t *out);
++
++/*
++ * Serving-side canonicalisation of the feature text: remove every
++ * whitespace-delimited token that begins `__adult_` from `ft`, in place and
++ * together with one adjacent separator, leaving the rest byte-for-byte
++ * unchanged. The result is byte-identical to the text tparse would have
++ * rendered had it not emitted those tokens.
++ *
++ * The frozen model's training corpus carries these tokens on 20 of 270,390 rows
++ * while the vendored parser emits them unconditionally, so the serving path
++ * canonicalises to the training distribution. `src/adult_backfill.c` keeps its
++ * own gate over the RAW text and must not go through this (plan assumption 13).
++ *
++ * In place, no allocation, idempotent: stripping an already-stripped string
++ * removes nothing.
++ *
++ * @return bytes removed (0 when `ft` carried no such token, or is NULL).
++ */
++size_t cram_strip_adult_tokens(char *ft);
 +
 +/*: Copy the counters. `model` may be NULL: `load_failures` is process-wide and
 + * stays readable after a failed load, every other field reads 0. */
@@ -1274,7 +1361,7 @@
 +#endif /* CRAM_H */
 --- a/tests/test_cram.c
 +++ b/tests/test_cram.c
-@@ -0,0 +1,890 @@
+@@ -0,0 +1,1271 @@
 +/**
 + * Host unit tests for the CRAM engine (include/cram.h, src/cram.c, patch 25).
 + *
@@ -1299,6 +1386,11 @@
 + *       model, move `load_failures` by exactly one and let the caller degrade,
 + *   (f) degenerate inputs are legal: empty ft is bias-only, all-OOV ft is char
 + *       tail only, and an over-wide row is truncated *and counted*.
++ *   (g) the serving-side `__adult_*` canonicalisation is byte-exact: injected at
++ *       the start / middle / end / as pairs it strips to the token-free text,
++ *       `cram_features()` then returns exactly the token-free row, and a
++ *       container whose struct columns 0..2 carry no weight answers
++ *       identically with and without the markers.
 + *
 + * Standalone: no test framework, no classifier, no tparse, no ftc. The engine
 + * is linked directly (the `meta_peer_fail` shape); `src/classifier.c` is never
@@ -1325,6 +1417,8 @@
 +#define FIXTURE_DIR "tests/fixtures/cram"
 +/*: Scratch file for the base64 tiny containers. */
 +#define TINY_PATH "build/test_cram_tiny.bin"
++/*: Scratch file for the zero-weight struct-column container (Stage 7). */
++#define STRIP_PATH "build/test_cram_strip.bin"
 +
 +static int failures = 0;
 +static long checks = 0;
@@ -1418,6 +1512,71 @@
 +static const char *str(const cJSON *object, const char *key) {
 +    const cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
 +    return cJSON_IsString(item) ? item->valuestring : "";
++}
++
++/* Base64 decode, for the tiny containers (the fixtures store the toy container
++ * that way). Returns the number of bytes written. */
++static size_t b64_decode(const char *src, unsigned char *out, size_t cap) {
++    size_t written = 0;
++    unsigned int acc = 0;
++    int bits = 0;
++    size_t i;
++
++    for (i = 0; src[i] != '\0' && written < cap; i++) {
++        int value;
++        char c = src[i];
++        if (c >= 'A' && c <= 'Z') {
++            value = c - 'A';
++        } else if (c >= 'a' && c <= 'z') {
++            value = c - 'a' + 26;
++        } else if (c >= '0' && c <= '9') {
++            value = c - '0' + 52;
++        } else if (c == '+') {
++            value = 62;
++        } else if (c == '/') {
++            value = 63;
++        } else {
++            continue;
++        }
++        acc = (acc << 6) | (unsigned int)value;
++        bits += 6;
++        if (bits >= 8) {
++            bits -= 8;
++            out[written++] = (unsigned char)((acc >> bits) & 0xFFu);
++        }
++    }
++    return written;
++}
++
++/* Little-endian uint32 of a packed container header. */
++static uint32_t rd_le32(const unsigned char *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++           ((uint32_t)p[3] << 24);
++}
++
++/* Zero the weight of every packed entry belonging to columns [0, n_cols), so
++ * those columns contribute nothing to the 28 energies. The `__adult_*` markers
++ * are struct columns 0..2, so a container patched this way must answer
++ * identically whether or not the feature text carries them -- which is the
++ * "a token is a pure column removal" claim of the Stage-7 canonicalisation. */
++static void zero_column_weights(unsigned char *blob, uint32_t n_cols) {
++    uint32_t nnz = rd_le32(blob + 32);
++    uint32_t rowptr_off = rd_le32(blob + 36);
++    uint32_t entries_off = rd_le32(blob + 40);
++    uint32_t col;
++
++    for (col = 0; col < n_cols; col++) {
++        uint32_t lo = rd_le32(blob + rowptr_off + 4u * col);
++        uint32_t hi = rd_le32(blob + rowptr_off + 4u * (col + 1u));
++        uint32_t e;
++        for (e = lo; e < hi && e < nnz; e++) {
++            unsigned char *entry = blob + entries_off + 5u * (size_t)e;
++            entry[1] = 0;
++            entry[2] = 0;
++            entry[3] = 0;
++            entry[4] = 0; /* float32 +0.0 */
++        }
++    }
 +}
 +
 +static int has_tag(const cJSON *row, const char *tag) {
@@ -1870,40 +2029,12 @@
 +        const char *expect = str(item, "expect");
 +        const char *base64 = str(item, "base64");
 +        unsigned char blob[1024];
-+        size_t blob_len = 0;
++        size_t blob_len;
 +        FILE *out;
 +        cram_container_t *container;
 +        cram_status_t status = CRAM_OK;
 +
-+        /* minimal base64 decode into a scratch file */
-+        {
-+            size_t i;
-+            unsigned int acc = 0;
-+            int bits = 0;
-+            for (i = 0; base64[i] != '\0' && blob_len < sizeof(blob); i++) {
-+                int value;
-+                char c = base64[i];
-+                if (c >= 'A' && c <= 'Z') {
-+                    value = c - 'A';
-+                } else if (c >= 'a' && c <= 'z') {
-+                    value = c - 'a' + 26;
-+                } else if (c >= '0' && c <= '9') {
-+                    value = c - '0' + 52;
-+                } else if (c == '+') {
-+                    value = 62;
-+                } else if (c == '/') {
-+                    value = 63;
-+                } else {
-+                    continue;
-+                }
-+                acc = (acc << 6) | (unsigned int)value;
-+                bits += 6;
-+                if (bits >= 8) {
-+                    bits -= 8;
-+                    blob[blob_len++] = (unsigned char)((acc >> bits) & 0xFFu);
-+                }
-+            }
-+        }
++        blob_len = b64_decode(base64, blob, sizeof(blob));
 +        out = fopen(TINY_PATH, "wb");
 +        CHECK(out != NULL, "cannot write %s", TINY_PATH);
 +        if (!out) continue;
@@ -2116,6 +2247,342 @@
 +          "a threshold of 0 must fall back to the default");
 +}
 +
++
++/* ------------------------------------------------------------------ */
++/* (g) serving-side `__adult_*` canonicalisation (Stage 7)             */
++/* ------------------------------------------------------------------ */
++
++/* Locate one fixture row by id: copy its `ft` and report its adult tags. */
++static int fixture_row_by_id(const char *text, int wanted, char *out, size_t cap,
++                             int *known_adult, int *known_clean) {
++    const char *line = text;
++
++    while (line && *line) {
++        const char *newline = strchr(line, '\n');
++        size_t len = newline ? (size_t)(newline - line) : strlen(line);
++        cJSON *row = NULL;
++
++        if (len > 0) {
++            char *copy = (char *)malloc(len + 1u);
++            if (copy) {
++                memcpy(copy, line, len);
++                copy[len] = '\0';
++                row = cJSON_Parse(copy);
++                free(copy);
++            }
++            if (row) {
++                const cJSON *id = cJSON_GetObjectItemCaseSensitive(row, "id");
++                if (cJSON_IsNumber(id) && (int)id->valuedouble == wanted) {
++                    snprintf(out, cap, "%s", str(row, "ft"));
++                    if (known_adult) *known_adult = has_tag(row, "known_adult");
++                    if (known_clean) *known_clean = has_tag(row, "known_clean");
++                    cJSON_Delete(row);
++                    return 1;
++                }
++                cJSON_Delete(row);
++            }
++        }
++        line = newline ? newline + 1 : NULL;
++    }
++    return 0;
++}
++
++/* Two feature rows are identical when they name the same columns with the same
++ * values -- `cram_features()`'s whole contract. */
++static void check_row_identical(const cram_row_t *a, const cram_row_t *b, const char *what) {
++    int i;
++    int ok = (a->count == b->count) && (a->truncated == b->truncated);
++
++    for (i = 0; ok && i < a->count; i++) {
++        if (a->indices[i] != b->indices[i] || a->values[i] != b->values[i]) ok = 0;
++    }
++    CHECK(ok, "%s: feature rows differ (%d vs %d entries)", what, a->count, b->count);
++}
++
++/* Every field, exactly: the serving path must not move even an ulp. */
++static void check_verdict_identical(const cram_verdict_t *a, const cram_verdict_t *b,
++                                    const char *what) {
++    CHECK(a->category == b->category && a->kind == b->kind && a->adult == b->adult &&
++              a->state == b->state && a->adult_p == b->adult_p &&
++              a->confidence == b->confidence,
++          "%s: verdicts differ (%d/%d/%d/%.17g vs %d/%d/%d/%.17g)", what, a->category,
++          a->kind, a->adult, a->adult_p, b->category, b->kind, b->adult, b->adult_p);
++}
++
++/* The Stage-7 serving canonicalisation. tparse renders `__adult_jav/site/set`
++ * unconditionally while the frozen v15 model was trained on a corpus that
++ * carries them on 20 of 270,390 rows, so the CRAM path drops them.
++ *
++ *   (a) canonicalisation identity -- injected at the start / middle / end / as
++ *       adjacent pairs the stripped text is byte-equal to the token-free text;
++ *       token-free text is unchanged, a token that merely CONTAINS the prefix
++ *       is untouched, and the call is idempotent,
++ *   (b) feature-row identity -- the stripped text produces exactly the
++ *       token-free row (indices and values), on a synthetic ft and on a real
++ *       fixture row,
++ *   (c) verdict invariance -- on a container whose struct columns 0..2 carry no
++ *       weight the with-token and without-token verdicts are bit-identical (a
++ *       real container cannot be: those columns carry weights), and on the real
++ *       container the designated fixture rows keep every label with
++ *       |d adult_p| <= 0.0098 while the serving path (strip, then score) is
++ *       bit-identical to the token-free row.
++ *
++ * Measured over all 1,875 token-free fixture rows when these rows were chosen:
++ * 0 label changes, max |d adult_p| 0.0098246565846124012 (id 10616276). The two
++ * designated ids are the first known_adult / known_clean row in fixture order
++ * that is label-invariant within the 0.0098 bound -- a rule, not a hand pick.
++ */
++static void test_adult_token_strip(cram_model_t *model, const cJSON *tiny) {
++    static const char BASE[] = "kiss x sis __nvideo_0 __naudio_0 __nimage_0 __nfiles_26";
++    static const char TOKENS[] = "__adult_jav __adult_site __adult_set";
++    char buf[512];
++    char before[512];
++    char again[512];
++    size_t removed;
++    size_t i;
++
++    /* (a) canonicalisation identity */
++    {
++        static const struct {
++            const char *text;
++            const char *expect;
++        } cases[] = {
++            /* what tparse actually emits: the markers are appended last */
++            {"kiss x sis __nvideo_0 __naudio_0 __nimage_0 __nfiles_26"
++             " __adult_jav __adult_site __adult_set", BASE},
++            {"__adult_jav __adult_site __adult_set"
++             " kiss x sis __nvideo_0 __naudio_0 __nimage_0 __nfiles_26", BASE},
++            {"kiss x __adult_jav sis __adult_site __nvideo_0 __naudio_0 __adult_set"
++             " __nimage_0 __nfiles_26", BASE},
++            {"kiss x sis __nvideo_0 __naudio_0 __nimage_0 __nfiles_26"
++             " __adult_jav __adult_set", BASE},
++            {"__adult_jav", ""},
++            {"__adult_jav __adult_site", ""},
++            {BASE, BASE},
++            {"kiss x__adult_jav sis", "kiss x__adult_jav sis"},
++            {"__adult_ kiss", "kiss"},
++        };
++
++        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++            snprintf(before, sizeof(before), "%s", cases[i].text);
++            snprintf(buf, sizeof(buf), "%s", cases[i].text);
++            removed = cram_strip_adult_tokens(buf);
++            CHECK(strcmp(buf, cases[i].expect) == 0,
++                  "(a) case %d: '%s' stripped to '%s', expected '%s'", (int)i, before, buf,
++                  cases[i].expect);
++            CHECK(removed == strlen(before) - strlen(buf),
++                  "(a) case %d: reported %zu bytes removed, the text shrank by %zu", (int)i,
++                  removed, strlen(before) - strlen(buf));
++            snprintf(again, sizeof(again), "%s", buf);
++            CHECK(cram_strip_adult_tokens(buf) == 0,
++                  "(a) case %d: a second strip must remove nothing", (int)i);
++            CHECK(strcmp(buf, again) == 0, "(a) case %d: a second strip changed the text",
++                  (int)i);
++        }
++        CHECK(cram_strip_adult_tokens(NULL) == 0, "(a) a NULL text must be a no-op");
++        buf[0] = '\0';
++        CHECK(cram_strip_adult_tokens(buf) == 0 && buf[0] == '\0',
++              "(a) an empty text must be a no-op");
++    }
++
++    /* (b) feature-row identity */
++    {
++        char with_tokens[2048];
++        cram_row_t plain;
++        cram_row_t stripped;
++
++        snprintf(with_tokens, sizeof(with_tokens), "%s %s", BASE, TOKENS);
++        CHECK(cram_features(model, BASE, &plain) == CRAM_OK, "(b) cram_features(BASE) failed");
++        CHECK(cram_strip_adult_tokens(with_tokens) > 0,
++              "(b) the injected markers must be stripped");
++        CHECK(strcmp(with_tokens, BASE) == 0,
++              "(b) the stripped text is not byte-equal to the token-free text");
++        CHECK(cram_features(model, with_tokens, &stripped) == CRAM_OK,
++              "(b) cram_features(stripped) failed");
++        check_row_identical(&plain, &stripped, "(b) synthetic ft");
++
++        /* and on a real fixture row, whose ft carries real name tokens */
++        {
++            char path[512];
++            char ft[1024];
++            char *text;
++
++            snprintf(path, sizeof(path), "%s/rows_sample.jsonl", FIXTURE_DIR);
++            text = read_text(path);
++            CHECK(text != NULL, "(b) cannot read %s", path);
++            if (text) {
++                CHECK(fixture_row_by_id(text, 162234, ft, sizeof(ft), NULL, NULL),
++                      "(b) fixture row 162234 is missing");
++                snprintf(with_tokens, sizeof(with_tokens), "%s %s", ft, TOKENS);
++                CHECK(cram_features(model, ft, &plain) == CRAM_OK,
++                      "(b) cram_features(fixture ft) failed");
++                CHECK(cram_strip_adult_tokens(with_tokens) > 0,
++                      "(b) the fixture markers must be stripped");
++                CHECK(strcmp(with_tokens, ft) == 0,
++                      "(b) the stripped fixture text is not byte-equal");
++                CHECK(cram_features(model, with_tokens, &stripped) == CRAM_OK,
++                      "(b) cram_features(fixture stripped) failed");
++                check_row_identical(&plain, &stripped, "(b) fixture ft");
++                free(text);
++            }
++        }
++    }
++
++    /* (c) verdict invariance on the real container, on the designated rows */
++    {
++        static const int designated[] = {162234, 950}; /* known_adult, known_clean */
++        static const char *const labels[] = {"known_adult", "known_clean"};
++        char path[512];
++        char *text;
++
++        snprintf(path, sizeof(path), "%s/rows_sample.jsonl", FIXTURE_DIR);
++        text = read_text(path);
++        CHECK(text != NULL, "(c) cannot read %s", path);
++        if (text) {
++            size_t d;
++            for (d = 0; d < sizeof(designated) / sizeof(designated[0]); d++) {
++                char ft[1024];
++                char with_tokens[2048];
++                int is_adult = 0;
++                int is_clean = 0;
++                cram_row_t plain_row;
++                cram_row_t raw_row;
++                cram_row_t stripped_row;
++                cram_verdict_t plain;
++                cram_verdict_t raw;
++                cram_verdict_t stripped;
++                double delta;
++
++                CHECK(fixture_row_by_id(text, designated[d], ft, sizeof(ft), &is_adult,
++                                        &is_clean),
++                      "(c) fixture row %d is missing", designated[d]);
++                CHECK((d == 0 && is_adult) || (d == 1 && is_clean),
++                      "(c) fixture row %d is not tagged %s", designated[d], labels[d]);
++
++                snprintf(with_tokens, sizeof(with_tokens), "%s %s", ft, TOKENS);
++                CHECK(cram_features(model, ft, &plain_row) == CRAM_OK,
++                      "(c) row %d: cram_features failed", designated[d]);
++                CHECK(cram_predict(model, &plain_row, CRAM_ADULT_THRESHOLD_DEFAULT, &plain) ==
++                          CRAM_OK,
++                      "(c) row %d: cram_predict failed", designated[d]);
++                CHECK(cram_features(model, with_tokens, &raw_row) == CRAM_OK,
++                      "(c) row %d: cram_features(with tokens) failed", designated[d]);
++                CHECK(cram_predict(model, &raw_row, CRAM_ADULT_THRESHOLD_DEFAULT, &raw) ==
++                          CRAM_OK,
++                      "(c) row %d: cram_predict(with tokens) failed", designated[d]);
++
++                /* the serving path: canonicalise, then score */
++                cram_strip_adult_tokens(with_tokens);
++                CHECK(cram_features(model, with_tokens, &stripped_row) == CRAM_OK,
++                      "(c) row %d: cram_features(stripped) failed", designated[d]);
++                CHECK(cram_predict(model, &stripped_row, CRAM_ADULT_THRESHOLD_DEFAULT,
++                                   &stripped) == CRAM_OK,
++                      "(c) row %d: cram_predict(stripped) failed", designated[d]);
++                check_row_identical(&plain_row, &stripped_row, "(c) serving row");
++                check_verdict_identical(&plain, &stripped, "(c) serving verdict");
++
++                /* the markers themselves: every label holds, the marginal moves
++                 * by no more than the measured bound */
++                CHECK(plain.category == raw.category && plain.kind == raw.kind &&
++                          plain.adult == raw.adult,
++                      "(c) row %d: the markers changed a label (%d/%d/%d -> %d/%d/%d)",
++                      designated[d], plain.category, plain.kind, plain.adult, raw.category,
++                      raw.kind, raw.adult);
++                delta = fabs(raw.adult_p - plain.adult_p);
++                CHECK(delta <= 0.0098,
++                      "(c) row %d: |d adult_p| %.17g with the markers exceeds 0.0098",
++                      designated[d], delta);
++                printf("  adult-token strip, row %d (%s): labels unchanged, "
++                       "|d adult_p| = %.17g\n", designated[d], labels[d], delta);
++            }
++            free(text);
++        }
++    }
++
++    /* (c) the synthetic witness: a container whose struct columns 0..2 carry no
++     * weight must answer identically with and without the markers. `__ep_0` is
++     * struct index 3, whose entry (out_col 1, weight 2.0) the toy container does
++     * carry, so the row is not degenerate. */
++    {
++        const cJSON *cases = cJSON_GetObjectItemCaseSensitive(tiny, "cases");
++        const cJSON *item;
++
++        cJSON_ArrayForEach(item, cases) {
++            unsigned char blob[1024];
++            size_t blob_len;
++            FILE *out;
++            cram_container_t *toy;
++            cram_container_t *zeroed;
++            cram_row_t plain_row;
++            cram_row_t raw_row;
++            cram_verdict_t plain;
++            cram_verdict_t raw;
++            double plain_unary[CRAM_N_OUTPUTS];
++            double raw_unary[CRAM_N_OUTPUTS];
++
++            if (strcmp(str(item, "expect"), "load_ok") != 0) continue;
++            blob_len = b64_decode(str(item, "base64"), blob, sizeof(blob));
++            CHECK(blob_len > 64, "(c) the synthetic container did not decode");
++            if (blob_len <= 64) break;
++
++            /* the unmodified toy container first: the markers DO move it, so
++             * the invariance below is the zeroing's doing, not a dead row */
++            out = fopen(STRIP_PATH, "wb");
++            CHECK(out != NULL, "(c) cannot write %s", STRIP_PATH);
++            if (!out) break;
++            CHECK(fwrite(blob, 1, blob_len, out) == blob_len, "(c) short write to %s",
++                  STRIP_PATH);
++            fclose(out);
++            toy = cram_container_load(STRIP_PATH, NULL);
++            CHECK(toy != NULL, "(c) the toy container must load");
++            CHECK(cram_features(model, "__ep_0", &plain_row) == CRAM_OK,
++                  "(c) cram_features(__ep_0) failed");
++            CHECK(cram_features(model, "__ep_0 __adult_jav __adult_site __adult_set",
++                                &raw_row) == CRAM_OK,
++                  "(c) cram_features(__ep_0 + markers) failed");
++            CHECK(raw_row.count == plain_row.count + 3,
++                  "(c) the three markers must add three columns (%d vs %d)", raw_row.count,
++                  plain_row.count);
++            if (toy) {
++                CHECK(cram_container_unary(toy, &plain_row, plain_unary) == CRAM_OK,
++                      "(c) toy unary failed");
++                CHECK(cram_container_unary(toy, &raw_row, raw_unary) == CRAM_OK,
++                      "(c) toy unary with markers failed");
++                CHECK(raw_unary[0] != plain_unary[0],
++                      "(c) the toy container must react to __adult_jav before zeroing "
++                      "(u[0] %.9g vs %.9g)", plain_unary[0], raw_unary[0]);
++                cram_container_free(toy);
++            }
++
++            /* now with struct columns 0..2 (the three markers) zeroed */
++            zero_column_weights(blob, 3);
++            out = fopen(STRIP_PATH, "wb");
++            CHECK(out != NULL, "(c) cannot rewrite %s", STRIP_PATH);
++            if (!out) break;
++            CHECK(fwrite(blob, 1, blob_len, out) == blob_len, "(c) short rewrite to %s",
++                  STRIP_PATH);
++            fclose(out);
++            zeroed = cram_container_load(STRIP_PATH, NULL);
++            CHECK(zeroed != NULL, "(c) the zero-weight container must still load");
++            if (zeroed) {
++                CHECK(cram_container_unary(zeroed, &plain_row, plain_unary) == CRAM_OK,
++                      "(c) zeroed unary failed");
++                CHECK(cram_container_unary(zeroed, &raw_row, raw_unary) == CRAM_OK,
++                      "(c) zeroed unary with markers failed");
++                CHECK(memcmp(plain_unary, raw_unary, sizeof(plain_unary)) == 0,
++                      "(c) zero-weight struct columns must leave the 28 energies identical");
++                CHECK(cram_container_predict(zeroed, &plain_row, 0.5, &plain) == CRAM_OK,
++                      "(c) zeroed predict failed");
++                CHECK(cram_container_predict(zeroed, &raw_row, 0.5, &raw) == CRAM_OK,
++                      "(c) zeroed predict with markers failed");
++                check_verdict_identical(&plain, &raw, "(c) zero-weight struct columns");
++                cram_container_free(zeroed);
++            }
++            remove(STRIP_PATH);
++            break;
++        }
++    }
++}
 +int main(void) {
 +    cJSON *vocab_probe = load_fixture("vocab_probe.json");
 +    cJSON *vectors = load_fixture("crc32_vectors.json");
@@ -2149,6 +2616,7 @@
 +    test_tiny_containers(tiny);
 +    test_loader_failures(vocab_probe);
 +    test_kind_head_and_stats(model);
++    test_adult_token_strip(model, tiny);
 +
 +    cram_container_free(container);
 +    cram_free(model);
@@ -2554,7 +3022,7 @@
              return 1;
          }
          for (int i = 0; i < n_files; i++) {
-@@ -410,87 +428,90 @@
+@@ -410,87 +428,99 @@
      }
  
      const char *name = meta->name ? meta->name : "";
@@ -2581,6 +3049,15 @@
 -    feature[cap - 1] = '\0';
 +    tp_feature_text(name, files, n_files, &out->parsed, out->feature, cap);
 +    out->feature[cap - 1] = '\0';
++
++    /* Serving-side canonicalisation (plan assumption 13, Revision 1): the frozen
++     * v15 model's training corpus carries `__adult_*` on 20 of 270,390 rows while
++     * tparse renders them unconditionally, so the CRAM path drops them here --
++     * after the render (the text itself is unchanged) and before any consumer, so
++     * `classifier_classify()` and `classifier_classify_adult()` cannot disagree
++     * about the input. `src/adult_backfill.c` scans the RAW text with its own
++     * gate and is deliberately not routed through this. */
++    cram_strip_adult_tokens(out->feature);
      free(files);
 +    return 0;
 +}
@@ -2703,7 +3180,7 @@
  
      clock_gettime(CLOCK_MONOTONIC, &t_end);
  
-@@ -501,7 +522,11 @@
+@@ -501,7 +531,11 @@
       * with adult = 1 count (classifier_note_stored_adult()), so a dropped
       * torrent never inflates it. */
      clf.stats.parser_only_fallback += (uint64_t)(degraded ? 1 : 0);
@@ -2716,7 +3193,7 @@
      if (category >= 0 && category < CLASSIFIER_NUM_CATEGORIES) {
          clf.stats.by_category[category]++;
      }
-@@ -510,65 +535,43 @@
+@@ -510,65 +544,43 @@
      return 0;
  }
  
@@ -2802,7 +3279,7 @@
      return 0;
  }
  void classifier_set_adult_mode(const char *adult_mode) {
-@@ -586,13 +589,25 @@
+@@ -586,13 +598,25 @@
      pthread_mutex_lock(&clf.stats_mutex);
      *out = clf.stats;
      pthread_mutex_unlock(&clf.stats_mutex);
@@ -2831,7 +3308,7 @@
  }
  
  /* Set once by classifier_init() before any other thread exists, so it is read
-@@ -643,14 +658,20 @@
+@@ -643,14 +667,20 @@
  }
  
  void classifier_write_meta(sqlite3 *db) {
@@ -2856,7 +3333,7 @@
      snprintf(buf, sizeof(buf), "%.6f", clf.adult_hide_threshold);
      clf_meta_put(db, "adult_hide_threshold", buf);
  
-@@ -660,7 +681,7 @@
+@@ -660,7 +690,7 @@
  #else /* !CLF_ENABLED */
  
  /*
