@@ -1,0 +1,123 @@
+{
+ "col_struct": 0,
+ "col_words": 1315,
+ "col_bigrams": 50072,
+ "col_char": 147406,
+ "buckets": 1048576,
+ "columns": 1195982,
+ "counts": {
+  "structs": 1315,
+  "words": 48757,
+  "bigrams": 97334
+ },
+ "present": {
+  "structs": [
+   {
+    "column": 0,
+    "text": "__adult_jav",
+    "index": 0
+   },
+   {
+    "column": 1,
+    "text": "__adult_set",
+    "index": 1
+   },
+   {
+    "column": 2,
+    "text": "__adult_site",
+    "index": 2
+   },
+   {
+    "column": 1312,
+    "text": "__src_webcap",
+    "index": 1312
+   },
+   {
+    "column": 1313,
+    "text": "__src_webdl",
+    "index": 1313
+   },
+   {
+    "column": 1314,
+    "text": "__src_webrip",
+    "index": 1314
+   }
+  ],
+  "words": [
+   {
+    "column": 1315,
+    "text": "0",
+    "index": 0
+   },
+   {
+    "column": 1316,
+    "text": "00",
+    "index": 1
+   },
+   {
+    "column": 1317,
+    "text": "000",
+    "index": 2
+   },
+   {
+    "column": 50069,
+    "text": "zzzgvvv",
+    "index": 48754
+   },
+   {
+    "column": 50070,
+    "text": "zzzz",
+    "index": 48755
+   },
+   {
+    "column": 50071,
+    "text": "zzzzz",
+    "index": 48756
+   }
+  ],
+  "bigrams": [
+   {
+    "column": 50072,
+    "text": "0 0",
+    "index": 0
+   },
+   {
+    "column": 50073,
+    "text": "0 01",
+    "index": 1
+   },
+   {
+    "column": 50074,
+    "text": "0 0658",
+    "index": 2
+   },
+   {
+    "column": 147403,
+    "text": "zzz ai",
+    "index": 97331
+   },
+   {
+    "column": 147404,
+    "text": "zzz npc",
+    "index": 97332
+   },
+   {
+    "column": 147405,
+    "text": "zzzgvvv mkv",
+    "index": 97333
+   }
+  ]
+ },
+ "absent": {
+  "structs": [
+   "__cram_absent_struct"
+  ],
+  "words": [
+   "zzqqxxvvuu",
+   "qqwweerrttyy"
+  ],
+  "bigrams": [
+   "zzqqxxvvuu qqwweerrttyy"
+  ]
+ }
+}

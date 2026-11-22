@@ -1,0 +1,731 @@
+{
+ "note": "Stage 5b G4 spot check: look each name up in the live-ingested DB by exact name; count only names PRESENT. Need >=20 present known-adult with adult=1 and >=20 present known-clean with adult=0.",
+ "source": {
+  "names": "/home/adam/apps/cram/tvkind/data/clean_v1/records.jsonl",
+  "labels": "/home/adam/apps/cram/tvkind/data/clean_v3/scored_all.jsonl"
+ },
+ "known_adult": [
+  {
+   "id": 36272,
+   "name": "JacquieEtMichelTV.25.06.19.Ruby.24.Years.Old.From.Nimes.XXX.1080p.MP4-P2P[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 127541,
+   "name": "JapanHDV.20.12.06.Ryo.Tsujimoto.XXX.1080p.MP4-WRB[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 216408,
+   "name": "ImmoralLive.24.02.02.Miss.Jackson.XXX.480p.MP4-XXX[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 449236,
+   "name": "fpn.brokensluts.25.08.01.hiyouth.dude22.1080p.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 609250,
+   "name": "Fitting-Room.20.06.12.Sofia.Star.Look.At.My.New.Panties.XXX.1080p.MP4-KTR[rarbg]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 681886,
+   "name": "BackroomCastingCouch.20.07.13.Kimberly.XXX.720p.WEB.x264-GalaXXXy[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 1688700,
+   "name": "WankItNow.23.04.09.Demi.Youre.Not.Gay.XXX.480p.MP4-XXX",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 2041390,
+   "name": "Lesbea.24.01.04.Adel.Morel.And.Rika.Fane.XXX.1080p.MP4-WRB[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 2212058,
+   "name": "Throated.13.04.12.Evilyn.Fierce.XXX.1080p.WMV-KTR[rarbg]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 2219361,
+   "name": "monstersofcock.18.01.07.valentina.nappi.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 2738705,
+   "name": "[DivineBitches.com] 2011.05.25 Felony and Drake Temple (13110).wmv",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 5665174,
+   "name": "Hardcore Whores 4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 7597630,
+   "name": "MyDirtyMaid.25.02.20.Sara.Retali.XXX.1080p.MP4-WRB[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8186674,
+   "name": "FemaleAgent.17.01.07.Tera.Joy.And.Miky.Love.XXX.XviD-iPT Team[tk].avi",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8351153,
+   "name": "FamilyTherapyXXX.25.08.06.Juniper.Ren.Weekend.At.The.Lake.House.XXX.1080p.MP4-WRB[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8376190,
+   "name": "2025-01-24 Aspen Reign, Savanah Storm (Tag Teaming The Hosts) 1080p.mkv",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8426445,
+   "name": "FirstBGG.14.05.22.Lilu.And.Juliya.XXX.720p.WMV.KTR",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8993466,
+   "name": "Emotion_-_The_Best",
+   "teacher_adult": 1,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 9822914,
+   "name": "NewSensations.25.05.24.Macy.Meadows.XXX.1080p.MP4-WRB[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 10557717,
+   "name": "BlackAmbush.19.02.02.Eden.XXX.1080p.MP4-KTR[N1C]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 10927824,
+   "name": "DeepThroatSirens.17.02.06.Kendra.Heart.XXX.SD.MP4-RARBG",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11155642,
+   "name": "Teenage Spermaholics 8_1080",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11245684,
+   "name": "Hotwife.Bound.5.XXX.1080p.WEBRiP.MP4-GUSH[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11835032,
+   "name": "NeighborAffair.20.01.20.Sarah.Jessie.XXX.1080p.MP4-KTR[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11941716,
+   "name": "DirtyDetention_s01_GeorgiaJones_BobbiDylan_540p.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11998752,
+   "name": "JaneWilde-AnAdultTimeCompilation_s01_JaneWilde_1080p.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 13181269,
+   "name": "IndustryInvaders.16.02.19.Brandy.Wine.XXX.1080p.MP4.KTR",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 13502108,
+   "name": "IHaveAWife.13.04.09.Karmen.Karma.XXX.1080p.MP4-KTR",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 13797805,
+   "name": "FakeHostel.21.03.07.Zaawaadi.XXX.1080p.MP4-WRB[rarbg]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 14559816,
+   "name": "TheUpperFloor 17 01 10 Emma Haize And Cherry Torn XXX XviD-iPT Team",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 15222438,
+   "name": "HelplessTeens.15.09.25.Michelle.Martinez.ge.1080.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 15903125,
+   "name": "POVD.19.10.04.Leah.Lee.Sex.In.Private.720p.HEVC.HQ",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 18641585,
+   "name": "[VivThomas.com] - 2026.04.21 - Bonnie Dolce, Sylvia Wise - Room For Rent Episode 1(1080p).mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 19964972,
+   "name": "CherryPimps.Busted.23.05.09.Athena.Anderson.XXX.1080p.HEVC.x265.PRT",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20132929,
+   "name": "Swallowed.21.11.15.Penelope.Woods.Rory.Knox.And.Aliya.Brynn.XXX.1080p.HEVC.x265.PRT[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20243451,
+   "name": "[Iron Sugar] Hajimete no Aite wa Otou-san deshita - #3 Inran Kyonyuu na Choujo [English] {biribiri}.zip",
+   "teacher_adult": 1,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 20315641,
+   "name": "bigwai@18P2P_inthecrack_#144-#165(2008)",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20417666,
+   "name": "Defloration.25.02.13.Ally.Laposh.XXX.1080p.HEVC.x265.PRT",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20821671,
+   "name": "BluePillMen.17.01.06.Stacie.XXX.1080p.MP4-KTR[N1C]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20921585,
+   "name": "MyDirtyMaid.23.11.16.Lola.Rose.XXX.2160p.MP4-WRB[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 21394262,
+   "name": "1By-Day.15.12.07.Sarah.Highlight.XXX.1080p.MP4-KTR[N1C]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 21889765,
+   "name": "RealityJunkies.21.01.22.Hime.Marie.Highly.Recommended.XXX.1080p.MP4-WRB[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 22278030,
+   "name": "TheRealWorkout.22.06.25.JC.Wilds.Outdoor.Stretches.XXX.480p.MP4-XXX",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 22389344,
+   "name": "YoungandHorny_s01_JohnnySins_GiaDerza_480p.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 24454373,
+   "name": "TheMistressAndHerPrey_s01_RaulCosta_LizaBillberry_480p.mp4",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 24697530,
+   "name": "BraceFaced.17.12.20.Lexi.Lore.XXX.SD.MP4-KLEENEX",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 25539540,
+   "name": "Erotic.Book.Club.S01E01.Bound.by.My.Stepbrother.1080p.DROP.WEB-DL.AAC2.0.H.264-NTb[TGx]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 25709434,
+   "name": "FirstAnalQuest.11.08.14.Stasy.XXX.720p.WMV-YAPG",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 28431074,
+   "name": "www.Torrenting.org - AnalMom 22 07 14 Dee Williams Scandal In Suburbia Part 1 X",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 30016151,
+   "name": "Tsuma ga Kirei ni Natta Wake - 02 [1080p] [LatinoHentai.com].mp4",
+   "teacher_adult": 1,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 30697040,
+   "name": "[mnsn.click] Moving On S02E01",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32646122,
+   "name": "Watch4Beauty.12.12.10.Abby.Maria.Spanking.XXX.720p.WMV-WATCH4BEAUTY[rbg]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32810577,
+   "name": "NewSensations.18.10.03.Danni.Rivers.XXX.1080p.MP4-KTR[rarbg]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32810905,
+   "name": "Oldje.Mega.Time.To.Fuck.Episode.432",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32822265,
+   "name": "Defloration.24.11.07.Emily.Pupsik.XXX.1080p.HEVC.x265.PRT",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32883374,
+   "name": "ATKGalleria.15.09.21.Alice.March.Interview.XXX.1080p.MP4-KTR",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32944691,
+   "name": "HotwifeXXX.26.07.15.Sophia.Locke.XXX.INTERNAL.1080p.MP4-WRB[XC]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 34170859,
+   "name": "1pondo.SiteRip.September.2013.720p.MPA.XviD-TayTO",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 34228646,
+   "name": "ClubSeventeen.20.08.25.Kristina.J.Hardcore.1080p.HEVC.HQ",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 34353421,
+   "name": "InterracialPickups.19.10.11.Violet.Myers.XXX.1080p.MP4-KTR[XvX]",
+   "teacher_adult": 1,
+   "teacher_category": "tv"
+  }
+ ],
+ "known_clean": [
+  {
+   "id": 46377,
+   "name": "The Complete Agile Scrum Fundamentals Course + Certification",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 442965,
+   "name": "[RedDeadProject] Spirited Away - Movie - [JPN Blu-ray] [Hybrid Remux] [Dual Audio]",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 900571,
+   "name": "[GJM] To Aru Majutsu no Index III - Volume 3 (BD 1080p)",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 934627,
+   "name": "Adam Zkt. Eva S02",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 1172114,
+   "name": "Yaruki Manman",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 1290161,
+   "name": "(tokusatsu.org)Kamen_Rider_Zeztz_-_Series_of_Sister's_Substory_Agent_Minami_02_WEBDL_1080p_h264_aac_[946EE274].mp4",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 1298857,
+   "name": "Pickup Lines 71 (2002)",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 1358062,
+   "name": "Touhou Niji Sousaku Doujin \ufffd\ufffd\ufffd\ufffd\ufffd Musou Kakyou",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 1684358,
+   "name": "[NoobSubs] Little Witch Academia - The Enchanted Parade (720p Blu-ray 8bit AC3).mp4",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 2504713,
+   "name": "[SHIZA Project] Ninja Warrior Sasuke [NIKITOS & OSLIKt] [SATRip]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 5365653,
+   "name": "Medalist 2nd Season - AniLiberty [WEB-DL 1080p]",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 5868164,
+   "name": "Killer.In.My.Village.S01E02.1080p.WEB.h264-BAWD[EZTVx.to].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 7697982,
+   "name": "www.UIndex.org    -    Young Sherlock 2026 S01E02 1080p 10bit WEBRip 6CH x265 HEVC-PSA",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8752560,
+   "name": "WWE Monday Night RAW 11.09.2017.mp4",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8817203,
+   "name": "\ucc9c\ub8e1\ud314\ubd80.\u5929\u9f8d\u516b\u90e8.2003.E21~E25.UpScaled.DVDRip.KORSUB.x264.AC3-SILI",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 8851812,
+   "name": "Surviving.Jack.S01E05.HDTV.x264-LOL.mp4",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 9035077,
+   "name": "Perpetual.Grace.LTD.S01E03.720p.WEB.x265-MiNX[eztv].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 9044509,
+   "name": "[Sakurato] Witch Watch [11][HEVC-10bit 1080p AAC][CHS&CHT].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 10021642,
+   "name": "The Walking Dead S01E04 1080p DSNP WEB-DL DDP5 1 H 264-FLUX[TGx]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 10717134,
+   "name": "www.1TamilBlasters.codes - Do Prasad Rao Kanabadutaledhu (2026) S01EP(01-06) [Telugu - HQ HDRip AVC - x264 - AAC - 500MB - ESub]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 10743793,
+   "name": "www.UIndex.org    -    The Simpsons S26E20 Lets Go Fly a Coot 720p DSNP WEB-DL DD 5 1 H 264-playWEB",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 10805612,
+   "name": "Tales of Wedding Rings S02E10 VOSTFR 720p WEB x264 AAC -Tsundere-Raws (CR).mkv",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 11026877,
+   "name": "Assassination.Classroom.S02E011.1080p.Multi.Subs.AAC.Lite.x265-DLKING.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 11149605,
+   "name": "alias.s04e07.720p.web.h264-nixon[eztv.io].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11224261,
+   "name": "Les.Norton.S01E09.1080p.HDTV.H264-CCT[rarbg]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 11255985,
+   "name": "www.UIndex.org    -    Australian.Idol.S11E18.1080p.AV1.10bit-MeGusta",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 12615648,
+   "name": "www.UIndex.org    -    Our Cartoon President S01E13 Loyalty Oath 1080p AMZN WEB-DL DDP2 0 H 264-monkee",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 12938455,
+   "name": "Star.Trek.Discovery.S03E05.Die.Trying.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb[eztv.re].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 14197889,
+   "name": "Physical.S01E09.Let's.Face.the.Facts.720p.10bit.WEBRip.2CH.x265.HEVC-PSA.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 17333537,
+   "name": "20251005_Un.giorno.in.pretura.h265.1080p.ITA.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 18952359,
+   "name": "The.Twilight.Zone.1959-1964",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20005411,
+   "name": "Adolescence.S01.ITA.ENG.2160p.NF.WEB-DL.DDP5.1.DV.HDR.H.265-MeM.GP",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20170914,
+   "name": "The.Simpsons.Season.9.Episode.19.Simpson.Tide.H264.DVDRip.EzzRips",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20333643,
+   "name": "The.Completely.Made-Up.Adventures.of.Dick.Turpin.S01E01.1080p.WEB.H264-SuccessfulCrab[TGx]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20488352,
+   "name": "The.Mandalorian.S02E02.1080p.DSNP.WEBRip.DDP5.1.Atmos.x264-PHOENiX[rartv]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20567136,
+   "name": "Family.Guy.S23.TVShows.WEB-DLRip.XviD.AC3.-Hqh",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20575633,
+   "name": "www.UIndex.org    -    The Great British Bake Off S02E02 Tarts NF WEB-DL DDP2 0 x264-BTW",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 20631424,
+   "name": "Resident Alien [HDTV 720p][Cap.305]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 21215446,
+   "name": "Tangled.The.Series.S02E08.King.Pascal.720p.WEBRip.2CH.x265.HEVC-PSA.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 21395515,
+   "name": "DARK.S01.NF.WEBRip.AAC2.0.x264-STRiFE[ettv]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 21433959,
+   "name": "Arcane.S02E04.1080p.WEB.H264-SuccessfulCrab.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 21960110,
+   "name": "Penny.Dreadful.City.of.Angels.01x01.Santa.Muerte.ITA.ENG.HDR.2160p.WEB.H265-Mirkoianni.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 22058734,
+   "name": "South.Park.S21E05.WEBRip.x264-RARBG",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 22284260,
+   "name": "[SubsPlease] Yumemiru Danshi wa Genjitsushugisha - 08 (480p) [DA4602B2].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "anime"
+  },
+  {
+   "id": 22839329,
+   "name": "www.Torrenting.com - The.Daily.Show.2017.10.19.Vic.Mensa.720p.HEVC.x265-MeGusta",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 22897251,
+   "name": "Abbott.Elementary.S01E08.Work.Family.1080p.DSNP.WEBRip.DDP5.1.x264-NTb[rarbg]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 22941801,
+   "name": "Race.Across.the.World.S04E07.1080p.HDTV.H264-DARKFLiX[EZTVx.to].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 25745520,
+   "name": "\u00c5sa-Nisse.6-10.Swedish.XviD-Drutten86",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 27921610,
+   "name": "www.Torrenting.com - Guys.Grocery.Games.S16E06.GGG.International.All.Stars.XviD-AFG",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 28188383,
+   "name": "Doctor Who Classic (1963-HD)",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 28260408,
+   "name": "www.UIndex.org    -    Law and Order S25E03 1080p x265-ELiTE",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 28352188,
+   "name": "CH4.\u672a\u6765\u4e4b\u5bb6.Channel4.Home Of The Future.S01E05.Chi_Eng.HR-HDTV.AC3.1024X576.x264-YYeTs\u4eba\u4eba\u5f71\u89c6.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 30393135,
+   "name": "Carson.Daly.2018.05.16.Natalie.Dormer.720p.WEB.x264-TBS[N1C]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32276608,
+   "name": "[ OxTorrent.pw ] Penny.Dreadful.City.of.Angels.S01E08.FRENCH.WEBRip.Xvid-EXTREME.avi",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32542235,
+   "name": "www.UIndex.org    -    Taskmaster AU S05E01 720p WEB H264-JFF",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32664961,
+   "name": "Mayor of Kingstown [HDTV 1080p][cap.307]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32693899,
+   "name": "Dirk.Gentlys.Holistic.Detective.Agency.S02E08.720p.HDTV.x264-W4F.[VTV].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 32828462,
+   "name": "www.5MovieRulz.condos - Iru Dhuruvam (2019) 720p S01 - EP(01-09)\u00a0WEB-DL - AVC - [Tel + Tam + Hin]",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 34205835,
+   "name": "Chodici mrtvi - Perkins.14.2009.1080p.HDTV.CZ.dabing.mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  },
+  {
+   "id": 34364759,
+   "name": "Call My Agent S03E01 1080p WEB-DL DD 5 1 x264-SbR[EZTVx.to].mkv",
+   "teacher_adult": 0,
+   "teacher_category": "tv"
+  }
+ ]
+}
