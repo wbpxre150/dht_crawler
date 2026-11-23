@@ -198,6 +198,7 @@ int main(int argc, char *argv[]) {
     bool check_db = false;
     bool recover_db = false;
     const char *restore_db_path = NULL;
+    const char *rebuild_fts_db_path = NULL;
     bool clear_failure_filter = false;
     bool category_filter_update = false;
     for (int i = 1; i < argc; i++) {
@@ -213,6 +214,8 @@ int main(int argc, char *argv[]) {
             printf("                           database, then replacing the original\n");
             printf("  --restore-database <sql> Replay an uncompressed SQL dump into a fresh database\n");
             printf("                           and replace the configured database with it\n");
+            printf("  --rebuild-fts <db>       Create the FTS5 search index in an existing database\n");
+            printf("                           and rebuild it with the bundled SQLite\n");
             printf("  --clear-failure-filter   Delete the persisted failure bloom filter (data/failure_bloom.dat)\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
@@ -232,6 +235,12 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             restore_db_path = argv[++i];
+        } else if (strcmp(argv[i], "--rebuild-fts") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--rebuild-fts requires a <database> argument");
+                return 1;
+            }
+            rebuild_fts_db_path = argv[++i];
         } else if (strcmp(argv[i], "--clear-failure-filter") == 0) {
             clear_failure_filter = true;
         }
@@ -620,6 +629,31 @@ int main(int argc, char *argv[]) {
         unlink(tmp_shm);
 
         log_msg(LOG_INFO, "--restore-database: complete. %d statements replayed.", nstmts);
+        return 0;
+    }
+
+    /*******************************************************************
+     * --rebuild-fts <db>: create the FTS5 tables + triggers in an
+     * existing database, rebuild the external-content torrent_search
+     * index and backfill the contentless torrent_docs index with the
+     * bundled SQLite, which always has FTS5 compiled in (unlike the
+     * platform SQLite). The restore path bulk-imports the base tables
+     * from the Kotlin side first, then calls this on the TEMP database
+     * before swapping it in, so a restore never leaves either search
+     * index silently empty.
+     *******************************************************************/
+    if (rebuild_fts_db_path) {
+        log_msg(LOG_INFO, "Rebuilding FTS indexes of %s ...", rebuild_fts_db_path);
+        int fts_rc = database_rebuild_fts(rebuild_fts_db_path);
+
+        cleanup_app_context(&g_app_ctx);
+
+        if (fts_rc != 0) {
+            log_msg(LOG_ERROR, "--rebuild-fts: FTS rebuild failed; database left unchanged.");
+            return 1;
+        }
+
+        log_msg(LOG_INFO, "--rebuild-fts: complete.");
         return 0;
     }
 

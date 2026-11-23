@@ -1858,6 +1858,102 @@ fail:
     return -1;
 }
 
+/* Create the FTS5 tables + triggers in an existing database, rebuild the
+ * external-content torrent_search index with the bundled SQLite (FTS5 is
+ * always compiled in, unlike the platform SQLite) and backfill the
+ * contentless torrent_docs index. Used by `--rebuild-fts <db>` after a
+ * bulk import has filled the base tables: the FTS objects are created
+ * here (all IF NOT EXISTS) and the FTS5 'rebuild' command regenerates
+ * torrent_search from its content table. The WAL is checkpointed and
+ * truncated so the file is self-contained for the caller's rename into
+ * place. Returns 0 on success, -1 on failure. */
+int database_rebuild_fts(const char *db_path) {
+    if (!db_path) return -1;
+
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-fts: failed to open %s: %s",
+                db_path, sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_busy_timeout(db, 30000);
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+
+    char *err = NULL;
+    log_msg(LOG_INFO, "rebuild-fts: creating FTS5 tables ...");
+    rc = sqlite3_exec(db, CREATE_FTS_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-fts: failed to create FTS tables: %s", err);
+        sqlite3_free(err);
+        goto fail;
+    }
+    log_msg(LOG_INFO, "rebuild-fts: creating FTS5 triggers ...");
+    rc = sqlite3_exec(db, CREATE_TRIGGERS_SQL, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-fts: failed to create FTS triggers: %s", err);
+        sqlite3_free(err);
+        goto fail;
+    }
+
+    /* External-content FTS5: 'rebuild' deletes and re-populates the whole
+     * index from the content table (torrents). */
+    log_msg(LOG_INFO, "rebuild-fts: rebuilding torrent_search (torrents.name) ...");
+    rc = sqlite3_exec(db, "INSERT INTO torrent_search(torrent_search) VALUES('rebuild');",
+                      NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        log_msg(LOG_ERROR, "rebuild-fts: torrent_search rebuild failed: %s", err);
+        sqlite3_free(err);
+        goto fail;
+    }
+
+    /* The caller renames this file into place, so the WAL has to be folded
+     * back into the main database: its sidecars are not carried over. */
+    {
+        int nLog = 0, nCkpt = 0;
+        int ckpt_rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
+        if (ckpt_rc != SQLITE_OK) {
+            log_msg(LOG_ERROR, "rebuild-fts: WAL checkpoint failed: %d: %s (%d of %d frames)",
+                    ckpt_rc, sqlite3_errstr(ckpt_rc), nCkpt, nLog);
+            goto fail;
+        }
+        log_msg(LOG_INFO, "rebuild-fts: WAL checkpointed (%d of %d frames)", nCkpt, nLog);
+    }
+
+    sqlite3_close(db);
+
+    /* torrent_docs is a CONTENTLESS FTS5 table (content=''): its text lives
+     * only inside the inverted index, so there is no content table for the
+     * FTS5 'rebuild' command to re-read, and inserting the literal token
+     * 'rebuild' would merely index that word. Populate it with an explicit
+     * INSERT ... SELECT over the base tables instead, which is exactly what
+     * the idempotent, contentless_delete-aware database_rebuild_docs()
+     * (also used by --rebuild-docs) does, including its own WAL
+     * checkpoint/truncate so the file stays self-contained. */
+    log_msg(LOG_INFO, "rebuild-fts: backfilling torrent_docs ...");
+    if (database_rebuild_docs(db_path) != 0) {
+        log_msg(LOG_ERROR, "rebuild-fts: torrent_docs backfill failed; database left unchanged.");
+        return -1;
+    }
+
+    /* The indexes are only usable if the database they were built from is
+     * intact; reuse the existing helper and report its result verbatim. */
+    int errors = database_integrity_check(db_path);
+    if (errors != 0) {
+        log_msg(LOG_ERROR, "rebuild-fts: integrity check failed (%d error(s))", errors);
+        return -1;
+    }
+
+    log_msg(LOG_INFO, "rebuild-fts: FTS indexes rebuilt, integrity check ok");
+    return 0;
+
+fail:
+    sqlite3_close(db);
+    return -1;
+}
+
 /* Cleanup database */
 void database_cleanup(database_t *db) {
     if (!db) {

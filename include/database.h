@@ -190,4 +190,11 @@ int database_recover(const char *src_path, const char *dst_path);
  * replayed, or -1 on fatal error (dst_path is unlinked on failure). */
 int database_restore(const char *sql_path, const char *dst_path);
 
+/* Create the FTS5 tables + triggers in an existing db_path database,
+ * rebuild the external-content index (torrent_search) and backfill the
+ * contentless torrent_docs index with the bundled SQLite. The WAL is
+ * checkpointed and truncated so the file is self-contained. Returns 0 on
+ * success, -1 on fatal error. */
+int database_rebuild_fts(const char *db_path);
+
 #endif /* DATABASE_H */
