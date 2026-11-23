@@ -128,6 +128,10 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Stage 6 adult handling */
     strncpy(sup->adult_mode, config->adult_mode, sizeof(sup->adult_mode) - 1);
 
+    /* "Categories to save" (ingest drop decision lives in tree_metadata.c) */
+    sup->save_category_mask = config->save_category_mask;
+    sup->save_tv_kind_mask = config->save_tv_kind_mask;
+
     /* BEP51 cache settings */
     sup->bep51_cache_capacity = config->bep51_cache_capacity > 0 ? config->bep51_cache_capacity : 10000;
     sup->bep51_cache_submit_percent = config->bep51_cache_submit_percent > 0 ? config->bep51_cache_submit_percent : 5;
@@ -506,6 +510,9 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .require_empty_queue = sup->require_empty_queue,
         .ema_alpha = sup->rate_ema_alpha,
         /* Stage 6 adult handling (adult_mode is copied after the literal below) */
+        /* "Categories to save" */
+        .save_category_mask = sup->save_category_mask,
+        .save_tv_kind_mask = sup->save_tv_kind_mask,
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,

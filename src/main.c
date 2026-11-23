@@ -5,6 +5,7 @@
 #include "language_filter.h"
 #include "classifier.h"
 #include "hard_block.h"
+#include "category_filter_cleanup.h"
 #include "torrent_search.h"
 #include "config.h"
 #include "udp_rate_limit.h"
@@ -198,11 +199,14 @@ int main(int argc, char *argv[]) {
     bool recover_db = false;
     const char *restore_db_path = NULL;
     bool clear_failure_filter = false;
+    bool category_filter_update = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
             printf("Options:\n");
             printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
+            printf("  --category-filter-update Remove torrents outside save_categories/save_tv_kinds\n");
+            printf("                           and adult-tagged torrents from the database\n");
             printf("  --compact                Compact the database by writing a fresh copy and replacing the original\n");
             printf("  --check-database         Run an integrity check on the database and report any errors\n");
             printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
@@ -214,6 +218,8 @@ int main(int argc, char *argv[]) {
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
             rebuild_bloom = true;
+        } else if (strcmp(argv[i], "--category-filter-update") == 0) {
+            category_filter_update = true;
         } else if (strcmp(argv[i], "--compact") == 0) {
             compact_db = true;
         } else if (strcmp(argv[i], "--check-database") == 0) {
@@ -924,6 +930,33 @@ int main(int argc, char *argv[]) {
     }
 
     /*******************************************************************
+     * --category-filter-update: delete the rows the current
+     * save_categories / save_tv_kinds selection rejects plus every
+     * adult-tagged row, then exit. No compaction: a VACUUM INTO of a large
+     * database takes long enough that Android's lowmemorykiller reaps the
+     * app mid-run, and an explicit --compact is still available. The flag
+     * never prompts: the app runs it with no TTY.
+     *******************************************************************/
+    if (category_filter_update) {
+        int cfrc = category_filter_update_run(&g_database, g_app_ctx.db_path,
+                                             config.save_category_mask,
+                                             config.save_tv_kind_mask);
+        database_cleanup(&g_database);
+        torrent_search_cleanup();
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        if (cfrc != 0) {
+            log_msg(LOG_ERROR, "category filter update failed (%d); the database was left in place", cfrc);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+        log_msg(LOG_INFO, "category filter update complete");
+        cleanup_app_context(&g_app_ctx);
+        return 0;
+    }
+
+    /*******************************************************************
      * --compact: write a fresh compacted copy, replace original, exit.
      *******************************************************************/
     if (compact_db) {
@@ -1063,6 +1096,9 @@ int main(int argc, char *argv[]) {
         .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
         .global_bootstrap_workers = config.global_bootstrap_workers,
         /* Stage 6 adult handling (adult_mode is copied after the literal) */
+        /* "Categories to save" (Stage: save_categories/save_tv_kinds) */
+        .save_category_mask = config.save_category_mask,
+        .save_tv_kind_mask = config.save_tv_kind_mask,
         /* Adaptive keyspace partitioning */
         .dead_partition_threshold = config.dead_partition_threshold,
         .max_trees_per_partition = config.max_trees_per_partition
