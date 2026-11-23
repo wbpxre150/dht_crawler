@@ -52,4 +52,29 @@ int http_fetch_to_file(const char *url, const char *dest_path,
                        const char *ca_file, const char *ca_dir,
                        char *err, size_t err_len);
 
+/**
+ * What the last transfer actually did, for callers that publish an outcome.
+ *
+ * Zeroed before the transfer starts, so a failure that never reached a server
+ * reports status 0 ("no response") instead of a code from an earlier call.
+ * `bytes` is the body length that reached the destination file, so it is 0
+ * unless the transfer completed; a 200 whose body then fails its own
+ * caller-side check (a sha256 gate, say) still reports the full byte count.
+ */
+typedef struct {
+    int status;      /*: HTTP status of the response that ended the transfer; 0 = none */
+    long long bytes; /*: body bytes written to the destination; 0 unless it completed */
+} http_fetch_info_t;
+
+/**
+ * Same as http_fetch_to_file(), plus the outcome in @p info (which may be
+ * NULL). The extra out-parameter is the only difference: same arguments, same
+ * return contract, same TLS backends.
+ */
+int http_fetch_to_file_ex(const char *url, const char *dest_path,
+                          size_t max_bytes, int timeout_sec,
+                          const char *ca_file, const char *ca_dir,
+                          http_fetch_info_t *info,
+                          char *err, size_t err_len);
+
 #endif /* HTTP_FETCH_H */

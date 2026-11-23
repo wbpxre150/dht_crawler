@@ -1307,6 +1307,38 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         }
         cJSON_AddItemToObject(root, "bep51_cache", cache_obj);
 
+        /* Published-cache fetch outcome. Published unconditionally, including
+         * with bep51_cache_url empty (enabled:false, last_result "disabled")
+         * and when nothing has been attempted yet ("not_attempted"), so a probe
+         * never has to guess why the column is blank.
+         *
+         * last_result is the wire verdict - ok / disabled / not_attempted /
+         * http_<code> / sha_mismatch / load_failed / network_error - and is
+         * derived from the numeric code plus the status, so the two can never
+         * disagree. The counters are supervisor-owned: one attempt per process
+         * in practice, but they survive a tree respawn and are reset only by
+         * supervisor_bep51_fetch_reset(). */
+        bep51_fetch_stats_t fetch_stats;
+        supervisor_bep51_fetch_stats(api->supervisor, &fetch_stats);
+        char fetch_result[32];
+        bep51_cache_fetch_result_name(fetch_stats.last_result, fetch_stats.last_http_status,
+                                      fetch_result, sizeof(fetch_result));
+        cJSON *fetch_json = cJSON_CreateObject();
+        cJSON_AddStringToObject(fetch_json, "url", api->supervisor->bep51_cache_url);
+        cJSON_AddBoolToObject(fetch_json, "enabled", fetch_stats.enabled);
+        cJSON_AddNumberToObject(fetch_json, "attempts", (double)fetch_stats.attempts);
+        cJSON_AddNumberToObject(fetch_json, "successes", (double)fetch_stats.successes);
+        cJSON_AddNumberToObject(fetch_json, "failures", (double)fetch_stats.failures);
+        cJSON_AddStringToObject(fetch_json, "last_result", fetch_result);
+        cJSON_AddNumberToObject(fetch_json, "last_http_status", fetch_stats.last_http_status);
+        cJSON_AddNumberToObject(fetch_json, "last_bytes", (double)fetch_stats.last_bytes);
+        cJSON_AddNumberToObject(fetch_json, "last_nodes_loaded", (double)fetch_stats.last_nodes);
+        cJSON_AddNumberToObject(fetch_json, "last_duration_ms",
+                                (double)fetch_stats.last_duration_ms);
+        cJSON_AddNumberToObject(fetch_json, "last_at_epoch", (double)fetch_stats.last_at_epoch);
+        cJSON_AddStringToObject(fetch_json, "last_error", fetch_stats.last_error);
+        cJSON_AddItemToObject(root, "bep51_cache_fetch", fetch_json);
+
         /* Add per-tree stats */
         cJSON *trees_array = cJSON_CreateArray();
         pthread_mutex_lock(&api->supervisor->trees_lock);

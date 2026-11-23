@@ -191,3 +191,13 @@ disabled map publishes `enabled: false`, `ttl_sec: 0` and zero counters.
 exclusive, so per window `offered = bloom_rejected + inflight_refused + queue_full + pushed` (±1 %);
 `tools/crawler/gp_probe.py` derives `queries/s/tree`, `offered/s/tree`, the accepted / bloom / in-flight /
 queue-full shares of offered and the identity gap from the two blocks.
+
+**`bep51_cache_fetch` (no config key of its own — it reports `bep51_cache_url`).** Sibling of the
+`bep51_cache` block: `url`, `enabled`, `attempts`, `successes`, `failures`, `last_result`,
+`last_http_status`, `last_bytes`, `last_nodes_loaded`, `last_duration_ms`, `last_at_epoch`,
+`last_error`. `last_result` is the verdict — `ok`, `disabled` (empty URL), `not_attempted` (a warm
+cache skips the fetch, so nothing ran), `http_<code>`, `sha_mismatch`, `load_failed` or
+`network_error` — and it is published unconditionally, so a disabled or never-attempted fetch still
+shows the block (`enabled: false` / `last_result: "not_attempted"`) rather than a blank column. The
+counters live on the supervisor and are reset only by `supervisor_bep51_fetch_reset()`; a DISABLED
+or NOT_ATTEMPTED verdict never increments `failures`.

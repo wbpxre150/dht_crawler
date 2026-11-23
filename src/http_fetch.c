@@ -726,12 +726,12 @@ static int hf_read_chunked(hf_reader_t *r, FILE *out, size_t *written, size_t ma
 
 static int hf_attempt(const hf_url_t *url, const char *dest_path, size_t max_bytes,
                       long long deadline, const char *ca_file, const char *ca_dir,
-                      char *err, size_t err_len);
+                      http_fetch_info_t *info, char *err, size_t err_len);
 
 static int hf_follow_redirect(const hf_url_t *cur, const char *location, int hops,
                               const char *dest_path, size_t max_bytes, long long deadline,
                               const char *ca_file, const char *ca_dir,
-                              char *err, size_t err_len) {
+                              http_fetch_info_t *info, char *err, size_t err_len) {
     if (hops <= 0) {
         hf_err(err, err_len, "too many redirects (last: %s)", location);
         return -1;
@@ -741,12 +741,12 @@ static int hf_follow_redirect(const hf_url_t *cur, const char *location, int hop
 
     hf_url_t resolved;
     if (hf_parse_url(next, &resolved, err, err_len) != 0) return -1;
-    return hf_attempt(&resolved, dest_path, max_bytes, deadline, ca_file, ca_dir, err, err_len);
+    return hf_attempt(&resolved, dest_path, max_bytes, deadline, ca_file, ca_dir, info, err, err_len);
 }
 
 static int hf_attempt(const hf_url_t *url, const char *dest_path, size_t max_bytes,
                       long long deadline, const char *ca_file, const char *ca_dir,
-                      char *err, size_t err_len) {
+                      http_fetch_info_t *info, char *err, size_t err_len) {
     hf_conn_t conn = {.fd = -1};
     hf_reader_t *reader = NULL;
     FILE *out = NULL;
@@ -801,6 +801,9 @@ static int hf_attempt(const hf_url_t *url, const char *dest_path, size_t max_byt
 
     hf_head_t head;
     if (hf_read_head(reader, &head, err, err_len) != 0) goto done;
+    /* The status of the response that ended the transfer, redirects included:
+     * a 404 is reported as 404 even though the attempt failed. */
+    if (info) info->status = head.status;
 
     if (head.status >= 300 && head.status < 400 && head.status != 304) {
         if (head.location[0] == '\0') {
@@ -808,7 +811,7 @@ static int hf_attempt(const hf_url_t *url, const char *dest_path, size_t max_byt
             goto done;
         }
         result = hf_follow_redirect(url, head.location, HTTP_FETCH_MAX_REDIRECTS, dest_path,
-                                    max_bytes, deadline, ca_file, ca_dir, err, err_len);
+                                    max_bytes, deadline, ca_file, ca_dir, info, err, err_len);
         goto done;
     }
     if (head.status < 200 || head.status >= 300) {
@@ -857,6 +860,7 @@ static int hf_attempt(const hf_url_t *url, const char *dest_path, size_t max_byt
         hf_err(err, err_len, "cannot move %s into place: %s", tmp_path, strerror(errno));
         goto done;
     }
+    if (info) info->bytes = (long long)written;
     result = 0;
 
 done:
@@ -868,10 +872,15 @@ done:
     return result;
 }
 
-int http_fetch_to_file(const char *url, const char *dest_path,
-                       size_t max_bytes, int timeout_sec,
-                       const char *ca_file, const char *ca_dir,
-                       char *err, size_t err_len) {
+int http_fetch_to_file_ex(const char *url, const char *dest_path,
+                          size_t max_bytes, int timeout_sec,
+                          const char *ca_file, const char *ca_dir,
+                          http_fetch_info_t *info,
+                          char *err, size_t err_len) {
+    if (info) {
+        info->status = 0;
+        info->bytes = 0;
+    }
     if (err && err_len) err[0] = '\0';
     if (!url || !dest_path) {
         hf_err(err, err_len, "url and destination are required");
@@ -884,5 +893,13 @@ int http_fetch_to_file(const char *url, const char *dest_path,
     if (hf_parse_url(url, &parsed, err, err_len) != 0) return -1;
 
     long long deadline = hf_now_ms() + (long long)timeout_sec * 1000LL;
-    return hf_attempt(&parsed, dest_path, max_bytes, deadline, ca_file, ca_dir, err, err_len);
+    return hf_attempt(&parsed, dest_path, max_bytes, deadline, ca_file, ca_dir, info, err, err_len);
+}
+
+int http_fetch_to_file(const char *url, const char *dest_path,
+                       size_t max_bytes, int timeout_sec,
+                       const char *ca_file, const char *ca_dir,
+                       char *err, size_t err_len) {
+    return http_fetch_to_file_ex(url, dest_path, max_bytes, timeout_sec,
+                                 ca_file, ca_dir, NULL, err, err_len);
 }

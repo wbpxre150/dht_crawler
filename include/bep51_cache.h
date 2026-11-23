@@ -88,6 +88,55 @@ int bep51_cache_fetch_remote(bep51_cache_t *cache, const char *url, const char *
                              int timeout_sec, const char *ca_file, const char *ca_dir);
 
 /**
+ * Outcome of one published-cache fetch.
+ *
+ * The numeric values are internal; the strings rendered by
+ * bep51_cache_fetch_result_name() are the wire contract (/stats
+ * bep51_cache_fetch.last_result), so a published block can never be blank.
+ */
+typedef enum {
+    BEP51_FETCH_NOT_ATTEMPTED = 0, /*: no fetch has run in this process */
+    BEP51_FETCH_OK,                /*: downloaded, validated, installed, loaded */
+    BEP51_FETCH_DISABLED,          /*: the URL is empty, so nothing is ever fetched */
+    BEP51_FETCH_HTTP_ERROR,        /*: the server answered and refused ("http_<status>") */
+    BEP51_FETCH_SHA_MISMATCH,      /*: a 200 body failed the loader's magic+sha256 gate */
+    BEP51_FETCH_LOAD_FAILED,       /*: validated, but could not be installed or loaded */
+    BEP51_FETCH_NETWORK_ERROR      /*: no HTTP status at all (DNS, connect, TLS, deadline) */
+} bep51_cache_fetch_result_t;
+
+/**
+ * One fetch's numbers, filled by bep51_cache_fetch_remote_ex().
+ *
+ * `bytes` is what the transfer wrote, so a 200 whose body then fails the sha256
+ * gate still reports its full size; `nodes_loaded` is only set on success.
+ */
+typedef struct {
+    bep51_cache_fetch_result_t result;
+    int http_status;      /*: 0 = no response was received */
+    long long bytes;      /*: body bytes received by the transfer */
+    size_t nodes_loaded;  /*: nodes in the cache after a successful install */
+    int duration_ms;      /*: wall time of the whole fetch, validation included */
+    char error[192];      /*: human-readable reason when the result is not OK */
+} bep51_cache_fetch_info_t;
+
+/**
+ * Render an outcome as its /stats string: "ok", "disabled",
+ * "not_attempted", "sha_mismatch", "load_failed", "network_error" or
+ * "http_<status>". Always writes a non-empty string into @p out.
+ */
+const char *bep51_cache_fetch_result_name(int result, int http_status,
+                                          char *out, size_t out_len);
+
+/**
+ * Same as bep51_cache_fetch_remote(), plus the outcome in @p info (which may
+ * be NULL). Callers that publish the result use this one; the plain wrapper
+ * exists so the historical call sites keep their signature.
+ */
+int bep51_cache_fetch_remote_ex(bep51_cache_t *cache, const char *url, const char *path,
+                                int timeout_sec, const char *ca_file, const char *ca_dir,
+                                bep51_cache_fetch_info_t *info);
+
+/**
  * Get current node count in cache (thread-safe)
  * @param cache The cache
  * @return Number of nodes currently cached

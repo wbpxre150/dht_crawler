@@ -551,15 +551,27 @@ int main(int argc, char *argv[]) {
             log_msg(LOG_ERROR, "--fetch-bep51-cache: cannot create the cache");
             return 1;
         }
-        int frc = bep51_cache_fetch_remote(cache, config.bep51_cache_url, config.bep51_cache_path,
-                                           config.bep51_cache_fetch_timeout_sec,
-                                           config.bep51_cache_ca_file[0] ? config.bep51_cache_ca_file : NULL,
-                                           config.bep51_cache_ca_dir[0] ? config.bep51_cache_ca_dir : NULL);
+        bep51_cache_fetch_info_t fetch;
+        int frc = bep51_cache_fetch_remote_ex(cache, config.bep51_cache_url, config.bep51_cache_path,
+                                              config.bep51_cache_fetch_timeout_sec,
+                                              config.bep51_cache_ca_file[0] ? config.bep51_cache_ca_file : NULL,
+                                              config.bep51_cache_ca_dir[0] ? config.bep51_cache_ca_dir : NULL,
+                                              &fetch);
+        /* No supervisor exists in this path, so the one-shot publishes its own
+         * single-shot numbers on this line instead of into /stats - the same
+         * verdict string the daemon's bep51_cache_fetch.last_result carries. */
+        char verdict[32];
+        bep51_cache_fetch_result_name((int)fetch.result, fetch.http_status, verdict, sizeof(verdict));
         if (frc == 0) {
-            log_msg(LOG_INFO, "--fetch-bep51-cache: %zu nodes in %s",
-                    bep51_cache_get_count(cache), config.bep51_cache_path);
+            log_msg(LOG_INFO, "--fetch-bep51-cache: %s, %zu nodes in %s (http %d, %lld bytes, %d ms)",
+                    verdict, bep51_cache_get_count(cache), config.bep51_cache_path,
+                    fetch.http_status, fetch.bytes, fetch.duration_ms);
         } else {
-            log_msg(LOG_ERROR, "--fetch-bep51-cache: failed (existing cache left untouched)");
+            log_msg(LOG_ERROR,
+                    "--fetch-bep51-cache: failed (%s%s%s; http %d, %lld bytes, %d ms); "
+                    "existing cache left untouched",
+                    verdict, fetch.error[0] ? ": " : "", fetch.error,
+                    fetch.http_status, fetch.bytes, fetch.duration_ms);
         }
         bep51_cache_destroy(cache);
         return frc == 0 ? 0 : 1;

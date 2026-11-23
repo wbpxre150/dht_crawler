@@ -32,7 +32,84 @@ static uint32_t choose_partition_for_respawn(supervisor_t *sup, thread_tree_t *t
 static void *monitor_thread_func(void *arg);
 static void *supervisor_bootstrap_worker_func(void *arg);
 int supervisor_bootstrap(supervisor_t *sup);
+static void supervisor_bep51_fetch_set_state(supervisor_t *sup, int result, const char *error);
 
+/* ---- Published-cache fetch outcome (published as /stats bep51_cache_fetch) --
+ *
+ * The cold-start GET is the supervisor's only non-DHT network operation, and on
+ * a fresh install its failure is the difference between starting and aborting,
+ * so its verdict is published rather than left in a log line. One attempt per
+ * process in practice, but the counters are atomic anyway: the civetweb worker
+ * threads read them while supervisor_start() writes them.
+ */
+
+static void supervisor_bep51_fetch_set_error(supervisor_t *sup, const char *error) {
+    pthread_mutex_lock(&sup->bep51_fetch_lock);
+    snprintf(sup->bep51_fetch_last_error, sizeof(sup->bep51_fetch_last_error), "%s",
+             error ? error : "");
+    pthread_mutex_unlock(&sup->bep51_fetch_lock);
+}
+
+/* Last verdict without counting an attempt: the disabled and warm-cache paths
+ * are policy states, not fetches. */
+static void supervisor_bep51_fetch_set_state(supervisor_t *sup, int result, const char *error) {
+    if (!sup) return;
+    atomic_store(&sup->bep51_fetch_last_result, result);
+    supervisor_bep51_fetch_set_error(sup, error);
+}
+
+void supervisor_bep51_fetch_reset(supervisor_t *sup) {
+    if (!sup) return;
+    atomic_store(&sup->bep51_fetch_attempts, 0);
+    atomic_store(&sup->bep51_fetch_successes, 0);
+    atomic_store(&sup->bep51_fetch_failures, 0);
+    atomic_store(&sup->bep51_fetch_last_result, (int)BEP51_FETCH_NOT_ATTEMPTED);
+    atomic_store(&sup->bep51_fetch_last_http_status, 0);
+    atomic_store(&sup->bep51_fetch_last_bytes, 0);
+    atomic_store(&sup->bep51_fetch_last_nodes, 0);
+    atomic_store(&sup->bep51_fetch_last_duration_ms, 0);
+    atomic_store(&sup->bep51_fetch_last_at_epoch, 0);
+    supervisor_bep51_fetch_set_error(sup, "");
+}
+
+void supervisor_bep51_fetch_record(supervisor_t *sup, int result, int http_status,
+                                   uint64_t bytes, uint64_t nodes, uint64_t duration_ms,
+                                   const char *error) {
+    if (!sup) return;
+    atomic_fetch_add(&sup->bep51_fetch_attempts, 1);
+    if (result == (int)BEP51_FETCH_OK) {
+        atomic_fetch_add(&sup->bep51_fetch_successes, 1);
+    } else if (result != (int)BEP51_FETCH_DISABLED &&
+               result != (int)BEP51_FETCH_NOT_ATTEMPTED) {
+        atomic_fetch_add(&sup->bep51_fetch_failures, 1);
+    }
+    atomic_store(&sup->bep51_fetch_last_result, result);
+    atomic_store(&sup->bep51_fetch_last_http_status, http_status);
+    atomic_store(&sup->bep51_fetch_last_bytes, bytes);
+    atomic_store(&sup->bep51_fetch_last_nodes, nodes);
+    atomic_store(&sup->bep51_fetch_last_duration_ms, duration_ms);
+    atomic_store(&sup->bep51_fetch_last_at_epoch, (uint64_t)time(NULL));
+    supervisor_bep51_fetch_set_error(sup, error);
+}
+
+void supervisor_bep51_fetch_stats(supervisor_t *sup, bep51_fetch_stats_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!sup) return;
+    out->enabled = sup->bep51_cache_url[0] != '\0';
+    out->last_result = atomic_load(&sup->bep51_fetch_last_result);
+    out->attempts = atomic_load(&sup->bep51_fetch_attempts);
+    out->successes = atomic_load(&sup->bep51_fetch_successes);
+    out->failures = atomic_load(&sup->bep51_fetch_failures);
+    out->last_http_status = atomic_load(&sup->bep51_fetch_last_http_status);
+    out->last_bytes = atomic_load(&sup->bep51_fetch_last_bytes);
+    out->last_nodes = atomic_load(&sup->bep51_fetch_last_nodes);
+    out->last_duration_ms = atomic_load(&sup->bep51_fetch_last_duration_ms);
+    out->last_at_epoch = atomic_load(&sup->bep51_fetch_last_at_epoch);
+    pthread_mutex_lock(&sup->bep51_fetch_lock);
+    snprintf(out->last_error, sizeof(out->last_error), "%s", sup->bep51_fetch_last_error);
+    pthread_mutex_unlock(&sup->bep51_fetch_lock);
+}
 
     /* Built-in DHT bootstrap routers for supervisor-level bootstrap */
     static const char *BOOTSTRAP_HOSTS[] = {
@@ -65,6 +142,14 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
         log_msg(LOG_ERROR, "[supervisor] Failed to allocate supervisor");
         return NULL;
     }
+
+    /* Published-cache fetch counters. The error-string lock has to exist before
+     * the reset path can clear it; a failed init is non-fatal (the fetch then
+     * records without the text, which is the only thing it protects). */
+    if (pthread_mutex_init(&sup->bep51_fetch_lock, NULL) != 0) {
+        log_msg(LOG_WARN, "[supervisor] Cannot init the BEP51 fetch lock; fetch errors will not be published");
+    }
+    supervisor_bep51_fetch_reset(sup);
 
     sup->max_trees = config->max_trees;
     sup->active_trees = 0;
@@ -912,12 +997,25 @@ void supervisor_start(supervisor_t *sup) {
         log_msg(LOG_INFO, "[supervisor] BEP51 cache has %zu of %d nodes; fetching %s",
                 bep51_cache_get_count(sup->bep51_cache), sup->global_bootstrap_target,
                 sup->bep51_cache_url);
-        if (bep51_cache_fetch_remote(sup->bep51_cache, sup->bep51_cache_url, sup->bep51_cache_path,
-                                     sup->bep51_cache_fetch_timeout_sec,
-                                     sup->bep51_cache_ca_file[0] ? sup->bep51_cache_ca_file : NULL,
-                                     sup->bep51_cache_ca_dir[0] ? sup->bep51_cache_ca_dir : NULL) != 0) {
+        bep51_cache_fetch_info_t fetch;
+        if (bep51_cache_fetch_remote_ex(sup->bep51_cache, sup->bep51_cache_url, sup->bep51_cache_path,
+                                        sup->bep51_cache_fetch_timeout_sec,
+                                        sup->bep51_cache_ca_file[0] ? sup->bep51_cache_ca_file : NULL,
+                                        sup->bep51_cache_ca_dir[0] ? sup->bep51_cache_ca_dir : NULL,
+                                        &fetch) != 0) {
             log_msg(LOG_WARN, "[supervisor] BEP51 cache fetch failed; falling back to router bootstrap");
         }
+        /* Published whether it worked or not: the cold-start fetch is the only
+         * thing standing between a fresh install and an aborted start, so its
+         * outcome has to be visible from /stats. */
+        supervisor_bep51_fetch_record(sup, (int)fetch.result, fetch.http_status,
+                                      (uint64_t)(fetch.bytes > 0 ? fetch.bytes : 0),
+                                      (uint64_t)fetch.nodes_loaded,
+                                      (uint64_t)(fetch.duration_ms > 0 ? fetch.duration_ms : 0),
+                                      fetch.error);
+    } else if (sup->bep51_cache_url[0] == '\0') {
+        supervisor_bep51_fetch_set_state(sup, BEP51_FETCH_DISABLED,
+                                         "bep51_cache_url is empty");
     }
 
     if (bep51_cache_get_count(sup->bep51_cache) < (size_t)sup->global_bootstrap_target) {
@@ -1165,6 +1263,7 @@ void supervisor_destroy(supervisor_t *sup) {
         sup->meta_peer_fail = NULL;
     }
 
+    pthread_mutex_destroy(&sup->bep51_fetch_lock);
     pthread_mutex_destroy(&sup->trees_lock);
     free(sup->home_partitions);
     free(sup->partition_stats);

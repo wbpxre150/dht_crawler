@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <openssl/sha.h>
+#include <time.h>
 
 /* Binary file format constants */
 #define BEP51_CACHE_MAGIC "BEP1"
@@ -675,58 +676,132 @@ void bep51_cache_destroy(bep51_cache_t *cache) {
     free(cache);
 }
 
-int bep51_cache_fetch_remote(bep51_cache_t *cache, const char *url, const char *path,
-                             int timeout_sec, const char *ca_file, const char *ca_dir) {
+/* Monotonic milliseconds, for the fetch duration the caller publishes. */
+static int bc_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (int)(ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L);
+}
+
+const char *bep51_cache_fetch_result_name(int result, int http_status,
+                                          char *out, size_t out_len) {
+    const char *fixed = "not_attempted";
+    switch ((bep51_cache_fetch_result_t)result) {
+    case BEP51_FETCH_OK:            fixed = "ok"; break;
+    case BEP51_FETCH_DISABLED:      fixed = "disabled"; break;
+    case BEP51_FETCH_SHA_MISMATCH:  fixed = "sha_mismatch"; break;
+    case BEP51_FETCH_LOAD_FAILED:   fixed = "load_failed"; break;
+    case BEP51_FETCH_NETWORK_ERROR: fixed = "network_error"; break;
+    case BEP51_FETCH_HTTP_ERROR:    fixed = NULL; break;
+    case BEP51_FETCH_NOT_ATTEMPTED:
+    default:                        fixed = "not_attempted"; break;
+    }
+    /* The one parameterised case: the status is part of the verdict, because
+     * "404" and "503" want different reactions from an operator. */
+    if (fixed) snprintf(out, out_len, "%s", fixed);
+    else       snprintf(out, out_len, "http_%d", http_status > 0 ? http_status : 0);
+    return out;
+}
+
+int bep51_cache_fetch_remote_ex(bep51_cache_t *cache, const char *url, const char *path,
+                                int timeout_sec, const char *ca_file, const char *ca_dir,
+                                bep51_cache_fetch_info_t *info) {
+    bep51_cache_fetch_info_t local;
+    if (!info) info = &local;
+    memset(info, 0, sizeof(*info));
+    info->result = BEP51_FETCH_NOT_ATTEMPTED;
+
+    int started = bc_now_ms();
+    char *tmp = NULL;
+    int rc = -1;
+
     if (!cache || !url || !*url || !path || !*path) {
-        return -1;
+        if (!url || !*url) {
+            info->result = BEP51_FETCH_DISABLED;
+        } else {
+            info->result = BEP51_FETCH_LOAD_FAILED;
+            snprintf(info->error, sizeof(info->error), "cache and path are required");
+        }
+        goto out;
     }
 
     size_t tmp_len = strlen(path) + 16;
-    char *tmp = malloc(tmp_len);
+    tmp = malloc(tmp_len);
     if (!tmp) {
         log_msg(LOG_ERROR, "[bep51_cache] Out of memory for the download path");
-        return -1;
+        info->result = BEP51_FETCH_LOAD_FAILED;
+        snprintf(info->error, sizeof(info->error), "out of memory for the download path");
+        goto out;
     }
     snprintf(tmp, tmp_len, "%s.download", path);
 
+    http_fetch_info_t transfer;
     char err[256] = {0};
-    if (http_fetch_to_file(url, tmp, 0, timeout_sec, ca_file, ca_dir, err, sizeof(err)) != 0) {
+    if (http_fetch_to_file_ex(url, tmp, 0, timeout_sec, ca_file, ca_dir, &transfer,
+                              err, sizeof(err)) != 0) {
         log_msg(LOG_WARN, "[bep51_cache] Fetch of %s failed: %s", url, err);
+        info->http_status = transfer.status;
+        info->bytes = transfer.bytes;
+        /* A status means the server answered and refused; no status at all is
+         * DNS, connect, TLS or the transfer deadline. */
+        info->result = transfer.status > 0 ? BEP51_FETCH_HTTP_ERROR
+                                           : BEP51_FETCH_NETWORK_ERROR;
+        snprintf(info->error, sizeof(info->error), "%s", err[0] ? err : "transfer failed");
         unlink(tmp);
-        free(tmp);
-        return -1;
+        goto out;
     }
+    info->http_status = transfer.status;
+    info->bytes = transfer.bytes;
 
     /* Validate before touching anything that already works: the same strict
      * loader (magic + version + sha256 trailer) runs against a scratch cache. */
     bep51_cache_t *scratch = bep51_cache_create(cache->capacity);
     if (!scratch) {
+        info->result = BEP51_FETCH_LOAD_FAILED;
+        snprintf(info->error, sizeof(info->error), "out of memory for the validation cache");
         unlink(tmp);
-        free(tmp);
-        return -1;
+        goto out;
     }
     if (bep51_cache_load_from_file(scratch, tmp) != 0 || bep51_cache_get_count(scratch) == 0) {
         log_msg(LOG_WARN, "[bep51_cache] Downloaded %s failed validation; keeping the existing cache", url);
         bep51_cache_destroy(scratch);
+        info->result = BEP51_FETCH_SHA_MISMATCH;
+        snprintf(info->error, sizeof(info->error),
+                 "downloaded cache failed its magic/sha256 validation");
         unlink(tmp);
-        free(tmp);
-        return -1;
+        goto out;
     }
     size_t fetched = bep51_cache_get_count(scratch);
     bep51_cache_destroy(scratch);
 
     if (rename(tmp, path) != 0) {
         log_msg(LOG_WARN, "[bep51_cache] Cannot install %s: %s", path, strerror(errno));
+        info->result = BEP51_FETCH_LOAD_FAILED;
+        snprintf(info->error, sizeof(info->error), "cannot install %s: %s", path, strerror(errno));
         unlink(tmp);
-        free(tmp);
-        return -1;
+        goto out;
     }
     free(tmp);
+    tmp = NULL;
 
     if (bep51_cache_load_from_file(cache, path) != 0) {
         log_msg(LOG_WARN, "[bep51_cache] Installed %s but could not load it", path);
-        return -1;
+        info->result = BEP51_FETCH_LOAD_FAILED;
+        snprintf(info->error, sizeof(info->error), "installed %s but could not load it", path);
+        goto out;
     }
     log_msg(LOG_INFO, "[bep51_cache] Fetched %zu nodes from %s", fetched, url);
-    return 0;
+    info->result = BEP51_FETCH_OK;
+    info->nodes_loaded = bep51_cache_get_count(cache);
+    rc = 0;
+
+out:
+    free(tmp);
+    info->duration_ms = bc_now_ms() - started;
+    return rc;
+}
+
+int bep51_cache_fetch_remote(bep51_cache_t *cache, const char *url, const char *path,
+                             int timeout_sec, const char *ca_file, const char *ca_dir) {
+    return bep51_cache_fetch_remote_ex(cache, url, path, timeout_sec, ca_file, ca_dir, NULL);
 }

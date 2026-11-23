@@ -106,6 +106,30 @@ Android build, which links no OpenSSL — against the system store, or against
 `bep51_cache_ca_file`/`_dir` when set (on Android the default is the per-cert
 `/system/etc/security/cacerts` directory). There is no "accept anything" mode.
 
+Every fetch publishes its outcome, so a cold start that fell back to router
+discovery is visible from `/stats` instead of only in the log:
+
+```json
+"bep51_cache_fetch": {
+  "url": "https://unjumble.au/bep51/bep51_cache.dat",
+  "enabled": true, "attempts": 1, "successes": 1, "failures": 0,
+  "last_result": "ok", "last_http_status": 200,
+  "last_bytes": 1932165, "last_nodes_loaded": 50000,
+  "last_duration_ms": 812, "last_at_epoch": 1764000000, "last_error": ""
+}
+```
+
+`last_result` is the verdict: `ok`, `disabled` (empty `bep51_cache_url`),
+`not_attempted` (nothing has run in this process yet — a warm cache skips the
+fetch entirely), `http_<code>` (the server answered and refused), `sha_mismatch`
+(the body failed the loader's magic + sha256 gate), `load_failed` (validated but
+not installable) or `network_error` (DNS, connect, TLS or the transfer
+deadline). The block is published unconditionally — a disabled fetch still
+reports `enabled: false` with `last_result: "disabled"` — so a probe never sees
+a blank column. The counters are supervisor-owned and reset only by
+`supervisor_bep51_fetch_reset()`; `--fetch-bep51-cache` runs without a
+supervisor and logs the same verdict as a single-shot line instead.
+
 ### Configuration
 
 Edit `config.ini` to customize behavior. Key settings:

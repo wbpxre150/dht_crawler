@@ -174,6 +174,24 @@ typedef struct supervisor {
     char bep51_cache_ca_file[512];
     char bep51_cache_ca_dir[512];
     int bep51_cache_submit_percent;
+    /* Published-cache fetch outcome, published as /stats bep51_cache_fetch.
+     * Written by the cold-start fetch in supervisor_start() and read by the
+     * civetweb workers, so every numeric field is atomic; the error text is
+     * guarded by bep51_fetch_lock. calloc() already yields the all-zero state
+     * (BEP51_FETCH_NOT_ATTEMPTED), and supervisor_bep51_fetch_reset() is the
+     * one place that returns it there, so a restarted fetch never inherits a
+     * stale verdict. */
+    atomic_uint_fast64_t bep51_fetch_attempts;
+    atomic_uint_fast64_t bep51_fetch_successes;
+    atomic_uint_fast64_t bep51_fetch_failures;
+    atomic_int bep51_fetch_last_result;      /* bep51_cache_fetch_result_t */
+    atomic_int bep51_fetch_last_http_status;
+    atomic_uint_fast64_t bep51_fetch_last_bytes;
+    atomic_uint_fast64_t bep51_fetch_last_nodes;
+    atomic_uint_fast64_t bep51_fetch_last_duration_ms;
+    atomic_uint_fast64_t bep51_fetch_last_at_epoch;
+    pthread_mutex_t bep51_fetch_lock;        /* protects bep51_fetch_last_error */
+    char bep51_fetch_last_error[192];
 
     /* Stage 3 settings (BEP51) */
     int infohash_queue_capacity;
@@ -420,3 +438,46 @@ int supervisor_get_total_connections(supervisor_t *sup);
 void supervisor_get_draining_stats(supervisor_t *sup, int *count, int *max_count, int *total_connections);
 
 #endif /* SUPERVISOR_H */
+
+/**
+ * One published-cache fetch outcome, as /stats bep51_cache_fetch publishes it.
+ *
+ * `enabled` is derived from the configured URL, so a crawler with no URL still
+ * reports the block (enabled false, last_result "disabled") instead of leaving
+ * a column blank.
+ */
+typedef struct {
+    int enabled;             /*: 1 = bep51_cache_url is configured */
+    int last_result;         /*: bep51_cache_fetch_result_t */
+    uint64_t attempts;
+    uint64_t successes;
+    uint64_t failures;
+    int last_http_status;
+    uint64_t last_bytes;
+    uint64_t last_nodes;
+    uint64_t last_duration_ms;
+    uint64_t last_at_epoch;
+    char last_error[192];
+} bep51_fetch_stats_t;
+
+/**
+ * Reset every fetch counter and the error text to the "never attempted" state.
+ * Called from supervisor_create(); the only other writer is
+ * supervisor_bep51_fetch_record().
+ */
+void supervisor_bep51_fetch_reset(supervisor_t *sup);
+
+/**
+ * Record one completed fetch: bumps `attempts`, plus `successes` on
+ * BEP51_FETCH_OK or `failures` otherwise (DISABLED and NOT_ATTEMPTED are
+ * policy states, not failures), and stores every last_* field.
+ */
+void supervisor_bep51_fetch_record(supervisor_t *sup, int result, int http_status,
+                                   uint64_t bytes, uint64_t nodes, uint64_t duration_ms,
+                                   const char *error);
+
+/**
+ * Snapshot the fetch counters for /stats. Never NULL, always populated: a
+ * process that never fetched reports last_result NOT_ATTEMPTED.
+ */
+void supervisor_bep51_fetch_stats(supervisor_t *sup, bep51_fetch_stats_t *out);
