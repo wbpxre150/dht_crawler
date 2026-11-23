@@ -1,16 +1,16 @@
 # config.ini — get_peers & metadata-fetch tuning (patch 19)
 
 Scope: this page documents the `config.ini` keys that crawler **patch 19**
-(`patches/getpeers-metadata-tuning.patch`) added or changed, with their shipped defaults, accepted ranges
+added or changed, with their shipped defaults, accepted ranges
 and semantics. It is not a full `config.ini` reference — for the complete key inventory read
 `src/config.c` (`config_load_file`) and the sanitized app-side template
 `app/src/main/assets/dht_crawler/config.ini.default`, which carries these seven keys with comments.
 
-Patch 21 (`patches/metadata-peer-fail-map.patch`) adds one key to this page,
+Patch 21 (in-tree) adds one key to this page,
 `tree_metadata_peer_blacklist_ttl_sec` — the per-address TCP connect-failure memory — under the same
 fail-open contract: `0` is the shipped value and restores legacy peer selection exactly. The two later
-patches of this run add **no key**: patch 22 (`patches/meta-peer-fail-capacity.patch`) only resizes that
-map's capacity, and patch 23 (`patches/bep51-funnel-stats.patch`) only adds `/stats` counters — see the
+patches of this run add **no key**: patch 22 only resizes that
+map's capacity, and patch 23 only adds `/stats` counters — see the
 last section for both.
 
 All values are parsed with `atoi`, so `= true` parses as `0`. **Every one of these keys ships at its legacy
@@ -109,7 +109,7 @@ window to the next untried peer.
 ## tree_metadata_peer_blacklist_ttl_sec
 
 Per-address TCP connect-failure memory for the BEP9/10 fetcher (patch 21,
-`patches/metadata-peer-fail-map.patch`). Measured baseline: ~83 % of the metadata failure mass is a TCP
+Measured baseline: ~83 % of the metadata failure mass is a TCP
 connect that never completes, and the peer list handed to a fetch is arrival-ordered with no dedup, so the
 same unreachable address is retried across infohashes and across trees. Every site that counts
 `metadata_failures.connect_total` also records the *address* into one supervisor-shared map

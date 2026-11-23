@@ -16,6 +16,11 @@ make clean        # Remove build/ and ./dht_crawler
 System dependencies: `libuv`, `libsqlite3`, `libssl`, `libcrypto`, `libpthread`.
 
 The first `make` automatically applies patches to `lib/bencode-c` and `lib/civetweb`, and builds `lib/libbloom`. No other setup required.
+Provenance: this repository used to ship most of its features as `.patch` files applied at build time by
+an external (Android) build. They are now committed directly to the tree, one commit per former patch, so
+the crawler builds and runs standalone. `patches/` keeps only the three fixes that patch third-party
+submodules (`lib/bencode-c`, `lib/civetweb`); `make` applies those automatically. Docs below still label
+the features "patch NN" — that is the historical series number, not a file to apply.
 
 ### CLI Flags
 
@@ -169,7 +174,7 @@ lazy TTL ageing on the lookup/insert path only (no thread, no sweep; the load-fa
 slots is fail-open). The capacity is sized by the TTL working set — 131,072 × 3/4 = 98,304 clear threshold >
 the ~66,000–79,800 entries a 600 s TTL accumulates at the measured ~110–133 NEW distinct fail addresses/s
 (~23 % margin) — because at 8192 slots the table was wiped every ~50–70 s and `expired_total` stayed 0, i.e.
-entries died by capacity clear and never by TTL (patch 22, `patches/meta-peer-fail-capacity.patch`). It is deliberately the opposite of the infohash strike blooms: address-keyed, TTL-aged and
+entries died by capacity clear and never by TTL (patch 22, in-tree as `META_PEER_FAIL_CAPACITY` in `include/meta_peer_fail.h`). It is deliberately the opposite of the infohash strike blooms: address-keyed, TTL-aged and
 consulted at *selection* rather than at *outcome*.
 
 - **Fail-open is absolute.** `ttl_sec = 0` never creates the map, so every lookup answers "do not skip" and
@@ -195,7 +200,7 @@ consulted at *selection* rather than at *outcome*.
 
 ### BEP51 query + dedup funnel (patch 23)
 
-Patch 23 (`patches/bep51-funnel-stats.patch`, last in the chain) is **instrumentation only** — no config
+Patch 23 (the last of the merged series) is **instrumentation only** — no config
 key, no behaviour change. Eight per-tree atomics are published as `trees[].bep51.*` and summed as
 `supervisor.bep51.*` (cumulative-folded at respawn like the `gp_*` counters):
 `queries_sent_total` (the `sample_infohashes` send), `responses_received_total` and `timeouts_total` (the
