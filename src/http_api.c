@@ -93,8 +93,9 @@ typedef struct {
     int has_min_conf;
     double min_conf;
     /* Stage 8: movie_kind_mask facet. movie_genre_bits is the OR of 1<<j for
-     * every selected CLS_MOVIE_KIND_NAMES entry; movie_none covers the rows
-     * with no genre verdict (mask SQL NULL or 0). The two OR together. */
+     * every selected CLS_MOVIE_KIND_NAMES entry and the genre test is
+     * conjunctive: a row must carry ALL of them. movie_none covers the rows
+     * with no genre verdict (mask SQL NULL or 0) and ORs into that. */
     int has_movie_kind;
     int movie_genre_bits;
     int movie_none;
@@ -273,9 +274,9 @@ static int parse_class_filter(const char *query_string, cls_filter_t *out, const
         int bits = 0;
         int none = 0;
         out->present = 1;
-        /* Comma-separated tokens with OR semantics: "none" selects the rows
-         * with no genre verdict (mask NULL or 0), every other token a genre
-         * bit. Unknown tokens are a 400. */
+        /* Comma-separated genre tokens are conjunctive: a row must carry ALL
+         * of them. "none" selects the rows with no genre verdict (mask NULL
+         * or 0) and ORs into that. Unknown tokens are a 400. */
         char *tok = movie_buf;
         while (*tok) {
             char *comma = strchr(tok, ',');
@@ -370,17 +371,21 @@ static int append_class_conditions(char *buf, size_t bufsize, int *pos,
 
     /* Stage 8: movie_kind_mask. SQLite's & is a plain INTEGER bit test and a
      * NULL mask makes it NULL (never true), so "none" needs its own explicit
-     * IS NULL arm. Only the genre-mask form consumes a bind. */
+     * IS NULL arm. The genre test is conjunctive — (mask & want) = want — and
+     * the one numbered bind is referenced twice, which SQLite counts as a
+     * single parameter, so bind_class_filter() stays as it is. Only the
+     * genre-mask form consumes a bind. */
     if (rc == 0 && f->has_movie_kind) {
         if (f->movie_genre_bits != 0 && f->movie_none) {
             rc = sb_append(buf, bufsize, &sp,
-                           " AND ((c.movie_kind_mask & ?%d) <> 0"
+                           " AND ((c.movie_kind_mask & ?%d) = ?%d"
                            " OR c.movie_kind_mask IS NULL OR c.movie_kind_mask = 0)",
-                           first_bind + binds);
+                           first_bind + binds, first_bind + binds);
             if (rc == 0) binds++;
         } else if (f->movie_genre_bits != 0) {
-            rc = sb_append(buf, bufsize, &sp, " AND (c.movie_kind_mask & ?%d) <> 0",
-                           first_bind + binds);
+            rc = sb_append(buf, bufsize, &sp,
+                           " AND (c.movie_kind_mask & ?%d) = ?%d",
+                           first_bind + binds, first_bind + binds);
             if (rc == 0) binds++;
         } else {
             rc = sb_append(buf, bufsize, &sp,
@@ -1497,8 +1502,8 @@ static int random_handler(struct mg_connection *conn, void *cbdata) {
     if (mg_get_var(qs, qs_len, "movie_kind", buf, sizeof(buf)) > 0) {
         int bits = 0;
         int none = 0;
-        /* Same rules as parse_class_filter(): comma-separated genre names or
-         * "none", OR semantics, unknown token = 400. */
+        /* Same rules as parse_class_filter(): comma-separated genre names
+         * (all of them must match) or "none" (an OR arm), unknown token = 400. */
         char *tok = buf;
         while (*tok) {
             char *comma = strchr(tok, ',');
@@ -2792,6 +2797,19 @@ static int browse_handler(struct mg_connection *conn, void *cbdata) {
  * NULL when it has never had a movie genre verdict). */
 #define RANDOM_CLASS_SQL_EX "SELECT category, tv_kind, adult, movie_kind_mask FROM torrent_class WHERE torrent_id = ?"
 
+/* Pure mirror of the genre test append_class_conditions() puts in SQL: a row
+ * matches the selected genres only when it carries ALL of them, and "none"
+ * (no mask, or mask 0) is an additional OR arm. The want_bits != 0 guard is
+ * load-bearing — without it a "none"-only filter would match every classified
+ * row, because (0 & mask) == 0 always holds. Non-static so the host test can
+ * pin the /random probe path. */
+int cls_movie_kind_row_matches(int want_bits, int want_none, int has_mask,
+                               long long mask) {
+    int genre_hit = (want_bits != 0 && has_mask && (want_bits & (int)mask) == want_bits);
+    int none_hit = (!has_mask || mask == 0);
+    return genre_hit || (want_none && none_hit);
+}
+
 /* Class-first candidate test for /random. A torrent with a class row is judged
  * by that row alone (adult per adult_mode, then category / tv_kind equality).
  * A torrent with no class row is eligible only when the caller passed no real
@@ -2854,13 +2872,14 @@ static int random_candidate_eligible_ex(database_t *db, sqlite3_stmt *class_stmt
             if (!*has_tv_kind || *tv_kind != want_tv_kind) return 0;
         }
 
-        /* Stage 8: movie_kind — OR of the selected genre bits and/or "none"
-         * (mask NULL or 0), the same criteria append_class_conditions() puts in
-         * SQL. */
+        /* Stage 8: movie_kind — rows must carry ALL the selected genre bits;
+         * "none" (mask NULL or 0) is an OR arm, the same criteria
+         * append_class_conditions() puts in SQL. */
         if (want_movie_bits != 0 || want_movie_none) {
-            int genre_hit = (*has_movie_kind && (want_movie_bits & *movie_kind_mask) != 0);
-            int none_hit = (!*has_movie_kind || *movie_kind_mask == 0);
-            if (!genre_hit && !(want_movie_none && none_hit)) return 0;
+            if (!cls_movie_kind_row_matches(want_movie_bits, want_movie_none,
+                                            *has_movie_kind, *movie_kind_mask)) {
+                return 0;
+            }
         }
 
         return 1;

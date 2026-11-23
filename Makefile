@@ -205,8 +205,23 @@ MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
 MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
 MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
 
+# The movie-kind filter test compiles src/http_api.c INTO its translation unit
+# (#include "../src/http_api.c"): cls_filter_t, append_class_conditions() and
+# bind_class_filter() are file-local there, and going through the real fragment
+# builder is the point of the test -- a copy of the predicate could not catch a
+# regression. -ffunction-sections plus --gc-sections then drop everything in
+# http_api.c the test does not reach, so the civetweb / movie_kind / supervisor
+# modules never enter the link and the binary needs only SQLite, libuv and the
+# bloom archive that src/database.c pulls in.
+MOVIE_KIND_FILTER_TEST_SRCS = tests/test_movie_kind_filter.c src/database.c \
+                              src/bloom_filter.c tests/stub_log.c
+MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
+MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
+MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+
 tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind \
-       tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon
+       tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon \
+       tests-movie-kind-filter
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -249,6 +264,11 @@ tests-movie-backfill-daemon: libbloom
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(MOVIE_BACKFILL_DAEMON_TEST_SRCS) -o $(MOVIE_BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS)
 	./$(MOVIE_BACKFILL_DAEMON_TEST_BIN)
+
+tests-movie-kind-filter: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_FILTER_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_FILTER_TEST_SRCS) -o $(MOVIE_KIND_FILTER_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_FILTER_TEST_LDFLAGS)
+	./$(MOVIE_KIND_FILTER_TEST_BIN)
 
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
@@ -298,4 +318,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
