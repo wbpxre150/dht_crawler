@@ -131,7 +131,7 @@ void config_init_defaults(crawler_config_t *config) {
      * is the measured steady state, and 82 °C is the backfill engine's pause
      * threshold. */
     config->movie_kind_enabled = 1;
-    strncpy(config->movie_kind_model_dir, "models/v10", sizeof(config->movie_kind_model_dir) - 1);
+    strncpy(config->movie_kind_model_dir, "models/v13", sizeof(config->movie_kind_model_dir) - 1);
     config->movie_kind_threads = 4;
     config->movie_kind_thermal_backoff_c = 82;
 

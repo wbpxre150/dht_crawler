@@ -58,7 +58,7 @@
 #define MOVIE_KIND_PROMPT_SUFFIX "\nFilm genres:"
 
 /*: Default model directory, cwd-relative like the keyword files and `models/v1`. */
-#define MOVIE_KIND_MODEL_DIR_DEFAULT "models/v10"
+#define MOVIE_KIND_MODEL_DIR_DEFAULT "models/v13"
 
 typedef struct {
     int enabled;                 /* 1 when movie_kind_init() verified the manifest
