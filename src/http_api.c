@@ -1445,6 +1445,31 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(aggregate, "metadata_fetch_success_percent",
                                 metadata_fetch_success_percent);
 
+        /* Last-interval (windowed) siblings of the lifetime numbers above
+         * (patch 20). Same numerators and denominators, but sampled by the
+         * supervisor monitor thread over its last completed 10 s tick, so one
+         * snapshot reports the current rate instead of a since-start average.
+         * stats_interval_sec is the elapsed time of that tick (measured, not
+         * assumed): rate = value / stats_interval_sec. Until the second tick
+         * has completed the counters are 0 and so is stats_interval_sec. */
+        uint64_t interval_attempts =
+            atomic_load(&api->supervisor->interval_metadata_attempts);
+        uint64_t interval_fetched =
+            atomic_load(&api->supervisor->interval_metadata_fetched);
+
+        cJSON_AddNumberToObject(aggregate, "metadata_attempts_last_interval",
+                                (double)interval_attempts);
+        cJSON_AddNumberToObject(aggregate, "metadata_fetched_last_interval",
+                                (double)interval_fetched);
+
+        double metadata_fetch_success_percent_last_interval = 0.0;
+        if (interval_attempts > 0) {
+            metadata_fetch_success_percent_last_interval =
+                (interval_fetched * 100.0) / (double)interval_attempts;
+        }
+        cJSON_AddNumberToObject(aggregate, "metadata_fetch_success_percent_last_interval",
+                                metadata_fetch_success_percent_last_interval);
+
         /* get_peers yield, same totals the supervisor block publishes, repeated at
          * aggregate level with both counters beside the percentage. */
         uint64_t agg_gp_lookups = 0;
@@ -1461,6 +1486,28 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
             get_peers_yield_percent = (agg_gp_with_peers * 100.0) / (double)agg_gp_lookups;
         }
         cJSON_AddNumberToObject(aggregate, "get_peers_yield_percent", get_peers_yield_percent);
+
+        /* Last-interval get_peers siblings, same window as above. */
+        uint64_t interval_gp_lookups =
+            atomic_load(&api->supervisor->interval_gp_lookups);
+        uint64_t interval_gp_with_peers =
+            atomic_load(&api->supervisor->interval_gp_with_peers);
+
+        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_last_interval",
+                                (double)interval_gp_lookups);
+        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_with_peers_last_interval",
+                                (double)interval_gp_with_peers);
+
+        double get_peers_yield_percent_last_interval = 0.0;
+        if (interval_gp_lookups > 0) {
+            get_peers_yield_percent_last_interval =
+                (interval_gp_with_peers * 100.0) / (double)interval_gp_lookups;
+        }
+        cJSON_AddNumberToObject(aggregate, "get_peers_yield_percent_last_interval",
+                                get_peers_yield_percent_last_interval);
+
+        cJSON_AddNumberToObject(aggregate, "stats_interval_sec",
+                                atomic_load(&api->supervisor->interval_elapsed_sec));
 
         cJSON_AddItemToObject(root, "aggregate", aggregate);
     }

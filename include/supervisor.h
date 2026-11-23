@@ -271,6 +271,20 @@ typedef struct supervisor {
     atomic_uint_fast64_t cumulative_gp_slot_expired_total;
     atomic_uint_fast64_t cumulative_gp_early_finish_total;
 
+    /* Last-interval ("windowed") rate publishing (patch 20). Every counter
+     * above is cumulative since process start, so one /stats snapshot cannot
+     * say how fast anything is happening right now. The monitor thread samples
+     * the same cumulative+live folds every 10 s (src/stats_window.c) and stores
+     * the delta since its previous tick here; /stats publishes them beside the
+     * lifetime totals as *_last_interval. All zeros until the second tick.
+     * Atomic because the civetweb worker threads read them while the monitor
+     * thread writes them (unlike the non-atomic per-tree metadata_rate). */
+    atomic_uint_fast64_t interval_metadata_attempts;
+    atomic_uint_fast64_t interval_metadata_fetched;
+    atomic_uint_fast64_t interval_gp_lookups;
+    atomic_uint_fast64_t interval_gp_with_peers;
+    atomic_int interval_elapsed_sec;   /* seconds the last completed interval covered */
+
     /* Monitor thread */
     pthread_t monitor_thread;
 

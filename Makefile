@@ -129,6 +129,16 @@ INFLIGHT_TEST_SRCS = tests/test_inflight_set.c src/inflight_set.c tests/stub_log
 INFLIGHT_TEST_BIN = $(BUILD_DIR)/test_inflight_set
 INFLIGHT_TEST_LDFLAGS = -luv -lpthread
 
+# The last-interval stats sampler is pure arithmetic over four counters: no
+# database, no bloom filter, no uv loop, no civetweb, no logging, so this test
+# needs only the module and the test itself. It covers the first-tick zeros, the
+# monotonic deltas, the saturating backwards jump per counter and the snapshot
+# advance.
+STATS_WINDOW_TEST_SRCS = tests/test_stats_window.c src/stats_window.c
+STATS_WINDOW_TEST_BIN = $(BUILD_DIR)/test_stats_window
+STATS_WINDOW_TEST_CFLAGS =
+STATS_WINDOW_TEST_LDFLAGS =
+
 # The backfill test defines its own stub classifier symbols (models_loaded,
 # current_version, write_meta, classify) so it never links src/classifier.c:
 # the host build compiles that module inert, which could never insert a row.
@@ -245,7 +255,7 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-inflight tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-search tests-docs tests-inflight tests-stats-window tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
 
@@ -258,6 +268,11 @@ tests-inflight:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(INFLIGHT_TEST_SRCS) -o $(INFLIGHT_TEST_BIN) $(TEST_LDFLAGS) $(INFLIGHT_TEST_LDFLAGS)
 	./$(INFLIGHT_TEST_BIN)
+
+tests-stats-window:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(STATS_WINDOW_TEST_CFLAGS) $(INCLUDES) $(STATS_WINDOW_TEST_SRCS) -o $(STATS_WINDOW_TEST_BIN) $(TEST_LDFLAGS) $(STATS_WINDOW_TEST_LDFLAGS)
+	./$(STATS_WINDOW_TEST_BIN)
 
 tests-docs: libbloom
 	@mkdir -p $(BUILD_DIR)
@@ -354,4 +369,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

@@ -12,6 +12,7 @@
 #include "tree_routing.h"
 #include "keyspace.h"
 #include "tree_infohash_queue.h"
+#include "stats_window.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -181,6 +182,13 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_gp_miss_penalties, 0);
     atomic_init(&sup->cumulative_gp_slot_expired_total, 0);
     atomic_init(&sup->cumulative_gp_early_finish_total, 0);
+
+    /* Last-interval (windowed) rate publishing (patch 20) */
+    atomic_init(&sup->interval_metadata_attempts, 0);
+    atomic_init(&sup->interval_metadata_fetched, 0);
+    atomic_init(&sup->interval_gp_lookups, 0);
+    atomic_init(&sup->interval_gp_with_peers, 0);
+    atomic_init(&sup->interval_elapsed_sec, 0);
 
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
@@ -1119,6 +1127,12 @@ static void *monitor_thread_func(void *arg) {
     /* Periodic BEP51 cache save; zero-initialized to mark "not yet recorded" */
     struct timespec last_save_ts = {0, 0};
 
+    /* Last-interval rate sampler (patch 20): monitor-thread-private state, one
+     * sample per 10 s tick. Zero-initialized so the first tick only records the
+     * baseline (it publishes all-zero deltas and stats_interval_sec 0). */
+    stats_window_t window = {0};
+    struct timespec last_window_ts = {0, 0};
+
     while (atomic_load(&sup->monitor_running)) {
         /* Sleep in small chunks (1 second) to be responsive to shutdown */
         for (int i = 0; i < 10 && atomic_load(&sup->monitor_running); i++) {
@@ -1128,6 +1142,55 @@ static void *monitor_thread_func(void *arg) {
 
         if (!atomic_load(&sup->monitor_running)) {
             break;
+        }
+
+        /* Publish last-interval (windowed) rates. The lifetime counters are
+         * cumulative since process start, so a reader cannot tell the current
+         * rate from one snapshot; this samples the same totals stats_handler()
+         * publishes (cumulative respawn buckets + live trees) and stores the
+         * delta since the previous tick. Deliberately NOT supervisor_stats():
+         * that folds six more counters this sampler does not need. The elapsed
+         * time is measured, not assumed, because the tick sleeps in 1 s chunks
+         * and can overshoot. */
+        {
+            uint64_t win_attempts = atomic_load(&sup->cumulative_metadata_attempts);
+            uint64_t win_fetched = atomic_load(&sup->cumulative_metadata_count);
+            uint64_t win_lookups = 0;
+            uint64_t win_with_peers = 0;
+            uint64_t win_deltas[4] = {0, 0, 0, 0};
+            struct timespec now_window_ts;
+            int interval_sec = 0;
+
+            pthread_mutex_lock(&sup->trees_lock);
+            for (int i = 0; i < sup->max_trees; i++) {
+                thread_tree_t *t = sup->trees[i];
+                if (!t) continue;
+                win_attempts += atomic_load(&t->metadata_attempts);
+                win_fetched += atomic_load(&t->metadata_count);
+            }
+            pthread_mutex_unlock(&sup->trees_lock);
+
+            /* Same cumulative+live fold /stats uses for the get_peers totals */
+            supervisor_getpeers_stats(sup, &win_lookups, &win_with_peers,
+                                      NULL, NULL, NULL, NULL, NULL);
+
+            stats_window_sample(&window, win_attempts, win_fetched,
+                                win_lookups, win_with_peers, win_deltas);
+
+            clock_gettime(CLOCK_MONOTONIC, &now_window_ts);
+            if (last_window_ts.tv_sec != 0 || last_window_ts.tv_nsec != 0) {
+                interval_sec = (int)(now_window_ts.tv_sec - last_window_ts.tv_sec);
+                if (interval_sec < 0) {
+                    interval_sec = 0;   /* monotonic clock: defensive only */
+                }
+            }
+            last_window_ts = now_window_ts;
+
+            atomic_store(&sup->interval_metadata_attempts, win_deltas[0]);
+            atomic_store(&sup->interval_metadata_fetched, win_deltas[1]);
+            atomic_store(&sup->interval_gp_lookups, win_deltas[2]);
+            atomic_store(&sup->interval_gp_with_peers, win_deltas[3]);
+            atomic_store(&sup->interval_elapsed_sec, interval_sec);
         }
 
         /* Check tree performance */
