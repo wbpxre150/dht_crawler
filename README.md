@@ -54,6 +54,56 @@ The first build automatically:
 - Builds `lib/libbloom` as a static library
 - Creates `data/` directory for the database and caches
 
+### Classifiers (optional, but they are the point)
+
+A plain `make` crawls and classifies nothing: `src/classifier.c` and
+`src/movie_kind.c` compile inert unless the build defines `CLF_ENABLED` /
+`MK_ENABLED`. Two extra flavours turn the engines on, and one command fetches the
+weights they serve with.
+
+```bash
+make models     # ~490 MB: v15 CRAM + v13 movie-kind, sha256-verified into ./models
+make clf        # CRAM only  -> build/clf/dht_crawler   (category, tv_kind, adult)
+make llama      # builds the pinned llama.cpp (18ab62a8) into build/llama-install
+make full       # CRAM + movie-kind -> build/full/dht_crawler
+```
+
+`make models` pulls from `https://unjumble.au/bep51/models/<gen>/` and verifies
+every file against the sha256 pinned in `tools/fetch-models.sh` before installing
+it; the crawler re-verifies at load. `./models/v13` and `./models/v15` are the
+compiled-in defaults (`movie_kind_model_dir`, `classifier_model_dir`), so a plain
+`./build/full/dht_crawler` picks them up with no config change. Override the
+source with `--base URL` and the generation with `--gen v13|v15`.
+
+Without the weights, or without the flavours, the crawler still crawls: the
+classifier degrades all-or-nothing (parser hint, `clf_ver` 0,
+`parser_only_fallback`) and `movie_kind` reports `enabled: false`. `/stats`
+publishes both states, so a silent degradation is visible.
+
+### BEP51 cache
+
+The crawler starts instantly when it already knows BEP51-capable nodes, and
+aborts when a cold cache cannot discover `global_bootstrap_target` nodes in time.
+So on a cold start it first fetches the published cache, and only falls back to
+router discovery if that fails:
+
+```bash
+./dht_crawler --fetch-bep51-cache     # refresh data/bep51_cache.dat and exit
+```
+
+| key | default | meaning |
+|---|---|---|
+| `bep51_cache_url` | `https://unjumble.au/bep51/bep51_cache.dat` | published cache; empty disables the fetch |
+| `bep51_cache_fetch_timeout_sec` | `30` | total deadline for the transfer (1..600) |
+| `bep51_cache_ca_file` / `_dir` | empty | CA overrides; empty = the system trust store |
+
+The download is validated with the loader's own magic + sha256 checks against a
+scratch cache, and the file is renamed into place only on success — a failed,
+truncated or corrupt download leaves the existing cache untouched and the crawler
+falls through to the router bootstrap exactly as before. HTTPS is verified against
+the system store with hostname (or IP SAN) checking; there is no "accept anything"
+mode.
+
 ### Configuration
 
 Edit `config.ini` to customize behavior. Key settings:

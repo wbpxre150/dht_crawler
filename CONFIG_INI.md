@@ -13,6 +13,10 @@ patches of this run add **no key**: patch 22 only resizes that
 map's capacity, and patch 23 only adds `/stats` counters — see the
 last section for both.
 
+Not covered here: the published-cache download keys (`bep51_cache_url`,
+`bep51_cache_fetch_timeout_sec`, `bep51_cache_ca_file`, `bep51_cache_ca_dir`) — see
+the "BEP51 cache" section of `README.md`.
+
 All values are parsed with `atoi`, so `= true` parses as `0`. **Every one of these keys ships at its legacy
 value — the tuning is opt-in.** Five of the seven treat `0` as "disabled / pre-patch behaviour"; all of them
 are fail-open to the old code path. The shipped defaults are the measured result: five 30-minute on-device

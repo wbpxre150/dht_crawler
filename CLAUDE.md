@@ -11,6 +11,12 @@ make asan         # Build with AddressSanitizer + UBSan
 make tsan         # Build with ThreadSanitizer
 make valgrind     # Debug build + valgrind wrapper
 make clean        # Remove build/ and ./dht_crawler
+
+# Classifier flavours (the plain build compiles both engines inert)
+make models       # fetch + verify the v13/v15 weights into ./models (~490 MB)
+make clf          # CRAM only      -> build/clf/dht_crawler
+make llama        # build pinned llama.cpp 18ab62a8 -> build/llama-install
+make full         # CRAM + movie-kind -> build/full/dht_crawler
 ```
 
 System dependencies: `libuv`, `libsqlite3`, `libssl`, `libcrypto`, `libpthread`.
@@ -27,10 +33,14 @@ the features "patch NN" — that is the historical series number, not a file to 
 ```
 ./dht_crawler [--rebuild-bloom-filter] [--compact]
               [--category-filter-update] [--check-database]
-              [--recover-database]
+              [--recover-database] [--fetch-bep51-cache]
 ```
 
 These are maintenance modes that exit after completing their task rather than running the crawler.
+`--fetch-bep51-cache` downloads `bep51_cache_url` (default the published
+`https://unjumble.au/bep51/bep51_cache.dat`) into `bep51_cache_path` and exits; the
+supervisor runs the same fetch automatically when its cache is below
+`global_bootstrap_target`, and falls back to router bootstrap if it fails.
 
 `--category-filter-update` purges the rows outside `save_categories`/`save_tv_kinds`
 and every adult-tagged row (`torrent_class.adult = 1`).
