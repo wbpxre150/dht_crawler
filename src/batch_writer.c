@@ -808,7 +808,11 @@ static void do_backup(batch_writer_t *writer) {
          * without it the INSERT ... SELECT * copies of torrent_class fail on a
          * column-count mismatch. */
         "  clf_ver INTEGER NOT NULL,"
-        "  movie_kind_mask INTEGER, movie_kind_clf_ver INTEGER);"
+        /* The adult-only generation rides last, in the same order the live DDL
+         * declares it, because the copies below are INSERT ... SELECT *: any
+         * other order silently writes adult_clf_ver into the wrong column. */
+        "  movie_kind_mask INTEGER, movie_kind_clf_ver INTEGER,"
+        "  adult_clf_ver INTEGER);"
         "CREATE INDEX IF NOT EXISTS idx_class_cat"
         "  ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
         "CREATE INDEX IF NOT EXISTS idx_class_ver"
@@ -838,7 +842,8 @@ static void do_backup(batch_writer_t *writer) {
     /* Widen a backup file created before the movie-kind columns existed, so the
      * INSERT ... SELECT * copies below keep matching the live schema. */
     if (backup_ensure_column(bak, "torrent_class", "movie_kind_mask", "INTEGER") != 0 ||
-        backup_ensure_column(bak, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0) {
+        backup_ensure_column(bak, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0 ||
+        backup_ensure_column(bak, "torrent_class", "adult_clf_ver", "INTEGER") != 0) {
         sqlite3_close(bak);
         goto done_fail;
     }

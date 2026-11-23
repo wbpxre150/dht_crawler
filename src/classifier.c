@@ -112,6 +112,7 @@ static struct {
     long long clf_ver;           /* model version string of the manifest */
     double adult_hide_threshold; /* effective tag threshold: config > manifest > default */
     double cfg_hide_threshold;   /* config adult_hide_threshold; 0 = config supplied none */
+    double adult_drop_threshold; /* manifest thresholds.adult_drop_threshold; 0 = not pinned */
     char model_dir[CLF_PATH_CAP];
     char adult_sha[CLF_SHA_HEX_LEN + 1];
     char category_sha[CLF_SHA_HEX_LEN + 1];
@@ -248,6 +249,18 @@ static void clf_load_manifest(void) {
                 clf.adult_hide_threshold);
     }
 
+    /* The calibrated drop threshold. It is deliberately NOT the tag boundary
+     * (that stays adult_hide_threshold): it is the number the operator reads
+     * back from /stats to confirm which generation's calibration is live. A
+     * manifest that omits it leaves 0.0, i.e. "not pinned", rather than
+     * inventing a second boundary. */
+    const cJSON *drop = thresholds
+                            ? cJSON_GetObjectItemCaseSensitive(thresholds, "adult_drop_threshold")
+                            : NULL;
+    if (cJSON_IsNumber(drop) && drop->valuedouble > 0.0 && drop->valuedouble <= 1.0) {
+        clf.adult_drop_threshold = drop->valuedouble;
+    }
+
     const cJSON *models = clf_json_object(root, "models");
     clf_manifest_sha(models, "adult", clf.adult_sha, sizeof(clf.adult_sha));
     clf_manifest_sha(models, "category", clf.category_sha, sizeof(clf.category_sha));
@@ -341,6 +354,16 @@ void classifier_init(const char *model_dir, double adult_hide_threshold) {
      * on, so /stats has to publish it rather than the config literal. */
     pthread_mutex_lock(&clf.stats_mutex);
     clf.stats.adult_hide_threshold = clf.adult_hide_threshold;
+    /* Provenance: what /stats reports as the live generation and the bytes it
+     * was produced from. Copied here, not read live, so a reader never sees a
+     * half-populated snapshot. */
+    clf.stats.adult_drop_threshold = clf.adult_drop_threshold;
+    snprintf(clf.stats.model_sha256_adult, sizeof clf.stats.model_sha256_adult, "%s",
+             clf.adult_sha);
+    snprintf(clf.stats.model_sha256_category, sizeof clf.stats.model_sha256_category, "%s",
+             clf.category_sha);
+    snprintf(clf.stats.model_sha256_tv_kind, sizeof clf.stats.model_sha256_tv_kind, "%s",
+             clf.tv_kind_sha);
     pthread_mutex_unlock(&clf.stats_mutex);
     if (!clf.manifest_ok) {
         /* Counted once: without the manifest none of the three models can be
@@ -487,6 +510,67 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     return 0;
 }
 
+/* Adult-only scoring, the token-gated backfill's entry point. The feature text
+ * is rendered exactly as classifier_classify() renders it (same buffer, same
+ * cap, same sizing call), so a backfilled verdict and an ingest verdict are
+ * produced from byte-identical input; only the students differ. */
+int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
+    if (adult) *adult = 0;
+    if (adult_p) *adult_p = 0.0;
+    if (!clf.enabled || !meta) return 1;
+    if (!clf.adult_model) return 1; /* no model: no verdict, leave the row alone */
+
+    int n_files = (meta->files && meta->num_files > 0) ? meta->num_files : 0;
+    tp_file_t *files = NULL;
+    if (n_files > 0) {
+        files = (tp_file_t *)malloc((size_t)n_files * sizeof(tp_file_t));
+        if (!files) {
+            log_msg(LOG_WARN, "Classifier: out of memory for %d files; no adult verdict",
+                    n_files);
+            return 1;
+        }
+        for (int i = 0; i < n_files; i++) {
+            files[i].path = meta->files[i].path ? meta->files[i].path : "";
+            files[i].size = meta->files[i].size_bytes;
+        }
+    }
+
+    const char *name = meta->name ? meta->name : "";
+    tp_result_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (tp_parse(name, files, n_files, meta->size_bytes, &parsed) != TP_OK) {
+        log_msg(LOG_WARN, "Classifier: tparse rejected '%s'; no adult verdict", name);
+        free(files);
+        return 1;
+    }
+
+    char feature[CLF_FEATURE_CAP];
+    size_t need = tp_feature_text(name, files, n_files, &parsed, NULL, 0);
+    size_t cap = sizeof(feature);
+    if (need + 1 < cap) cap = need + 1;
+    tp_feature_text(name, files, n_files, &parsed, feature, cap);
+    feature[cap - 1] = '\0';
+    free(files);
+
+    /* 0/1 softmax, identical to the ingest path: P(1) is the winning
+     * probability for label 1 and its complement when label 0 wins. */
+    int label = -1;
+    float prob = 0.0f;
+    if (ftc_predict(clf.adult_model, feature, 1, &label, &prob) <= 0) {
+        /* No prediction at all: report "no verdict" rather than a fabricated
+         * adult = 0, which would silently rewrite a good stored row. */
+        return 1;
+    }
+    double p = (label == 1) ? (double)prob : 1.0 - (double)prob;
+    if (p < 0.0) p = 0.0;
+    if (p > 1.0) p = 1.0;
+    if (adult_p) *adult_p = p;
+    if (adult) *adult = (p >= clf.adult_hide_threshold) ? 1 : 0;
+    /* Deliberately no stats bump: these are backfill rows, not ingest rows, and
+     * folding them into total_classified would distort mean_us_per_item (which
+     * measures the full three-student call). */
+    return 0;
+}
 void classifier_set_adult_mode(const char *adult_mode) {
     /* Race-free by contract: main.c calls this once, before any worker thread
      * exists. The stats mutex keeps it on the same publish/copy path as every
@@ -621,6 +705,14 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     return 1;
 }
 
+/* This flavour has no models and no tparse, so it never produces an adult
+ * verdict; every adult-backfill run reports DISABLED before it gets here. */
+int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
+    (void)meta;
+    if (adult) *adult = 0;
+    if (adult_p) *adult_p = 0.0;
+    return 1;
+}
 void classifier_set_adult_mode(const char *adult_mode) {
     /* Race-free by contract: main.c calls this once, before any worker thread
      * exists. The stats mutex keeps it on the same publish/copy path as every

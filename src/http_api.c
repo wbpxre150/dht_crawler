@@ -791,6 +791,20 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                                 clf_stats.adult_mode[0] ? clf_stats.adult_mode : "tag");
         cJSON_AddNumberToObject(classifier, "adult_hide_threshold",
                                 clf_stats.adult_hide_threshold);
+        /* Provenance of the live generation: the version the loaded manifest
+         * names, the calibrated drop threshold it carries, and the three model
+         * sha256s the loader verified. Without these a reader cannot tell which
+         * generation produced the rows it is looking at. */
+        cJSON_AddNumberToObject(classifier, "clf_ver",
+                                (double)classifier_current_version());
+        cJSON_AddNumberToObject(classifier, "adult_drop_threshold",
+                                clf_stats.adult_drop_threshold);
+        cJSON_AddStringToObject(classifier, "model_sha256_adult",
+                                clf_stats.model_sha256_adult);
+        cJSON_AddStringToObject(classifier, "model_sha256_category",
+                                clf_stats.model_sha256_category);
+        cJSON_AddStringToObject(classifier, "model_sha256_tv_kind",
+                                clf_stats.model_sha256_tv_kind);
         cJSON_AddNumberToObject(classifier, "total_classified", (double)clf_stats.total_classified);
 
         double mean_us = 0.0;
@@ -840,6 +854,31 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(classifier_backfill, "finished_at", (double)cb_stats.finished_at);
         cJSON_AddStringToObject(classifier_backfill, "last_error", cb_stats.last_error);
         cJSON_AddItemToObject(root, "classifier_backfill", classifier_backfill);
+    }
+
+    /* Adult backfill: the token-gated pass. Its own object because it reports
+     * its own counters (gated_out/scored/updated) and because "off" - the
+     * shipped classify_backfill_mode - must be visible as such rather than as a
+     * full re-classify that never happened. */
+    {
+        classify_backfill_daemon_adult_stats_t ab_stats;
+        classify_backfill_daemon_get_adult_stats(&ab_stats);
+
+        cJSON *adult_backfill = cJSON_CreateObject();
+        cJSON_AddStringToObject(adult_backfill, "state", ab_stats.state);
+        cJSON_AddNumberToObject(adult_backfill, "target_adult_clf_ver",
+                                (double)ab_stats.target_adult_clf_ver);
+        cJSON_AddNumberToObject(adult_backfill, "rows_total", (double)ab_stats.rows_total);
+        cJSON_AddNumberToObject(adult_backfill, "rows_gated_out",
+                                (double)ab_stats.rows_gated_out);
+        cJSON_AddNumberToObject(adult_backfill, "rows_scored", (double)ab_stats.rows_scored);
+        cJSON_AddNumberToObject(adult_backfill, "rows_updated", (double)ab_stats.rows_updated);
+        cJSON_AddNumberToObject(adult_backfill, "rows_failed", (double)ab_stats.rows_failed);
+        cJSON_AddNumberToObject(adult_backfill, "last_id", (double)ab_stats.last_id);
+        cJSON_AddNumberToObject(adult_backfill, "started_at", (double)ab_stats.started_at);
+        cJSON_AddNumberToObject(adult_backfill, "finished_at", (double)ab_stats.finished_at);
+        cJSON_AddStringToObject(adult_backfill, "last_error", ab_stats.last_error);
+        cJSON_AddItemToObject(root, "adult_backfill", adult_backfill);
     }
 
     /* Movie-kind (v9 JEV head): counters, present even at zero, so a dashboard

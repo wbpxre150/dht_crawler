@@ -138,8 +138,8 @@ BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom
 # stubs, exactly like the backfill test above.
 BACKFILL_DAEMON_TEST_SRCS = tests/test_classify_backfill_daemon.c \
                             src/classify_backfill_daemon.c \
-                            src/classify_backfill.c src/database.c \
-                            src/bloom_filter.c tests/stub_log.c
+                            src/classify_backfill.c src/adult_backfill.c \
+                            src/database.c src/bloom_filter.c tests/stub_log.c
 BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_classify_backfill_daemon
 BACKFILL_DAEMON_TEST_CFLAGS = -DCLF_BACKFILL_DAEMON_TEST
 BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
@@ -209,6 +209,21 @@ MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
 MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
 MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
 
+# The adult-backfill engine test links the real src/adult_backfill.c and drives
+# it with -DADULT_BACKFILL_TEST, which exposes the verdict seam AND the gate
+# seam. The token gate needs tparse, which this build does not have, so the real
+# gate answers "nothing gated out"; the test installs its own gate instead and
+# drives the SQL, the gate, the UPDATE and the watermark path with canned
+# verdicts - exactly what the model-free host build can verify (the real gate is
+# covered by the clf-backfill smoke run and by G1's parser parity). It defines
+# its own classifier symbols instead of linking src/classifier.c, which compiles
+# inert on the host (same trick tests-backfill plays).
+ADULT_BACKFILL_TEST_SRCS = tests/test_adult_backfill.c src/adult_backfill.c \
+                           src/database.c src/bloom_filter.c tests/stub_log.c
+ADULT_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_adult_backfill
+ADULT_BACKFILL_TEST_CFLAGS = -DADULT_BACKFILL_TEST
+ADULT_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
+
 # The movie-kind filter test compiles src/http_api.c INTO its translation unit
 # (#include "../src/http_api.c"): cls_filter_t, append_class_conditions() and
 # bind_class_filter() are file-local there, and going through the real fragment
@@ -223,9 +238,9 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind \
-       tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon \
-       tests-movie-kind-filter
+tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill \
+       tests-movie-kind tests-movie-kind-render tests-movie-backfill \
+       tests-movie-backfill-daemon tests-movie-kind-filter
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -273,6 +288,11 @@ tests-movie-kind-filter: libbloom
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_FILTER_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_FILTER_TEST_SRCS) -o $(MOVIE_KIND_FILTER_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_FILTER_TEST_LDFLAGS)
 	./$(MOVIE_KIND_FILTER_TEST_BIN)
+
+tests-adult-backfill: libbloom
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(ADULT_BACKFILL_TEST_CFLAGS) $(INCLUDES) $(ADULT_BACKFILL_TEST_SRCS) -o $(ADULT_BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(ADULT_BACKFILL_TEST_LDFLAGS)
+	./$(ADULT_BACKFILL_TEST_BIN)
 
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
@@ -322,4 +342,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

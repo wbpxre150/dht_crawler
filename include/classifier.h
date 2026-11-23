@@ -60,6 +60,15 @@ typedef struct {
     uint64_t hard_block_dropped;   /* rows dropped by the hard block list */
     uint64_t tv_kind_model_used;   /* items where the tv_kind student was consulted */
     uint64_t by_category[CLASSIFIER_NUM_CATEGORIES]; /* per category, all items */
+    /* Provenance the dashboard reads back (exit criteria 2/3). These are
+     * module state rather than counters, but /stats renders them beside the
+     * threshold it already takes from here, so they ride the same snapshot.
+     * 0.0 / "" mean "the manifest named nothing" (and, for the inert host
+     * build, "no manifest was ever read"). */
+    double adult_drop_threshold; /* manifest thresholds.adult_drop_threshold */
+    char model_sha256_adult[65]; /* manifest models.adult, lowercase hex */
+    char model_sha256_category[65];
+    char model_sha256_tv_kind[65];
 } classifier_stats_t;
 
 /*
@@ -100,6 +109,26 @@ void classifier_init(const char *model_dir, double adult_hide_threshold);
  *         and no torrent_class row is written.
  */
 int classifier_classify(const torrent_metadata_t *meta, classification_t *out);
+
+/*
+ * Score ONLY the adult student for one torrent.
+ *
+ * The token-gated adult backfill needs the adult verdict of a row it has
+ * already established is worth scoring, and nothing else: running the full
+ * classifier_classify() would pay for the category student on every gated row
+ * and would couple the pass to a category model that may have failed to load.
+ * The feature text is rendered once (tparse), then predicted with the adult
+ * model alone; the returned verdict uses the same rule as the ingest path
+ * (adult = adult_p >= the effective adult hide threshold) so a backfilled row
+ * and a freshly ingested one can never disagree about the boundary.
+ *
+ * @return 0 and both out-parameters filled on success; 1 when no verdict is
+ *         available (feature off, built without CLF_ENABLED, adult model not
+ *         loaded, tparse rejected the name, or the student predicted nothing),
+ *         in which case the caller must leave the stored row untouched rather
+ *         than downgrade a good one. Either out-parameter may be NULL.
+ */
+int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p);
 
 /* Copy the current counters into *out (zeroed when classification is off). */
 void classifier_get_stats(classifier_stats_t *out);

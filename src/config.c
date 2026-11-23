@@ -122,6 +122,10 @@ void config_init_defaults(crawler_config_t *config) {
     strncpy(config->adult_mode, "tag", sizeof(config->adult_mode) - 1);
     config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
     strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
+    /* The C default stays "all": a direct binary user sees the historical
+     * behaviour. The Android app pins "off" and drives the adult pass from
+     * the maintenance action. */
+    strncpy(config->classify_backfill_mode, "all", sizeof(config->classify_backfill_mode) - 1);
 
     /* Movie-kind defaults (movie-kind Stage B): v10 ships in models/v10, 4 threads
      * is the measured steady state, and 82 °C is the backfill engine's pause
@@ -407,6 +411,19 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             if (threshold < 0.0) threshold = 0.0;
             if (threshold > 1.0) threshold = 1.0;
             config->adult_hide_threshold = threshold;
+        } else if (strcmp(key, "classify_backfill_mode") == 0) {
+            /* Same shape as adult_mode: enum string, case-sensitive, invalid
+             * values warn and keep the previous one. */
+            if (strcmp(value, "all") == 0 || strcmp(value, "adult") == 0 ||
+                strcmp(value, "off") == 0) {
+                strncpy(config->classify_backfill_mode, value,
+                        sizeof(config->classify_backfill_mode) - 1);
+            } else {
+                log_msg(LOG_WARN,
+                        "Invalid classify_backfill_mode '%s' (expected all|adult|off); "
+                        "keeping '%s'",
+                        value, config->classify_backfill_mode);
+            }
         } else if (strcmp(key, "hard_block_file") == 0) {
             strncpy(config->hard_block_file, value, sizeof(config->hard_block_file) - 1);
         /* "Categories to save": comma-separated taxonomy names/indices; an
@@ -660,13 +677,14 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
         {"log-level",   required_argument, 0, 'l'},
         {"config",      required_argument, 0, 'c'},
         {"help",        no_argument,       0, '?'},
+        {"classify-backfill-mode", required_argument, 0, 'B'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:d:l:c?", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:l:c?B:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 config->dht_port = atoi(optarg);
@@ -690,6 +708,20 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
             case 'c':
                 /* Config file is loaded separately */
                 break;
+            case 'B':
+                /* Same validation as the config-file key, so the CLI can
+                 * neither widen the enum nor silently ignore a typo. */
+                if (strcmp(optarg, "all") == 0 || strcmp(optarg, "adult") == 0 ||
+                    strcmp(optarg, "off") == 0) {
+                    strncpy(config->classify_backfill_mode, optarg,
+                            sizeof(config->classify_backfill_mode) - 1);
+                } else {
+                    fprintf(stderr,
+                            "--classify-backfill-mode takes all|adult|off, got '%s'\n",
+                            optarg);
+                    return -1;
+                }
+                break;
             case '?':
             default:
                 fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
@@ -698,6 +730,7 @@ int config_parse_args(crawler_config_t *config, int argc, char *argv[]) {
                 fprintf(stderr, "  -d, --db-path PATH       Database path (default: data/torrents.db)\n");
                 fprintf(stderr, "  -l, --log-level LEVEL    Log level: DEBUG|INFO|WARN|ERROR (default: INFO)\n");
                 fprintf(stderr, "  -c, --config FILE        Config file path (default: config.ini)\n");
+                fprintf(stderr, "      --classify-backfill-mode MODE  all|adult|off (default: all)\n");
                 fprintf(stderr, "  -?, --help               Show this help message\n");
                 return -1;
         }
@@ -724,6 +757,9 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
     log_msg(LOG_DEBUG, "Logging:");
     log_msg(LOG_DEBUG, "  Level: %s", log_levels[config->log_level]);
+    log_msg(LOG_DEBUG, "Classifier Settings:");
+    log_msg(LOG_DEBUG, "  classify_backfill_mode: %s",
+            config->classify_backfill_mode[0] ? config->classify_backfill_mode : "all");
     log_msg(LOG_DEBUG, "Bloom persist interval: %d sec", config->bloom_persist_interval_sec);
 }
 

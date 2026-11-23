@@ -61,6 +61,50 @@ typedef struct {
 void classify_backfill_daemon_start(app_context_t *ctx, database_t *db);
 
 /*
+ * Select which pass the thread runs: "all" (the historical full re-classify,
+ * also the default when this is never called), "adult" (the token-gated adult
+ * pass only) or "off" (never touch the database; publish the disabled state).
+ *
+ * Call once from main.c before start(); the value is copied, so the caller's
+ * buffer need not outlive the call. Anything unrecognised keeps the current
+ * mode, mirroring how the config layer keeps the previous value on a bad
+ * classify_backfill_mode. Race-free by contract for the same reason as
+ * classifier_set_adult_mode(): it runs before the thread exists.
+ */
+void classify_backfill_daemon_set_mode(const char *mode);
+
+/*
+ * Adult-pass surface: the same shape as classify_backfill_daemon_stats_t, but
+ * for the token-gated adult engine. Separate because the two passes report
+ * different counters (gated_out/scored/updated instead of
+ * processed/inserted/skipped) and /stats renders both objects independently.
+ * Zero counters plus state "idle" mean the adult pass never ran in this
+ * process, which is what the release expects while classify_backfill_mode is
+ * pinned to "off".
+ */
+typedef struct {
+    char state[16];                  /* adult_backfill_state_name() */
+    long long target_adult_clf_ver;  /* generation the adult pass writes; 0 = unknown */
+    long long rows_total;            /* candidates counted at pass start */
+    long long rows_gated_out;        /* candidates the token gate rejected */
+    long long rows_scored;           /* candidates the adult student scored */
+    long long rows_updated;          /* committed UPDATEs that changed a row */
+    long long rows_failed;           /* no verdict available: row left untouched */
+    long long last_id;               /* highest committed torrent id */
+    long long started_at;            /* epoch secs of the last adult pass, 0 = never */
+    long long finished_at;           /* epoch secs it ended, 0 = not finished */
+    char last_error[256];            /* "" normally, non-empty after a failure */
+} classify_backfill_daemon_adult_stats_t;
+
+/*
+ * Copy the current adult-pass snapshot into *out; *out may be NULL (no-op).
+ * Safe from any thread at any time, including while a pass runs: it merges the
+ * module's mutex-guarded stats with the engine's own live snapshot, so the
+ * returned struct is always internally consistent.
+ */
+void classify_backfill_daemon_get_adult_stats(classify_backfill_daemon_adult_stats_t *out);
+
+/*
  * Ask the thread to stop: sets its stop flag (it is out of the sliced sleep
  * within 250 ms) and, when a pass is in flight, asks the engine to stop after
  * the batch it is in commits. Returns immediately; pair it with destroy().

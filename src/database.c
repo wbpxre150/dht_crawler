@@ -65,7 +65,17 @@ static const char *CREATE_TABLES_SQL =
      * mask of 0 is a valid `none` verdict, never a marker). Deliberately no
      * index: the candidate walk reuses idx_class_cat below. */
     "    movie_kind_mask INTEGER,"
-    "    movie_kind_clf_ver INTEGER"
+    "    movie_kind_clf_ver INTEGER,"
+    /* Adult-only generation (v11): the generation that produced the adult and
+     * adult_p values of this row. Appended after the movie-kind pair on
+     * purpose - the ingest binds 13/14 and the backup's INSERT ... SELECT *
+     * copy both key off this order. NULL means "never adult-scored by the
+     * token-gated pass", which is exactly the backfill engine's candidate
+     * predicate. Additive and nullable: a database that predates the column
+     * simply has no row marked, and a mask-style 0 verdict does not exist
+     * here (adult is 0/1), so the generation - never the label - is the
+     * watermark. */
+    "    adult_clf_ver INTEGER"
     ");"
     ""
     "CREATE INDEX IF NOT EXISTS idx_class_cat ON torrent_class(category, tv_kind, torrent_id) WHERE adult = 0;"
@@ -505,7 +515,8 @@ int database_create_schema(database_t *db) {
     /* Additive migration for a database created before the movie-kind columns
      * existed. Idempotent and metadata-only, so it runs on every start. */
     if (database_ensure_column(db->db, "torrent_class", "movie_kind_mask", "INTEGER") != 0 ||
-        database_ensure_column(db->db, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0) {
+        database_ensure_column(db->db, "torrent_class", "movie_kind_clf_ver", "INTEGER") != 0 ||
+        database_ensure_column(db->db, "torrent_class", "adult_clf_ver", "INTEGER") != 0) {
         return -1;
     }
 
@@ -581,8 +592,8 @@ int database_create_schema(database_t *db) {
         "INSERT OR IGNORE INTO torrent_class "
         "(torrent_id, category, tv_kind, adult, adult_p, season_lo, season_hi, "
         " episode_lo, episode_hi, resolution, confidence, clf_ver, "
-        " movie_kind_mask, movie_kind_clf_ver) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        " movie_kind_mask, movie_kind_clf_ver, adult_clf_ver) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     rc = sqlite3_prepare_v2(db->db, insert_class_sql, -1, &db->insert_class_stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -1054,6 +1065,13 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
             sqlite3_bind_null(db->insert_class_stmt, 13);
             sqlite3_bind_null(db->insert_class_stmt, 14);
         }
+        /* Bind 15: the adult-only generation. A fresh row's adult verdict comes
+         * from the same classify() call as its category, so the adult
+         * generation IS clf_ver - no second struct field, no new
+         * torrent_metadata_t member. Appending the column (rather than
+         * inserting it beside clf_ver) keeps the movie-kind binds above and
+         * the backup's INSERT ... SELECT * column order intact. */
+        sqlite3_bind_int64(db->insert_class_stmt, 15, c->clf_ver);
 
         rc = sqlite3_step(db->insert_class_stmt);
         sqlite3_reset(db->insert_class_stmt);

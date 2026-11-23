@@ -19,6 +19,7 @@
  */
 #include "classify_backfill_daemon.h"
 
+#include "adult_backfill.h"
 #include "classifier.h"
 #include "classify_backfill.h"
 
@@ -52,6 +53,9 @@
  * FAILED pass gets this text (last_error is never empty after a failure). */
 #define CB_ERROR_TEXT "classify backfill failed"
 
+/* Same for the adult engine. */
+#define CBD_ADULT_ERROR_TEXT "adult backfill failed"
+
 /* ------------------------------------------------------------------------ *
  * Test seams
  *
@@ -75,8 +79,19 @@ typedef void (*cbd_sleep_fn)(long long ms);
 
 static void cbd_sleep_real(long long ms);
 
+typedef int (*cbd_adult_needed_fn)(database_t *db, long long target_adult_clf_ver,
+                                  long long *rows_left);
+typedef int (*cbd_adult_run_fn)(database_t *db, const adult_backfill_opts_t *opts,
+                               adult_backfill_progress_t *out);
+typedef void (*cbd_adult_stop_fn)(void);
+typedef void (*cbd_adult_get_progress_fn)(adult_backfill_progress_t *out);
+
 static cbd_needed_fn cbd_needed = classify_backfill_needed;
 static cbd_run_fn cbd_run = classify_backfill_run;
+static cbd_adult_needed_fn cbd_adult_needed = adult_backfill_needed;
+static cbd_adult_run_fn cbd_adult_run = adult_backfill_run;
+static cbd_adult_stop_fn cbd_adult_request_stop = adult_backfill_request_stop;
+static cbd_adult_get_progress_fn cbd_adult_get_progress = adult_backfill_get_progress;
 static cbd_request_stop_fn cbd_request_stop = classify_backfill_request_stop;
 static cbd_get_progress_fn cbd_get_progress = classify_backfill_get_progress;
 static cbd_flag_fn cbd_enabled = classifier_enabled;
@@ -129,7 +144,8 @@ typedef enum {
     CBD_DECISION_RAN = 1,
     CBD_DECISION_DISABLED_FEATURE = 2,
     CBD_DECISION_DISABLED_NO_MODELS = 3,
-    CBD_DECISION_DISABLED_NO_TARGET = 4
+    CBD_DECISION_DISABLED_NO_TARGET = 4,
+    CBD_DECISION_DISABLED_MODE = 5
 } cbd_decision_t;
 
 /* cbd_stats is the module-owned half of the published snapshot (timestamps,
@@ -143,7 +159,19 @@ static int cbd_started;          /* guarded by cbd_mutex */
 static database_t *cbd_db;       /* not owned; outlives the thread by contract */
 static atomic_bool cbd_stop;     /* request_shutdown() sets it, the loop reads it */
 static atomic_bool cbd_pass_active; /* 1 while cbd_run() is in flight */
+static atomic_bool cbd_adult_active; /* 1 while cbd_adult_run() is in flight */
 static cbd_decision_t cbd_last_decision = CBD_DECISION_NONE;
+
+/* Which pass this process runs: "all" | "adult" | "off". Written once by
+ * classify_backfill_daemon_set_mode() before the thread exists, then read-only,
+ * so no lock is needed - the same contract as classifier_set_adult_mode(). */
+static char cbd_mode[8] = "all";
+
+/* cbd_adult_stats is the module-owned half of the adult surface (timestamps,
+ * error text, the last engine outcome); every read and write of it happens
+ * under cbd_mutex, and the engine's live counters are merged in by
+ * classify_backfill_daemon_get_adult_stats(). */
+static classify_backfill_daemon_adult_stats_t cbd_adult_stats = { .state = "idle" };
 
 /* ------------------------------------------------------------------------ *
  * Small helpers
@@ -163,6 +191,11 @@ static void cbd_sleep_real(long long ms) {
 /* Copy a state name into the fixed-width stats field. */
 static void cbd_set_state(classify_backfill_daemon_stats_t *stats, int state) {
     snprintf(stats->state, sizeof stats->state, "%s", classify_backfill_state_name(state));
+}
+
+/* The adult surface has its own state vocabulary. */
+static void cbd_set_adult_state(classify_backfill_daemon_adult_stats_t *stats, int state) {
+    snprintf(stats->state, sizeof stats->state, "%s", adult_backfill_state_name(state));
 }
 
 /* rows_total is always "what this pass handled plus what is left", so a reader
@@ -280,6 +313,64 @@ static void cbd_run_pass(long long rows_left, long long target_clf_ver) {
             progress.rows_total - progress.rows_done, finished_at - started_at);
 }
 
+/* Run one adult-engine pass and publish its outcome. The sibling of
+ * cbd_run_pass(): same announce-before-enter / publish-after-return shape, so a
+ * /stats reader merges the engine's live counters from the first committed
+ * batch on and never sees the previous pass's outcome while this one runs. */
+static void cbd_run_adult_pass(long long rows_left, long long target_adult_clf_ver) {
+    adult_backfill_opts_t opts;
+    adult_backfill_progress_t progress;
+    long long started_at = (long long)time(NULL);
+    long long finished_at;
+    int rc;
+
+    memset(&opts, 0, sizeof opts);
+    opts.target_adult_clf_ver = 0; /* whatever the loaded manifest describes */
+    opts.chunk_ids = CB_CHUNK_IDS;
+    opts.batch_rows = CB_BATCH_ROWS;
+    opts.dry_run = 0;
+    opts.limit_rows = 0;
+
+    pthread_mutex_lock(&cbd_mutex);
+    cbd_set_adult_state(&cbd_adult_stats, ADULT_BACKFILL_RUNNING);
+    cbd_adult_stats.target_adult_clf_ver = target_adult_clf_ver;
+    cbd_adult_stats.rows_total = rows_left;
+    cbd_adult_stats.started_at = started_at;
+    cbd_adult_stats.finished_at = 0;
+    cbd_adult_stats.last_error[0] = '\0';
+    pthread_mutex_unlock(&cbd_mutex);
+    atomic_store(&cbd_adult_active, true);
+
+    memset(&progress, 0, sizeof progress);
+    rc = cbd_adult_run(cbd_db, &opts, &progress);
+
+    finished_at = (long long)time(NULL);
+    pthread_mutex_lock(&cbd_mutex);
+    cbd_set_adult_state(&cbd_adult_stats, progress.state);
+    if (progress.target_adult_clf_ver > 0) {
+        cbd_adult_stats.target_adult_clf_ver = progress.target_adult_clf_ver;
+    }
+    cbd_adult_stats.rows_total = progress.rows_total;
+    cbd_adult_stats.rows_gated_out = progress.rows_gated_out;
+    cbd_adult_stats.rows_scored = progress.rows_scored;
+    cbd_adult_stats.rows_updated = progress.rows_updated;
+    cbd_adult_stats.rows_failed = progress.rows_failed;
+    cbd_adult_stats.last_id = progress.last_id;
+    cbd_adult_stats.finished_at = finished_at;
+    if (rc < 0) {
+        snprintf(cbd_adult_stats.last_error, sizeof cbd_adult_stats.last_error, "%s",
+                 CBD_ADULT_ERROR_TEXT);
+    }
+    pthread_mutex_unlock(&cbd_mutex);
+    atomic_store(&cbd_adult_active, false);
+
+    log_msg(rc < 0 ? LOG_ERROR : (rc > 0 ? LOG_WARN : LOG_INFO),
+            "adult-backfill: pass finished state=%s target=%lld scored=%lld updated=%lld "
+            "failed=%lld elapsed=%llds",
+            adult_backfill_state_name(progress.state), progress.target_adult_clf_ver,
+            progress.rows_scored, progress.rows_updated, progress.rows_failed,
+            finished_at - started_at);
+}
 /* ------------------------------------------------------------------------ *
  * One poll
  * ------------------------------------------------------------------------ */
@@ -304,6 +395,17 @@ static void cbd_poll_once(void) {
         cbd_publish_disabled(0);
         return;
     }
+    /* classify_backfill_mode=off: the operator (the app pins it) wants nothing
+     * automatic. Reported as disabled rather than idle, because "idle" would
+     * claim the database is up to date and this process never looked. */
+    if (strcmp(cbd_mode, "off") == 0) {
+        cbd_log_decision(CBD_DECISION_DISABLED_MODE, LOG_INFO,
+                         "classify-backfill: disabled (classify_backfill_mode=off); not "
+                         "polling the database (rows_left=%lld target_clf_ver=%lld)",
+                         0, 0);
+        cbd_publish_disabled(0);
+        return;
+    }
     if (!cbd_models_loaded()) {
         cbd_log_decision(CBD_DECISION_DISABLED_NO_MODELS, LOG_WARN,
                          "classify-backfill: disabled (no classifier models loaded); not "
@@ -320,6 +422,43 @@ static void cbd_poll_once(void) {
                          "generation) (rows_left=%lld target_clf_ver=%lld)",
                          0, 0);
         cbd_publish_disabled(0);
+        return;
+    }
+
+    /* classify_backfill_mode=adult: skip the full re-classify entirely and run
+     * the token-gated adult engine in-process instead. Both passes use the same
+     * target (the loaded manifest's generation) and the same thread, so only
+     * one of them can ever be in flight. */
+    if (strcmp(cbd_mode, "adult") == 0) {
+        long long adult_left = 0;
+        int adult_needed = cbd_adult_needed(cbd_db, 0, &adult_left);
+        if (adult_left < 0) {
+            adult_left = 0;
+        }
+        if (!adult_needed || adult_left <= 0) {
+            cbd_log_decision(CBD_DECISION_IDLE, LOG_INFO,
+                             "classify-backfill: adult pass not needed (rows_left=%lld "
+                             "target_clf_ver=%lld)",
+                             adult_left, target_clf_ver);
+            /* Keep the adult surface truthful: a process that never ran a pass
+             * reports idle at the resolved target, not a stale one. */
+            pthread_mutex_lock(&cbd_mutex);
+            if (cbd_adult_stats.started_at == 0) {
+                cbd_set_adult_state(&cbd_adult_stats, ADULT_BACKFILL_IDLE);
+                cbd_adult_stats.target_adult_clf_ver = target_clf_ver;
+            }
+            pthread_mutex_unlock(&cbd_mutex);
+            cbd_publish_no_work(adult_left, target_clf_ver);
+            return;
+        }
+        if (atomic_load(&cbd_stop)) {
+            return; /* shutdown arrived between the decision and the pass */
+        }
+        cbd_log_decision(CBD_DECISION_RAN, LOG_INFO,
+                         "classify-backfill: adult pass needed (rows_left=%lld "
+                         "target_clf_ver=%lld); starting a background pass",
+                         adult_left, target_clf_ver);
+        cbd_run_adult_pass(adult_left, target_clf_ver);
         return;
     }
 
@@ -383,6 +522,23 @@ static void *cbd_thread_main(void *arg) {
  * Public API
  * ------------------------------------------------------------------------ */
 
+void classify_backfill_daemon_set_mode(const char *mode) {
+    if (!mode) {
+        return;
+    }
+    /* Copied before the thread exists, so the loop reads it lock-free. An
+     * unrecognised value keeps the current mode, exactly like the config
+     * layer's warn-and-keep on a bad classify_backfill_mode. */
+    if (strcmp(mode, "all") == 0 || strcmp(mode, "adult") == 0 || strcmp(mode, "off") == 0) {
+        snprintf(cbd_mode, sizeof cbd_mode, "%s", mode);
+    } else {
+        log_msg(LOG_WARN,
+                "classify-backfill: unknown mode '%s' (expected all|adult|off); keeping "
+                "'%s'",
+                mode, cbd_mode);
+    }
+}
+
 void classify_backfill_daemon_start(app_context_t *ctx, database_t *db) {
     (void)ctx; /* kept in the signature for symmetry with the other supervisors */
 
@@ -421,9 +577,13 @@ void classify_backfill_daemon_start(app_context_t *ctx, database_t *db) {
 void classify_backfill_daemon_request_shutdown(void) {
     atomic_store(&cbd_stop, true);
     /* Cooperative: an in-flight pass returns after the batch it is in commits,
-     * and the thread is out of its sliced sleep within CB_SLEEP_SLICE_MS. */
+     * and the thread is out of its sliced sleep within CB_SLEEP_SLICE_MS. Both
+     * engines are asked: at most one of them can be in flight. */
     if (atomic_load(&cbd_pass_active)) {
         cbd_request_stop();
+    }
+    if (atomic_load(&cbd_adult_active)) {
+        cbd_adult_request_stop();
     }
 }
 
@@ -442,6 +602,9 @@ void classify_backfill_daemon_destroy(void) {
     atomic_store(&cbd_stop, true);
     if (atomic_load(&cbd_pass_active)) {
         cbd_request_stop();
+    }
+    if (atomic_load(&cbd_adult_active)) {
+        cbd_adult_request_stop();
     }
     pthread_join(cbd_thread, NULL);
     log_msg(LOG_INFO, "classify-backfill: background thread joined");
@@ -477,5 +640,45 @@ void classify_backfill_daemon_get_stats(classify_backfill_daemon_stats_t *out) {
         cbd_set_state(out, progress.state);
         out->target_clf_ver = (int)progress.target_clf_ver;
         cbd_set_counters(out, progress.rows_done, progress.rows_total - progress.rows_done);
+    }
+}
+
+void classify_backfill_daemon_get_adult_stats(classify_backfill_daemon_adult_stats_t *out) {
+    adult_backfill_progress_t progress;
+    int live = 0;
+
+    if (!out) {
+        return;
+    }
+
+    /* Same merge rule as the full-pass accessor: an adult pass in flight is not
+     * visible in cbd_adult_stats (the thread is blocked inside the engine), so
+     * take the engine's own live snapshot. Both are read outside the module
+     * mutex; the engine's accessor has its own lock and never touches
+     * database_t.mutex, so this cannot deadlock against the pass. */
+    if (atomic_load(&cbd_adult_active)) {
+        memset(&progress, 0, sizeof progress);
+        cbd_adult_get_progress(&progress);
+        live = (progress.state == ADULT_BACKFILL_RUNNING);
+    }
+
+    pthread_mutex_lock(&cbd_mutex);
+    *out = cbd_adult_stats;
+    pthread_mutex_unlock(&cbd_mutex);
+
+    if (out->state[0] == '\0') {
+        snprintf(out->state, sizeof out->state, "%s",
+                 adult_backfill_state_name(ADULT_BACKFILL_IDLE));
+    }
+
+    if (live) {
+        cbd_set_adult_state(out, progress.state);
+        out->target_adult_clf_ver = progress.target_adult_clf_ver;
+        out->rows_total = progress.rows_total;
+        out->rows_gated_out = progress.rows_gated_out;
+        out->rows_scored = progress.rows_scored;
+        out->rows_updated = progress.rows_updated;
+        out->rows_failed = progress.rows_failed;
+        out->last_id = progress.last_id;
     }
 }

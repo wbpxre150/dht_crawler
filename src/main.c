@@ -13,6 +13,7 @@
 #include "batch_writer.h"
 #include "refresh_thread.h"
 #include "refresh_query.h"
+#include "adult_backfill.h"
 #include "classify_backfill.h"
 #include "classify_backfill_daemon.h"
 #include "movie_kind.h"
@@ -278,6 +279,8 @@ int main(int argc, char *argv[]) {
     const char *classify_backfill_db = NULL;
     long long classify_backfill_limit = 0;
     bool classify_backfill_write = false;
+    const char *adult_backfill_db = NULL;
+    long long adult_backfill_limit = 0;
     const char *movie_backfill_db = NULL;
     long long movie_backfill_limit = 0;
     bool movie_backfill_dry_run = false;
@@ -315,6 +318,28 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             classify_backfill_limit = limit_rows;
+        } else if (strcmp(argv[i], "--adult-backfill") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--adult-backfill requires a <database> argument");
+                return 1;
+            }
+            adult_backfill_db = argv[++i];
+        } else if (strcmp(argv[i], "--adult-backfill-limit") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--adult-backfill-limit requires a <rows> argument");
+                return 1;
+            }
+            const char *limit_arg = argv[++i];
+            char *limit_end = NULL;
+            errno = 0;
+            long long limit_rows = strtoll(limit_arg, &limit_end, 10);
+            if (errno != 0 || limit_end == limit_arg || *limit_end != '\0' || limit_rows < 0) {
+                log_msg(LOG_ERROR,
+                        "--adult-backfill-limit requires a non-negative integer, got '%s'",
+                        limit_arg);
+                return 1;
+            }
+            adult_backfill_limit = limit_rows;
         } else if (strcmp(argv[i], "--write") == 0) {
             classify_backfill_write = true;
         } else if (strcmp(argv[i], "--movie-kind-backfill") == 0) {
@@ -864,6 +889,88 @@ int main(int argc, char *argv[]) {
         return (bf_rc == 0) ? 0 : 1;
     }
 
+    /* --adult-backfill <db> [--write] [--adult-backfill-limit <n>]: one-shot
+     * maintenance over the database named on the command line, dispatched for
+     * exactly the reasons --classify-backfill is (after classifier_init(), so
+     * the adult student is loaded; before database_init(), so the configured
+     * daemon database is never opened). Dry run by default: without --write it
+     * runs the SAME two-stage token gate the write pass runs - no student, no
+     * UPDATE, no commit - and reports the predicate count (total) plus how many
+     * of those rows the gate rejected (gated_out). The gated-in candidate set,
+     * i.e. the rows the write pass would score, is total - gated_out; `total`
+     * alone is NOT that number. */
+    if (adult_backfill_db) {
+        adult_backfill_opts_t ab_opts = {
+            .target_adult_clf_ver = 0, /* whatever the loaded manifest describes */
+            .chunk_ids = 0,            /* engine defaults */
+            .batch_rows = 0,
+            .dry_run = classify_backfill_write ? 0 : 1,
+            .limit_rows = adult_backfill_limit,
+        };
+        adult_backfill_progress_t ab_progress;
+        database_t ab_db;
+
+        memset(&ab_progress, 0, sizeof(ab_progress));
+        log_msg(LOG_INFO, "adult-backfill: %s %s ...",
+                classify_backfill_write ? "write pass on" : "dry run on", adult_backfill_db);
+
+        rc = database_init(&ab_db, adult_backfill_db, &g_app_ctx);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "adult-backfill: cannot open %s: %d", adult_backfill_db, rc);
+            mprog_terminal("adult-backfill", 0, 1, NULL);
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        rc = database_create_schema(&ab_db);
+        if (rc != 0) {
+            log_msg(LOG_ERROR, "adult-backfill: cannot create the schema of %s: %d",
+                    adult_backfill_db, rc);
+            mprog_terminal("adult-backfill", 0, 1, NULL);
+            database_cleanup(&ab_db);
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        int ab_rc = adult_backfill_run(&ab_db, &ab_opts, &ab_progress);
+        log_msg(ab_rc == 0 ? LOG_INFO : LOG_ERROR,
+                "adult-backfill: state=%s target=%lld total=%lld gated_out=%lld "
+                "scored=%lld updated=%lld failed=%lld last_id=%lld",
+                adult_backfill_state_name(ab_progress.state),
+                ab_progress.target_adult_clf_ver, ab_progress.rows_total,
+                ab_progress.rows_gated_out, ab_progress.rows_scored,
+                ab_progress.rows_updated, ab_progress.rows_failed, ab_progress.last_id);
+
+        /* Terminal [MPROG] line, so the app's maintenance status finalises from
+         * the same stream as every other one-shot (the counters ride the
+         * extra k=v tail; parseMaintenanceProgress keeps unknown keys as
+         * extras). */
+        {
+            char ab_extra[192];
+            snprintf(ab_extra, sizeof ab_extra,
+                     "total=%lld gated_out=%lld scored=%lld updated=%lld failed=%lld",
+                     ab_progress.rows_total, ab_progress.rows_gated_out,
+                     ab_progress.rows_scored, ab_progress.rows_updated,
+                     ab_progress.rows_failed);
+            mprog_terminal("adult-backfill", ab_rc == 0, ab_rc == 0 ? 0 : 1, ab_extra);
+        }
+
+        database_cleanup(&ab_db);
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        cleanup_app_context(&g_app_ctx);
+        /* DISABLED and FAILED must both fail loudly: a backfill that cannot run
+         * must never look like a success. */
+        return (ab_rc == 0) ? 0 : 1;
+    }
+
     /* --movie-kind-backfill <db> --reset: the stage-10 one-shot that clears the
      * movie columns of every row a broken pass labelled, plus the resume and
      * completion meta keys (include/movie_backfill.h). Dispatched before the
@@ -1308,6 +1415,9 @@ int main(int argc, char *argv[]) {
     /* Start the classify-backfill thread: the DB, the classifier and the HTTP
      * API are all up by now, so /stats can serve its object from the first
      * request. Non-blocking - the thread takes its own first decision. */
+    /* Which pass that thread runs is a config decision, read once here so the
+     * thread never has to look at the config. */
+    classify_backfill_daemon_set_mode(config.classify_backfill_mode);
     classify_backfill_daemon_start(&g_app_ctx, &g_database);
 
     /* The movie-kind backfill thread is deliberately NOT started: production

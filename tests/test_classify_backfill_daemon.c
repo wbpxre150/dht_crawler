@@ -209,6 +209,16 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     return 1; /* no verdict: this test never classifies anything */
 }
 
+/* src/adult_backfill.c is linked too (the daemon's adult mode calls it), and it
+ * defaults its verdict pointer to this symbol. No verdict, for the same reason
+ * as classifier_classify above. */
+int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
+    (void)meta;
+    if (adult) *adult = 0;
+    if (adult_p) *adult_p = 0.0;
+    return 1;
+}
+
 /* ------------------------------------------------------------------------- *
  * Helpers
  * ------------------------------------------------------------------------- */

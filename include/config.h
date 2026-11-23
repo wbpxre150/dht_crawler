@@ -94,6 +94,12 @@ typedef struct {
     char adult_mode[8];                 /* "tag" (default) or "drop" at ingest */
     double adult_hide_threshold;        /* Classifier adult tag threshold; 0 = take it from the manifest */
     char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
+    /* Which pass the classify-backfill daemon runs. "all" (default) keeps the
+     * historical full re-classify, "adult" runs only the token-gated adult
+     * pass, "off" makes the daemon never touch the database. The app pins
+     * this to "off" for the v11 release so the deliberate write is driven by
+     * the adult-backfill maintenance action instead of by launch. */
+    char classify_backfill_mode[8];
 
     /* Movie-kind (genre mask) settings — movie-kind Stage B. The model directory
      * pins the manifest whose sha256s gate the load; the thermal ceiling is read
