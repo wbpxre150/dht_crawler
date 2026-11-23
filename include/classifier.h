@@ -16,20 +16,25 @@
  * never stored at all. The tag boundary — not a separate, higher value — is
  * the drop boundary, so drop mode never stores what tag mode would hide.
  *
- * Decision path (classifier.md §4):
- *   - tparse always runs (release name + file list) and supplies the season /
- *     episode / resolution fields and a category hint;
- *   - the category and adult fastText students override/confirm the hint;
- *   - the tv_kind student is consulted only when tparse left tv_kind undecided
- *     and the effective category is tv or anime, and it is loaded lazily on
- *     first use (~19 MB RSS per resident model; see stage 4 measurements).
+ * Decision path (CRAM v15 — one engine, one forward pass, no fastText):
+ *   - tparse runs first (release name + the FIRST 50 files) and supplies the
+ *     season / episode / resolution fields and the hints the degraded path
+ *     falls back on;
+ *   - one CRAM forward pass over the feature text decides category (masked
+ *     48-state argmin — the category model), confidence (T-tempered category
+ *     marginal), adult_p (raw adult marginal, no temperature) and adult
+ *     (adult_p >= the effective adult_hide_threshold);
+ *   - the standalone kind head decides tv_kind for every CRAM-decided tv/anime
+ *     row and tv_kind is TP_TV_NONE otherwise. There is no parser gate on
+ *     tv_kind any more.
  *
- * Model load failure or a missing model directory is never fatal: the item is
- * classified parser-only (category hint, adult 0, clf_ver from the manifest or
- * 0), a warning is logged and the fallback counters move.
+ * Engine load failure or a missing model directory is never fatal and is
+ * all-or-nothing (there is no second model): the item is classified
+ * parser-only (category hint, parser tv_kind, adult 0, adult_p 0.0, clf_ver 0),
+ * a warning is logged and the fallback counters move.
  *
- * Build gating: the real implementation needs the vendored tparse/ftc
- * libraries, which only the Android wrapper build provides (it defines
+ * Build gating: the real implementation needs the vendored tparse library and
+ * the CRAM engine, which only the Android wrapper build provides (it defines
  * CLF_ENABLED). The crawler's own host `make` (plain gcc, no tparse include
  * path) compiles the inert stubs below instead; /stats then reports
  * enabled:false and zeros.
@@ -58,17 +63,32 @@ typedef struct {
     uint64_t adult_dropped;        /* adult_mode=drop rows dropped for being
                                     * adult-tagged */
     uint64_t hard_block_dropped;   /* rows dropped by the hard block list */
-    uint64_t tv_kind_model_used;   /* items where the tv_kind student was consulted */
+    uint64_t tv_kind_model_used;   /* items where the kind head was consulted
+                                    * (CRAM fills it on every prediction; the
+                                    * caller applies it only on tv/anime) */
     uint64_t by_category[CLASSIFIER_NUM_CATEGORIES]; /* per category, all items */
+    uint64_t file_cap_hits;        /* items whose file list was capped at 50 */
     /* Provenance the dashboard reads back (exit criteria 2/3). These are
      * module state rather than counters, but /stats renders them beside the
      * threshold it already takes from here, so they ride the same snapshot.
      * 0.0 / "" mean "the manifest named nothing" (and, for the inert host
      * build, "no manifest was ever read"). */
-    double adult_drop_threshold; /* manifest thresholds.adult_drop_threshold */
-    char model_sha256_adult[65]; /* manifest models.adult, lowercase hex */
-    char model_sha256_category[65];
-    char model_sha256_tv_kind[65];
+    double adult_drop_threshold; /* mirrors adult_hide_threshold: v15 has ONE
+                                  * adult boundary (tag == drop); the key is
+                                  * kept for /stats shape stability */
+    int cram_enabled;            /* 1 when the CRAM engine is loaded and usable */
+    double cram_temperature;     /* manifest cram.temperature (category
+                                  * confidence only; adult is raw) */
+    char cram_sha256[65];        /* verified cram.bin digest, lowercase hex */
+    char cram_vocab_sha256[65];  /* verified cram_vocab.bin digest */
+    /* Engine counters, merged from cram_get_stats() at snapshot time (the
+     * module owns them so a failed load is still visible). */
+    uint64_t cram_rows_predicted;           /* rows the engine predicted */
+    uint64_t cram_load_failures;            /* engine load failures; the same
+                                             * events as model_load_failures */
+    uint64_t cram_kind_head_used;           /* predictions that filled kind */
+    uint64_t cram_adult_tagged_predictions; /* predictions with adult == 1 */
+    uint64_t cram_feature_cap_hits;         /* rows truncated at the engine cap */
 } classifier_stats_t;
 
 /*
@@ -87,8 +107,8 @@ void classifier_set_adult_mode(const char *adult_mode);
  * feature is off (config classifier_enabled=0) do not call it at all, and
  * classifier_classify() then declines every item.
  *
- * @param model_dir directory holding manifest.json and {adult,category,tv_kind}.ftz
- *                  (NULL/empty falls back to "models/v1", cwd-relative like the
+ * @param model_dir directory holding manifest.json, cram.bin and cram_vocab.bin
+ *                  (NULL/empty falls back to "models/v15", cwd-relative like the
  *                  keyword files).
  * @param adult_hide_threshold config adult_hide_threshold; > 0 is authoritative
  *                  (it is what the operator wrote in config.ini), <= 0 means
@@ -101,7 +121,8 @@ void classifier_init(const char *model_dir, double adult_hide_threshold);
 
 /*
  * Classify one torrent. Thread-safe: many tree metadata workers call this
- * concurrently (the ftc models are const on the predict path).
+ * concurrently (a loaded CRAM model is immutable on the predict path, and the
+ * feature scratch is per call).
  *
  * @return 0 and *out filled on success; 1 when no classification is available
  *         (feature disabled, not initialised, or built without CLF_ENABLED), in
@@ -111,22 +132,22 @@ void classifier_init(const char *model_dir, double adult_hide_threshold);
 int classifier_classify(const torrent_metadata_t *meta, classification_t *out);
 
 /*
- * Score ONLY the adult student for one torrent.
+ * Score the adult verdict for one torrent (the token-gated backfill's entry
+ * point).
  *
- * The token-gated adult backfill needs the adult verdict of a row it has
- * already established is worth scoring, and nothing else: running the full
- * classifier_classify() would pay for the category student on every gated row
- * and would couple the pass to a category model that may have failed to load.
- * The feature text is rendered once (tparse), then predicted with the adult
- * model alone; the returned verdict uses the same rule as the ingest path
- * (adult = adult_p >= the effective adult hide threshold) so a backfilled row
- * and a freshly ingested one can never disagree about the boundary.
+ * It runs the same capped-50 -> tparse -> feature text -> CRAM forward pass as
+ * classifier_classify() (the feature helper is shared), so a backfilled verdict
+ * and an ingest verdict are produced from byte-identical input; only the fields
+ * returned differ. The verdict is the CRAM adult marginal, tagged with the same
+ * rule as the ingest path (adult = adult_p >= the effective adult hide
+ * threshold), so a backfilled row and a freshly ingested one can never disagree
+ * about the boundary.
  *
  * @return 0 and both out-parameters filled on success; 1 when no verdict is
- *         available (feature off, built without CLF_ENABLED, adult model not
- *         loaded, tparse rejected the name, or the student predicted nothing),
- *         in which case the caller must leave the stored row untouched rather
- *         than downgrade a good one. Either out-parameter may be NULL.
+ *         available (feature off, built without CLF_ENABLED, CRAM not loaded,
+ *         tparse rejected the name, or the engine predicted nothing), in which
+ *         case the caller must leave the stored row untouched rather than
+ *         downgrade a good one. Either out-parameter may be NULL.
  */
 int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p);
 
@@ -134,9 +155,9 @@ int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double
 void classifier_get_stats(classifier_stats_t *out);
 
 /*
- * 1 when the adult model is loaded and usable, i.e. the classifier owns adult
- * tagging. 0 when the classifier is disabled (feature off, built without
- * CLF_ENABLED, or its models missing/unusable).
+ * 1 when the CRAM engine is loaded and usable, i.e. the classifier owns
+ * category, tv_kind and adult tagging. 0 when the classifier is disabled
+ * (feature off, built without CLF_ENABLED, or its container missing/unusable).
  */
 int classifier_models_loaded(void);
 
@@ -167,10 +188,11 @@ void classifier_note_hard_block_dropped(void); /* row dropped by the hard block 
 const char *classifier_category_name(int category);
 
 /*
- * Write the classifier_meta rows (clf_ver, model sha256s, adult hide
- * threshold) with INSERT OR REPLACE. Called after database_create_schema()
- * because classifier_init() runs before the database is open; a no-op when the
- * classifier is off, when no manifest was read, or when the table is missing.
+ * Write the classifier_meta rows (clf_ver, adult_clf_ver, the two CRAM
+ * sha256s, adult hide threshold) with INSERT OR REPLACE. Called after
+ * database_create_schema() because classifier_init() runs before the database
+ * is open; a no-op when the classifier is off, when no manifest was read, when
+ * the engine is not loaded, or when the table is missing.
  */
 void classifier_write_meta(sqlite3 *db);
 

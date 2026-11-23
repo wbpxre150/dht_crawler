@@ -152,6 +152,21 @@ META_PEER_FAIL_TEST_BIN = $(BUILD_DIR)/test_meta_peer_fail
 META_PEER_FAIL_TEST_CFLAGS =
 META_PEER_FAIL_TEST_LDFLAGS = -lpthread
 
+# The CRAM engine (patch 25) is pure C99 + libm: the container/vocab loaders,
+# the crc32 char tail and the whole forward pass, all over bytes the export
+# wrote, with the fixtures parsed by the vendored cJSON. No database, no libuv,
+# no civetweb, no tparse/ftc and no src/classifier.c -- the real classifier half
+# only exists under CLF_ENABLED, so the engine is linked directly (the
+# meta_peer_fail shape). The model files live in the *main* repo, so their
+# directory is passed absolutely: this target is also built from the
+# Gradle-prepared copy, where ../dht_crawler-android does not resolve. A missing
+# model directory fails the target loudly instead of skipping the arithmetic
+# checks.
+CRAM_TEST_SRCS = tests/test_cram.c src/cram.c tests/stub_log.c lib/cJSON/cJSON.c
+CRAM_TEST_BIN = $(BUILD_DIR)/test_cram
+CRAM_TEST_CFLAGS = -DCRAM_TEST_MODEL_DIR='"$(CLF_ANDROID_DIR)/models/v15"'
+CRAM_TEST_LDFLAGS = -lm -lpthread
+
 # The backfill test defines its own stub classifier symbols (models_loaded,
 # current_version, write_meta, classify) so it never links src/classifier.c:
 # the host build compiles that module inert, which could never insert a row.
@@ -268,7 +283,7 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
 
@@ -291,6 +306,11 @@ tests-meta-peer-fail:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(META_PEER_FAIL_TEST_CFLAGS) $(INCLUDES) $(META_PEER_FAIL_TEST_SRCS) -o $(META_PEER_FAIL_TEST_BIN) $(TEST_LDFLAGS) $(META_PEER_FAIL_TEST_LDFLAGS)
 	./$(META_PEER_FAIL_TEST_BIN)
+
+tests-cram:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(CRAM_TEST_CFLAGS) $(INCLUDES) $(CRAM_TEST_SRCS) -o $(CRAM_TEST_BIN) $(TEST_LDFLAGS) $(CRAM_TEST_LDFLAGS)
+	./$(CRAM_TEST_BIN)
 
 tests-docs: libbloom
 	@mkdir -p $(BUILD_DIR)
@@ -342,6 +362,12 @@ tests-adult-backfill: libbloom
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
+# Scoped sanitizer gate for the CRAM engine: the loader mallocs a whole file and
+# cram_features() mallocs its raw-hit scratch per call, so leak/UB coverage of
+# this binary alone is the point.
+tests-asan-cram:
+	$(MAKE) tests-cram TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
+
 # Scoped sanitizer gate for the backfill engine: builds and runs only that test
 # binary, so its leak/UB verdict never depends on the other test binaries.
 tests-asan-backfill:
@@ -387,4 +413,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

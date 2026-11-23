@@ -794,19 +794,16 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(classifier, "adult_hide_threshold",
                                 clf_stats.adult_hide_threshold);
         /* Provenance of the live generation: the version the loaded manifest
-         * names, the calibrated drop threshold it carries, and the three model
-         * sha256s the loader verified. Without these a reader cannot tell which
+         * names, the single adult boundary (the drop key mirrors the tag
+         * threshold: v15 has one boundary) and the two CRAM container sha256s
+         * the loader verified. Without these a reader cannot tell which
          * generation produced the rows it is looking at. */
         cJSON_AddNumberToObject(classifier, "clf_ver",
                                 (double)classifier_current_version());
         cJSON_AddNumberToObject(classifier, "adult_drop_threshold",
                                 clf_stats.adult_drop_threshold);
-        cJSON_AddStringToObject(classifier, "model_sha256_adult",
-                                clf_stats.model_sha256_adult);
-        cJSON_AddStringToObject(classifier, "model_sha256_category",
-                                clf_stats.model_sha256_category);
-        cJSON_AddStringToObject(classifier, "model_sha256_tv_kind",
-                                clf_stats.model_sha256_tv_kind);
+        cJSON_AddStringToObject(classifier, "cram_sha256", clf_stats.cram_sha256);
+        cJSON_AddStringToObject(classifier, "cram_vocab_sha256", clf_stats.cram_vocab_sha256);
         cJSON_AddNumberToObject(classifier, "total_classified", (double)clf_stats.total_classified);
 
         double mean_us = 0.0;
@@ -823,8 +820,34 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                                 (double)clf_stats.parser_only_fallback);
         cJSON_AddNumberToObject(classifier, "model_load_failures",
                                 (double)clf_stats.model_load_failures);
+        /* Same key as the fastText era, new meaning: "the kind head was
+         * consulted" (CRAM fills it on every prediction; the caller applies
+         * the verdict only on tv/anime). */
         cJSON_AddNumberToObject(classifier, "tv_kind_model_used",
                                 (double)clf_stats.tv_kind_model_used);
+        cJSON_AddNumberToObject(classifier, "file_cap_hits",
+                                (double)clf_stats.file_cap_hits);
+        cJSON_AddNumberToObject(classifier, "cram_adult_tagged_predictions",
+                                (double)clf_stats.cram_adult_tagged_predictions);
+        cJSON_AddNumberToObject(classifier, "cram_feature_cap_hits",
+                                (double)clf_stats.cram_feature_cap_hits);
+
+        /* The CRAM engine itself (v15 is single-engine, so this is the whole
+         * classifier). `generation` is the model version -- the same number
+         * clf_ver carries -- deliberately NOT the manifest's cram container
+         * generation; `file_cap` is the evidence cap classify() applies. */
+        cJSON *cram = cJSON_CreateObject();
+        cJSON_AddBoolToObject(cram, "enabled", clf_stats.cram_enabled ? 1 : 0);
+        cJSON_AddNumberToObject(cram, "generation", (double)classifier_current_version());
+        cJSON_AddNumberToObject(cram, "temperature", clf_stats.cram_temperature);
+        cJSON_AddNumberToObject(cram, "rows_predicted",
+                                (double)clf_stats.cram_rows_predicted);
+        cJSON_AddNumberToObject(cram, "load_failures",
+                                (double)clf_stats.cram_load_failures);
+        cJSON_AddNumberToObject(cram, "kind_head_used",
+                                (double)clf_stats.cram_kind_head_used);
+        cJSON_AddNumberToObject(cram, "file_cap", 50);
+        cJSON_AddItemToObject(classifier, "cram", cram);
 
         /* Only the categories that actually occurred, keyed by taxonomy name. */
         cJSON *by_category = cJSON_CreateObject();

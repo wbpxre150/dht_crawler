@@ -88,7 +88,7 @@ typedef struct {
 
     /* Ingest-time classifier settings (Stage 5, tag mode) */
     int classifier_enabled;             /* Enable ingest-time classification (0=disabled, default: 1) */
-    char classifier_model_dir[512];     /* Directory with manifest.json + *.ftz (default: "models/v1") */
+    char classifier_model_dir[512];     /* Directory with manifest.json + cram.bin + cram_vocab.bin (default: "models/v15") */
 
     /* Stage 6 adult handling */
     char adult_mode[8];                 /* "tag" (default) or "drop" at ingest */

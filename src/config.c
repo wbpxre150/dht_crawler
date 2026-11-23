@@ -116,9 +116,11 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* Ingest-time classifier defaults (Stage 5, tag mode) */
     config->classifier_enabled = 1;                 /* On by default; tag mode only */
-    strncpy(config->classifier_model_dir, "models/v1", sizeof(config->classifier_model_dir) - 1);
+    strncpy(config->classifier_model_dir, "models/v15", sizeof(config->classifier_model_dir) - 1);
 
-    /* Stage 6 adult handling defaults (calibrated values from models/v1/manifest.json) */
+    /* Stage 6 adult handling defaults (v15: the CRAM adult marginal; the shipped
+     * manifest carries 0.375, and the app always writes this key, so the C
+     * literal is only the last resort when config.ini names nothing) */
     strncpy(config->adult_mode, "tag", sizeof(config->adult_mode) - 1);
     config->adult_hide_threshold = 0.917039;        /* 0 = take the threshold from the manifest */
     strncpy(config->hard_block_file, "hard_block.txt", sizeof(config->hard_block_file) - 1);
