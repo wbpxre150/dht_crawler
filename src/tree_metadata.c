@@ -7,6 +7,7 @@
 #include "batch_writer.h"
 #include "bloom_filter.h"
 #include "inflight_set.h"
+#include "meta_peer_fail.h"
 #include "dht_crawler.h"
 #include "database.h"
 #include "hard_block.h"
@@ -794,6 +795,10 @@ typedef struct {
     time_t last_piece_time;         /* Last NEW data piece copied (piece-idle eviction) */
     int outstanding_count;          /* Currently in-flight piece requests */
     int outstanding_pieces[METADATA_OUTSTANDING_PER_PEER];
+    /* The address this slot connected to. The poll-loop failure sites have no
+     * other handle on it, and the per-address connect-failure memory (patch 21)
+     * is keyed on exactly that. */
+    struct sockaddr_storage peer;
 } parallel_conn_t;
 
 /* Shared piece-aggregation state for one parallel metadata fetch. Owned by
@@ -850,6 +855,43 @@ static void meta_count_fail(thread_tree_t *tree, meta_fail_kind_t kind) {
     }
 }
 
+/* Remember that a TCP connect to [peer] failed (patch 21). Additive only: it
+ * changes no counter and no outcome - the eight metadata_failures partitions
+ * keep their exact count-once meaning - and a NULL map (the shipped default,
+ * tree_metadata_peer_blacklist_ttl_sec = 0) makes it a no-op. */
+static void meta_record_connect_fail(thread_tree_t *tree,
+                                     const struct sockaddr_storage *peer) {
+    if (!tree || !peer) return;
+    meta_peer_fail_record(tree->shared_meta_peer_fail, peer, meta_peer_fail_now_ms());
+}
+
+/* Advance [*next_peer] over the addresses the failure map remembers as dead,
+ * counting every skipped window SLOT (peers are not deduplicated, so the same
+ * address can be skipped several times in one attempt).
+ *
+ * Skip-to-empty guard, part 1: the cursor never passes peer_count - 1, so the
+ * last candidate of an attempt is always really tried. A zero-connection
+ * attempt would return NULL and feed the irreversible infohash strike bloom
+ * further down, permanently blocking an infohash because of a *peer address's*
+ * history - which is exactly what this map must never cause. Part 2 (the no-skip
+ * refill) lives in tree_fetch_metadata_parallel. */
+static int meta_peer_advance_untried(struct meta_peer_fail_set *peer_fail,
+                                     const struct sockaddr_storage *peers,
+                                     int peer_count, int *next_peer,
+                                     int skip_disabled) {
+    if (skip_disabled || !peer_fail || !peers || !next_peer) return 0;
+
+    uint64_t now_ms = meta_peer_fail_now_ms();
+    int skipped = 0;
+    while (*next_peer < peer_count - 1 &&
+           meta_peer_fail_should_skip(peer_fail, &peers[*next_peer], now_ms)) {
+        meta_peer_fail_note_skip(peer_fail);
+        (*next_peer)++;
+        skipped++;
+    }
+    return skipped;
+}
+
 /* Generic close sites (POLLERR/POLLHUP/POLLNVAL, read EOF) know only the state
  * the connection had reached: still connecting is a connect failure, still
  * handshaking (BT or extended) a handshake failure, anything later is
@@ -863,6 +905,12 @@ static void meta_count_conn_fail(thread_tree_t *tree, const parallel_conn_t *con
         kind = META_FAIL_HANDSHAKE;
     }
     meta_count_fail(tree, kind);
+    if (kind == META_FAIL_CONNECT) {
+        /* Same event, second (additive) bookkeeping: remember the ADDRESS.
+         * Only connect failures are remembered - a handshake or stall failure
+         * says nothing about reachability. */
+        meta_record_connect_fail(tree, &conn->peer);
+    }
 }
 
 /* Initialize a connection slot with a new peer */
@@ -872,11 +920,14 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
     memset(conn, 0, sizeof(*conn));
     conn->fd = -1;
     conn->state = CONN_STATE_ERROR;
+    /* Kept on the slot so the poll-loop failure sites can name the address. */
+    conn->peer = *peer;
 
     int family = peer->ss_family;
     int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) {
         meta_count_fail(tree, META_FAIL_CONNECT);
+        meta_record_connect_fail(tree, peer);
         return -1;
     }
 
@@ -886,6 +937,7 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
         meta_count_fail(tree, META_FAIL_CONNECT);
+        meta_record_connect_fail(tree, peer);
         return -1;
     }
 
@@ -903,6 +955,7 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
             if (tree) atomic_fetch_sub(&tree->active_connections, 1);
             close(fd);
             meta_count_fail(tree, META_FAIL_CONNECT);
+            meta_record_connect_fail(tree, peer);
             return -1;
         }
         conn->state = CONN_STATE_HANDSHAKING;
@@ -912,6 +965,7 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
         meta_count_fail(tree, META_FAIL_CONNECT);
+        meta_record_connect_fail(tree, peer);
         return -1;
     }
 
@@ -1240,6 +1294,9 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
     int window_size = config ? config->parallel_peers : 2;
     int piece_idle_ms = config ? config->metadata_piece_idle_ms : 0;
     thread_tree_t *tree = config ? config->tree : NULL;
+    /* Per-address TCP connect-failure memory (patch 21). NULL = disabled, which
+     * is the shipped default and leaves selection byte-identical to legacy. */
+    struct meta_peer_fail_set *peer_fail = config ? config->meta_peer_fail : NULL;
 
     if (window_size < 1) window_size = 1;
     if (window_size > MAX_PARALLEL_PEERS) window_size = MAX_PARALLEL_PEERS;
@@ -1259,11 +1316,35 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
 
     /* Fill initial window */
     int active_count = 0;
+    int skipped_slots = 0;   /* window slots the failure map stepped over */
+    int skip_disabled = 0;   /* latched by the no-skip refill below */
     for (int i = 0; i < window_size && next_peer < peer_count; i++) {
+        skipped_slots += meta_peer_advance_untried(peer_fail, peers, peer_count,
+                                                   &next_peer, skip_disabled);
         if (parallel_conn_start(&fetch.conns[i], infohash, &peers[next_peer], tree) == 0) {
             active_count++;
         }
         next_peer++;
+    }
+
+    /* Skip-to-empty guard, part 2 (patch 21). The per-address memory can only
+     * skip, so an attempt whose whole window was skipped would open no
+     * connection at all and reach the irreversible infohash strike bloom with a
+     * NULL result - blocking the infohash for a *peer address's* history. When
+     * nothing opened and candidates remain, walk on with the map ignored for the
+     * rest of this attempt. The cursor is NOT reset: re-trying an address this
+     * attempt already failed would add a second connect_total event for the same
+     * connection and make R = connect_total/attempts unreadable. With the map
+     * disabled (peer_fail == NULL) skipped_slots is 0, so this never runs and
+     * selection stays byte-identical to legacy. */
+    if (active_count == 0 && skipped_slots > 0 && next_peer < peer_count) {
+        skip_disabled = 1;
+        for (int i = 0; i < window_size && next_peer < peer_count; i++) {
+            if (parallel_conn_start(&fetch.conns[i], infohash, &peers[next_peer], tree) == 0) {
+                active_count++;
+            }
+            next_peer++;
+        }
     }
 
     /* Main poll loop */
@@ -1315,6 +1396,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 if (conn->state == CONN_STATE_CONNECTING &&
                     difftime(time(NULL), conn->connect_start) > tcp_timeout / 1000) {
                     meta_count_fail(tree, META_FAIL_CONNECT);
+                    meta_record_connect_fail(tree, &conn->peer);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                 }
@@ -1335,6 +1417,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 socklen_t len = sizeof(error);
                 if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
                     meta_count_fail(tree, META_FAIL_CONNECT);
+                    meta_record_connect_fail(tree, &conn->peer);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
@@ -1345,6 +1428,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 generate_peer_id(peer_id);
                 if (send_handshake(conn->fd, infohash, peer_id) < 0) {
                     meta_count_fail(tree, META_FAIL_CONNECT);
+                    meta_record_connect_fail(tree, &conn->peer);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
@@ -1425,6 +1509,11 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
             for (int i = 0; i < window_size && next_peer < peer_count; i++) {
                 if (fetch.conns[i].fd >= 0) continue;  /* Slot still active */
                 if (fetch.conns[i].state != CONN_STATE_ERROR) continue;
+
+                /* Same per-address skip, for free. This loop only runs while
+                 * active_count > 0, so it can never empty an attempt. */
+                skipped_slots += meta_peer_advance_untried(peer_fail, peers, peer_count,
+                                                           &next_peer, skip_disabled);
 
                 if (parallel_conn_start(&fetch.conns[i], infohash, &peers[next_peer], tree) == 0) {
                     active_count++;
@@ -1558,6 +1647,7 @@ void *tree_metadata_worker_func(void *arg) {
         .max_metadata_size = 10 * 1024 * 1024,
         .parallel_peers = tree->parallel_peers,
         .metadata_piece_idle_ms = tree->metadata_piece_idle_ms,
+        .meta_peer_fail = tree->shared_meta_peer_fail,
         .tree = tree
     };
 

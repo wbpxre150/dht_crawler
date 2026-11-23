@@ -12,6 +12,7 @@
 #include "torrent_search.h"
 #include "supervisor.h"
 #include "inflight_set.h"   /* /stats: the dedup counters */
+#include "meta_peer_fail.h" /* /stats: the per-address connect-failure memory */
 #include "udp_rate_limit.h"
 #include "thread_tree.h"
 #include "bep51_cache.h"
@@ -1224,6 +1225,32 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                                 (double)inflight_stats.tree_released);
         cJSON_AddNumberToObject(inflight_json, "clears", (double)inflight_stats.clears);
         cJSON_AddItemToObject(root, "inflight", inflight_json);
+
+        /* Per-address TCP connect-failure memory (patch 21). Supervisor-owned, so
+         * these counters survive a tree respawn - exactly when the memory matters.
+         * The two counter units are deliberately different:
+         *   metadata_peers_skipped_total  = window SLOTS skipped (peers are not
+         *                                   deduplicated, so one address can be
+         *                                   skipped several times per attempt),
+         *   metadata_connect_fail_addresses_total = NEW distinct addresses
+         *                                   admitted since start (not events).
+         * A disabled map publishes enabled:false, ttl_sec:0 and zero counters, so
+         * the probe always sees the block. */
+        meta_peer_fail_stats_t mpf_stats;
+        meta_peer_fail_stats(api->supervisor->meta_peer_fail,
+                            meta_peer_fail_now_ms(), &mpf_stats);
+        cJSON *mpf_json = cJSON_CreateObject();
+        cJSON_AddBoolToObject(mpf_json, "enabled", api->supervisor->meta_peer_fail != NULL);
+        cJSON_AddNumberToObject(mpf_json, "capacity", (double)mpf_stats.capacity);
+        cJSON_AddNumberToObject(mpf_json, "held", (double)mpf_stats.held);
+        cJSON_AddNumberToObject(mpf_json, "ttl_sec", mpf_stats.ttl_sec);
+        cJSON_AddNumberToObject(mpf_json, "clears_total", (double)mpf_stats.clears);
+        cJSON_AddNumberToObject(mpf_json, "expired_total", (double)mpf_stats.expired);
+        cJSON_AddNumberToObject(mpf_json, "metadata_peers_skipped_total",
+                                (double)mpf_stats.skipped);
+        cJSON_AddNumberToObject(mpf_json, "metadata_connect_fail_addresses_total",
+                                (double)mpf_stats.addresses);
+        cJSON_AddItemToObject(root, "metadata_peer_fail", mpf_json);
 
         /* BEP51 cache global stats */
         cJSON *cache_obj = cJSON_CreateObject();

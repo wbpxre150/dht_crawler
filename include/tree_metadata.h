@@ -15,6 +15,7 @@
 /* Forward declarations */
 struct thread_tree;
 struct batch_writer;
+struct meta_peer_fail_set;
 
 /**
  * Torrent metadata structure (simplified for tree architecture)
@@ -38,6 +39,8 @@ typedef struct tree_metadata_config {
     int parallel_peers;             /* Number of peers to connect in parallel (default: 2, max 4) */
     int metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long
                                      * (default: 0 = disabled, 3000-60000) */
+    struct meta_peer_fail_set *meta_peer_fail; /* Per-address connect-failure memory
+                                     * (NULL = disabled, legacy selection) */
     struct thread_tree *tree;       /* Tree pointer for connection tracking (optional) */
 } tree_metadata_config_t;
 

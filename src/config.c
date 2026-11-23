@@ -170,6 +170,7 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_metadata_fresh_peer_retries = 1;   /* 1 fresh-peer re-lookup before a strike (0 = off) */
     config->tree_metadata_timeout_ms = 60000;       /* 60s metadata fetch deadline */
     config->tree_metadata_piece_idle_ms = 0;        /* shipped off (opt-in): evict a conn with no new piece after N ms (0 = off, 3000-60000) */
+    config->tree_metadata_peer_blacklist_ttl_sec = 0; /* shipped off (opt-in): skip an address whose TCP connect failed, for N s (0 = off, 60-3600) */
 
     /* Thread tree metadata rate-based respawn defaults */
     config->min_metadata_rate = 0.01;                  /* Floor for dynamic threshold */
@@ -605,6 +606,23 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
                 if (config->tree_metadata_piece_idle_ms < 3000) config->tree_metadata_piece_idle_ms = 3000;
                 if (config->tree_metadata_piece_idle_ms > 60000) config->tree_metadata_piece_idle_ms = 60000;
             }
+        } else if (strcmp(key, "tree_metadata_peer_blacklist_ttl_sec") == 0) {
+            config->tree_metadata_peer_blacklist_ttl_sec = atoi(value);
+            /* 0 is meaningful (per-address connect-failure memory disabled, the
+             * shipped fail-open default), so only a non-zero value is clamped
+             * into 60-3600 and logged. */
+            if (config->tree_metadata_peer_blacklist_ttl_sec != 0) {
+                if (config->tree_metadata_peer_blacklist_ttl_sec < 60) {
+                    log_msg(LOG_WARN, "tree_metadata_peer_blacklist_ttl_sec %d out of range (0, 60-3600); clamping to 60",
+                            config->tree_metadata_peer_blacklist_ttl_sec);
+                    config->tree_metadata_peer_blacklist_ttl_sec = 60;
+                }
+                if (config->tree_metadata_peer_blacklist_ttl_sec > 3600) {
+                    log_msg(LOG_WARN, "tree_metadata_peer_blacklist_ttl_sec %d out of range (0, 60-3600); clamping to 3600",
+                            config->tree_metadata_peer_blacklist_ttl_sec);
+                    config->tree_metadata_peer_blacklist_ttl_sec = 3600;
+                }
+            }
         }
         /* Thread tree metadata rate-based respawn settings */
         else if (strcmp(key, "min_metadata_rate") == 0) {
@@ -816,6 +834,9 @@ void config_print(const crawler_config_t *config) {
             config->tree_get_peers_max_queries, config->tree_get_peers_round_idle_ms,
             config->tree_get_peers_penalize_misses, config->tree_get_peers_slot_budget_ms,
             config->tree_get_peers_finish_on_peers);
+    log_msg(LOG_DEBUG, "  metadata: piece_idle_ms=%d peer_blacklist_ttl_sec=%d",
+            config->tree_metadata_piece_idle_ms,
+            config->tree_metadata_peer_blacklist_ttl_sec);
     log_msg(LOG_DEBUG, "Database Settings:");
     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
     log_msg(LOG_DEBUG, "Logging:");

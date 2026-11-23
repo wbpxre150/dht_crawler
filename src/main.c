@@ -1297,6 +1297,7 @@ int main(int argc, char *argv[]) {
         .fresh_peer_retries = config.tree_metadata_fresh_peer_retries,
         .metadata_timeout_ms = config.tree_metadata_timeout_ms,
         .metadata_piece_idle_ms = config.tree_metadata_piece_idle_ms,
+        .metadata_peer_blacklist_ttl_sec = config.tree_metadata_peer_blacklist_ttl_sec,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = config.min_metadata_rate,
         .dynamic_rate_margin = config.dynamic_rate_margin,

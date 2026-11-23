@@ -152,6 +152,7 @@ typedef struct {
     int tree_metadata_fresh_peer_retries;/* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
     int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
     int tree_metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long (default: 0 = off, 3000-60000) */
+    int tree_metadata_peer_blacklist_ttl_sec; /* Remember a failed TCP connect per peer address for this long (default: 0 = off, 60-3600) */
 
     /* Thread tree metadata rate-based respawn settings */
     double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */

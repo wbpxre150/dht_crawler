@@ -111,6 +111,7 @@ typedef struct tree_config {
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
     struct inflight_set *inflight;         /* Shared in-flight claim set (NULL = dedup disabled) */
+    struct meta_peer_fail_set *meta_peer_fail; /* Shared per-address connect-failure map (NULL = disabled) */
     struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
     int failure_strike_count;              /* Failures before permanent block (1 or 2, default: 2) */
 
@@ -142,6 +143,8 @@ typedef struct thread_tree {
     /* Shared resources (from supervisor) */
     struct bloom_filter *shared_bloom;     /* Stage 3: Shared bloom filter (thread-safe) */
     struct inflight_set *shared_inflight;  /* Shared in-flight claim set (NULL = dedup disabled) */
+    struct meta_peer_fail_set *shared_meta_peer_fail; /* Shared per-address connect-failure map
+                                        * (NULL = disabled, legacy selection) */
     struct bloom_filter *failure_bloom;    /* NEW: Failure bloom filter for two-strike filtering */
     int failure_strike_count;              /* Failures before permanent block (1 or 2, default: 2) */
 

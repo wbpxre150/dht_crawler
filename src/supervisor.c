@@ -13,6 +13,7 @@
 #include "keyspace.h"
 #include "tree_infohash_queue.h"
 #include "stats_window.h"
+#include "meta_peer_fail.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -130,6 +131,21 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* 0 disables piece-idle eviction, so only a negative field falls back to the
      * compiled default; config_init_defaults() sets 15000. */
     sup->metadata_piece_idle_ms = config->metadata_piece_idle_ms >= 0 ? config->metadata_piece_idle_ms : 15000;
+    /* Per-address TCP connect-failure memory (patch 21). 0 (the shipped default)
+     * means disabled and the map is not even allocated, so peer selection is
+     * byte-identical to legacy. A creation failure is non-fatal and lands in the
+     * same NULL = disabled state. Supervisor-owned on purpose: the counters and
+     * the memory then survive a tree respawn, which fires exactly when the
+     * metadata rate is low - i.e. when this memory is worth the most. */
+    sup->metadata_peer_blacklist_ttl_sec = config->metadata_peer_blacklist_ttl_sec >= 0
+                                               ? config->metadata_peer_blacklist_ttl_sec
+                                               : 0;
+    sup->meta_peer_fail = meta_peer_fail_create(META_PEER_FAIL_CAPACITY,
+                                                sup->metadata_peer_blacklist_ttl_sec);
+    if (!sup->meta_peer_fail && sup->metadata_peer_blacklist_ttl_sec > 0) {
+        log_msg(LOG_WARN, "[supervisor] Metadata peer-fail map unavailable: dead peer "
+                          "addresses will be retried (legacy selection)");
+    }
 
     /* Metadata rate-based respawn settings */
     sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
@@ -558,6 +574,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,
         .inflight = sup->inflight,
+        .meta_peer_fail = sup->meta_peer_fail,
         .failure_bloom = sup->failure_bloom,
         .failure_strike_count = sup->failure_strike_count,
         .supervisor_ctx = sup,
@@ -1097,6 +1114,24 @@ void supervisor_destroy(supervisor_t *sup) {
     if (sup->shared_socket) {
         tree_socket_destroy(sup->shared_socket);
         sup->shared_socket = NULL;
+    }
+
+    /* Per-address TCP connect-failure memory (patch 21). Every tree is stopped
+     * and joined by now, so nothing can consult the map any more. */
+    if (sup->meta_peer_fail) {
+        meta_peer_fail_stats_t mpf;
+        meta_peer_fail_stats(sup->meta_peer_fail, meta_peer_fail_now_ms(), &mpf);
+        log_msg(LOG_INFO,
+                "Metadata peer-fail map: addresses=%llu bumped=%llu skipped=%llu "
+                "expired=%llu clears=%llu still_held=%llu",
+                (unsigned long long)mpf.addresses,
+                (unsigned long long)mpf.bumped,
+                (unsigned long long)mpf.skipped,
+                (unsigned long long)mpf.expired,
+                (unsigned long long)mpf.clears,
+                (unsigned long long)mpf.held);
+        meta_peer_fail_destroy(sup->meta_peer_fail);
+        sup->meta_peer_fail = NULL;
     }
 
     pthread_mutex_destroy(&sup->trees_lock);

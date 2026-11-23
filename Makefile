@@ -139,6 +139,19 @@ STATS_WINDOW_TEST_BIN = $(BUILD_DIR)/test_stats_window
 STATS_WINDOW_TEST_CFLAGS =
 STATS_WINDOW_TEST_LDFLAGS =
 
+# The per-address connect-failure memory is pure too: a mutex over a fixed slot
+# table, a normalized 19-byte key and an injected clock. It logs (creation, the
+# load-factor clear), so the log stub is linked in place of src/main.c; no
+# database, bloom filter, uv loop or civetweb. Covers the NULL/ttl-0 fail-open
+# contract, the idempotent record, the TTL expiry, the load-factor clear, the
+# v4-mapped key fold, the refused addresses and the slot-vs-address counter
+# semantics.
+META_PEER_FAIL_TEST_SRCS = tests/test_meta_peer_fail.c src/meta_peer_fail.c \
+                           tests/stub_log.c
+META_PEER_FAIL_TEST_BIN = $(BUILD_DIR)/test_meta_peer_fail
+META_PEER_FAIL_TEST_CFLAGS =
+META_PEER_FAIL_TEST_LDFLAGS = -lpthread
+
 # The backfill test defines its own stub classifier symbols (models_loaded,
 # current_version, write_meta, classify) so it never links src/classifier.c:
 # the host build compiles that module inert, which could never insert a row.
@@ -255,7 +268,7 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-inflight tests-stats-window tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
 
@@ -273,6 +286,11 @@ tests-stats-window:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(STATS_WINDOW_TEST_CFLAGS) $(INCLUDES) $(STATS_WINDOW_TEST_SRCS) -o $(STATS_WINDOW_TEST_BIN) $(TEST_LDFLAGS) $(STATS_WINDOW_TEST_LDFLAGS)
 	./$(STATS_WINDOW_TEST_BIN)
+
+tests-meta-peer-fail:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(META_PEER_FAIL_TEST_CFLAGS) $(INCLUDES) $(META_PEER_FAIL_TEST_SRCS) -o $(META_PEER_FAIL_TEST_BIN) $(TEST_LDFLAGS) $(META_PEER_FAIL_TEST_LDFLAGS)
+	./$(META_PEER_FAIL_TEST_BIN)
 
 tests-docs: libbloom
 	@mkdir -p $(BUILD_DIR)
@@ -369,4 +387,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

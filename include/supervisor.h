@@ -88,6 +88,7 @@ typedef struct supervisor_config {
     int fresh_peer_retries;          /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
     int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
     int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
+    int metadata_peer_blacklist_ttl_sec; /* Per-address TCP connect-failure memory window (default: 0 = off, 60-3600) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */
@@ -141,6 +142,7 @@ typedef struct supervisor {
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
     struct inflight_set *inflight;             /* Shared in-flight claim set (NULL = dedup disabled) */
+    struct meta_peer_fail_set *meta_peer_fail; /* Shared per-address connect-failure map (NULL = disabled) */
     struct bloom_filter *failure_bloom;        /* NEW: Failure bloom filter for two-strike filtering */
     const char *failure_bloom_path;            /* NEW: Persistence path for failure bloom */
     struct bep51_cache *bep51_cache;            /* BEP51 node cache for persistent bootstrap */
@@ -186,6 +188,7 @@ typedef struct supervisor {
     int fresh_peer_retries;          /* Fresh-peer re-lookups before metadata failure strike (0-3) */
     int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
     int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
+    int metadata_peer_blacklist_ttl_sec; /* Per-address TCP connect-failure memory window (0 = off) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */
