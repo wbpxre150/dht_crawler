@@ -199,6 +199,7 @@ int main(int argc, char *argv[]) {
     bool compact_db = false;
     bool check_db = false;
     bool recover_db = false;
+    const char *restore_db_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
@@ -210,6 +211,8 @@ int main(int argc, char *argv[]) {
             printf("  --check-database         Run an integrity check on the database and report any errors\n");
             printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
             printf("                           database, then replacing the original\n");
+            printf("  --restore-database <sql> Replay an uncompressed SQL dump into a fresh database\n");
+            printf("                           and replace the configured database with it\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -222,6 +225,12 @@ int main(int argc, char *argv[]) {
             check_db = true;
         } else if (strcmp(argv[i], "--recover-database") == 0) {
             recover_db = true;
+        } else if (strcmp(argv[i], "--restore-database") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--restore-database requires a <dump.sql> argument");
+                return 1;
+            }
+            restore_db_path = argv[++i];
         }
     }
 
@@ -532,6 +541,66 @@ int main(int argc, char *argv[]) {
         unlink(tmp_shm);
 
         log_msg(LOG_INFO, "--recover-database: complete. %d torrents recovered.", nrows);
+        return 0;
+    }
+
+    /*******************************************************************
+     * --restore-database <dump.sql>: replay the dump into a fresh
+     * database, then replace the configured one. The dump is plain
+     * (uncompressed) SQL in the incremental-dump format; the C side is
+     * deliberately dumb — no decompression, no chain knowledge.
+     *******************************************************************/
+    if (restore_db_path) {
+        char tmp_path[PATH_MAX];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.restore.tmp", g_app_ctx.db_path);
+
+        if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+
+        unlink(tmp_path);
+
+        log_msg(LOG_INFO, "Restoring database %s from SQL dump %s ...",
+                g_app_ctx.db_path, restore_db_path);
+        int nstmts = database_restore(restore_db_path, tmp_path);
+
+        cleanup_app_context(&g_app_ctx);
+
+        if (nstmts < 0) {
+            log_msg(LOG_ERROR, "--restore-database: restore failed; original database unchanged.");
+            unlink(tmp_path);
+            return 1;
+        }
+
+        int chk = database_integrity_check(tmp_path);
+        if (chk != 0) {
+            log_msg(LOG_ERROR, "--restore-database: restored database failed integrity check (%d errors); aborting.", chk);
+            unlink(tmp_path);
+            return 1;
+        }
+
+        /* Remove stale WAL/SHM from the original database before rename */
+        char wal_path[PATH_MAX], shm_path[PATH_MAX];
+        snprintf(wal_path, sizeof(wal_path), "%s-wal", g_app_ctx.db_path);
+        snprintf(shm_path, sizeof(shm_path), "%s-shm", g_app_ctx.db_path);
+        unlink(wal_path);
+        unlink(shm_path);
+
+        if (rename(tmp_path, g_app_ctx.db_path) != 0) {
+            log_msg(LOG_ERROR, "--restore-database: failed to replace database: %s", strerror(errno));
+            log_msg(LOG_ERROR, "Restored copy left at %s", tmp_path);
+            return 1;
+        }
+
+        /* Clean up any WAL/SHM left by the tmp database */
+        char tmp_wal[PATH_MAX], tmp_shm[PATH_MAX];
+        snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+        snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+        unlink(tmp_wal);
+        unlink(tmp_shm);
+
+        log_msg(LOG_INFO, "--restore-database: complete. %d statements replayed.", nstmts);
         return 0;
     }
 
