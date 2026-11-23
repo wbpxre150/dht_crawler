@@ -100,9 +100,11 @@ router discovery if that fails:
 The download is validated with the loader's own magic + sha256 checks against a
 scratch cache, and the file is renamed into place only on success — a failed,
 truncated or corrupt download leaves the existing cache untouched and the crawler
-falls through to the router bootstrap exactly as before. HTTPS is verified against
-the system store with hostname (or IP SAN) checking; there is no "accept anything"
-mode.
+falls through to the router bootstrap exactly as before. HTTPS is verified with
+chain and peer-name (or IP SAN) checking — OpenSSL on the host, mbedTLS on the
+Android build, which links no OpenSSL — against the system store, or against
+`bep51_cache_ca_file`/`_dir` when set (on Android the default is the per-cert
+`/system/etc/security/cacerts` directory). There is no "accept anything" mode.
 
 ### Configuration
 

@@ -32,9 +32,28 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Two TLS backends, chosen at build time.
+ *
+ * The Android build links mbedTLS (the crawler already uses libmbedcrypto for
+ * sha256 through compat/openssl/sha.h) and has no OpenSSL at all, so
+ * dht_crawler-android defines HTTP_FETCH_MBEDTLS and links libmbedtls +
+ * libmbedx509. The host Makefile uses the system OpenSSL. Both paths verify the
+ * chain AND the peer name; neither has an "accept anything" mode. */
+#ifdef HTTP_FETCH_MBEDTLS
+#include <dirent.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/error.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+/*: Android keeps one PEM per CA here; there is no single system bundle. */
+#define HF_ANDROID_CA_DIR "/system/etc/security/cacerts"
+#else
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+#endif
 
 #define HF_HEADER_CAP 16384
 #define HF_READ_CHUNK 16384
@@ -48,7 +67,16 @@ typedef struct {
 
 typedef struct {
     int fd;
+#ifdef HTTP_FETCH_MBEDTLS
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt cacert;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    int tls_active;
+#else
     SSL *ssl;
+#endif
 } hf_conn_t;
 
 /* Buffered reader: header parsing and body reading share the same window, so
@@ -249,10 +277,121 @@ static int hf_connect(const hf_url_t *url, int timeout_ms, hf_conn_t *conn,
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     conn->fd = fd;
+#ifdef HTTP_FETCH_MBEDTLS
+    conn->tls_active = 0;
+#else
     conn->ssl = NULL;
+#endif
     return 0;
 }
 
+#ifdef HTTP_FETCH_MBEDTLS
+/* Parse a PEM bundle, or every file in a hashed CA directory (Android ships one
+ * certificate per file). Returns 0 when at least one certificate was loaded. */
+static int hf_load_ca(mbedtls_x509_crt *crt, const char *ca_file, const char *ca_dir,
+                      char *err, size_t err_len) {
+    mbedtls_x509_crt_init(crt);
+    int loaded = 0;
+
+    if (ca_file) {
+        if (mbedtls_x509_crt_parse_file(crt, ca_file) != 0) {
+            hf_err(err, err_len, "cannot parse CA file %s", ca_file);
+            return -1;
+        }
+        loaded = 1;
+    }
+    if (ca_dir) {
+        DIR *d = opendir(ca_dir);
+        if (!d) {
+            hf_err(err, err_len, "cannot open CA directory %s: %s", ca_dir, strerror(errno));
+            return -1;
+        }
+        struct dirent *e;
+        char path[1024];
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            int n = snprintf(path, sizeof(path), "%s/%s", ca_dir, e->d_name);
+            if (n < 0 || (size_t)n >= sizeof(path)) continue;
+            if (mbedtls_x509_crt_parse_file(crt, path) == 0) loaded = 1;
+        }
+        closedir(d);
+    }
+    if (!loaded) {
+        hf_err(err, err_len, "no CA certificates loaded (file=%s dir=%s)",
+               ca_file ? ca_file : "-", ca_dir ? ca_dir : "-");
+        return -1;
+    }
+    return 0;
+}
+
+static int hf_start_tls(hf_conn_t *conn, const hf_url_t *url, const char *ca_file,
+                        const char *ca_dir, char *err, size_t err_len) {
+    /* No explicit CA: fall back to the platform store (Android's per-cert dir). */
+    const char *dir = ca_dir ? ca_dir : (ca_file ? NULL : HF_ANDROID_CA_DIR);
+
+    mbedtls_entropy_init(&conn->entropy);
+    mbedtls_ctr_drbg_init(&conn->ctr_drbg);
+    if (mbedtls_ctr_drbg_seed(&conn->ctr_drbg, mbedtls_entropy_func, &conn->entropy,
+                              (const unsigned char *)"dht_crawler/http_fetch", 22) != 0) {
+        hf_err(err, err_len, "cannot seed the TLS RNG");
+        return -1;
+    }
+    if (hf_load_ca(&conn->cacert, ca_file, dir, err, err_len) != 0) return -1;
+
+    mbedtls_ssl_config_init(&conn->conf);
+    if (mbedtls_ssl_config_defaults(&conn->conf, MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+        hf_err(err, err_len, "cannot build the TLS config");
+        return -1;
+    }
+    /* Chain + peer name, never optional: this fetch installs the peer list. */
+    mbedtls_ssl_conf_authmode(&conn->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_conf_ca_chain(&conn->conf, &conn->cacert, NULL);
+    mbedtls_ssl_conf_rng(&conn->conf, mbedtls_ctr_drbg_random, &conn->ctr_drbg);
+    mbedtls_ssl_conf_min_tls_version(&conn->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+    mbedtls_ssl_init(&conn->ssl);
+    if (mbedtls_ssl_setup(&conn->ssl, &conn->conf) != 0) {
+        hf_err(err, err_len, "cannot set up the TLS session");
+        return -1;
+    }
+    /* Also covers IP literals: mbedTLS matches them against the certificate's
+     * iPAddress SAN when the name parses as an address. */
+    if (mbedtls_ssl_set_hostname(&conn->ssl, url->host) != 0) {
+        hf_err(err, err_len, "cannot set expected hostname %s", url->host);
+        return -1;
+    }
+    mbedtls_ssl_set_bio(&conn->ssl, &conn->fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+    int ret;
+    while ((ret = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            char why[160] = {0};
+            mbedtls_strerror(ret, why, sizeof(why));
+            uint32_t vr = mbedtls_ssl_get_verify_result(&conn->ssl);
+            if (vr != 0) {
+                char info[256] = {0};
+                mbedtls_x509_crt_verify_info(info, sizeof(info), "", vr);
+                hf_err(err, err_len, "certificate verify failed for %s: %s", url->host, info);
+            } else {
+                hf_err(err, err_len, "TLS handshake failed for %s: %s", url->host, why);
+            }
+            return -1;
+        }
+    }
+    if (mbedtls_ssl_get_verify_result(&conn->ssl) != 0) {
+        char info[256] = {0};
+        mbedtls_x509_crt_verify_info(info, sizeof(info), "",
+                                     mbedtls_ssl_get_verify_result(&conn->ssl));
+        hf_err(err, err_len, "certificate verify failed for %s: %s", url->host, info);
+        return -1;
+    }
+
+    conn->tls_active = 1;
+    return 0;
+}
+#else
 static int hf_start_tls(hf_conn_t *conn, const hf_url_t *url, const char *ca_file,
                         const char *ca_dir, char *err, size_t err_len) {
     static int ssl_initialised = 0;
@@ -325,13 +464,26 @@ static int hf_start_tls(hf_conn_t *conn, const hf_url_t *url, const char *ca_fil
     conn->ssl = ssl;
     return 0;
 }
+#endif
 
 static void hf_close(hf_conn_t *conn) {
+#ifdef HTTP_FETCH_MBEDTLS
+    if (conn->tls_active) {
+        mbedtls_ssl_close_notify(&conn->ssl);
+        mbedtls_ssl_free(&conn->ssl);
+        mbedtls_ssl_config_free(&conn->conf);
+        mbedtls_x509_crt_free(&conn->cacert);
+        mbedtls_ctr_drbg_free(&conn->ctr_drbg);
+        mbedtls_entropy_free(&conn->entropy);
+        conn->tls_active = 0;
+    }
+#else
     if (conn->ssl) {
         SSL_shutdown(conn->ssl);
         SSL_free(conn->ssl);
         conn->ssl = NULL;
     }
+#endif
     if (conn->fd >= 0) {
         close(conn->fd);
         conn->fd = -1;
@@ -339,6 +491,17 @@ static void hf_close(hf_conn_t *conn) {
 }
 
 static ssize_t hf_read(hf_conn_t *conn, void *buf, size_t len) {
+#ifdef HTTP_FETCH_MBEDTLS
+    if (conn->tls_active) {
+        for (;;) {
+            int n = mbedtls_ssl_read(&conn->ssl, buf, len);
+            if (n > 0) return n;
+            if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            return -1;
+        }
+    }
+#else
     if (conn->ssl) {
         int n = SSL_read(conn->ssl, buf, (int)len);
         if (n > 0) return n;
@@ -346,14 +509,26 @@ static ssize_t hf_read(hf_conn_t *conn, void *buf, size_t len) {
         if (e == SSL_ERROR_ZERO_RETURN) return 0;
         return -1;
     }
+#endif
     return recv(conn->fd, buf, len, 0);
 }
 
 static ssize_t hf_write(hf_conn_t *conn, const void *buf, size_t len) {
+#ifdef HTTP_FETCH_MBEDTLS
+    if (conn->tls_active) {
+        for (;;) {
+            int n = mbedtls_ssl_write(&conn->ssl, buf, len);
+            if (n > 0) return n;
+            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            return -1;
+        }
+    }
+#else
     if (conn->ssl) {
         int n = SSL_write(conn->ssl, buf, (int)len);
         return n > 0 ? n : -1;
     }
+#endif
     return send(conn->fd, buf, len, 0);
 }
 
@@ -572,7 +747,7 @@ static int hf_follow_redirect(const hf_url_t *cur, const char *location, int hop
 static int hf_attempt(const hf_url_t *url, const char *dest_path, size_t max_bytes,
                       long long deadline, const char *ca_file, const char *ca_dir,
                       char *err, size_t err_len) {
-    hf_conn_t conn = {.fd = -1, .ssl = NULL};
+    hf_conn_t conn = {.fd = -1};
     hf_reader_t *reader = NULL;
     FILE *out = NULL;
     char *tmp_path = NULL;
