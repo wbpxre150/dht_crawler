@@ -191,7 +191,9 @@ static void test_load_factor_clear(void) {
     meta_peer_fail_set_t *set = meta_peer_fail_create(META_PEER_FAIL_CAPACITY, TTL_SEC);
     if (!set) { CHECK(false, "map created"); return; }
 
-    /* 3/4 of 8192 slots = 6144: the clear fires on the insert after that. */
+    /* 3/4 of the shipped capacity: the clear fires on the insert after that.
+     * Derived symbolically, so this case scales with META_PEER_FAIL_CAPACITY
+     * (98,304 inserts at the shipped 131,072 slots). */
     const uint32_t load_limit = (uint32_t)(META_PEER_FAIL_CAPACITY * 3 / 4);
     struct sockaddr_storage first = v4_peer(0x0A000001u, 6881);
 

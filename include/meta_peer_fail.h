@@ -42,9 +42,17 @@
  * key distinct from any IPv4 key. 19 bytes - the slot pads to 32. */
 #define META_PEER_FAIL_KEY_LEN 19
 
-/** Shipped sizing: 8192 slots x 32 B = 256 KiB (slot bytes are asserted in
- * src/meta_peer_fail.c). At the 3/4 load clear that is ~6,100 live addresses. */
-#define META_PEER_FAIL_CAPACITY 8192
+/** Shipped sizing: 131,072 slots x 32 B = 4 MiB (slot bytes are asserted in
+ * src/meta_peer_fail.c). The sizing rule: the 3/4-load clear threshold has to
+ * hold the whole TTL working set without a clear, i.e. it must exceed the
+ * worst-case number of live entries. Measured ~110-133 NEW distinct connect
+ * failure addresses/s x a 600 s TTL = 66,000-79,800 live entries, and
+ * 131,072 x 3/4 = 98,304 clear threshold (~23 % margin over that worst case).
+ * The original 8192 slots (clear at 6,144) were wiped every ~50-70 s at the
+ * measured rate, so entries died by capacity clear instead of by TTL and the
+ * knob could not age anything out (reports/w3-sizing-blocker.md). 4 MiB is
+ * ~0.2 % of the measured 2.04 GB crawler RSS. */
+#define META_PEER_FAIL_CAPACITY 131072
 
 typedef struct meta_peer_fail_set meta_peer_fail_set_t;
 

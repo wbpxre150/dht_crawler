@@ -34,9 +34,12 @@ typedef struct {
     uint64_t last_fail_ms;                /* monotonic ms of the last failure (TTL) */
 } meta_peer_fail_slot_t;
 
-/* 8192 slots x 32 B = 256 KiB: +0.013 % of the measured 1,995 MB crawler RSS.
- * The static assertion is the budget's guard rail - a field added to the slot
- * must be paid for here, not silently. */
+/* 131,072 slots x 32 B = 4 MiB: ~0.2 % of the measured 2.04 GB crawler RSS.
+ * Sized so the 3/4-load clear (98,304) exceeds the whole 600 s TTL working set
+ * (~110-133 new fail addresses/s x 600 s = 66,000-79,800); at 8192 slots the
+ * table cleared every ~50-70 s and no entry ever reached its TTL. The static
+ * assertion is the budget's guard rail - a field added to the slot must be paid
+ * for here, not silently. */
 typedef char meta_peer_fail_slot_size_check[(sizeof(meta_peer_fail_slot_t) == 32) ? 1 : -1];
 
 struct meta_peer_fail_set {
