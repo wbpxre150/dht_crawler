@@ -51,6 +51,12 @@ typedef struct {
     int adult;
     int has_confidence;
     double confidence;
+    /* Stage 8: torrent_class.movie_kind_mask of this torrent's class row (see
+     * movie_kind.h). has_movie_kind 0 means the column is SQL NULL (never
+     * classified); has_movie_kind 1 with mask 0 is a genuine "no genre"
+     * verdict, so the two cases have to stay distinguishable in the JSON. */
+    int has_movie_kind;
+    int movie_kind_mask;
 } search_result_t;
 
 /* Function declarations */
