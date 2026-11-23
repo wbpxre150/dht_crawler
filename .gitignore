@@ -65,3 +65,6 @@ build/
 
 # Claude files
 .claude
+
+# Live configuration (may hold backup hosts/credentials) — never commit
+config.ini
