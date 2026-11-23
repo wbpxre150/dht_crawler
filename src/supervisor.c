@@ -125,9 +125,6 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->require_empty_queue = config->require_empty_queue;
     sup->rate_ema_alpha = (config->rate_ema_alpha > 0.0 && config->rate_ema_alpha <= 1.0) ? config->rate_ema_alpha : 0.3;
 
-    /* Porn filter settings */
-    sup->porn_filter_enabled = config->porn_filter_enabled;
-
     /* Stage 6 adult handling */
     strncpy(sup->adult_mode, config->adult_mode, sizeof(sup->adult_mode) - 1);
 
@@ -508,8 +505,6 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .min_lifetime_minutes = sup->min_lifetime_minutes,
         .require_empty_queue = sup->require_empty_queue,
         .ema_alpha = sup->rate_ema_alpha,
-        /* Porn filter settings */
-        .porn_filter_enabled = sup->porn_filter_enabled,
         /* Stage 6 adult handling (adult_mode is copied after the literal below) */
         /* Shared resources */
         .batch_writer = sup->batch_writer,

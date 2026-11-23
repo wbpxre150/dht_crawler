@@ -2,8 +2,6 @@
 #include "database.h"
 #include "http_api.h"
 #include "bloom_filter.h"
-#include "porn_filter.h"
-#include "porn_filter_cleanup.h"
 #include "language_filter.h"
 #include "classifier.h"
 #include "hard_block.h"
@@ -195,7 +193,6 @@ void cleanup_app_context(app_context_t *ctx) {
 int main(int argc, char *argv[]) {
     int rc;
     bool rebuild_bloom = false;
-    bool porn_filter_update = false;
     bool compact_db = false;
     bool check_db = false;
     bool recover_db = false;
@@ -206,9 +203,7 @@ int main(int argc, char *argv[]) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
             printf("Options:\n");
             printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
-            printf("  --porn-filter-update     Re-scan the database and remove entries matching the porn filter\n");
             printf("  --compact                Compact the database by writing a fresh copy and replacing the original\n");
-            printf("                           Can be used alone or combined with --porn-filter-update\n");
             printf("  --check-database         Run an integrity check on the database and report any errors\n");
             printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
             printf("                           database, then replacing the original\n");
@@ -219,8 +214,6 @@ int main(int argc, char *argv[]) {
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
             rebuild_bloom = true;
-        } else if (strcmp(argv[i], "--porn-filter-update") == 0) {
-            porn_filter_update = true;
         } else if (strcmp(argv[i], "--compact") == 0) {
             compact_db = true;
         } else if (strcmp(argv[i], "--check-database") == 0) {
@@ -681,24 +674,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Initialize pornography content filter (if enabled) */
-    if (config.porn_filter_enabled) {
-        log_msg(LOG_DEBUG, "Initializing porn filter (keyword file: %s)...", config.porn_filter_keyword_file);
-        rc = porn_filter_init(config.porn_filter_keyword_file);
-        if (rc != 0) {
-            log_msg(LOG_WARN, "Failed to initialize porn filter, continuing without filtering");
-        } else {
-            log_msg(LOG_DEBUG, "Porn filter enabled");
-        }
-    } else {
-        log_msg(LOG_DEBUG, "Porn filter disabled");
-    }
-
     /* Initialize the always-on hard block list (Stage 6). Non-fatal: a missing
      * file only disables the list, and hard_block_init() logs the warning. */
     hard_block_init(config.hard_block_file);
 
-    /* Initialize language filter (independent of porn filter) */
+    /* Initialize the language filter */
     language_filter_init(config.language_filter_non_latin_threshold);
 
     /* Initialize ingest-time classifier (Stage 5, tag mode). Non-fatal: without
@@ -916,7 +896,6 @@ int main(int argc, char *argv[]) {
     rc = database_init(&g_database, g_app_ctx.db_path, &g_app_ctx);
     if (rc != 0) {
         log_msg(LOG_ERROR, "Failed to initialize database: %d", rc);
-        porn_filter_cleanup();
         hard_block_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
@@ -945,38 +924,6 @@ int main(int argc, char *argv[]) {
     }
 
     /*******************************************************************
-     * --porn-filter-update maintenance mode: scan DB and remove rows
-     * the current filter would have rejected, then exit.
-     *******************************************************************/
-    if (porn_filter_update) {
-        if (!config.porn_filter_enabled) {
-            log_msg(LOG_ERROR, "--porn-filter-update requires porn_filter_enabled=1 in config.ini. Aborting.");
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-        if (porn_filter_get_keyword_count() < 0) {
-            log_msg(LOG_ERROR, "--porn-filter-update: porn filter failed to initialize earlier. Aborting.");
-            database_cleanup(&g_database);
-            bloom_filter_cleanup(g_bloom);
-            return 1;
-        }
-
-        int rrc = porn_filter_cleanup_run(&g_database, g_app_ctx.db_path);
-
-        if (rrc != 0 || !compact_db) {
-            database_cleanup(&g_database);
-            torrent_search_cleanup();
-            porn_filter_cleanup();
-            hard_block_cleanup();
-            language_filter_cleanup();
-            bloom_filter_cleanup(g_bloom);
-            cleanup_app_context(&g_app_ctx);
-            return rrc;
-        }
-    }
-
-    /*******************************************************************
      * --compact: write a fresh compacted copy, replace original, exit.
      *******************************************************************/
     if (compact_db) {
@@ -986,7 +933,6 @@ int main(int argc, char *argv[]) {
         if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
             database_cleanup(&g_database);
             torrent_search_cleanup();
-            porn_filter_cleanup();
             hard_block_cleanup();
             language_filter_cleanup();
             bloom_filter_cleanup(g_bloom);
@@ -1001,7 +947,6 @@ int main(int argc, char *argv[]) {
 
         database_cleanup(&g_database);
         torrent_search_cleanup();
-        porn_filter_cleanup();
         hard_block_cleanup();
         language_filter_cleanup();
         bloom_filter_cleanup(g_bloom);
@@ -1117,8 +1062,6 @@ int main(int argc, char *argv[]) {
         .global_bootstrap_target = config.global_bootstrap_target,
         .global_bootstrap_timeout_sec = config.global_bootstrap_timeout_sec,
         .global_bootstrap_workers = config.global_bootstrap_workers,
-        /* Porn filter settings */
-        .porn_filter_enabled = config.porn_filter_enabled,
         /* Stage 6 adult handling (adult_mode is copied after the literal) */
         /* Adaptive keyspace partitioning */
         .dead_partition_threshold = config.dead_partition_threshold,
@@ -1324,7 +1267,6 @@ int main(int argc, char *argv[]) {
     }
     database_cleanup(&g_database);
     torrent_search_cleanup();
-    porn_filter_cleanup();
     hard_block_cleanup();
     language_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
