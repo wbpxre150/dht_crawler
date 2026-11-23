@@ -92,7 +92,8 @@ typedef struct {
 
     /* Stage 6 adult handling */
     char adult_mode[8];                 /* "tag" (default) or "drop" at ingest */
-    double adult_hide_threshold;        /* Classifier adult tag threshold; 0 = take it from the manifest */
+    double adult_hide_threshold;        /* Classifier adult tag threshold (default: 0.375, CRAM v15's
+                                         * recall-0.90 point); 0 = take it from the manifest */
     char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
     /* Which pass the classify-backfill daemon runs. "all" (default) keeps the
      * historical full re-classify, "adult" runs only the token-gated adult
