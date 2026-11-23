@@ -18,6 +18,7 @@
 #include "movie_kind.h"
 #include "movie_backfill.h"
 #include "movie_backfill_daemon.h"
+#include "maintenance_progress.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -442,14 +443,17 @@ int main(int argc, char *argv[]) {
     if (rebuild_bloom) {
         if (!config.bloom_enabled) {
             log_msg(LOG_ERROR, "--rebuild-bloom-filter: bloom filter is disabled in config.ini");
+            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
             return 1;
         }
         if (!config.bloom_persist) {
             log_msg(LOG_ERROR, "--rebuild-bloom-filter: bloom filter persistence is disabled in config.ini (bloom_persist=0)");
+            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
             return 1;
         }
         if (ensure_parent_directory_exists(config.bloom_path) != 0) {
             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to create bloom filter directory");
+            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
             return 1;
         }
 
@@ -457,26 +461,41 @@ int main(int argc, char *argv[]) {
         bloom_filter_t *bloom = bloom_filter_init(config.bloom_capacity, config.bloom_error_rate);
         if (!bloom) {
             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to allocate bloom filter");
+            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
             return 1;
         }
+
+        /* Count first, so the very first [MPROG] line already carries the percent
+         * base; database_rebuild_bloom counts the same rows again for its own
+         * scan phase (an index-only COUNT(*), milliseconds either way). */
+        long long bloom_total = database_count_torrents(g_app_ctx.db_path);
+        mprog_emit("rebuild-bloom-filter", "count", 0, bloom_total, NULL);
 
         int added = database_rebuild_bloom(g_app_ctx.db_path, bloom);
         if (added < 0) {
             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to read database");
             bloom_filter_cleanup(bloom);
+            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
             return 1;
         }
 
         log_msg(LOG_INFO, "Added %d infohashes to bloom filter", added);
 
+        mprog_emit("rebuild-bloom-filter", "save", -1, 0, NULL);
         if (bloom_filter_save(bloom, config.bloom_path) != 0) {
             log_msg(LOG_ERROR, "--rebuild-bloom-filter: failed to save bloom filter to %s", config.bloom_path);
             bloom_filter_cleanup(bloom);
+            mprog_terminal("rebuild-bloom-filter", 0, 1, NULL);
             return 1;
         }
 
         bloom_filter_cleanup(bloom);
         log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s.", config.bloom_path);
+        {
+            char bloom_extra[64];
+            snprintf(bloom_extra, sizeof(bloom_extra), "added=%d", added);
+            mprog_terminal("rebuild-bloom-filter", 1, 0, bloom_extra);
+        }
         return 0;
     }
 
@@ -484,15 +503,21 @@ int main(int argc, char *argv[]) {
      * metadata fetch (and were suppressed from retry) become eligible again.
      * The crawler re-creates an empty filter on its next start. */
     if (clear_failure_filter) {
+        /* Phase-only by nature: one unlink(), so there is no denominator to
+         * report - the outcome rides on the terminal line as removed=1|0. */
+        mprog_emit("clear-failure-filter", "unlink", -1, 0, NULL);
         if (unlink("data/failure_bloom.dat") == 0) {
             log_msg(LOG_INFO, "--clear-failure-filter: removed data/failure_bloom.dat");
+            mprog_terminal("clear-failure-filter", 1, 0, "removed=1");
             return 0;
         }
         if (errno == ENOENT) {
             log_msg(LOG_INFO, "--clear-failure-filter: data/failure_bloom.dat not present; nothing to remove");
+            mprog_terminal("clear-failure-filter", 1, 0, "removed=0");
             return 0;
         }
         log_msg(LOG_ERROR, "--clear-failure-filter: failed to remove data/failure_bloom.dat: %s", strerror(errno));
+        mprog_terminal("clear-failure-filter", 0, 1, "removed=0");
         return 1;
     }
 
@@ -501,17 +526,27 @@ int main(int argc, char *argv[]) {
      *******************************************************************/
     if (check_db) {
         log_msg(LOG_INFO, "Checking database integrity: %s", g_app_ctx.db_path);
+        /* Phase-only: PRAGMA integrity_check reports a verdict at the end and
+         * nothing incremental, so there is no honest denominator to show. */
+        mprog_emit("check-database", "integrity_check", -1, 0, NULL);
         int nerrors = database_integrity_check(g_app_ctx.db_path);
         cleanup_app_context(&g_app_ctx);
         if (nerrors < 0) {
             log_msg(LOG_ERROR, "--check-database: failed to open or query database.");
+            mprog_terminal("check-database", 0, 1, NULL);
             return 1;
         }
         if (nerrors == 0) {
             log_msg(LOG_INFO, "--check-database: database is clean.");
+            mprog_terminal("check-database", 1, 0, "errors=0");
             return 0;
         }
         log_msg(LOG_ERROR, "--check-database: %d integrity error(s) found.", nerrors);
+        {
+            char check_extra[64];
+            snprintf(check_extra, sizeof(check_extra), "errors=%d", nerrors);
+            mprog_terminal("check-database", 0, 1, check_extra);
+        }
         return 1;
     }
 
@@ -525,12 +560,14 @@ int main(int argc, char *argv[]) {
 
         if (check_disk_space(g_app_ctx.db_path, tmp_path) != 0) {
             cleanup_app_context(&g_app_ctx);
+            mprog_terminal("recover-database", 0, 1, NULL);
             return 1;
         }
 
         unlink(tmp_path);
 
         log_msg(LOG_INFO, "Recovering database %s into %s ...", g_app_ctx.db_path, tmp_path);
+        /* The three copy phases emit their own lines from database_recover(). */
         int nrows = database_recover(g_app_ctx.db_path, tmp_path);
 
         cleanup_app_context(&g_app_ctx);
@@ -538,13 +575,20 @@ int main(int argc, char *argv[]) {
         if (nrows < 0) {
             log_msg(LOG_ERROR, "--recover-database: recovery failed; original database unchanged.");
             unlink(tmp_path);
+            mprog_terminal("recover-database", 0, 1, NULL);
             return 1;
         }
 
+        mprog_emit("recover-database", "verify", -1, 0, NULL);
         int chk = database_integrity_check(tmp_path);
         if (chk != 0) {
             log_msg(LOG_ERROR, "--recover-database: recovered database failed integrity check (%d errors); aborting.", chk);
             unlink(tmp_path);
+            {
+                char recover_extra[64];
+                snprintf(recover_extra, sizeof(recover_extra), "errors=%d", chk);
+                mprog_terminal("recover-database", 0, 1, recover_extra);
+            }
             return 1;
         }
 
@@ -555,9 +599,11 @@ int main(int argc, char *argv[]) {
         unlink(wal_path);
         unlink(shm_path);
 
+        mprog_emit("recover-database", "rename", -1, 0, NULL);
         if (rename(tmp_path, g_app_ctx.db_path) != 0) {
             log_msg(LOG_ERROR, "--recover-database: failed to replace database: %s", strerror(errno));
             log_msg(LOG_ERROR, "Recovered copy left at %s", tmp_path);
+            mprog_terminal("recover-database", 0, 1, NULL);
             return 1;
         }
 
@@ -569,6 +615,11 @@ int main(int argc, char *argv[]) {
         unlink(tmp_shm);
 
         log_msg(LOG_INFO, "--recover-database: complete. %d torrents recovered.", nrows);
+        {
+            char recover_extra[64];
+            snprintf(recover_extra, sizeof(recover_extra), "torrents=%d", nrows);
+            mprog_terminal("recover-database", 1, 0, recover_extra);
+        }
         return 0;
     }
 

@@ -1,6 +1,7 @@
 #include "database.h"
 #include "dht_crawler.h"
 #include "bloom_filter.h"
+#include "maintenance_progress.h"
 #include <time.h>   /* Stage 7: CLOCK_MONOTONIC for the read-connection open timing */
 #include <stdio.h>
 #include <string.h>
@@ -1389,6 +1390,45 @@ int database_optimize(database_t *db) {
     return 0;
 }
 
+/* COUNT(*) of `table` over an already-open connection, or -1 when it cannot be
+ * read. A corrupt source must degrade a progress report to phase-only, never
+ * abort the action, so every failure here returns -1 instead of propagating. */
+static long long count_table_rows(sqlite3 *db, const char *table) {
+    char sql[128];
+    sqlite3_stmt *stmt = NULL;
+    long long total = -1;
+
+    if (!db || !table) {
+        return -1;
+    }
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s", table);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return total;
+}
+
+/* Row count of the torrents table in db_path, or -1 when it cannot be read.
+ * Cheap enough to serve as a maintenance-progress denominator: COUNT(*) on a
+ * rowid table is an index-only scan (~ms over the 6.1M rows on the phone). */
+long long database_count_torrents(const char *db_path) {
+    sqlite3 *db = NULL;
+    long long total;
+
+    if (!db_path) {
+        return -1;
+    }
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    total = count_table_rows(db, "torrents");
+    sqlite3_close(db);
+    return total;
+}
+
 /* Rebuild bloom filter from all infohashes in the database.
  * Opens the database read-only, iterates every info_hash in torrents,
  * and adds each to the provided bloom filter.
@@ -1416,7 +1456,14 @@ int database_rebuild_bloom(const char *db_path, bloom_filter_t *bloom) {
         return -1;
     }
 
+    /* Denominator for the [MPROG] percent - the same COUNT(*) main.c reports as
+     * its "count" phase. -1 (unreadable) degrades the scan to done-only. */
+    long long total = database_count_torrents(db_path);
+    mprog_throttle_t scan_prog;
+    mprog_throttle_init(&scan_prog);
+
     int count = 0;
+    mprog_progress(&scan_prog, "rebuild-bloom-filter", "scan", 0, total, NULL);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const void *blob = sqlite3_column_blob(stmt, 0);
         int blob_len = sqlite3_column_bytes(stmt, 0);
@@ -1426,6 +1473,7 @@ int database_rebuild_bloom(const char *db_path, bloom_filter_t *bloom) {
             if (count % 100000 == 0) {
                 log_msg(LOG_INFO, "rebuild_bloom: %d infohashes processed...", count);
             }
+            mprog_progress(&scan_prog, "rebuild-bloom-filter", "scan", count, total, NULL);
         }
     }
 
@@ -1550,6 +1598,10 @@ int database_recover(const char *src_path, const char *dst_path) {
 
     /* --- path_prefixes --- */
     int prefix_count = 0;
+    long long prefix_total = count_table_rows(src, "path_prefixes");
+    mprog_throttle_t prefix_prog;
+    mprog_throttle_init(&prefix_prog);
+    mprog_progress(&prefix_prog, "recover-database", "path_prefixes", 0, prefix_total, NULL);
     rc = sqlite3_prepare_v2(src, "SELECT id, prefix FROM path_prefixes", -1, &sel, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_prepare_v2(dst,
@@ -1563,6 +1615,8 @@ int database_recover(const char *src_path, const char *dst_path) {
             if (sqlite3_step(ins) == SQLITE_DONE) prefix_count++;
             else skipped++;
             sqlite3_reset(ins);
+            mprog_progress(&prefix_prog, "recover-database", "path_prefixes",
+                           prefix_count, prefix_total, NULL);
         }
         if (rc != SQLITE_DONE)
             log_msg(LOG_WARN, "recover: path_prefixes scan ended early: %s", sqlite3_errmsg(src));
@@ -1573,6 +1627,10 @@ int database_recover(const char *src_path, const char *dst_path) {
 
     /* --- torrents --- */
     int torrent_count = 0;
+    long long torrent_total = count_table_rows(src, "torrents");
+    mprog_throttle_t torrent_prog;
+    mprog_throttle_init(&torrent_prog);
+    mprog_progress(&torrent_prog, "recover-database", "torrents", 0, torrent_total, NULL);
     rc = sqlite3_prepare_v2(src,
         "SELECT id, info_hash, name, size_bytes, total_peers, added_timestamp FROM torrents",
         -1, &sel, NULL);
@@ -1601,6 +1659,8 @@ int database_recover(const char *src_path, const char *dst_path) {
 
             if (torrent_count % 100000 == 0 && torrent_count > 0)
                 log_msg(LOG_INFO, "recover: %d torrents copied...", torrent_count);
+            mprog_progress(&torrent_prog, "recover-database", "torrents",
+                           torrent_count, torrent_total, NULL);
         }
         if (rc != SQLITE_DONE)
             log_msg(LOG_WARN, "recover: torrents scan ended early: %s", sqlite3_errmsg(src));
@@ -1610,6 +1670,12 @@ int database_recover(const char *src_path, const char *dst_path) {
 
     /* --- torrent_files --- */
     int file_count = 0;
+    /* Done-only: COUNT(*) over 286.7M torrent_files rows is an unmeasured full
+     * scan on a possibly-corrupt source, so this phase reports a count and no
+     * percent rather than paying for a denominator it does not need. */
+    mprog_throttle_t file_prog;
+    mprog_throttle_init(&file_prog);
+    mprog_progress(&file_prog, "recover-database", "torrent_files", 0, 0, NULL);
     rc = sqlite3_prepare_v2(src,
         "SELECT id, torrent_id, prefix_id, filename, size_bytes, file_index FROM torrent_files",
         -1, &sel, NULL);
@@ -1636,6 +1702,8 @@ int database_recover(const char *src_path, const char *dst_path) {
             if (sqlite3_step(ins) == SQLITE_DONE) file_count++;
             else skipped++;
             sqlite3_reset(ins);
+            mprog_progress(&file_prog, "recover-database", "torrent_files",
+                           file_count, 0, NULL);
         }
         if (rc != SQLITE_DONE)
             log_msg(LOG_WARN, "recover: torrent_files scan ended early: %s", sqlite3_errmsg(src));

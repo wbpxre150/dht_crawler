@@ -30,6 +30,7 @@
 
 #include "dht_crawler.h"
 #include "movie_kind.h"
+#include "maintenance_progress.h"
 
 #include <pthread.h>
 #include <signal.h>
@@ -1102,6 +1103,7 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
 
     if (!db_path) {
         log_msg(LOG_ERROR, "movie-kind-bench: no database path");
+        mprog_terminal("movie-kind-bench", 0, 1, NULL);
         return -1;
     }
     if (rows <= 0) {
@@ -1123,6 +1125,7 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
         log_msg(LOG_ERROR,
                 "movie-kind-bench: the movie-kind module is disabled (no verified v9 "
                 "manifest, or this build has no encoder); nothing measured");
+        mprog_terminal("movie-kind-bench", 0, 1, NULL);
         return 1;
     }
 
@@ -1135,9 +1138,11 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
         if (db) {
             sqlite3_close(db);
         }
+        mprog_terminal("movie-kind-bench", 0, 1, NULL);
         return -1;
     }
     sqlite3_busy_timeout(db, MB_BUSY_TIMEOUT_MS);
+    mprog_emit("movie-kind-bench", "load", -1, 0, NULL);
 
     rc = sqlite3_prepare_v2(db,
                             "SELECT t.name FROM torrents t "
@@ -1202,6 +1207,18 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
         (void)mb_classify(names[0], &warm_mask);
     }
 
+    /* [MPROG] encode phase. done is the index inside the CURRENT pass, not the
+     * cumulative sample count: the sustained loop repeats the pass until it has
+     * run MB_BENCH_MIN_SECONDS, so a cumulative done would pass total (n) and
+     * the app drops a denominator it cannot trust. The cumulative numbers ride
+     * along as samples=/failures=, and the throttle re-arms on the wrap back to
+     * 0 so each pass reports its own 0-100 % instead of freezing at 100 %.
+     * Gate: one line per 1 % AND per second - the same rule as everywhere else,
+     * which is what keeps a fast bench from evicting the 2000-line console. */
+    mprog_throttle_t bench_prog;
+    mprog_throttle_init(&bench_prog);
+    mprog_emit("movie-kind-bench", "encode", 0, n, NULL);
+
     started = mb_now_seconds();
     for (;;) {
         for (i = 0; i < n; i++) {
@@ -1226,6 +1243,13 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
             if (temp_c > max_temp_c) {
                 max_temp_c = temp_c;
             }
+            {
+                char bench_extra[64];
+                snprintf(bench_extra, sizeof(bench_extra), "samples=%lld failures=%lld",
+                         samples_n, failures);
+                mprog_progress(&bench_prog, "movie-kind-bench", "encode", i + 1, n,
+                               bench_extra);
+            }
         }
         elapsed = mb_now_seconds() - started;
         if (dump_masks || elapsed >= MB_BENCH_MIN_SECONDS || samples_n <= 0) {
@@ -1236,6 +1260,7 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
         }
     }
     elapsed = mb_now_seconds() - started;
+    mprog_emit("movie-kind-bench", "report", -1, 0, NULL);
 
     /* Only the retained samples are sorted; `samples` reports how many names
      * were actually measured, so a run longer than the sample cap is honest
@@ -1260,8 +1285,14 @@ int movie_backfill_bench(const char *db_path, int rows, int threads, int dump_ma
         fflush(stdout);
     }
     result = 0;
+    mprog_terminal("movie-kind-bench", 1, 0, NULL);
 
 done:
+    if (result != 0) {
+        /* Every goto done path (candidate query, OOM) exits without a terminal
+         * otherwise, and the app would wait for a phase that never arrives. */
+        mprog_terminal("movie-kind-bench", 0, 1, NULL);
+    }
     sqlite3_finalize(stmt);
     if (db) {
         sqlite3_close(db);

@@ -164,6 +164,11 @@ void db_free_torrent_file_rows(torrent_file_row_t *rows, int count);
  * Returns the number of hashes added, or -1 on error. */
 int database_rebuild_bloom(const char *db_path, struct bloom_filter *bloom);
 
+/* Row count of the torrents table in db_path, or -1 when it cannot be read.
+ * The denominator for maintenance progress ([MPROG]); COUNT(*) on a rowid
+ * table is an index-only scan, so it costs milliseconds, not minutes. */
+long long database_count_torrents(const char *db_path);
+
 /* Backfill the schema-v2 torrent-level word index (torrent_docs) of an existing
  * db_path database from its base tables, in bounded id chunks. Idempotent (a
  * re-run replaces each chunk's rowid range); the WAL is checkpointed and
