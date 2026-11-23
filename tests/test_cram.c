@@ -32,10 +32,11 @@
  * is linked directly (the `meta_peer_fail` shape); `src/classifier.c` is never
  * linked, because its real half only exists under `CLF_ENABLED`.
  *
- * The model files live in the main repo, not in the prepared tree, so the
- * Makefile passes an absolute path:
+ * The model files are vendored beside the other fixtures, so this target is
+ * hermetic (no Android repo, no network). The Makefile passes the directory:
  *
- *     make tests-cram        (CRAM_TEST_MODEL_DIR=$(CLF_ANDROID_DIR)/models/v15)
+ *     make tests-cram        (CRAM_TEST_MODEL_DIR=tests/fixtures/cram/models/v15)
+ *     make tests-cram CRAM_MODEL_DIR=<dir>     (a different generation)
  */
 #include <math.h>
 #include <stdio.h>
@@ -46,7 +47,7 @@
 #include "cram.h"
 
 #ifndef CRAM_TEST_MODEL_DIR
-#error "tests-cram must be built with -DCRAM_TEST_MODEL_DIR=<abs path to models/v15>"
+#error "tests-cram must be built with -DCRAM_TEST_MODEL_DIR=<path to models/v15>"
 #endif
 
 /*: Fixtures ride the submodule; the test runs with cwd = the prepared tree. */

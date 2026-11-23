@@ -1,0 +1,32 @@
+{
+  "manifest_version": 1,
+  "version": "v15",
+  "engine": "cram",
+  "models": {
+    "cram": {
+      "file": "cram.bin",
+      "bytes": 9388835,
+      "sha256": "834159b642d67da728bbdc3411badf83b639742743c95d414fc62ddd81e45bec"
+    },
+    "cram_vocab": {
+      "file": "cram_vocab.bin",
+      "bytes": 2046524,
+      "sha256": "6e24c4b27e3bd546a7dad0cb9a929dc7f354e664139604f0bb75f3ca1cf21cee"
+    }
+  },
+  "thresholds": {
+    "adult_hide_threshold": 0.375
+  },
+  "cram": {
+    "generation": 2,
+    "temperature": 0.7629844484210975,
+    "columns": 1195982,
+    "states": 48,
+    "file_cap": 50,
+    "adult_threshold_recall": 0.9,
+    "source_npz_sha256": "1cad6d9f9ddfd4afd72338288d12dda6855dceda4cb531d5417b9ee22406fff2"
+  },
+  "taxonomy": {
+    "sha256": "313dafd4a5fd27e35e15530cee5279c409a92d2cb818a3d4878cfc914f7148b4"
+  }
+}

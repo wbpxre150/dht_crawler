@@ -23,7 +23,7 @@ LIB_OBJS = $(BUILD_DIR)/bencode.o \
 # Target executable
 TARGET = dht_crawler
 
-.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb
+.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb check-clf-deps
 
 all: dirs patch-bencode patch-civetweb libbloom $(TARGET)
 
@@ -152,19 +152,24 @@ META_PEER_FAIL_TEST_BIN = $(BUILD_DIR)/test_meta_peer_fail
 META_PEER_FAIL_TEST_CFLAGS =
 META_PEER_FAIL_TEST_LDFLAGS = -lpthread
 
-# The CRAM engine (patch 25) is pure C99 + libm: the container/vocab loaders,
-# the crc32 char tail and the whole forward pass, all over bytes the export
-# wrote, with the fixtures parsed by the vendored cJSON. No database, no libuv,
-# no civetweb, no tparse/ftc and no src/classifier.c -- the real classifier half
-# only exists under CLF_ENABLED, so the engine is linked directly (the
-# meta_peer_fail shape). The model files live in the *main* repo, so their
-# directory is passed absolutely: this target is also built from the
-# Gradle-prepared copy, where ../dht_crawler-android does not resolve. A missing
-# model directory fails the target loudly instead of skipping the arithmetic
-# checks.
+# The CRAM engine is pure C99 + libm: the container/vocab loaders, the crc32
+# char tail and the whole forward pass, all over bytes the export wrote, with
+# the fixtures parsed by the vendored cJSON. No database, no libuv, no civetweb,
+# no tparse/ftc and no src/classifier.c -- the real classifier half only exists
+# under CLF_ENABLED, so the engine is linked directly (the meta_peer_fail
+# shape).
+#
+# The model is the shipped v15 container, vendored under tests/fixtures/cram so
+# this target is hermetic: `make tests` needs no Android repo, no network and no
+# operator-supplied model. cram_load() verifies the pinned sha256s, so a drifted
+# fixture fails loudly instead of silently changing the arithmetic under test.
+# Point CRAM_MODEL_DIR at another generation to test that one instead. The path
+# is cwd-relative like FIXTURE_DIR, which is how the test already resolves its
+# other fixtures -- and it therefore also works from the Gradle-prepared copy.
+CRAM_MODEL_DIR ?= tests/fixtures/cram/models/v15
 CRAM_TEST_SRCS = tests/test_cram.c src/cram.c tests/stub_log.c lib/cJSON/cJSON.c
 CRAM_TEST_BIN = $(BUILD_DIR)/test_cram
-CRAM_TEST_CFLAGS = -DCRAM_TEST_MODEL_DIR='"$(CLF_ANDROID_DIR)/models/v15"'
+CRAM_TEST_CFLAGS = -DCRAM_TEST_MODEL_DIR='"$(CRAM_MODEL_DIR)"'
 CRAM_TEST_LDFLAGS = -lm -lpthread
 
 # The backfill test defines its own stub classifier symbols (models_loaded,
@@ -215,17 +220,17 @@ MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/bui
 # The renderer test compiles src/movie_kind_render.c, which is deliberately
 # ungated: the stage-11 P0 was a broken NFC length *inside* the MK_ENABLED half,
 # where the host build only ever saw a stub, so the one broken function had no
-# coverage. Built twice — plain (passthrough NFC) and with -DMK_NFC_ENABLED plus
-# the vendored utf8proc, which is what the shipped NDK binary compiles. The outer
-# wrapper directory is reached by absolute path for the same reason as
-# clf-backfill: this target is also built from the Gradle-prepared copy
-# (app/build/native/src/dht_crawler), where ../dht_crawler-android does not
-# resolve.
+# coverage. Built twice -- plain (passthrough NFC) and with -DMK_NFC_ENABLED plus
+# a real utf8proc, which is what the shipped NDK binary compiles. utf8proc
+# 2.12.0 is vendored under tests/vendor/utf8proc for exactly this binary (the
+# device build gets it from the dht_crawler-android wrapper), so the target is
+# hermetic: no Android repo, no network.
 RENDER_TEST_SRCS = tests/test_movie_kind_render.c src/movie_kind_render.c
 RENDER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_render
 RENDER_TEST_NFC_BIN = $(BUILD_DIR)/test_movie_kind_render_nfc
-RENDER_NFC_CFLAGS = -DMK_NFC_ENABLED -I$(CLF_ANDROID_DIR)/utf8proc
-RENDER_NFC_SRCS = $(RENDER_TEST_SRCS) $(CLF_ANDROID_DIR)/utf8proc/utf8proc.c
+UTF8PROC_DIR = tests/vendor/utf8proc
+RENDER_NFC_CFLAGS = -DMK_NFC_ENABLED -I$(UTF8PROC_DIR)
+RENDER_NFC_SRCS = $(RENDER_TEST_SRCS) $(UTF8PROC_DIR)/utf8proc.c
 
 # The movie-kind backfill engine test links the real src/movie_backfill.c and the
 # real src/movie_kind.c (host flavour: manifest/sha256 only), and drives the
@@ -396,7 +401,11 @@ FTC_LIB ?= $(HOME)/apps/classifier-model/build/ftc/libftc.a
 CLF_DIR = build/clf
 CLF_TARGET = $(CLF_DIR)/dht_crawler
 CLF_OBJS = $(SRCS:$(SRC_DIR)/%.c=$(CLF_DIR)/%.o)
-# Absolute on purpose: this target is built from the Gradle-prepared copy
+# Only this optional target needs the Android wrapper: it compiles the real
+# classifier half (-DCLF_ENABLED), which requires the wrapper's tparse/ftc
+# headers and the prebuilt host students. `make` and `make tests` do not touch
+# it -- the test suite is hermetic (see the CRAM and render targets above).
+# Absolute on purpose: this target is also built from the Gradle-prepared copy
 # (app/build/native/src/dht_crawler), where ../dht_crawler-android does not
 # resolve.
 CLF_ANDROID_DIR ?= $(HOME)/apps/torrent_kotlin_app/app/src/main/cpp/dht_crawler-android
@@ -405,11 +414,21 @@ CLF_INCLUDES = -I$(CLF_ANDROID_DIR)/tparse -I$(CLF_ANDROID_DIR)/ftc
 $(CLF_DIR):
 	mkdir -p $(CLF_DIR)
 
-$(CLF_DIR)/%.o: $(SRC_DIR)/%.c | $(CLF_DIR)
+$(CLF_DIR)/%.o: $(SRC_DIR)/%.c | $(CLF_DIR) check-clf-deps
 	$(CC) $(CFLAGS) $(INCLUDES) -DCLF_ENABLED $(CLF_INCLUDES) -c $< -o $@
 
 $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(CLF_OBJS) $(LIB_OBJS) $(LDFLAGS) -lstdc++ $(TPARSE_LIB) $(FTC_LIB)
+
+# Fail with a readable message instead of a wall of "tparse/taxonomy.h: No such
+# file" for anyone who runs this without the classifier model checkout.
+check-clf-deps:
+	@if [ ! -d "$(CLF_ANDROID_DIR)/tparse" ] || [ ! -d "$(CLF_ANDROID_DIR)/ftc" ]; then \
+		echo "clf-backfill: $(CLF_ANDROID_DIR) has no tparse/ or ftc/ headers."; \
+		echo "  Override CLF_ANDROID_DIR, TPARSE_LIB and FTC_LIB for your checkout,"; \
+		echo "  or use plain 'make' (the crawler and 'make tests' need none of this)."; \
+		exit 1; \
+	fi
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
