@@ -1052,7 +1052,116 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 ((double)sup_gp_lookups + (double)sup_gp_rounds) / (double)sup_gp_lookups;
         }
         cJSON_AddNumberToObject(supervisor_get_peers, "mean_rounds_per_lookup", sup_gp_mean_rounds_per_lookup);
+
+        /* Exit-reason split + silent-node penalties: idle_exits_total counts
+         * lookups that ended on the round-idle cap (i.e. completed early),
+         * deadline_exits_total those that still burned the whole per-infohash
+         * deadline. unanswered_slots_total counts round slots that were queried
+         * and never answered; miss_penalties_total those charged against the
+         * node's fail_count. */
+        uint64_t sup_gp_idle_exits = 0;
+        uint64_t sup_gp_deadline_exits = 0;
+        uint64_t sup_gp_unanswered_slots = 0;
+        uint64_t sup_gp_miss_penalties = 0;
+        uint64_t sup_gp_slot_expired = 0;
+        uint64_t sup_gp_early_finish = 0;
+        supervisor_getpeers_exit_stats(api->supervisor, &sup_gp_idle_exits,
+                                       &sup_gp_deadline_exits, &sup_gp_unanswered_slots,
+                                       &sup_gp_miss_penalties, &sup_gp_slot_expired,
+                                       &sup_gp_early_finish);
+        cJSON_AddNumberToObject(supervisor_get_peers, "idle_exits_total", (double)sup_gp_idle_exits);
+        cJSON_AddNumberToObject(supervisor_get_peers, "deadline_exits_total", (double)sup_gp_deadline_exits);
+        cJSON_AddNumberToObject(supervisor_get_peers, "unanswered_slots_total", (double)sup_gp_unanswered_slots);
+        cJSON_AddNumberToObject(supervisor_get_peers, "miss_penalties_total", (double)sup_gp_miss_penalties);
+        /* Round completion (patch 19 rev2): slot_expired_total is the unanswered
+         * subset whose per-slot budget ran out, early_finish_total the lookups
+         * ended by finish-on-peers once peers were found. Both must grow on a live
+         * window — unlike the round-idle exit, which measured inert on device. */
+        cJSON_AddNumberToObject(supervisor_get_peers, "slot_expired_total", (double)sup_gp_slot_expired);
+        cJSON_AddNumberToObject(supervisor_get_peers, "early_finish_total", (double)sup_gp_early_finish);
         cJSON_AddItemToObject(supervisor_json, "get_peers", supervisor_get_peers);
+
+        /* Metadata failure attribution: cumulative respawned trees + live trees,
+         * the same sum supervisor_stats() publishes for first_strike_failures.
+         * Each failed connection is counted once, at the site that first detected
+         * it, so these eight turn the ~86 % failure mass into a distribution;
+         * deadline_total is per attempt (every live slot abandoned together). */
+        uint64_t mf_connect = 0, mf_handshake = 0, mf_stall = 0, mf_ut_reject = 0;
+        uint64_t mf_size = 0, mf_hash = 0, mf_deadline = 0, mf_other = 0;
+        int meta_parallel_peers = 0, meta_timeout_ms = 0, meta_workers = 0;
+        int meta_tcp_timeout_ms = 0, meta_fresh_retries = 0;
+        int meta_piece_idle_ms = 0;
+        int metadata_cfg_seen = 0;
+
+        pthread_mutex_lock(&api->supervisor->trees_lock);
+        for (int i = 0; i < api->supervisor->max_trees; i++) {
+            thread_tree_t *mf_tree = api->supervisor->trees[i];
+            if (!mf_tree) continue;
+
+            mf_connect += atomic_load(&mf_tree->metadata_fail_connect);
+            mf_handshake += atomic_load(&mf_tree->metadata_fail_handshake);
+            mf_stall += atomic_load(&mf_tree->metadata_fail_stall);
+            mf_ut_reject += atomic_load(&mf_tree->metadata_fail_ut_reject);
+            mf_size += atomic_load(&mf_tree->metadata_fail_size);
+            mf_hash += atomic_load(&mf_tree->metadata_fail_hash);
+            mf_deadline += atomic_load(&mf_tree->metadata_fail_deadline);
+            mf_other += atomic_load(&mf_tree->metadata_fail_other);
+
+            /* Effective metadata knobs of the first live tree, beside the counters
+             * so every snapshot carries the settings it was measured under - the
+             * per-tree get_peers echo does the same for the get_peers knobs. */
+            if (!metadata_cfg_seen) {
+                meta_parallel_peers = mf_tree->parallel_peers;
+                meta_timeout_ms = mf_tree->metadata_timeout_ms;
+                meta_workers = mf_tree->num_metadata_workers;
+                meta_tcp_timeout_ms = mf_tree->tcp_connect_timeout_ms;
+                meta_fresh_retries = mf_tree->fresh_peer_retries;
+                meta_piece_idle_ms = mf_tree->metadata_piece_idle_ms;
+                metadata_cfg_seen = 1;
+            }
+        }
+        pthread_mutex_unlock(&api->supervisor->trees_lock);
+
+        if (!metadata_cfg_seen) {
+            /* No live tree (drain/respawn window): echo the supervisor's own
+             * values rather than zeros, so a snapshot taken mid-respawn still
+             * reports the settings it was measured under. */
+            meta_parallel_peers = api->supervisor->parallel_peers;
+            meta_timeout_ms = api->supervisor->metadata_timeout_ms;
+            meta_workers = api->supervisor->num_metadata_workers;
+            meta_tcp_timeout_ms = api->supervisor->tcp_connect_timeout_ms;
+            meta_fresh_retries = api->supervisor->fresh_peer_retries;
+            meta_piece_idle_ms = api->supervisor->metadata_piece_idle_ms;
+        }
+
+        mf_connect += atomic_load(&api->supervisor->cumulative_metadata_fail_connect);
+        mf_handshake += atomic_load(&api->supervisor->cumulative_metadata_fail_handshake);
+        mf_stall += atomic_load(&api->supervisor->cumulative_metadata_fail_stall);
+        mf_ut_reject += atomic_load(&api->supervisor->cumulative_metadata_fail_ut_reject);
+        mf_size += atomic_load(&api->supervisor->cumulative_metadata_fail_size);
+        mf_hash += atomic_load(&api->supervisor->cumulative_metadata_fail_hash);
+        mf_deadline += atomic_load(&api->supervisor->cumulative_metadata_fail_deadline);
+        mf_other += atomic_load(&api->supervisor->cumulative_metadata_fail_other);
+
+        cJSON *metadata_failures = cJSON_CreateObject();
+        cJSON_AddNumberToObject(metadata_failures, "connect_total", (double)mf_connect);
+        cJSON_AddNumberToObject(metadata_failures, "handshake_total", (double)mf_handshake);
+        cJSON_AddNumberToObject(metadata_failures, "stall_total", (double)mf_stall);
+        cJSON_AddNumberToObject(metadata_failures, "ut_reject_total", (double)mf_ut_reject);
+        cJSON_AddNumberToObject(metadata_failures, "size_total", (double)mf_size);
+        cJSON_AddNumberToObject(metadata_failures, "hash_total", (double)mf_hash);
+        cJSON_AddNumberToObject(metadata_failures, "deadline_total", (double)mf_deadline);
+        cJSON_AddNumberToObject(metadata_failures, "other_total", (double)mf_other);
+        cJSON_AddItemToObject(supervisor_json, "metadata_failures", metadata_failures);
+
+        cJSON *metadata_cfg = cJSON_CreateObject();
+        cJSON_AddNumberToObject(metadata_cfg, "parallel_peers", meta_parallel_peers);
+        cJSON_AddNumberToObject(metadata_cfg, "metadata_timeout_ms", meta_timeout_ms);
+        cJSON_AddNumberToObject(metadata_cfg, "metadata_workers", meta_workers);
+        cJSON_AddNumberToObject(metadata_cfg, "tcp_connect_timeout_ms", meta_tcp_timeout_ms);
+        cJSON_AddNumberToObject(metadata_cfg, "fresh_peer_retries", meta_fresh_retries);
+        cJSON_AddNumberToObject(metadata_cfg, "piece_idle_ms", meta_piece_idle_ms);
+        cJSON_AddItemToObject(supervisor_json, "metadata", metadata_cfg);
 
         /* UDP dispatcher counters. With a fixed dht_port every tree aliases the
          * supervisor's shared dispatcher, so read it ONCE - summing per tree
@@ -1137,6 +1246,7 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(tree_json, "partition_index", tree->partition_index);
                 cJSON_AddStringToObject(tree_json, "phase", thread_tree_phase_name(atomic_load(&tree->current_phase)));
                 cJSON_AddNumberToObject(tree_json, "metadata_count", (double)atomic_load(&tree->metadata_count));
+                cJSON_AddNumberToObject(tree_json, "metadata_attempts", (double)atomic_load(&tree->metadata_attempts));
                 cJSON_AddNumberToObject(tree_json, "metadata_piece_reasks", (double)atomic_load(&tree->metadata_piece_reasks));
                 cJSON_AddNumberToObject(tree_json, "filtered_count", (double)atomic_load(&tree->filtered_count));
                 cJSON_AddNumberToObject(tree_json, "metadata_rate", tree->metadata_rate);
@@ -1211,6 +1321,10 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(get_peers, "deadline_ms", (double)tree->get_peers_deadline_ms);
                 cJSON_AddNumberToObject(get_peers, "fanout", (double)tree->get_peers_fanout);
                 cJSON_AddNumberToObject(get_peers, "max_queries", (double)tree->get_peers_max_queries);
+                cJSON_AddNumberToObject(get_peers, "round_idle_ms", (double)tree->get_peers_round_idle_ms);
+                cJSON_AddNumberToObject(get_peers, "penalize_misses", (double)tree->get_peers_penalize_misses);
+                cJSON_AddNumberToObject(get_peers, "slot_budget_ms", (double)tree->get_peers_slot_budget_ms);
+                cJSON_AddNumberToObject(get_peers, "finish_on_peers", (double)tree->get_peers_finish_on_peers);
                 cJSON_AddNumberToObject(get_peers, "lookups_total", (double)gp_lookups);
                 cJSON_AddNumberToObject(get_peers, "lookups_with_peers", (double)gp_with_peers);
 
@@ -1245,6 +1359,18 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                         ((double)gp_lookups + (double)gp_rounds) / (double)gp_lookups;
                 }
                 cJSON_AddNumberToObject(get_peers, "mean_rounds_per_lookup", gp_mean_rounds_per_lookup);
+                cJSON_AddNumberToObject(get_peers, "idle_exits_total",
+                                        (double)atomic_load(&tree->gp_idle_exits));
+                cJSON_AddNumberToObject(get_peers, "deadline_exits_total",
+                                        (double)atomic_load(&tree->gp_deadline_exits));
+                cJSON_AddNumberToObject(get_peers, "unanswered_slots_total",
+                                        (double)atomic_load(&tree->gp_unanswered_slots));
+                cJSON_AddNumberToObject(get_peers, "miss_penalties_total",
+                                        (double)atomic_load(&tree->gp_miss_penalties));
+                cJSON_AddNumberToObject(get_peers, "slot_expired_total",
+                                        (double)atomic_load(&tree->gp_slot_expired_total));
+                cJSON_AddNumberToObject(get_peers, "early_finish_total",
+                                        (double)atomic_load(&tree->gp_early_finish_total));
                 cJSON_AddItemToObject(tree_json, "get_peers", get_peers);
                 cJSON_AddItemToArray(trees_array, tree_json);
             }
@@ -1296,7 +1422,11 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         int total_connections = supervisor_get_total_connections(api->supervisor);
         cJSON_AddNumberToObject(aggregate, "active_connections", total_connections);
 
-        /* Calculate metadata fetch success rate */
+        /* Metadata fetch success. The denominator is published beside the
+         * percentage (metadata_attempts_total = cumulative respawned trees + live
+         * trees) so the number is reproducible from the two counters printed with
+         * it. This replaces metadata_success_rate_percent, whose denominator was
+         * implicit: a reader could not tell what the percentage was a share of. */
         uint64_t total_attempts = atomic_load(&api->supervisor->cumulative_metadata_attempts);
         pthread_mutex_lock(&api->supervisor->trees_lock);
         for (int i = 0; i < api->supervisor->max_trees; i++) {
@@ -1306,11 +1436,31 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         }
         pthread_mutex_unlock(&api->supervisor->trees_lock);
 
-        double success_rate = 0.0;
+        cJSON_AddNumberToObject(aggregate, "metadata_attempts_total", (double)total_attempts);
+
+        double metadata_fetch_success_percent = 0.0;
         if (total_attempts > 0) {
-            success_rate = (total_metadata * 100.0) / total_attempts;
+            metadata_fetch_success_percent = (total_metadata * 100.0) / (double)total_attempts;
         }
-        cJSON_AddNumberToObject(aggregate, "metadata_success_rate_percent", success_rate);
+        cJSON_AddNumberToObject(aggregate, "metadata_fetch_success_percent",
+                                metadata_fetch_success_percent);
+
+        /* get_peers yield, same totals the supervisor block publishes, repeated at
+         * aggregate level with both counters beside the percentage. */
+        uint64_t agg_gp_lookups = 0;
+        uint64_t agg_gp_with_peers = 0;
+        supervisor_getpeers_stats(api->supervisor, &agg_gp_lookups, &agg_gp_with_peers,
+                                  NULL, NULL, NULL, NULL, NULL);
+
+        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_total", (double)agg_gp_lookups);
+        cJSON_AddNumberToObject(aggregate, "get_peers_lookups_with_peers",
+                                (double)agg_gp_with_peers);
+
+        double get_peers_yield_percent = 0.0;
+        if (agg_gp_lookups > 0) {
+            get_peers_yield_percent = (agg_gp_with_peers * 100.0) / (double)agg_gp_lookups;
+        }
+        cJSON_AddNumberToObject(aggregate, "get_peers_yield_percent", get_peers_yield_percent);
 
         cJSON_AddItemToObject(root, "aggregate", aggregate);
     }

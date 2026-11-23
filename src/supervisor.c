@@ -111,11 +111,24 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : 6000;
     sup->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : 8;
     sup->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
+    /* 0 is a meaningful value here (round-idle exit disabled), so only a negative
+     * field falls back to the compiled default; config_init_defaults() sets 1500. */
+    sup->get_peers_round_idle_ms = config->get_peers_round_idle_ms >= 0 ? config->get_peers_round_idle_ms : 1500;
+    sup->get_peers_penalize_misses = config->get_peers_penalize_misses > 0 ? 1 : 0;
+    /* 0 is a meaningful value here too (slot budget disabled), so only a negative
+     * field falls back to the compiled default; config_init_defaults() sets 2000. */
+    sup->get_peers_slot_budget_ms = config->get_peers_slot_budget_ms >= 0
+                                        ? config->get_peers_slot_budget_ms
+                                        : 2000;
+    sup->get_peers_finish_on_peers = config->get_peers_finish_on_peers > 0 ? 1 : 0;
     /* Stage 5 settings */
     sup->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
     sup->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
     sup->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
-    sup->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 60000;
+    sup->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 30000;
+    /* 0 disables piece-idle eviction, so only a negative field falls back to the
+     * compiled default; config_init_defaults() sets 15000. */
+    sup->metadata_piece_idle_ms = config->metadata_piece_idle_ms >= 0 ? config->metadata_piece_idle_ms : 15000;
 
     /* Metadata rate-based respawn settings */
     sup->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;
@@ -147,6 +160,14 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_second_strike_failures, 0);
     atomic_init(&sup->cumulative_filtered_count, 0);
     atomic_init(&sup->cumulative_metadata_attempts, 0);
+    atomic_init(&sup->cumulative_metadata_fail_connect, 0);
+    atomic_init(&sup->cumulative_metadata_fail_handshake, 0);
+    atomic_init(&sup->cumulative_metadata_fail_stall, 0);
+    atomic_init(&sup->cumulative_metadata_fail_ut_reject, 0);
+    atomic_init(&sup->cumulative_metadata_fail_size, 0);
+    atomic_init(&sup->cumulative_metadata_fail_hash, 0);
+    atomic_init(&sup->cumulative_metadata_fail_deadline, 0);
+    atomic_init(&sup->cumulative_metadata_fail_other, 0);
     atomic_init(&sup->cumulative_gp_lookups, 0);
     atomic_init(&sup->cumulative_gp_lookups_with_peers, 0);
     atomic_init(&sup->cumulative_gp_lookups_from_retry, 0);
@@ -154,6 +175,12 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_gp_answers, 0);
     atomic_init(&sup->cumulative_gp_lookup_us_total, 0);
     atomic_init(&sup->cumulative_gp_rounds_total, 0);
+    atomic_init(&sup->cumulative_gp_idle_exits, 0);
+    atomic_init(&sup->cumulative_gp_deadline_exits, 0);
+    atomic_init(&sup->cumulative_gp_unanswered_slots, 0);
+    atomic_init(&sup->cumulative_gp_miss_penalties, 0);
+    atomic_init(&sup->cumulative_gp_slot_expired_total, 0);
+    atomic_init(&sup->cumulative_gp_early_finish_total, 0);
 
     /* Initialize mutex */
     if (pthread_mutex_init(&sup->trees_lock, NULL) != 0) {
@@ -498,11 +525,16 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         .get_peers_deadline_ms = sup->get_peers_deadline_ms,
         .get_peers_fanout = sup->get_peers_fanout,
         .get_peers_max_queries = sup->get_peers_max_queries,
+        .get_peers_round_idle_ms = sup->get_peers_round_idle_ms,
+        .get_peers_penalize_misses = sup->get_peers_penalize_misses,
+        .get_peers_slot_budget_ms = sup->get_peers_slot_budget_ms,
+        .get_peers_finish_on_peers = sup->get_peers_finish_on_peers,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = sup->tcp_connect_timeout_ms,
         .parallel_peers = sup->parallel_peers,
         .fresh_peer_retries = sup->fresh_peer_retries,
         .metadata_timeout_ms = sup->metadata_timeout_ms,
+        .metadata_piece_idle_ms = sup->metadata_piece_idle_ms,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = sup->min_metadata_rate,
         .rate_check_interval_sec = sup->rate_check_interval_sec,
@@ -1181,6 +1213,14 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_first_strike = atomic_load(&tree->first_strike_failures);
                     uint64_t tree_second_strike = atomic_load(&tree->second_strike_failures);
                     uint64_t tree_attempts = atomic_load(&tree->metadata_attempts);
+                    uint64_t tree_fail_connect = atomic_load(&tree->metadata_fail_connect);
+                    uint64_t tree_fail_handshake = atomic_load(&tree->metadata_fail_handshake);
+                    uint64_t tree_fail_stall = atomic_load(&tree->metadata_fail_stall);
+                    uint64_t tree_fail_ut_reject = atomic_load(&tree->metadata_fail_ut_reject);
+                    uint64_t tree_fail_size = atomic_load(&tree->metadata_fail_size);
+                    uint64_t tree_fail_hash = atomic_load(&tree->metadata_fail_hash);
+                    uint64_t tree_fail_deadline = atomic_load(&tree->metadata_fail_deadline);
+                    uint64_t tree_fail_other = atomic_load(&tree->metadata_fail_other);
                     uint64_t tree_fresh_relookups = atomic_load(&tree->fresh_peer_relookups);
                     uint64_t tree_fresh_rescues = atomic_load(&tree->fresh_peer_rescues);
                     uint64_t tree_piece_reasks = atomic_load(&tree->metadata_piece_reasks);
@@ -1191,12 +1231,26 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_gp_answers = atomic_load(&tree->gp_answers);
                     uint64_t tree_gp_lookup_us_total = atomic_load(&tree->gp_lookup_us_total);
                     uint64_t tree_gp_rounds_total = atomic_load(&tree->gp_rounds_total);
+                    uint64_t tree_gp_idle_exits = atomic_load(&tree->gp_idle_exits);
+                    uint64_t tree_gp_deadline_exits = atomic_load(&tree->gp_deadline_exits);
+                    uint64_t tree_gp_unanswered_slots = atomic_load(&tree->gp_unanswered_slots);
+                    uint64_t tree_gp_miss_penalties = atomic_load(&tree->gp_miss_penalties);
+                    uint64_t tree_gp_slot_expired = atomic_load(&tree->gp_slot_expired_total);
+                    uint64_t tree_gp_early_finish = atomic_load(&tree->gp_early_finish_total);
 
                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
                     atomic_fetch_add(&sup->cumulative_first_strike_failures, tree_first_strike);
                     atomic_fetch_add(&sup->cumulative_second_strike_failures, tree_second_strike);
                     atomic_fetch_add(&sup->cumulative_metadata_attempts, tree_attempts);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_connect, tree_fail_connect);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_handshake, tree_fail_handshake);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_stall, tree_fail_stall);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_ut_reject, tree_fail_ut_reject);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_size, tree_fail_size);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_hash, tree_fail_hash);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_deadline, tree_fail_deadline);
+                    atomic_fetch_add(&sup->cumulative_metadata_fail_other, tree_fail_other);
                     atomic_fetch_add(&sup->cumulative_fresh_peer_relookups, tree_fresh_relookups);
                     atomic_fetch_add(&sup->cumulative_fresh_peer_rescues, tree_fresh_rescues);
                     atomic_fetch_add(&sup->cumulative_metadata_piece_reasks, tree_piece_reasks);
@@ -1207,6 +1261,12 @@ static void *monitor_thread_func(void *arg) {
                     atomic_fetch_add(&sup->cumulative_gp_answers, tree_gp_answers);
                     atomic_fetch_add(&sup->cumulative_gp_lookup_us_total, tree_gp_lookup_us_total);
                     atomic_fetch_add(&sup->cumulative_gp_rounds_total, tree_gp_rounds_total);
+                    atomic_fetch_add(&sup->cumulative_gp_idle_exits, tree_gp_idle_exits);
+                    atomic_fetch_add(&sup->cumulative_gp_deadline_exits, tree_gp_deadline_exits);
+                    atomic_fetch_add(&sup->cumulative_gp_unanswered_slots, tree_gp_unanswered_slots);
+                    atomic_fetch_add(&sup->cumulative_gp_miss_penalties, tree_gp_miss_penalties);
+                    atomic_fetch_add(&sup->cumulative_gp_slot_expired_total, tree_gp_slot_expired);
+                    atomic_fetch_add(&sup->cumulative_gp_early_finish_total, tree_gp_early_finish);
 
                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
@@ -1497,6 +1557,57 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
     }
     if (out_rounds) {
         *out_rounds = cumulative_rounds + active_rounds;
+    }
+}
+
+void supervisor_getpeers_exit_stats(supervisor_t *sup, uint64_t *out_idle_exits,
+                                    uint64_t *out_deadline_exits,
+                                    uint64_t *out_unanswered_slots,
+                                    uint64_t *out_miss_penalties,
+                                    uint64_t *out_slot_expired,
+                                    uint64_t *out_early_finish) {
+    uint64_t idle = 0, deadline = 0, unanswered = 0, penalties = 0;
+    uint64_t slot_expired = 0, early_finish = 0;
+
+    if (sup) {
+        idle = atomic_load(&sup->cumulative_gp_idle_exits);
+        deadline = atomic_load(&sup->cumulative_gp_deadline_exits);
+        unanswered = atomic_load(&sup->cumulative_gp_unanswered_slots);
+        penalties = atomic_load(&sup->cumulative_gp_miss_penalties);
+        slot_expired = atomic_load(&sup->cumulative_gp_slot_expired_total);
+        early_finish = atomic_load(&sup->cumulative_gp_early_finish_total);
+
+        pthread_mutex_lock(&sup->trees_lock);
+        for (int i = 0; i < sup->max_trees; i++) {
+            if (sup->trees[i]) {
+                idle += atomic_load(&sup->trees[i]->gp_idle_exits);
+                deadline += atomic_load(&sup->trees[i]->gp_deadline_exits);
+                unanswered += atomic_load(&sup->trees[i]->gp_unanswered_slots);
+                penalties += atomic_load(&sup->trees[i]->gp_miss_penalties);
+                slot_expired += atomic_load(&sup->trees[i]->gp_slot_expired_total);
+                early_finish += atomic_load(&sup->trees[i]->gp_early_finish_total);
+            }
+        }
+        pthread_mutex_unlock(&sup->trees_lock);
+    }
+
+    if (out_idle_exits) {
+        *out_idle_exits = idle;
+    }
+    if (out_deadline_exits) {
+        *out_deadline_exits = deadline;
+    }
+    if (out_unanswered_slots) {
+        *out_unanswered_slots = unanswered;
+    }
+    if (out_miss_penalties) {
+        *out_miss_penalties = penalties;
+    }
+    if (out_slot_expired) {
+        *out_slot_expired = slot_expired;
+    }
+    if (out_early_finish) {
+        *out_early_finish = early_finish;
     }
 }
 

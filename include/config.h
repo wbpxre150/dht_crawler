@@ -141,12 +141,17 @@ typedef struct {
     int tree_get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
     int tree_get_peers_fanout;           /* concurrent get_peers queries per round (default: 8, 2-12) */
     int tree_get_peers_max_queries;      /* total get_peers packets per infohash (default: 16, 8-32) */
+    int tree_get_peers_round_idle_ms;    /* per-round silence cap before the round is abandoned (default: 0 = off, 250-6000) */
+    int tree_get_peers_penalize_misses;  /* 1 = charge an unanswered round slot against the node (default: 0, 0-1) */
+    int tree_get_peers_slot_budget_ms;   /* per-slot answer budget before a round stops waiting on that slot (default: 0 = off, 500-6000) */
+    int tree_get_peers_finish_on_peers;  /* 1 = end the lookup as soon as peers are found (default: 0, 0-1) */
     /* Thread tree Stage 5 settings (metadata) */
     int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
     int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
+    int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2, 1-4 = MAX_PARALLEL_PEERS) */
     int tree_metadata_fresh_peer_retries;/* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
     int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
+    int tree_metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long (default: 0 = off, 3000-60000) */
 
     /* Thread tree metadata rate-based respawn settings */
     double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */

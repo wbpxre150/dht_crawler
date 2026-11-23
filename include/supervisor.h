@@ -78,11 +78,16 @@ typedef struct supervisor_config {
     int get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
     int get_peers_fanout;           /* get_peers queries per lookup (default: 8, 2-12) */
     int get_peers_max_queries;      /* get_peers query budget (default: 16, 8-32, >= fanout) */
+    int get_peers_round_idle_ms;    /* per-round silence cap (default: 1500, 0 = off, 250-6000) */
+    int get_peers_penalize_misses;  /* 1 = charge unanswered round slots against the node (default: 0, 0-1) */
+    int get_peers_slot_budget_ms;   /* per-slot answer budget in ms (default: 2000, 0 = off, 500-6000) */
+    int get_peers_finish_on_peers;  /* 1 = end a lookup as soon as peers are found (default: 1, 0-1) */
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;          /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
-    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
+    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
+    int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */
@@ -171,11 +176,16 @@ typedef struct supervisor {
     int get_peers_deadline_ms;
     int get_peers_fanout;
     int get_peers_max_queries;
+    int get_peers_round_idle_ms;     /* Per-round silence cap (default: 1500, 0 = off) */
+    int get_peers_penalize_misses;   /* Charge unanswered round slots against the node (default: 0) */
+    int get_peers_slot_budget_ms;    /* Per-slot answer budget (default: 2000, 0 = off) */
+    int get_peers_finish_on_peers;   /* End a lookup as soon as peers are found (default: 1) */
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;          /* Fresh-peer re-lookups before metadata failure strike (0-3) */
-    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
+    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
+    int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */
@@ -235,6 +245,15 @@ typedef struct supervisor {
     atomic_uint_fast64_t cumulative_second_strike_failures;
     atomic_uint_fast64_t cumulative_filtered_count;
     atomic_uint_fast64_t cumulative_metadata_attempts;
+    /* Metadata connection-failure attribution accumulated from respawned trees */
+    atomic_uint_fast64_t cumulative_metadata_fail_connect;
+    atomic_uint_fast64_t cumulative_metadata_fail_handshake;
+    atomic_uint_fast64_t cumulative_metadata_fail_stall;
+    atomic_uint_fast64_t cumulative_metadata_fail_ut_reject;
+    atomic_uint_fast64_t cumulative_metadata_fail_size;
+    atomic_uint_fast64_t cumulative_metadata_fail_hash;
+    atomic_uint_fast64_t cumulative_metadata_fail_deadline;
+    atomic_uint_fast64_t cumulative_metadata_fail_other;
     /* get_peers lookup instrumentation accumulated from respawned trees */
     atomic_uint_fast64_t cumulative_gp_lookups;
     atomic_uint_fast64_t cumulative_gp_lookups_with_peers;
@@ -243,6 +262,14 @@ typedef struct supervisor {
     atomic_uint_fast64_t cumulative_gp_answers;
     atomic_uint_fast64_t cumulative_gp_lookup_us_total;
     atomic_uint_fast64_t cumulative_gp_rounds_total;
+    /* get_peers lookup exit reasons and silent-node penalties */
+    atomic_uint_fast64_t cumulative_gp_idle_exits;
+    atomic_uint_fast64_t cumulative_gp_deadline_exits;
+    atomic_uint_fast64_t cumulative_gp_unanswered_slots;
+    atomic_uint_fast64_t cumulative_gp_miss_penalties;
+    /* get_peers round-completion counters (rev2) */
+    atomic_uint_fast64_t cumulative_gp_slot_expired_total;
+    atomic_uint_fast64_t cumulative_gp_early_finish_total;
 
     /* Monitor thread */
     pthread_t monitor_thread;
@@ -309,6 +336,20 @@ void supervisor_getpeers_stats(supervisor_t *sup, uint64_t *out_lookups,
                                uint64_t *out_with_peers, uint64_t *out_from_retry,
                                uint64_t *out_packets, uint64_t *out_answers,
                                uint64_t *out_lookup_us, uint64_t *out_rounds);
+
+/**
+ * Get the get_peers exit-reason and silent-node counters (cumulative respawned
+ * trees + live trees): idle exits, deadline exits, unanswered round slots and
+ * miss penalties, plus the rev2 round-completion counters (slots that ran out
+ * their per-slot answer budget, and lookups finished early on peers). Any out
+ * pointer may be NULL.
+ */
+void supervisor_getpeers_exit_stats(supervisor_t *sup, uint64_t *out_idle_exits,
+                                    uint64_t *out_deadline_exits,
+                                    uint64_t *out_unanswered_slots,
+                                    uint64_t *out_miss_penalties,
+                                    uint64_t *out_slot_expired,
+                                    uint64_t *out_early_finish);
 
 /**
  * Get total active connections across all trees

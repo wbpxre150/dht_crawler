@@ -158,13 +158,18 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_get_peers_deadline_ms = 6000;      /* 6s get_peers lookup deadline (500-8000) */
     config->tree_get_peers_fanout = 8;              /* 8 concurrent get_peers queries per round (2-12) */
     config->tree_get_peers_max_queries = 16;        /* 16 get_peers packets per infohash (8-32, >= fanout) */
+    config->tree_get_peers_round_idle_ms = 0;       /* shipped off (opt-in): abandon a round after N ms without an answer (0 = off, 250-6000) */
+    config->tree_get_peers_penalize_misses = 0;     /* charge unanswered round slots against the node (0-1; off by default, the churn cost 10.8 pp yield) */
+    config->tree_get_peers_slot_budget_ms = 0;      /* shipped off (opt-in): a slot stops pinning its round after N ms (0 = off, 500-6000) */
+    config->tree_get_peers_finish_on_peers = 0;     /* shipped off (opt-in): end a lookup as soon as peers are found (0-1) */
 
     /* Thread tree Stage 5 defaults (metadata) */
     config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
-    config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash */
+    config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash (1-4) */
     config->tree_metadata_fresh_peer_retries = 1;   /* 1 fresh-peer re-lookup before a strike (0 = off) */
     config->tree_metadata_timeout_ms = 60000;       /* 60s metadata fetch deadline */
+    config->tree_metadata_piece_idle_ms = 0;        /* shipped off (opt-in): evict a conn with no new piece after N ms (0 = off, 3000-60000) */
 
     /* Thread tree metadata rate-based respawn defaults */
     config->min_metadata_rate = 0.01;                  /* Floor for dynamic threshold */
@@ -524,6 +529,52 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
                         config->tree_get_peers_max_queries);
                 config->tree_get_peers_max_queries = 32;
             }
+        } else if (strcmp(key, "tree_get_peers_round_idle_ms") == 0) {
+            /* 0 keeps the pre-patch-19 behaviour exactly: a round is only bounded
+             * by the per-infohash deadline. Anything else is a per-round silence
+             * cap, clamped into 250-6000 ms so it can neither busy-loop the drain
+             * nor outlive the deadline itself. */
+            config->tree_get_peers_round_idle_ms = atoi(value);
+            if (config->tree_get_peers_round_idle_ms < 0) {
+                log_msg(LOG_WARN, "tree_get_peers_round_idle_ms %d out of range (0, 250-6000); clamping to 0",
+                        config->tree_get_peers_round_idle_ms);
+                config->tree_get_peers_round_idle_ms = 0;
+            }
+            if (config->tree_get_peers_round_idle_ms > 0 && config->tree_get_peers_round_idle_ms < 250) {
+                log_msg(LOG_WARN, "tree_get_peers_round_idle_ms %d out of range (0, 250-6000); clamping to 250",
+                        config->tree_get_peers_round_idle_ms);
+                config->tree_get_peers_round_idle_ms = 250;
+            }
+            if (config->tree_get_peers_round_idle_ms > 6000) {
+                log_msg(LOG_WARN, "tree_get_peers_round_idle_ms %d out of range (0, 250-6000); clamping to 6000",
+                        config->tree_get_peers_round_idle_ms);
+                config->tree_get_peers_round_idle_ms = 6000;
+            }
+        } else if (strcmp(key, "tree_get_peers_penalize_misses") == 0) {
+            config->tree_get_peers_penalize_misses = atoi(value) > 0 ? 1 : 0;
+        } else if (strcmp(key, "tree_get_peers_slot_budget_ms") == 0) {
+            /* 0 keeps the pre-patch-19-rev2 behaviour exactly: a slot is bounded
+             * only by the per-infohash deadline. Anything else is the per-slot
+             * answer budget, clamped into 500-6000 ms so it cannot busy-loop the
+             * drain and never outlives the deadline itself. */
+            config->tree_get_peers_slot_budget_ms = atoi(value);
+            if (config->tree_get_peers_slot_budget_ms < 0) {
+                log_msg(LOG_WARN, "tree_get_peers_slot_budget_ms %d out of range (0, 500-6000); clamping to 0",
+                        config->tree_get_peers_slot_budget_ms);
+                config->tree_get_peers_slot_budget_ms = 0;
+            }
+            if (config->tree_get_peers_slot_budget_ms > 0 && config->tree_get_peers_slot_budget_ms < 500) {
+                log_msg(LOG_WARN, "tree_get_peers_slot_budget_ms %d out of range (0, 500-6000); clamping to 500",
+                        config->tree_get_peers_slot_budget_ms);
+                config->tree_get_peers_slot_budget_ms = 500;
+            }
+            if (config->tree_get_peers_slot_budget_ms > 6000) {
+                log_msg(LOG_WARN, "tree_get_peers_slot_budget_ms %d out of range (0, 500-6000); clamping to 6000",
+                        config->tree_get_peers_slot_budget_ms);
+                config->tree_get_peers_slot_budget_ms = 6000;
+            }
+        } else if (strcmp(key, "tree_get_peers_finish_on_peers") == 0) {
+            config->tree_get_peers_finish_on_peers = atoi(value) > 0 ? 1 : 0;
         }
         /* Thread tree Stage 5 settings (metadata) */
         else if (strcmp(key, "tree_metadata_workers") == 0) {
@@ -535,7 +586,9 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "tree_parallel_peers") == 0) {
             config->tree_parallel_peers = atoi(value);
             if (config->tree_parallel_peers < 1) config->tree_parallel_peers = 1;
-            if (config->tree_parallel_peers > 10) config->tree_parallel_peers = 10;
+            /* The fetch window cannot exceed MAX_PARALLEL_PEERS (tree_metadata.c);
+             * clamping here keeps the accepted value and the effective one equal. */
+            if (config->tree_parallel_peers > 4) config->tree_parallel_peers = 4;
         } else if (strcmp(key, "tree_metadata_fresh_peer_retries") == 0) {
             config->tree_metadata_fresh_peer_retries = atoi(value);
             if (config->tree_metadata_fresh_peer_retries < 0) config->tree_metadata_fresh_peer_retries = 0;
@@ -544,6 +597,14 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->tree_metadata_timeout_ms = atoi(value);
             if (config->tree_metadata_timeout_ms < 5000) config->tree_metadata_timeout_ms = 5000;
             if (config->tree_metadata_timeout_ms > 600000) config->tree_metadata_timeout_ms = 600000;
+        } else if (strcmp(key, "tree_metadata_piece_idle_ms") == 0) {
+            config->tree_metadata_piece_idle_ms = atoi(value);
+            /* 0 is meaningful (piece-idle eviction disabled), so only a non-zero
+             * value is clamped into 3000-60000. */
+            if (config->tree_metadata_piece_idle_ms != 0) {
+                if (config->tree_metadata_piece_idle_ms < 3000) config->tree_metadata_piece_idle_ms = 3000;
+                if (config->tree_metadata_piece_idle_ms > 60000) config->tree_metadata_piece_idle_ms = 60000;
+            }
         }
         /* Thread tree metadata rate-based respawn settings */
         else if (strcmp(key, "min_metadata_rate") == 0) {
@@ -750,9 +811,11 @@ void config_print(const crawler_config_t *config) {
     log_msg(LOG_DEBUG, "=== DHT Crawler Configuration ===");
     log_msg(LOG_DEBUG, "DHT Settings:");
     log_msg(LOG_DEBUG, "  Port: %d", config->dht_port);
-    log_msg(LOG_DEBUG, "  get_peers: deadline_ms=%d fanout=%d max_queries=%d",
+    log_msg(LOG_DEBUG, "  get_peers: deadline_ms=%d fanout=%d max_queries=%d round_idle_ms=%d penalize_misses=%d slot_budget_ms=%d finish_on_peers=%d",
             config->tree_get_peers_deadline_ms, config->tree_get_peers_fanout,
-            config->tree_get_peers_max_queries);
+            config->tree_get_peers_max_queries, config->tree_get_peers_round_idle_ms,
+            config->tree_get_peers_penalize_misses, config->tree_get_peers_slot_budget_ms,
+            config->tree_get_peers_finish_on_peers);
     log_msg(LOG_DEBUG, "Database Settings:");
     log_msg(LOG_DEBUG, "  Path: %s", config->db_path);
     log_msg(LOG_DEBUG, "Logging:");

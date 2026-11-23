@@ -1287,11 +1287,16 @@ int main(int argc, char *argv[]) {
         .get_peers_deadline_ms = config.tree_get_peers_deadline_ms,
         .get_peers_fanout = config.tree_get_peers_fanout,
         .get_peers_max_queries = config.tree_get_peers_max_queries,
+        .get_peers_round_idle_ms = config.tree_get_peers_round_idle_ms,
+        .get_peers_penalize_misses = config.tree_get_peers_penalize_misses,
+        .get_peers_slot_budget_ms = config.tree_get_peers_slot_budget_ms,
+        .get_peers_finish_on_peers = config.tree_get_peers_finish_on_peers,
         /* Stage 5 settings */
         .tcp_connect_timeout_ms = config.tree_tcp_connect_timeout_ms,
         .parallel_peers = config.tree_parallel_peers,
         .fresh_peer_retries = config.tree_metadata_fresh_peer_retries,
         .metadata_timeout_ms = config.tree_metadata_timeout_ms,
+        .metadata_piece_idle_ms = config.tree_metadata_piece_idle_ms,
         /* Metadata rate-based respawn settings */
         .min_metadata_rate = config.min_metadata_rate,
         .dynamic_rate_margin = config.dynamic_rate_margin,

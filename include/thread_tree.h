@@ -80,12 +80,17 @@ typedef struct tree_config {
     int get_peers_deadline_ms;      /* Get_peers lookup deadline (default: 6000, 500-8000) */
     int get_peers_fanout;           /* Get_peers queries per lookup (default: 8, 2-12) */
     int get_peers_max_queries;      /* Get_peers query budget (default: 16, 8-32, >= fanout) */
+    int get_peers_round_idle_ms;    /* Get_peers per-round silence cap (default: 0 = off, 250-6000) */
+    int get_peers_penalize_misses;  /* 1 = charge an unanswered round slot against the node (default: 0) */
+    int get_peers_slot_budget_ms;   /* Per-slot answer budget in ms (default: 0 = off, 500-6000) */
+    int get_peers_finish_on_peers;  /* End the lookup as soon as peers are found (default: 0, 0-1) */
 
     /* Stage 5: Metadata fetcher settings */
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
-    int parallel_peers;             /* Parallel peer connections per infohash (default: 2) */
+    int parallel_peers;             /* Parallel peer connections per infohash (default: 2, 1-4) */
     int fresh_peer_retries;         /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
     int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
+    int metadata_piece_idle_ms;     /* Piece-progress eviction window in ms (default: 0 = off, 3000-60000) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
@@ -152,12 +157,17 @@ typedef struct thread_tree {
     int get_peers_deadline_ms;
     int get_peers_fanout;
     int get_peers_max_queries;
+    int get_peers_round_idle_ms;    /* Per-round silence cap before the round is abandoned (0 = off) */
+    int get_peers_penalize_misses;  /* 1 = tree_routing_mark_failed() the nodes that left a slot unanswered (default: 0) */
+    int get_peers_slot_budget_ms;   /* A slot stops pinning its round after this long (0 = off) */
+    int get_peers_finish_on_peers;  /* 1 = stop waiting on the remaining slots once peers are found */
 
     /* Stage 5 config */
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;         /* Fresh-peer re-lookups before a metadata failure strike (0-3) */
-    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
+    int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
+    int metadata_piece_idle_ms;     /* Evict a conn with no new data piece for this long (0 = off) */
 
     /* Shared resources (from supervisor) */
     struct batch_writer *shared_batch_writer;
@@ -202,6 +212,18 @@ typedef struct thread_tree {
     /* Statistics */
     atomic_uint_fast64_t metadata_count;
     atomic_uint_fast64_t metadata_attempts;  /* Total infohashes attempted (including failures) */
+    /* Metadata connection-failure attribution. Each failed metadata connection is
+     * counted exactly once, under the outcome that first detected it, so a window
+     * of these partitions the failure mass that metadata_attempts - metadata_count
+     * only bounds. Per-attempt events (deadline) are counted once per attempt. */
+    atomic_uint_fast64_t metadata_fail_connect;    /* socket/nonblock/connect/send_handshake error */
+    atomic_uint_fast64_t metadata_fail_handshake;  /* bad BT handshake, extended-handshake failure, EOF while handshaking */
+    atomic_uint_fast64_t metadata_fail_stall;      /* silence watchdog (no readable data for CONN_SILENCE_CLOSE_MS) */
+    atomic_uint_fast64_t metadata_fail_ut_reject;  /* peer answered UT_METADATA_REJECT */
+    atomic_uint_fast64_t metadata_fail_size;       /* size over the cap, or peers disagreeing on size */
+    atomic_uint_fast64_t metadata_fail_hash;       /* SHA-1 mismatch event (incl. the one that triggers the reset) */
+    atomic_uint_fast64_t metadata_fail_deadline;   /* one per attempt that hit the global metadata deadline */
+    atomic_uint_fast64_t metadata_fail_other;      /* any other ERROR transition (bad message, EOF while requesting, ...) */
     atomic_uint_fast64_t filtered_count;    /* Dropped by the ingest filters (hard block/language/adult) */
     atomic_uint_fast64_t first_strike_failures;   /* Infohashes with first failure (retry allowed) */
     atomic_uint_fast64_t second_strike_failures;  /* Infohashes with second failure (permanently blocked) */
@@ -217,6 +239,12 @@ typedef struct thread_tree {
     atomic_uint_fast64_t gp_lookup_us_total;     /* Total microseconds spent inside tree_lookup_peers() */
     atomic_uint_fast64_t last_metadata_time;
     atomic_uint_fast64_t gp_rounds_total;       /* Completed rounds after the first, summed over lookups */
+    atomic_uint_fast64_t gp_idle_exits;          /* Lookups that ended on the round-idle cap, not the deadline */
+    atomic_uint_fast64_t gp_deadline_exits;      /* Lookups whose terminal cause was the per-infohash deadline */
+    atomic_uint_fast64_t gp_unanswered_slots;    /* Round slots queried and never answered (any exit) */
+    atomic_uint_fast64_t gp_miss_penalties;      /* Unanswered slots charged via tree_routing_mark_failed() */
+    atomic_uint_fast64_t gp_slot_expired_total;  /* Unanswered slots whose per-slot answer budget had run out */
+    atomic_uint_fast64_t gp_early_finish_total;  /* Lookups ended by finish-on-peers once peers were found */
     double metadata_rate;
     atomic_int active_connections;  /* Track active TCP connections */
 

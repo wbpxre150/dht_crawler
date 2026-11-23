@@ -35,7 +35,9 @@ typedef struct tree_metadata_config {
     int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
     int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 60000) */
     int max_metadata_size;          /* Max metadata size in bytes (default: 10MB) */
-    int parallel_peers;             /* Number of peers to connect in parallel (default: 2) */
+    int parallel_peers;             /* Number of peers to connect in parallel (default: 2, max 4) */
+    int metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long
+                                     * (default: 0 = disabled, 3000-60000) */
     struct thread_tree *tree;       /* Tree pointer for connection tracking (optional) */
 } tree_metadata_config_t;
 

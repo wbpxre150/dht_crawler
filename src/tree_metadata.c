@@ -791,6 +791,7 @@ typedef struct {
     int metadata_size;              /* Peer-advertised size (consistency check) */
     time_t connect_start;
     time_t last_activity;           /* Last readable data (silence watchdog) */
+    time_t last_piece_time;         /* Last NEW data piece copied (piece-idle eviction) */
     int outstanding_count;          /* Currently in-flight piece requests */
     int outstanding_pieces[METADATA_OUTSTANDING_PER_PEER];
 } parallel_conn_t;
@@ -818,6 +819,52 @@ typedef struct {
     metadata_fetch_state_t st;
 } parallel_fetch_t;
 
+/* Which outcome killed a metadata connection. Every failed connection is counted
+ * exactly once, at the site that first detects it: the sites that know the
+ * outcome pass it explicitly, the generic poll-error / read-EOF closes classify
+ * by the state the connection had reached (meta_count_conn_fail). */
+typedef enum {
+    META_FAIL_CONNECT,
+    META_FAIL_HANDSHAKE,
+    META_FAIL_STALL,
+    META_FAIL_UT_REJECT,
+    META_FAIL_SIZE,
+    META_FAIL_HASH,
+    META_FAIL_DEADLINE,
+    META_FAIL_OTHER
+} meta_fail_kind_t;
+
+/* Bump the per-tree counter for one outcome. tree is NULL when the fetch ran
+ * without a tree (host tests) - then nothing is counted. */
+static void meta_count_fail(thread_tree_t *tree, meta_fail_kind_t kind) {
+    if (!tree) return;
+    switch (kind) {
+        case META_FAIL_CONNECT:   atomic_fetch_add(&tree->metadata_fail_connect, 1); break;
+        case META_FAIL_HANDSHAKE: atomic_fetch_add(&tree->metadata_fail_handshake, 1); break;
+        case META_FAIL_STALL:     atomic_fetch_add(&tree->metadata_fail_stall, 1); break;
+        case META_FAIL_UT_REJECT: atomic_fetch_add(&tree->metadata_fail_ut_reject, 1); break;
+        case META_FAIL_SIZE:      atomic_fetch_add(&tree->metadata_fail_size, 1); break;
+        case META_FAIL_HASH:      atomic_fetch_add(&tree->metadata_fail_hash, 1); break;
+        case META_FAIL_DEADLINE:  atomic_fetch_add(&tree->metadata_fail_deadline, 1); break;
+        case META_FAIL_OTHER:     atomic_fetch_add(&tree->metadata_fail_other, 1); break;
+    }
+}
+
+/* Generic close sites (POLLERR/POLLHUP/POLLNVAL, read EOF) know only the state
+ * the connection had reached: still connecting is a connect failure, still
+ * handshaking (BT or extended) a handshake failure, anything later is
+ * unattributed ("other"). */
+static void meta_count_conn_fail(thread_tree_t *tree, const parallel_conn_t *conn) {
+    meta_fail_kind_t kind = META_FAIL_OTHER;
+    if (conn->state == CONN_STATE_CONNECTING) {
+        kind = META_FAIL_CONNECT;
+    } else if (conn->state == CONN_STATE_HANDSHAKING ||
+               conn->state == CONN_STATE_EXTENDED_HANDSHAKE) {
+        kind = META_FAIL_HANDSHAKE;
+    }
+    meta_count_fail(tree, kind);
+}
+
 /* Initialize a connection slot with a new peer */
 static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
                                 const struct sockaddr_storage *peer,
@@ -828,13 +875,17 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
 
     int family = peer->ss_family;
     int fd = socket(family, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        meta_count_fail(tree, META_FAIL_CONNECT);
+        return -1;
+    }
 
     if (tree) atomic_fetch_add(&tree->active_connections, 1);
 
     if (set_nonblocking(fd) < 0) {
         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
+        meta_count_fail(tree, META_FAIL_CONNECT);
         return -1;
     }
 
@@ -851,6 +902,7 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
         if (send_handshake(fd, infohash, peer_id) < 0) {
             if (tree) atomic_fetch_sub(&tree->active_connections, 1);
             close(fd);
+            meta_count_fail(tree, META_FAIL_CONNECT);
             return -1;
         }
         conn->state = CONN_STATE_HANDSHAKING;
@@ -859,12 +911,14 @@ static int parallel_conn_start(parallel_conn_t *conn, const uint8_t *infohash,
     } else {
         if (tree) atomic_fetch_sub(&tree->active_connections, 1);
         close(fd);
+        meta_count_fail(tree, META_FAIL_CONNECT);
         return -1;
     }
 
     conn->fd = fd;
     conn->connect_start = time(NULL);
     conn->last_activity = conn->connect_start;
+    conn->last_piece_time = conn->connect_start;
     return 0;
 }
 
@@ -951,6 +1005,7 @@ static void metadata_schedule_conn(parallel_fetch_t *fetch, int ci, thread_tree_
 
         if (send_metadata_request(conn->fd, conn->ut_metadata_id, found) < 0) {
             conn->state = CONN_STATE_ERROR;  /* caller closes + refills */
+            meta_count_fail(tree, META_FAIL_OTHER);
             return;
         }
         if (found_was_outstanding && tree) {
@@ -990,11 +1045,13 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
                 (conn->recv_buf[25] & 0x10) == 0 ||
                 memcmp(conn->recv_buf + 28, infohash, 20) != 0) {
                 conn->state = CONN_STATE_ERROR;
+                meta_count_fail(tree, META_FAIL_HANDSHAKE);
                 return NULL;
             }
 
             if (send_extended_handshake(conn->fd) < 0) {
                 conn->state = CONN_STATE_ERROR;
+                meta_count_fail(tree, META_FAIL_HANDSHAKE);
                 return NULL;
             }
 
@@ -1018,6 +1075,7 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
 
         if (msg_len > 1024 * 1024) {
             conn->state = CONN_STATE_ERROR;
+            meta_count_conn_fail(tree, conn);
             return NULL;
         }
 
@@ -1038,12 +1096,14 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
                 if (parse_extended_handshake(conn->recv_buf + 6, msg_len - 2,
                                              &conn->ut_metadata_id, &conn->metadata_size) < 0) {
                     conn->state = CONN_STATE_ERROR;
+                    meta_count_fail(tree, META_FAIL_HANDSHAKE);
                     goto shift;
                 }
 
                 if (conn->metadata_size > max_metadata) {
                     /* Advertised size exceeds our cap: drop this peer. */
                     conn->state = CONN_STATE_ERROR;
+                    meta_count_fail(tree, META_FAIL_SIZE);
                     goto shift;
                 }
 
@@ -1063,6 +1123,7 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
                         free(st->outstanding); st->outstanding = NULL;
                         free(st->last_request_ms); st->last_request_ms = NULL;
                         conn->state = CONN_STATE_ERROR;
+                        meta_count_fail(tree, META_FAIL_OTHER);
                         goto shift;
                     }
                     st->initialized = 1;
@@ -1070,10 +1131,15 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
                     /* Peers disagree on size; at most one is right and the final
                      * SHA-1 arbitrates. Close this conn and refill its slot. */
                     conn->state = CONN_STATE_ERROR;
+                    meta_count_fail(tree, META_FAIL_SIZE);
                     goto shift;
                 }
 
                 conn->state = CONN_STATE_REQUESTING_METADATA;
+                /* The piece-idle clock starts now, not at connect time: a peer
+                 * that spent a while handshaking must not be evicted on the
+                 * first tick after it became askable. */
+                conn->last_piece_time = time(NULL);
                 metadata_schedule_conn(fetch, ci, tree);
 
             } else if (ext_id == OUR_UT_METADATA_ID && conn->state == CONN_STATE_REQUESTING_METADATA) {
@@ -1087,6 +1153,7 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
 
                 if (piece_msg_type == UT_METADATA_REJECT) {
                     conn->state = CONN_STATE_ERROR;
+                    meta_count_fail(tree, META_FAIL_UT_REJECT);
                     goto shift;
                 }
 
@@ -1111,6 +1178,10 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
                             memcpy(st->metadata_buffer + offset, piece_data, piece_len);
                             st->pieces_bitmap[byte_idx] |= (1 << bit_idx);
                             st->pieces_received++;
+                            /* Real progress: this is the ONLY refresh of the
+                             * piece-idle clock. Keep-alives, have/bitfield and
+                             * duplicate pieces refresh last_activity instead. */
+                            conn->last_piece_time = time(NULL);
 
                             if (st->pieces_received >= st->total_pieces) {
                                 uint8_t computed_hash[20];
@@ -1125,11 +1196,13 @@ static tree_torrent_metadata_t *parallel_conn_process(parallel_fetch_t *fetch, i
                                     /* Assembled bytes do not hash to the infohash:
                                      * peers disagreed on content. Reset the piece
                                      * bitfield once and re-request everything. */
+                                    meta_count_fail(tree, META_FAIL_HASH);
                                     metadata_state_reset(fetch);
                                 } else {
                                     /* Wrong even after the one allowed reset: fail
                                      * the entry so it falls to the normal path. */
                                     conn->state = CONN_STATE_ERROR;
+                                    meta_count_fail(tree, META_FAIL_HASH);
                                     goto shift;
                                 }
                             }
@@ -1165,6 +1238,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
     int metadata_timeout = config ? config->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS;
     int max_metadata = config ? config->max_metadata_size : MAX_METADATA_SIZE_DEFAULT;
     int window_size = config ? config->parallel_peers : 2;
+    int piece_idle_ms = config ? config->metadata_piece_idle_ms : 0;
     thread_tree_t *tree = config ? config->tree : NULL;
 
     if (window_size < 1) window_size = 1;
@@ -1194,8 +1268,10 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
 
     /* Main poll loop */
     while (active_count > 0 && !result) {
-        /* Check global timeout */
+        /* Check global timeout. One deadline event per attempt, not per
+         * connection: every window slot still live here is abandoned together. */
         if (difftime(time(NULL), global_start) > metadata_timeout / 1000) {
+            meta_count_fail(tree, META_FAIL_DEADLINE);
             break;
         }
 
@@ -1238,6 +1314,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 /* Check per-connection timeout for connecting state */
                 if (conn->state == CONN_STATE_CONNECTING &&
                     difftime(time(NULL), conn->connect_start) > tcp_timeout / 1000) {
+                    meta_count_fail(tree, META_FAIL_CONNECT);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                 }
@@ -1245,6 +1322,8 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
             }
 
             if (pfds[p].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                /* Generic socket error: classify by the state it died in. */
+                meta_count_conn_fail(tree, conn);
                 parallel_conn_close(conn, tree, &fetch.st);
                 active_count--;
                 continue;
@@ -1255,6 +1334,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 int error;
                 socklen_t len = sizeof(error);
                 if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+                    meta_count_fail(tree, META_FAIL_CONNECT);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
@@ -1264,6 +1344,7 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 uint8_t peer_id[20];
                 generate_peer_id(peer_id);
                 if (send_handshake(conn->fd, infohash, peer_id) < 0) {
+                    meta_count_fail(tree, META_FAIL_CONNECT);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
@@ -1277,6 +1358,9 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
                 ssize_t nread = read(conn->fd, conn->recv_buf + conn->recv_offset,
                                      sizeof(conn->recv_buf) - conn->recv_offset);
                 if (nread <= 0) {
+                    /* Peer closed the connection (or the read failed): classify by
+                     * the state it died in. */
+                    meta_count_conn_fail(tree, conn);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
@@ -1304,6 +1388,25 @@ tree_torrent_metadata_t *tree_fetch_metadata_parallel(
 
                 if (conn->state != CONN_STATE_CONNECTING &&
                     difftime(now, conn->last_activity) > CONN_SILENCE_CLOSE_MS / 1000) {
+                    meta_count_fail(tree, META_FAIL_STALL);
+                    parallel_conn_close(conn, tree, &fetch.st);
+                    active_count--;
+                    continue;
+                }
+
+                /* Piece-progress eviction. The silence watchdog above only fires
+                 * when NOT ONE byte arrives; a peer that trickles keep-alive /
+                 * have / bitfield bytes refreshes last_activity forever without
+                 * ever delivering a data piece, so it would hold its window slot
+                 * for the whole global deadline. last_piece_time is refreshed
+                 * ONLY when a new data piece is copied into the shared buffer, so
+                 * this closes exactly that case and lets the refill loop below
+                 * advance the window to the next untried peer. 0 disables it
+                 * (legacy behaviour). */
+                if (piece_idle_ms > 0 &&
+                    conn->state == CONN_STATE_REQUESTING_METADATA &&
+                    difftime(now, conn->last_piece_time) > piece_idle_ms / 1000) {
+                    meta_count_fail(tree, META_FAIL_STALL);
                     parallel_conn_close(conn, tree, &fetch.st);
                     active_count--;
                     continue;
@@ -1454,6 +1557,7 @@ void *tree_metadata_worker_func(void *arg) {
         .metadata_timeout_ms = tree->metadata_timeout_ms > 0 ? tree->metadata_timeout_ms : DEFAULT_METADATA_TIMEOUT_MS,
         .max_metadata_size = 10 * 1024 * 1024,
         .parallel_peers = tree->parallel_peers,
+        .metadata_piece_idle_ms = tree->metadata_piece_idle_ms,
         .tree = tree
     };
 

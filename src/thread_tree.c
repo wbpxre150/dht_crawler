@@ -655,6 +655,21 @@ typedef struct get_peers_worker_ctx {
 #define GP_DEADLINE_MS 6000  /* hard cap per lookup; below the dispatcher's 10 s stale-TID reaper (TID_TIMEOUT) */
 #define GP_SEND_GAP_US 8000  /* space the fan-out burst so the UDP token bucket paces it instead of stalling it */
 #define GP_MAX_CANDIDATES 32  /* candidate-set cap: responses repeat the same nodes heavily */
+#define GP_ROUND_IDLE_MS 1500  /* per-round silence cap when config does not say (0 = off) */
+#define GP_SLOT_BUDGET_MS 2000  /* per-slot answer budget when config does not say (0 = off) */
+/* Why a lookup ended. Only GP_EXIT_IDLE and GP_EXIT_DEADLINE have /stats
+ * counters (gp_idle_exits / gp_deadline_exits); the other causes are recorded
+ * so the terminal reason is explicit at every break instead of inferred — the
+ * slot-budget exit is visible instead through gp_slot_expired_total. */
+typedef enum {
+    GP_EXIT_PEERS = 0,   /* peers found: the good case */
+    GP_EXIT_IDLE,        /* the round-idle cap fired with no answer in that round */
+    GP_EXIT_DEADLINE,    /* the per-infohash deadline */
+    GP_EXIT_SLOT_BUDGET, /* every remaining slot ran out its own answer budget */
+    GP_EXIT_EXHAUSTED,   /* packet budget spent, or no eligible candidate left */
+    GP_EXIT_SHUTDOWN,    /* the tree is going down */
+    GP_EXIT_NO_NODES     /* routing table empty: nothing to query */
+} gp_exit_t;
 /* A node worth querying in a later round: learned from a response's closer-node
  * list, ordered by XOR distance to the infohash. One set per lookup, never per
  * round (~148 B each, ~4.8 KB for the set). */
@@ -704,9 +719,37 @@ static uint64_t now_us(void) {
  * being consumed by the next round. The n == 0 prologue exit happens before any
  * registration, so it sweeps nothing.
  *
- * Instrumentation only: updates the tree's gp_* counters (gp_rounds_total counts
- * completed rounds after the first) and adds the elapsed microseconds to
- * gp_lookup_us_total; no behaviour change outside the lookup itself.
+ * Four behaviour knobs, every one fail-open (0 restores the pre-patch-19
+ * behaviour):
+ * - tree->get_peers_round_idle_ms caps how long a round waits for its FIRST or
+ *   NEXT answer — silence, not round age — and a round that ends on that cap
+ *   with no answer at all terminates the lookup. On the device this one measured
+ *   inert (264 idle vs 257,062 deadline exits): with fan-out 8 the ~5 answers a
+ *   lookup gets arrive < 1.5 s apart and keep resetting it, so it is kept as a
+ *   cheap backstop rather than as the completion mechanism.
+ * - tree->get_peers_slot_budget_ms is the completion mechanism: every slot's
+ *   budget starts when ITS query is sent and is never extended by a sibling
+ *   slot's answer, so one dead peer cannot pin the round. A round in which every
+ *   remaining slot expired with no answer at all ends the lookup.
+ * - tree->get_peers_finish_on_peers ends the lookup once peers are found, after
+ *   consuming the answers already queued (a burst is not lost).
+ * - tree->get_peers_penalize_misses charges each unanswered round slot against
+ *   its node via tree_routing_mark_failed() (eviction at MAX_FAIL_COUNT). The
+ *   compiled default is OFF: ~1,000 penalties/s churned the ~1,432-node tables
+ *   and cost 10.8 pp of yield. When it is enabled, an answer resets the node's
+ *   fail_count (tree_routing_add_node() at the matched-answer site), so eviction
+ *   means repeatedly silent, never "3 misses despite answering".
+ *
+ * The per-infohash deadline is also enforced inside the fan-out loop, the one
+ * place a started round can run past it: each tree_send_get_peers() may sleep up
+ * to 50 ms in udp_rate_limit_acquire() plus the 8 ms pacing gap, which is what
+ * made the on-device mean_lookup_ms (7,044) exceed deadline_ms (6,000).
+ *
+ * Instrumentation: updates the tree's gp_* counters (gp_rounds_total counts
+ * completed rounds after the first, gp_idle_exits/gp_deadline_exits the terminal
+ * exit reason, gp_unanswered_slots/gp_miss_penalties the sweep, gp_slot_expired
+ * the unanswered subset whose budget ran out, gp_early_finish_total the lookups
+ * finished on peers) and adds the elapsed microseconds to gp_lookup_us_total.
  *
  * Returns the number of peers found (out->peer_count); 0 when the routing table
  * is empty or no node returned peers. */
@@ -727,11 +770,16 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
     memset(out, 0, sizeof(*out));
     memcpy(out->infohash, infohash, 20);
 
+    /* Declared before the first goto done so every exit path can record why it
+     * left (see gp_exit_t); only the idle and deadline causes are counted. */
+    gp_exit_t exit_reason = GP_EXIT_EXHAUSTED;
+
     /* Get closest nodes from routing table */
     tree_node_t closest[GP_FANOUT_MAX];
     int n = tree_routing_get_closest(rt, infohash, closest, GP_FANOUT_MAX);
     if (n == 0) {
         /* No nodes to query: no peers */
+        exit_reason = GP_EXIT_NO_NODES;
         goto done;
     }
 
@@ -761,6 +809,8 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         uint8_t tid[4];
         int tid_len;
         int sent;
+        uint8_t node_id[20];  /* id of the node this slot queried, captured at send */
+        uint64_t sent_us;     /* when the query went out: the per-slot budget starts here */
     } slot[GP_FANOUT_MAX];
     int outstanding = 0;
 
@@ -786,13 +836,18 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         if (round_index > 0) {
             /* Later rounds are optional: stop rather than spend packets when the
              * budget or the wall clock is gone, or the tree is going down. */
-            if (queries_sent >= tree->get_peers_max_queries) {
+            /* Deadline first: when both the packet budget and the wall clock are
+             * gone, the lookup ended because it ran out of time. */
+            if (now_us() >= deadline_us) {
+                exit_reason = GP_EXIT_DEADLINE;
                 break;
             }
-            if (now_us() >= deadline_us) {
+            if (queries_sent >= tree->get_peers_max_queries) {
+                exit_reason = GP_EXIT_EXHAUSTED;
                 break;
             }
             if (atomic_load(&tree->shutdown_requested)) {
+                exit_reason = GP_EXIT_SHUTDOWN;
                 break;  /* pop's -1 conflates timeout and shutdown */
             }
         }
@@ -831,6 +886,7 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
                 picked[picked_count++] = c;
             }
             if (picked_count == 0) {
+                exit_reason = GP_EXIT_EXHAUSTED;
                 break;  /* nothing eligible left: the search is exhausted */
             }
         }
@@ -839,9 +895,24 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
          * every attempt against the budget, unregister immediately on failure. */
         for (int k = 0; k < picked_count; k++) {
             gp_candidate_t *c = &cand[picked[k]];
+            /* Deadline enforcement where the time is actually spent. This loop is
+             * the one place a started round can run PAST deadline_us: every send
+             * may sleep up to 50 ms in udp_rate_limit_acquire() plus the pacing
+             * gap. Stop fanning out the moment the lookup's budget is gone; the
+             * candidates never reached keep queried == 0 and their slots keep
+             * tid_len == 0, so the sweep has nothing to unregister for them.
+             * now_us() returning 0 (clock_gettime failure) can never trip this. */
+            if (now_us() >= deadline_us) {
+                break;
+            }
             if (k > 0) usleep(GP_SEND_GAP_US);  /* pace the burst (see GP_SEND_GAP_US) */
             slot[k].tid_len = tree_protocol_gen_tid(slot[k].tid);
             slot[k].sent = 0;
+            /* Capture the queried node's IDENTITY, not its position: the
+             * response merge in the drain loop reorders cand[] (distance-ordered
+             * insert, farthest evicted at capacity), so an index recorded here
+             * would name a different node by sweep time. */
+            memcpy(slot[k].node_id, c->id, 20);
             c->queried = 1;
 
             /* Register TID with dispatcher BEFORE sending */
@@ -853,6 +924,9 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
             if (tree_send_get_peers(tree, sock, slot[k].tid, slot[k].tid_len,
                                     infohash, &c->addr) > 0) {
                 slot[k].sent = 1;
+                /* The slot's answer budget starts when its query is on the wire,
+                 * i.e. AFTER the send's own rate-limit sleep. */
+                slot[k].sent_us = now_us();
                 outstanding++;
             } else {
                 /* Send failed (incl. EAGAIN): unregister immediately */
@@ -861,27 +935,94 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
             }
         }
 
+        /* Round-idle bookkeeping. The timer starts with the fan-out and is
+         * refreshed by every matched answer, so it measures silence SINCE THE
+         * LAST ANSWER, not the age of the round: a round that is still producing
+         * responses is never cut short by it. get_peers_round_idle_ms == 0
+         * disables it entirely (legacy full-deadline behaviour). */
+        uint64_t last_answer_us = now_us();
+        int answers_this_round = 0;
+        int round_went_idle = 0;
+        /* Set when every slot still outstanding has run out its own per-slot
+         * answer budget. Unlike the idle timer this is NOT refreshed by a sibling
+         * slot's answer: a trickle from slot A cannot extend slot B's budget,
+         * which is what "one dead peer must not pin the round" requires. */
+        int round_went_expired = 0;
+        /* Finish-on-peers tail: once armed the drain stops blocking and consumes
+         * only what is already queued, bounded by that queue depth. */
+        int finish_armed = 0;
+        int finish_tail_left = 0;
+
         /* Drain against the single deadline. pop() only ever gets a small RELATIVE
          * slice, so its internal CLOCK_REALTIME wait never sees the lookup deadline
          * and wall-clock jumps cannot extend or shorten the cap. */
         while (outstanding > 0 && out->peer_count < MAX_PEERS_PER_ENTRY) {
-            int64_t remaining_us = (int64_t)(deadline_us - now_us());
-            if (remaining_us <= 0) {
-                break;
-            }
-            if (atomic_load(&tree->shutdown_requested)) {
-                break;  /* pop's -1 conflates timeout and shutdown */
-            }
+            int slice_ms;
+            if (finish_armed) {
+                if (finish_tail_left <= 0) {
+                    break;  /* nothing left queued: the lookup already has its peers */
+                }
+                finish_tail_left--;
+                slice_ms = 0;  /* non-blocking: take only an answer already queued */
+            } else {
+                int64_t remaining_us = (int64_t)(deadline_us - now_us());
+                if (remaining_us <= 0) {
+                    exit_reason = GP_EXIT_DEADLINE;
+                    break;
+                }
+                if (atomic_load(&tree->shutdown_requested)) {
+                    break;  /* pop's -1 conflates timeout and shutdown */
+                }
+                if (tree->get_peers_round_idle_ms > 0) {
+                    uint64_t now = now_us();
+                    uint64_t idle_us = (uint64_t)tree->get_peers_round_idle_ms * 1000;
+                    /* now_us() returns 0 when clock_gettime() fails: fall back to the
+                     * deadline instead of declaring the round instantly idle. */
+                    if (now >= last_answer_us && now - last_answer_us >= idle_us) {
+                        round_went_idle = 1;
+                        break;
+                    }
+                }
+                if (tree->get_peers_slot_budget_ms > 0) {
+                    /* How many outstanding slots are still inside their own budget?
+                     * When none is, every remaining slot has answered or expired and
+                     * waiting longer cannot produce anything. A slot whose timestamp
+                     * is unusable (clock_gettime() failed) counts as still live, so a
+                     * broken clock falls back to the deadline instead of hot-looping. */
+                    uint64_t budget_now = now_us();
+                    uint64_t budget_us = (uint64_t)tree->get_peers_slot_budget_ms * 1000;
+                    int live_slots = 1;
+                    if (budget_now != 0) {
+                        live_slots = 0;
+                        for (int i = 0; i < GP_FANOUT_MAX; i++) {
+                            if (slot[i].tid_len <= 0) {
+                                continue;
+                            }
+                            if (slot[i].sent_us == 0 || budget_now < slot[i].sent_us ||
+                                budget_now - slot[i].sent_us < budget_us) {
+                                live_slots++;
+                            }
+                        }
+                    }
+                    if (live_slots == 0) {
+                        round_went_expired = 1;
+                        break;
+                    }
+                }
 
-            int slice_ms = 250;
-            if (remaining_us / 1000 < slice_ms) {
-                slice_ms = (int)(remaining_us / 1000 + 1);
-            }
-            if (tree->get_peers_timeout_ms > 0 && tree->get_peers_timeout_ms < slice_ms) {
-                slice_ms = tree->get_peers_timeout_ms;  /* drain-slice cap only, not the deadline */
+                slice_ms = 250;
+                if (remaining_us / 1000 < slice_ms) {
+                    slice_ms = (int)(remaining_us / 1000 + 1);
+                }
+                if (tree->get_peers_timeout_ms > 0 && tree->get_peers_timeout_ms < slice_ms) {
+                    slice_ms = tree->get_peers_timeout_ms;  /* drain-slice cap only, not the deadline */
+                }
             }
 
             if (tree_response_queue_pop(rsp_queue, &pkt, slice_ms) != 0) {
+                if (finish_armed) {
+                    break;  /* queue drained: nothing left worth waiting for */
+                }
                 continue;
             }
 
@@ -904,9 +1045,20 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
             }
 
             outstanding--;
+            answers_this_round++;
+            last_answer_us = now_us();
             atomic_fetch_add(&tree->gp_answers, 1);
             tree_dispatcher_unregister_tid(dispatcher, slot[s].tid, slot[s].tid_len);
             slot[s].tid_len = 0;
+
+            /* The node answered, so it is demonstrably alive: refresh its routing
+             * entry. tree_routing_add_node()'s existing-node branch resets
+             * fail_count to 0 and refreshes last_seen, so when the miss penalty IS
+             * enabled eviction means "repeatedly silent and never answering"
+             * instead of "3 misses despite answering". The penalty's target is
+             * still the id captured at send time (slot[].node_id) — this only
+             * softens the mechanism, it does not move the capture. */
+            tree_routing_add_node(rt, slot[s].node_id, &pkt.from);
 
             tree_get_peers_response_t response;
             if (tree_handle_get_peers_response(tree, pkt.data, pkt.len, &pkt.from, &response) == 0) {
@@ -972,13 +1124,50 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
                     cand_count++;
                 }
             }
+
+            /* Finish-on-peers: the lookup has what it came for, so stop waiting on
+             * the remaining slots — baseline waits for all of them, up to the full
+             * deadline, even after success. Answers that arrived together are not
+             * thrown away: the drain keeps going non-blocking for as many packets as
+             * the queue holds at this instant. Counted once per lookup terminated. */
+            if (!finish_armed && tree->get_peers_finish_on_peers && out->peer_count > 0) {
+                finish_armed = 1;
+                finish_tail_left = tree_response_queue_count(rsp_queue);
+                atomic_fetch_add(&tree->gp_early_finish_total, 1);
+            }
         }
 
         /* Exactly one unregister per register: sweep whatever this round left
-         * outstanding before the next round starts and before returning. */
+         * outstanding before the next round starts and before returning. Every
+         * slot still holding a TID was queried and never answered — answered and
+         * failed-send slots were zeroed above — so each one is counted, and
+         * (unless disabled) charged against that node's fail_count. A node that
+         * stays silent for MAX_FAIL_COUNT rounds is evicted from the routing
+         * table by tree_routing_mark_failed() and stops being re-selected; the
+         * find_node workers replenish the table. */
+        const uint64_t sweep_us = now_us();
+        const uint64_t slot_budget_us = tree->get_peers_slot_budget_ms > 0
+                                            ? (uint64_t)tree->get_peers_slot_budget_ms * 1000
+                                            : 0;
         for (int i = 0; i < GP_FANOUT_MAX; i++) {
             if (slot[i].tid_len > 0) {
                 tree_dispatcher_unregister_tid(dispatcher, slot[i].tid, slot[i].tid_len);
+                atomic_fetch_add(&tree->gp_unanswered_slots, 1);
+                /* The expired subset of the unanswered slots: a slot abandoned by
+                 * finish-on-peers is unanswered but NOT expired, so the two counts
+                 * stay distinct (slot_expired_total <= unanswered_slots_total). */
+                if (slot_budget_us > 0 && slot[i].sent_us != 0 && sweep_us >= slot[i].sent_us &&
+                    sweep_us - slot[i].sent_us >= slot_budget_us) {
+                    atomic_fetch_add(&tree->gp_slot_expired_total, 1);
+                }
+                if (tree->get_peers_penalize_misses) {
+                    /* Charged to the node this slot actually queried: the id was
+                     * copied at send time, so no cand[] reordering can redirect
+                     * it, and mark_failed() no-ops when the node has already
+                     * left the routing table (nothing to evict). */
+                    tree_routing_mark_failed(rt, slot[i].node_id);
+                    atomic_fetch_add(&tree->gp_miss_penalties, 1);
+                }
             }
         }
 
@@ -990,13 +1179,51 @@ int tree_lookup_peers(thread_tree_t *tree, const uint8_t infohash[20],
         round_index++;
 
         if (out->peer_count > 0) {
+            /* A lookup whose peer list fills MAX_PEERS_PER_ENTRY leaves the drain on
+             * its loop condition instead of arming finish-on-peers, but it too ended
+             * on peers: count it so early_finish_total tracks the with-peers lookups
+             * of the window. The finish_armed guard keeps this once per lookup. */
+            if (tree->get_peers_finish_on_peers && !finish_armed) {
+                atomic_fetch_add(&tree->gp_early_finish_total, 1);
+            }
+            exit_reason = GP_EXIT_PEERS;
             break;  /* peers found: no reason to spend more packets */
+        }
+        if (round_went_expired && answers_this_round == 0) {
+            /* Every remaining slot ran out its own answer budget and nothing came
+             * back at all: querying more candidates would only spend packets on the
+             * same silence, so end the lookup here (the same rule the zero-answer
+             * idle round uses). A round that answered at least once falls through to
+             * the budget/progress gates for the next round. */
+            exit_reason = GP_EXIT_SLOT_BUDGET;
+            break;
+        }
+        if (round_went_idle && answers_this_round == 0) {
+            /* The round ended on the idle cap and nothing came back at all:
+             * every further round would spend packets on the same silence, so
+             * end the lookup here instead of walking the rest of the candidate
+             * set. A round that answered at least once falls through to the
+             * existing budget/progress gates for the next round. */
+            exit_reason = GP_EXIT_IDLE;
+            break;
         }
     }
 
 done:
     if (out->peer_count > 0) {
         atomic_fetch_add(&tree->gp_lookups_with_peers, 1);
+    }
+    /* Exit-reason split: an idle exit is a lookup that completed without
+     * burning the whole deadline, a deadline exit is one that did not. */
+    switch (exit_reason) {
+    case GP_EXIT_IDLE:
+        atomic_fetch_add(&tree->gp_idle_exits, 1);
+        break;
+    case GP_EXIT_DEADLINE:
+        atomic_fetch_add(&tree->gp_deadline_exits, 1);
+        break;
+    default:
+        break;
     }
     const uint64_t end_us = now_us();
     if (end_us >= start_us) {
@@ -1313,12 +1540,30 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->get_peers_deadline_ms = config->get_peers_deadline_ms > 0 ? config->get_peers_deadline_ms : GP_DEADLINE_MS;
     tree->get_peers_fanout = config->get_peers_fanout > 0 ? config->get_peers_fanout : GP_FANOUT;
     tree->get_peers_max_queries = config->get_peers_max_queries > 0 ? config->get_peers_max_queries : 16;
+    /* 0 disables the round-idle exit (legacy full-deadline behaviour); the compiled
+     * default 1500 lives in config_init_defaults() and arrives here via the supervisor. */
+    tree->get_peers_round_idle_ms = config->get_peers_round_idle_ms >= 0
+                                        ? config->get_peers_round_idle_ms
+                                        : GP_ROUND_IDLE_MS;
+    tree->get_peers_penalize_misses = config->get_peers_penalize_misses > 0 ? 1 : 0;
+    /* 0 disables the per-slot answer budget (exact pre-rev2 wait-for-every-slot
+     * behaviour); the compiled default 2000 lives in config_init_defaults() and
+     * arrives here via the supervisor. */
+    tree->get_peers_slot_budget_ms = config->get_peers_slot_budget_ms >= 0
+                                         ? config->get_peers_slot_budget_ms
+                                         : GP_SLOT_BUDGET_MS;
+    tree->get_peers_finish_on_peers = config->get_peers_finish_on_peers > 0 ? 1 : 0;
 
     /* Stage 5 config */
     tree->tcp_connect_timeout_ms = config->tcp_connect_timeout_ms > 0 ? config->tcp_connect_timeout_ms : 5000;
-    tree->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 2;
+    tree->parallel_peers = config->parallel_peers > 0 ? config->parallel_peers : 4;
     tree->fresh_peer_retries = (config->fresh_peer_retries >= 0 && config->fresh_peer_retries <= 3) ? config->fresh_peer_retries : 1;
-    tree->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 60000;
+    tree->metadata_timeout_ms = config->metadata_timeout_ms > 0 ? config->metadata_timeout_ms : 30000;
+    /* 0 disables piece-idle eviction (legacy behaviour); the compiled default
+     * 15000 lives in config_init_defaults() and arrives here via the supervisor. */
+    tree->metadata_piece_idle_ms = config->metadata_piece_idle_ms >= 0
+                                       ? config->metadata_piece_idle_ms
+                                       : 15000;
     tree->shared_batch_writer = config->batch_writer;
 
     /* Initialize thread counts from config */
@@ -1357,6 +1602,15 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     /* Initialize statistics */
     atomic_store(&tree->metadata_count, 0);
     atomic_store(&tree->metadata_attempts, 0);
+    /* Metadata connection-failure attribution (see thread_tree.h). */
+    atomic_store(&tree->metadata_fail_connect, 0);
+    atomic_store(&tree->metadata_fail_handshake, 0);
+    atomic_store(&tree->metadata_fail_stall, 0);
+    atomic_store(&tree->metadata_fail_ut_reject, 0);
+    atomic_store(&tree->metadata_fail_size, 0);
+    atomic_store(&tree->metadata_fail_hash, 0);
+    atomic_store(&tree->metadata_fail_deadline, 0);
+    atomic_store(&tree->metadata_fail_other, 0);
     atomic_store(&tree->filtered_count, 0);
     atomic_store(&tree->last_metadata_time, 0);
     tree->metadata_rate = 0.0;
@@ -1370,6 +1624,12 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     atomic_store(&tree->gp_answers, 0);
     atomic_store(&tree->gp_lookup_us_total, 0);
     atomic_store(&tree->gp_rounds_total, 0);
+    atomic_store(&tree->gp_idle_exits, 0);
+    atomic_store(&tree->gp_deadline_exits, 0);
+    atomic_store(&tree->gp_unanswered_slots, 0);
+    atomic_store(&tree->gp_miss_penalties, 0);
+    atomic_store(&tree->gp_slot_expired_total, 0);
+    atomic_store(&tree->gp_early_finish_total, 0);
 
     /* Initialize BEP51 cache statistics */
     atomic_store(&tree->bep51_nodes_cached, 0);
