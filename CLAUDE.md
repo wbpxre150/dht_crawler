@@ -33,7 +33,7 @@ the features "patch NN" — that is the historical series number, not a file to 
 ```
 ./dht_crawler [--rebuild-bloom-filter] [--compact]
               [--category-filter-update] [--check-database]
-              [--recover-database] [--fetch-bep51-cache]
+              [--recover-database] [--fetch-bep51-cache] [--fetch-models]
 ```
 
 These are maintenance modes that exit after completing their task rather than running the crawler.
@@ -41,6 +41,16 @@ These are maintenance modes that exit after completing their task rather than ru
 `https://unjumble.au/bep51/bep51_cache.dat`) into `bep51_cache_path` and exits; the
 supervisor runs the same fetch automatically when its cache is below
 `global_bootstrap_target`, and falls back to router bootstrap if it fails.
+
+`--fetch-models [--models-base <url>] [--models-dir <dir>] [--force]` downloads the
+classifier weights (`v15` CRAM + `v13` movie-kind) into `<dir>/<gen>` (default `./models`,
+the compiled-in model dirs) and exits. The trust chain is two pins, not six: each
+generation's `manifest.json` sha256 is pinned in `src/model_fetch.c`, and every other file
+is verified against the sha256 that manifest declares. Only missing or mismatched files are
+downloaded, each is renamed into place only after it verifies (manifest last), and an
+already-correct tree is a no-op with no network — so it is cheap to call on every start.
+`--force` re-downloads, `--models-base` retargets the object prefix; progress is on stderr,
+nothing on stdout. See `include/model_fetch.h`.
 
 `--category-filter-update` purges the rows outside `save_categories`/`save_tv_kinds`
 and every adult-tagged row (`torrent_class.adult = 1`).

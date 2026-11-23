@@ -75,6 +75,29 @@ compiled-in defaults (`movie_kind_model_dir`, `classifier_model_dir`), so a plai
 `./build/full/dht_crawler` picks them up with no config change. Override the
 source with `--base URL` and the generation with `--gen v13|v15`.
 
+The crawler can also fetch them itself, with no shell scripts involved:
+
+```bash
+./dht_crawler --fetch-models                        # -> ./models/v15 and ./models/v13
+./dht_crawler --fetch-models --models-dir /srv/models --force
+```
+
+Same objects, same gates, same directories — which is what lets a packaged
+build stop shipping 490 MB of weights and pull them on first run instead. The
+trust chain is **two pins, not six**: each generation's `manifest.json` is
+sha256-pinned in `src/model_fetch.c` and is the root of trust, and every other
+file is verified against the sha256 that manifest declares. A file is
+downloaded only when it is missing or does not match, and it is renamed into
+place only after it verifies (the manifest last), so an interrupted download
+never leaves a corrupt model behind. `--force` re-downloads anyway,
+`--models-base URL` retargets the object prefix, and the command exits 0 only
+when every requested generation is present and verified.
+
+It is cheap to call on every process start: a tree that already verifies costs
+a handful of sha256s and no network at all (measured: 1.3 s for the full
+512,972,090 B tree, versus 49.9 s and 512,953,487 B of transfers for the cold
+run). Progress goes to stderr and nothing to stdout.
+
 Without the weights, or without the flavours, the crawler still crawls: the
 classifier degrades all-or-nothing (parser hint, `clf_ver` 0,
 `parser_only_fallback`) and `movie_kind` reports `enabled: false`. `/stats`

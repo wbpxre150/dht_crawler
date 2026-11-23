@@ -23,7 +23,7 @@ LIB_OBJS = $(BUILD_DIR)/bencode.o \
 # Target executable
 TARGET = dht_crawler
 
-.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb clf clf-backfill full check-llama models llama
+.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb clf clf-backfill full check-llama models llama tests-model-fetch
 
 all: dirs patch-bencode patch-civetweb libbloom $(TARGET)
 
@@ -175,6 +175,20 @@ HTTP_FETCH_TEST_BIN = $(BUILD_DIR)/test_http_fetch
 HTTP_FETCH_TEST_CFLAGS =
 HTTP_FETCH_TEST_LDFLAGS = -lssl -lcrypto -lpthread
 
+# The weights download behind `--fetch-models`. The trust chain is two pins -
+# each generation's manifest.json - and every other file is verified against the
+# sha256 that manifest declares, so the test can prove the whole gate without
+# the 490 MB of real weights: a forked scripted server answers the manifest
+# request with a body that cannot match its pin, and the no-op case points at a
+# CLOSED PORT on purpose, which is what proves an already-correct tree never
+# dials out. src/http_fetch.c is linked as-is (the fetcher is already covered by
+# tests-http-fetch); cJSON is compiled in for the manifest parse.
+MODEL_FETCH_TEST_SRCS = tests/test_model_fetch.c src/model_fetch.c src/http_fetch.c \
+                        lib/cJSON/cJSON.c
+MODEL_FETCH_TEST_BIN = $(BUILD_DIR)/test_model_fetch
+MODEL_FETCH_TEST_CFLAGS =
+MODEL_FETCH_TEST_LDFLAGS = -lssl -lcrypto -lpthread
+
 CRAM_MODEL_DIR ?= tests/fixtures/cram/models/v15
 CRAM_TEST_SRCS = tests/test_cram.c src/cram.c tests/stub_log.c lib/cJSON/cJSON.c
 CRAM_TEST_BIN = $(BUILD_DIR)/test_cram
@@ -297,7 +311,7 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-http-fetch tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-http-fetch tests-model-fetch tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
 
@@ -305,6 +319,11 @@ tests-http-fetch:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(HTTP_FETCH_TEST_SRCS) -o $(HTTP_FETCH_TEST_BIN) $(TEST_LDFLAGS) $(HTTP_FETCH_TEST_LDFLAGS)
 	./$(HTTP_FETCH_TEST_BIN)
+
+tests-model-fetch:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MODEL_FETCH_TEST_CFLAGS) $(INCLUDES) $(MODEL_FETCH_TEST_SRCS) -o $(MODEL_FETCH_TEST_BIN) $(TEST_LDFLAGS) $(MODEL_FETCH_TEST_LDFLAGS)
+	./$(MODEL_FETCH_TEST_BIN)
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)

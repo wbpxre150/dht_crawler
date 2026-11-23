@@ -21,6 +21,7 @@
 #include "movie_backfill.h"
 #include "movie_backfill_daemon.h"
 #include "maintenance_progress.h"
+#include "model_fetch.h"
 #include <signal.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -214,6 +215,10 @@ int main(int argc, char *argv[]) {
     const char *rebuild_fts_db_path = NULL;
     bool clear_failure_filter = false;
     bool fetch_bep51_cache = false;
+    bool fetch_models = false;
+    const char *models_base = NULL;
+    const char *models_dir = NULL;
+    bool models_force = false;
     bool category_filter_update = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -232,6 +237,8 @@ int main(int argc, char *argv[]) {
             printf("                           and rebuild it with the bundled SQLite\n");
             printf("  --clear-failure-filter   Delete the persisted failure bloom filter (data/failure_bloom.dat)\n");
             printf("  --fetch-bep51-cache      Download bep51_cache_url into bep51_cache_path and exit\n");
+            printf("  --fetch-models           Download the classifier weights into ./models and exit\n");
+            printf("                           (--models-base <url>, --models-dir <dir>, --force)\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -260,6 +267,23 @@ int main(int argc, char *argv[]) {
             clear_failure_filter = true;
         } else if (strcmp(argv[i], "--fetch-bep51-cache") == 0) {
             fetch_bep51_cache = true;
+        } else if (strcmp(argv[i], "--fetch-models") == 0) {
+            fetch_models = true;
+        } else if (strcmp(argv[i], "--models-base") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--models-base requires a <url> argument");
+                return 1;
+            }
+            models_base = argv[++i];
+        } else if (strcmp(argv[i], "--models-dir") == 0) {
+            if (i + 1 >= argc) {
+                log_msg(LOG_ERROR, "--models-dir requires a <dir> argument");
+                return 1;
+            }
+            models_dir = argv[++i];
+        } else if (strcmp(argv[i], "--force") == 0) {
+            /* Only --fetch-models consumes it; see the dispatch below. */
+            models_force = true;
         }
     }
 
@@ -411,6 +435,24 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* --fetch-models [--models-base <url>] [--models-dir <dir>] [--force]:
+     * download the classifier weights this binary serves with, then exit.
+     *
+     * Dispatched before any configuration or database work: it needs neither,
+     * and it must be cheap to call on every process start - a tree whose files
+     * already verify costs a handful of sha256s and no network at all. Progress
+     * goes to stderr and nothing to stdout, so a caller can capture stdout.
+     * Exit 0 means both generations are present and verified (including the
+     * already-present no-op case); 1 means something failed. */
+    if (fetch_models) {
+        model_fetch_options_t models_opts;
+        memset(&models_opts, 0, sizeof(models_opts));
+        models_opts.base = models_base;
+        models_opts.dir = models_dir;
+        models_opts.force = models_force;
+        models_opts.log = stderr;
+        return model_fetch_run(&models_opts) == 0 ? 0 : 1;
+    }
     if (print_schema) {
         database_print_schema(stdout);
         return 0;
