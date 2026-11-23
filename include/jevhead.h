@@ -6,9 +6,10 @@
  * Stage B. Keep this file byte-comparable with the reference: it is what pins
  * the on-device head arithmetic to the parity harness that fitted it.
  *
- * `models/v9/movie_kind_head.bin` is a `JEVH` file: a little-endian header, then fp32
+ * `models/v10/movie_kind_head.bin` is a `JEVH` file: a little-endian header, then fp32
  * `W[n_labels * hidden]` (row-major), `b[n_labels]` and `thr[n_labels]`. The head is
- * `sigmoid(W x + b) >= thr` per genre, where `x` is the **unnormalised** CLS embedding of
+ * `sigmoid(W x + b) >= thr` per genre, where `x` is the **unnormalised** last-token
+ * embedding of
  * `Torrent: {name}\nFilm genres:` out of the quantised GGUF backbone.
  *
  * Deliberately no dependency on llama.cpp: the embedding is an input, the head is pure

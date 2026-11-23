@@ -18,6 +18,11 @@
  *     missing manifest, unusable version, genre/label disagreement, missing
  *     file, wrong file size, wrong sha256 — each of which must leave the
  *     module disabled and bump `model_load_failures`.
+ *   - the inline ingest write path (movie-kind v10): a labelled movie row
+ *     carries movie_kind_mask and movie_kind_clf_ver = the manifest generation
+ *     into torrent_class through database_insert_batch(), a row with no verdict
+ *     stores both columns NULL, and a mask without a fastText verdict never
+ *     forces a class row.
  *
  * The encoder half (llama.cpp + utf8proc) is MK_ENABLED-gated and CANNOT link
  * here: utf8proc is vendored in the outer repo only (movie-kind Stage A), so
@@ -40,6 +45,8 @@
 #include <unistd.h>
 
 #include "clf_sha256.h"
+#include "database.h"
+#include "dht_crawler.h"
 #include "jevhead.h"
 #include "movie_kind.h"
 
@@ -321,7 +328,7 @@ static int write_manifest(const char *dir, const manifest_spec_t *spec) {
     }
     used += (size_t)snprintf(text + used, sizeof(text) - used,
                              "  ],\n  \"backbone\": {\"file\": \"%s\", \"bytes\": %lld, "
-                             "\"sha256\": \"%s\", \"hidden\": 768},\n",
+                             "\"sha256\": \"%s\", \"hidden\": 1024},\n",
                              BACKBONE_FILE, spec->backbone_bytes, spec->backbone_sha);
     used += (size_t)snprintf(text + used, sizeof(text) - used,
                              "  \"head\": {\"file\": \"%s\", \"bytes\": %lld, \"sha256\": \"%s\", "
@@ -379,7 +386,7 @@ static void case_manifest_ok(void) {
         .head_bytes = HEAD_BYTES,
         .head_sha = head_sha,
         .n_labels = MOVIE_KIND_MAX_GENRES,
-        .head_hidden = 768,
+        .head_hidden = 1024,
     };
     if (write_manifest(SCRATCH_DIR, &spec) != 0) {
         fail("the manifest is writable", SCRATCH_DIR);
@@ -418,7 +425,7 @@ static void case_manifest_ok(void) {
     movie_kind_stats_t stats;
     movie_kind_get_stats(&stats);
     if (stats.generation != 9 || stats.genre_count != MOVIE_KIND_MAX_GENRES ||
-        stats.n_labels != MOVIE_KIND_MAX_GENRES || stats.hidden != 768) {
+        stats.n_labels != MOVIE_KIND_MAX_GENRES || stats.hidden != 1024) {
         fail("the stats snapshot publishes the manifest shape", "get_stats");
     }
     if (strcmp(stats.backbone_sha, backbone_sha) != 0 || strcmp(stats.head_sha, head_sha) != 0) {
@@ -496,7 +503,7 @@ static void case_refusals(void) {
         .head_bytes = HEAD_BYTES,
         .head_sha = head_sha,
         .n_labels = MOVIE_KIND_MAX_GENRES,
-        .head_hidden = 768,
+        .head_hidden = 1024,
     };
 
     /* Missing manifest. */
@@ -574,14 +581,14 @@ static void case_refusals(void) {
 /* ---- the embedding seam: the guarded classify path without a GGUF ------ *
  *
  * The stage-9 P0 was an *embedding read* bug: llama_get_embeddings() is the
- * LLAMA_POOLING_TYPE_NONE accessor, so with CLS pooling it handed back 768
+ * LLAMA_POOLING_TYPE_NONE accessor, so with CLS pooling it handed back 1024
  * zeros, and sigmoid(0 + b_j) >= thr_j then produced one constant mask (20744)
  * for every movie. These cases pin that bug class through the real classify
  * path - with synthetic vectors and no model - so the guard can never be
  * dropped again without a red host test.
  * ------------------------------------------------------------------------ */
 
-#define SEAM_HIDDEN 768
+#define SEAM_HIDDEN 1024
 #define SEAM_LABELS MOVIE_KIND_MAX_GENRES
 #define SEAM_HEAD_BYTES \
     (JEVHEAD_HEADER_SIZE + 4u * ((size_t)SEAM_LABELS * SEAM_HIDDEN + 2u * SEAM_LABELS))
@@ -605,7 +612,7 @@ static int seam_provider(void *userdata, const char *name, float *out, int hidde
     return 0;
 }
 
-/* A 768x16 JEVH head: label i sees only dimension i (W[i][i] = 1), every
+/* A 1024x16 JEVH head: label i sees only dimension i (W[i][i] = 1), every
  * threshold is 0.5, and the bias is +1 on SEAM_HOT_BITS and -1 elsewhere. Two
  * properties are deliberate:
  *   - the all-zero vector then answers 0x5108 = 20744 - the documented
@@ -668,7 +675,7 @@ static void case_embedding_seam(void) {
     }
     snprintf(path, sizeof(path), "%s/%s", SCRATCH_DIR, HEAD_FILE);
     if (seam_write_head(path) != 0) {
-        fail("the 768x16 seam head is writable", path);
+        fail("the 1024x16 seam head is writable", path);
         return;
     }
     if (clf_sha256_file(path, head_sha) != 0) {
@@ -823,6 +830,203 @@ static void case_embedding_seam(void) {
            "NULL provider\n");
 }
 
+/* ---- inline ingest write path ------------------------------------------ */
+
+/* The ingest case's database, and the generation its manifest reports:
+ * "v10-nemotron-q4" resolves to 10 by mk_parse_generation(), never a literal. */
+#define STREAM_DB "/tmp/movie-kind-streaming.db"
+#define STREAM_VERSION "v10-nemotron-q4"
+#define STREAM_GENERATION 10
+
+static void remove_stream_db(void) {
+    static const char *const suffixes[] = {"", "-wal", "-shm"};
+    char path[512];
+
+    for (size_t index = 0; index < sizeof(suffixes) / sizeof(suffixes[0]); index++) {
+        snprintf(path, sizeof(path), "%s%s", STREAM_DB, suffixes[index]);
+        remove(path);
+    }
+}
+
+/* One ingest-shaped torrent_metadata_t, the way tree_metadata.c hands rows to
+ * batch_writer_add(): plain C values plus a one-file list. */
+static torrent_metadata_t *stream_torrent(int id, const char *name, int has_classification) {
+    torrent_metadata_t *torrent = calloc(1, sizeof(*torrent));
+
+    if (!torrent) return NULL;
+    torrent->info_hash[0] = (uint8_t)(0xA0 + id);
+    for (int index = 1; index < SHA1_DIGEST_LENGTH; index++) {
+        torrent->info_hash[index] = (uint8_t)(index * 7 + id);
+    }
+    torrent->name = strdup(name);
+    torrent->size_bytes = 1024 * (int64_t)id;
+    torrent->total_peers = 1;
+    torrent->added_timestamp = 1700000000 + id;
+    if (has_classification) {
+        torrent->has_classification = 1;
+        torrent->classification.category = 1;  /* TP_CAT_MOVIE */
+        torrent->classification.adult = 0;
+        torrent->classification.clf_ver = 4;
+    }
+    torrent->num_files = 1;
+    torrent->files = calloc(1, sizeof(file_info_t));
+    if (torrent->files) {
+        torrent->files[0].path = strdup("movie.mkv");
+        torrent->files[0].size_bytes = 1024;
+    }
+    return torrent;
+}
+
+static void free_stream_torrent(torrent_metadata_t *torrent) {
+    if (!torrent) return;
+    if (torrent->files) {
+        free(torrent->files[0].path);
+        free(torrent->files);
+    }
+    free(torrent->name);
+    free(torrent);
+}
+
+/* The label tree_metadata_worker_func computes inline must reach torrent_class
+ * through the real ingest write path, stamped with the manifest's generation -
+ * and a row the classifier could not label must store NULL, never 0. */
+static void case_ingest_streaming(void) {
+    char backbone_sha[CLF_SHA_HEX_LEN + 1];
+    char head_sha[CLF_SHA_HEX_LEN + 1];
+    char path[512];
+    static app_context_t app_ctx;  /* zeroed: database_init only stores it */
+    database_t db;
+    torrent_metadata_t *batch[3];
+    size_t written = 0;
+    uint16_t inline_mask = 0;
+
+    /* A v10-shaped model directory: hidden 1024, version v10-nemotron-q4. */
+    if (stage_model_dir(backbone_sha, head_sha) != 0) {
+        fail("the streaming model directory stages", SCRATCH_DIR);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/%s", SCRATCH_DIR, HEAD_FILE);
+    if (seam_write_head(path) != 0) {
+        fail("the 1024x16 seam head is writable", path);
+        return;
+    }
+    if (clf_sha256_file(path, head_sha) != 0) {
+        fail("the seam head hashes", path);
+        return;
+    }
+    manifest_spec_t spec = {
+        .version = STREAM_VERSION,
+        .backbone_bytes = BACKBONE_BYTES,
+        .backbone_sha = backbone_sha,
+        .head_bytes = (long long)SEAM_HEAD_BYTES,
+        .head_sha = head_sha,
+        .n_labels = SEAM_LABELS,
+        .head_hidden = SEAM_HIDDEN,
+    };
+    if (write_manifest(SCRATCH_DIR, &spec) != 0) {
+        fail("the streaming manifest is writable", SCRATCH_DIR);
+        return;
+    }
+    if (movie_kind_init(SCRATCH_DIR) != 0) {
+        fail("the v10 manifest initialises the module", SCRATCH_DIR);
+        return;
+    }
+    if (movie_kind_generation() != STREAM_GENERATION) {
+        fail_int("manifest.version \"v10-nemotron-q4\" resolves to generation 10",
+                 movie_kind_generation(), STREAM_GENERATION);
+        return;
+    }
+    movie_kind_test_set_embedding_provider(seam_provider, NULL);
+    if (movie_kind_enabled() != 1) {
+        fail("the seam enables the module for the streaming case", "enabled");
+        return;
+    }
+
+    remove_stream_db();
+    memset(&db, 0, sizeof(db));
+    if (database_init(&db, STREAM_DB, &app_ctx) != 0) {
+        fail("database_init", STREAM_DB);
+        return;
+    }
+    if (database_create_schema(&db) != 0) {
+        fail("database_create_schema", STREAM_DB);
+        database_cleanup(&db);
+        remove_stream_db();
+        return;
+    }
+
+    /* Row 1: the inline path labels it. The embedding is the seam case's A
+     * vector, whose mask is bits 0..7. */
+    for (int index = 0; index < SEAM_HIDDEN; index++) {
+        seam_embedding[index] = (index < 8) ? 2.0f : ((index < 16) ? -2.0f : 0.0f);
+    }
+    batch[0] = stream_torrent(1, "Some.2024.1080p.mkv", 1);
+    batch[1] = stream_torrent(2, "Unlabelled.2024.1080p.mkv", 1);
+    batch[2] = stream_torrent(3, "Unclassified.2024.1080p.mkv", 0);
+    if (!batch[0] || !batch[1] || !batch[2]) {
+        fail("calloc ingest torrents", NULL);
+    } else {
+        if (movie_kind_classify(batch[0]->name, &inline_mask) != 0) {
+            fail("the seam labels the inline movie", "classify");
+        } else {
+            batch[0]->movie_kind_mask = inline_mask;
+            batch[0]->movie_kind_clf_ver = movie_kind_generation();
+            batch[0]->has_movie_kind = 1;
+        }
+        /* Row 2 gets no verdict: both columns must stay NULL. Row 3 carries a
+         * mask but no fastText verdict: the class row is gated on
+         * has_classification, so the mask is dropped, not invented. */
+        batch[2]->movie_kind_mask = 0x0005u;
+        batch[2]->has_movie_kind = 1;
+
+        if (database_insert_batch(&db, batch, 3, &written) != 0 || written != 3) {
+            fail("database_insert_batch", STREAM_DB);
+        }
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db.db,
+                               "SELECT movie_kind_mask, movie_kind_clf_ver FROM torrent_class "
+                               "ORDER BY torrent_id",
+                               -1, &stmt, NULL) != SQLITE_OK) {
+            fail("prepare the torrent_class read", sqlite3_errmsg(db.db));
+        } else {
+            if (sqlite3_step(stmt) != SQLITE_ROW) {
+                fail("the labelled movie has a torrent_class row", "no row");
+            } else {
+                if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER ||
+                    sqlite3_column_int(stmt, 0) != (int)inline_mask) {
+                    fail_int("the inline mask is stored", sqlite3_column_int(stmt, 0),
+                             (long long)inline_mask);
+                }
+                if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER ||
+                    sqlite3_column_int64(stmt, 1) != STREAM_GENERATION) {
+                    fail_int("movie_kind_clf_ver is the manifest generation",
+                             sqlite3_column_int64(stmt, 1), STREAM_GENERATION);
+                }
+            }
+            if (sqlite3_step(stmt) != SQLITE_ROW) {
+                fail("the unlabelled movie has a torrent_class row", "no row");
+            } else if (sqlite3_column_type(stmt, 0) != SQLITE_NULL ||
+                       sqlite3_column_type(stmt, 1) != SQLITE_NULL) {
+                fail("no verdict stores both movie columns NULL", "not NULL");
+            }
+            if (sqlite3_step(stmt) != SQLITE_DONE) {
+                fail("a mask without a classification forces no class row", "extra row");
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    for (size_t index = 0; index < sizeof(batch) / sizeof(batch[0]); index++) {
+        free_stream_torrent(batch[index]);
+    }
+    database_cleanup(&db);
+    remove_stream_db();
+    movie_kind_test_set_embedding_provider(NULL, NULL);
+    printf("  case 8 ok: inline ingest stores movie_kind_mask + clf_ver %d, NULL without a "
+           "verdict, no class row without a classification\n", STREAM_GENERATION);
+}
+
 int main(void) {
     mkdir(SCRATCH_DIR, 0755);
 
@@ -832,6 +1036,7 @@ int main(void) {
     case_manifest_ok();
     case_refusals();
     case_embedding_seam();
+    case_ingest_streaming();
 
     /* Leave nothing behind. */
     char path[512];

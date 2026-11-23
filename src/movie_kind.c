@@ -9,7 +9,7 @@
  *     pinned-size + sha256 verification, the stats block — is plain C99 with
  *     cJSON and OpenSSL, so the crawler's own host `make` build compiles it
  *     and tests/test_movie_kind.c exercises the *real* refusal paths;
- *   - the encoder — llama.cpp model/context and `llama_encode` — is
+ *   - the encoder — llama.cpp model/context and `llama_encode`/`llama_decode` — is
  *     `MK_ENABLED`-gated, with an inert `#else` that answers "no verdict"
  *     exactly like classifier.c's host stubs, so a plain CMake configure and
  *     the host Makefile stay llama-free;
@@ -127,8 +127,9 @@ static void mk_update_enabled_locked(void);
 static int mk_ensure_locked(void);
 
 #ifdef MK_ENABLED
-/* The llama.cpp embedding provider (render -> tokenise -> llama_encode -> read
- * the pooled CLS vector) and the backbone/context load behind it. */
+/* The llama.cpp embedding provider (render -> tokenise -> llama_encode for an
+ * encoder backbone / llama_decode for a decoder one -> read the pooled
+ * last-token vector) and the backbone/context load behind it. */
 static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden);
 static int mk_model_ensure_locked(void);
 #endif
@@ -513,7 +514,7 @@ static int mk_model_ensure_locked(void) {
     snprintf(path, sizeof(path), "%s/%s", mk.model_dir, mk.backbone_file);
     struct llama_model_params model_params = llama_model_default_params();
     /* CPU-only on the phone; mmap is the default load mode and is what keeps
-     * the 152.8 MiB out of RSS until the pages are touched. */
+     * the 478.2 MiB out of RSS until the pages are touched. */
     model_params.n_gpu_layers = 0;
     mk.model = llama_model_load_from_file(path, model_params);
     if (!mk.model) {
@@ -543,7 +544,9 @@ static int mk_model_ensure_locked(void) {
     context_params.n_seq_max = 1;
     context_params.n_threads = mk.threads;
     context_params.n_threads_batch = mk.threads;
-    context_params.pooling_type = LLAMA_POOLING_TYPE_CLS;
+    /* LAST, not CLS: the v10 head was fitted on the final-token state of the
+     * one unpadded sequence, so the pooled vector below must be that state. */
+    context_params.pooling_type = LLAMA_POOLING_TYPE_LAST;
     context_params.embeddings = true;
     mk.context = llama_init_from_model(mk.model, context_params);
     if (!mk.context) {
@@ -562,17 +565,26 @@ static int mk_model_ensure_locked(void) {
 }
 
 /* The llama.cpp embedding provider: tokenise the serving text with the GGUF's
- * own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, encode one row, read the pooled
- * CLS vector. Called with `mutex` held and the model resident.
+ * own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, run one row through the entry
+ * point the backbone demands, read the pooled last-token vector. Called with
+ * `mutex` held and the model resident.
+ *
+ * The entry point is a property of the model, not a habit: llama_encode runs
+ * the encoder graph and llama_decode the decoder graph. A decoder backbone
+ * (v10's qwen35) faults inside build_inp_mem_hybrid when handed the encoder
+ * graph, so the choice below is load-bearing, not stylistic.
  *
  * The read is llama_get_embeddings_seq(ctx, 0) - the *pooled* accessor. The
- * context is always built with LLAMA_POOLING_TYPE_CLS, and llama_get_embeddings()
- * is documented as the LLAMA_POOLING_TYPE_NONE accessor: with pooling set it
- * does not return the pooled vector. On the phone it handed back a zero-filled
- * 768-float buffer, so sigmoid(0 + b_j) >= thr_j produced one constant mask for
- * every movie (the stage-9 P0: mask 20744 on all 500 sampled names). There is
- * deliberately no NONE-pooling fallback: this module never pools NONE, so the
- * fallback could only be unreachable dead code that re-opens the wrong path. */
+ * context is always built with LLAMA_POOLING_TYPE_LAST, so the one unpadded
+ * sequence's pooled vector is its final token's state: exactly the vector the
+ * v10 JEVH head was fitted on (`models/v10/manifest.json`, "pooling": "last").
+ * llama_get_embeddings() is documented as the LLAMA_POOLING_TYPE_NONE
+ * accessor: with pooling set it does not return the pooled vector. On the
+ * phone it handed back a zero-filled `hidden`-float buffer, so
+ * sigmoid(0 + b_j) >= thr_j produced one constant mask for every movie (the
+ * stage-9 P0: mask 20744 on all 500 sampled names). There is deliberately no
+ * NONE-pooling fallback: this module never pools NONE, so the fallback could
+ * only be unreachable dead code that re-opens the wrong path. */
 static int mk_llama_embed(void *userdata, const char *name, float *out, int hidden) {
     (void)userdata;
     /* The serving text comes from the ungated renderer (src/movie_kind_render.c),
@@ -613,19 +625,45 @@ static int mk_llama_embed(void *userdata, const char *name, float *out, int hidd
 
     int32_t n_tokens = got;
     if (n_tokens > MOVIE_KIND_MAX_TOKENS) n_tokens = MOVIE_KIND_MAX_TOKENS;
-    struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
-    int32_t encoded = llama_encode(mk.context, batch);
-    free(tokens);
-    if (encoded != 0) {
-        log_msg(LOG_WARN, "MovieKind: llama_encode failed (%d)", encoded);
+    /* Entry point by model: an encoder backbone (v9's modern-bert) needs
+     * llama_encode, a decoder backbone (v10's qwen35) needs llama_decode.
+     * Handing a hybrid decoder the encoder graph makes build_inp_mem_hybrid
+     * read a null recurrent-memory context and SIGSEGV on the first movie row.
+     * Encoder-decoder models are refused loudly, as llama.cpp's own embedding
+     * example does: this module has no use for the cross-attention half. */
+    const int has_encoder = llama_model_has_encoder(mk.model) ? 1 : 0;
+    const int has_decoder = llama_model_has_decoder(mk.model) ? 1 : 0;
+    if (has_encoder && has_decoder) {
+        log_msg(LOG_WARN, "MovieKind: the backbone is an encoder-decoder model; movie-kind "
+                          "needs a pure encoder or a pure decoder backbone");
+        free(tokens);
         return -1;
     }
 
-    /* Pooling is CLS and the head was fitted on *unnormalised* states: do not
-     * L2-normalise here, whatever an embedding example does. */
+    struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
+    int32_t ran;
+    if (has_encoder) {
+        /* llama_encode does not use the KV cache, so it needs no memory clear. */
+        ran = llama_encode(mk.context, batch);
+    } else {
+        /* Decode *does* carry memory across calls: without the per-call clear
+         * every name after the first would start from the previous name's
+         * final recurrent/KV state and pool the wrong vector. */
+        llama_memory_clear(llama_get_memory(mk.context), true);
+        ran = llama_decode(mk.context, batch);
+    }
+    free(tokens);
+    if (ran != 0) {
+        log_msg(LOG_WARN, "MovieKind: llama_encode/llama_decode failed (%d)", ran);
+        return -1;
+    }
+
+    /* Pooling is LAST (the final token of the single unpadded sequence) and the
+     * head was fitted on *unnormalised* states: do not L2-normalise here,
+     * whatever an embedding example does. */
     const float *embedding = llama_get_embeddings_seq(mk.context, 0);
     if (!embedding) {
-        log_msg(LOG_WARN, "MovieKind: llama_encode produced no pooled CLS embedding (seq 0)");
+        log_msg(LOG_WARN, "MovieKind: the model produced no pooled last-token embedding (seq 0)");
         return -1;
     }
     memcpy(out, embedding, (size_t)hidden * sizeof(float));
@@ -734,10 +772,11 @@ static int mk_embed_mask_locked(const char *name, uint16_t *out_mask) {
     }
 
     /* Zero-embedding guard: an all-zero vector is a broken read path, not an
-     * embedding. A genuine unnormalised CLS vector has L1 ~ 750 (||x|| ~ 41.3),
-     * so L1 == 0 always means the encoder handed back nothing. Failing here is
-     * what makes the whole zero-buffer bug class loud: without it,
-     * sigmoid(0 + b_j) >= thr_j emits one degenerate mask for every movie. */
+     * embedding. A genuine unnormalised last-token vector has a large L1 (the
+     * v9 768-float states measured ~750, ||x|| ~ 41), so L1 == 0 always means
+     * the encoder handed back nothing. Failing here is what makes the whole
+     * zero-buffer bug class loud: without it, sigmoid(0 + b_j) >= thr_j emits
+     * one degenerate mask for every movie. */
     double l1 = 0.0;
     for (int index = 0; index < mk.hidden; index++) {
         l1 += fabs((double)mk.embedding[index]);

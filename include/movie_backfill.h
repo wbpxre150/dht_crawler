@@ -50,7 +50,8 @@
 #define MOVIE_BACKFILL_VER_KEY "movie_kind_clf_ver"
 
 /* Lowest generation `--reset` clears. Generation 9 is the pass that shipped the
- * constant-mask bug (the wrong pooling accessor), so every row carrying 9 is a
+ * constant-mask bug (the wrong pooling accessor: CLS where the head was fitted
+ * on last-token states), so every row carrying 9 is a
  * poisoned label. Older generations were never written by this pipeline and a
  * newer one cannot be poisoned by that bug, hence ">=" and not "= 9". */
 #define MOVIE_BACKFILL_RESET_MIN_GENERATION 9

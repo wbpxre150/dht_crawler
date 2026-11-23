@@ -48,6 +48,18 @@ typedef struct {
      * after the filters pass; has_classification gates the torrent_class row. */
     classification_t classification;
     int has_classification;
+    /* Movie-kind (v10) inline label: set by tree_metadata.c right after the
+     * fastText verdict, for a classified non-adult movie only. It rides into
+     * torrent_class with the same row (has_classification still gates the row,
+     * a movie mask never creates one) and through the same memcpy deep copy.
+     * movie_kind_mask 0 is a valid `none` verdict, so has_movie_kind - never
+     * the mask - says whether the columns are written. The generation rides
+     * here for the same reason classification_t.clf_ver does: the write path
+     * binds what the classifier stamped, and src/database.c keeps no
+     * dependency on the movie-kind module. */
+    uint16_t movie_kind_mask;
+    int has_movie_kind;
+    long long movie_kind_clf_ver;  /* movie_kind_generation() at label time */
 } torrent_metadata_t;
 
 /* Forward declaration */

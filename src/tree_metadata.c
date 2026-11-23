@@ -11,6 +11,7 @@
 #include "hard_block.h"
 #include "language_filter.h"
 #include "classifier.h"
+#include "movie_kind.h"
 #include "category_filter_cleanup.h"
 #include "../lib/bencode-c/bencode.h"
 
@@ -45,6 +46,13 @@
 
 /* Our ut_metadata extension ID */
 #define OUR_UT_METADATA_ID 1
+
+/* torrent_class.category value for a movie: TP_CAT_MOVIE from the vendored
+ * dht_crawler-android/tparse/taxonomy.h. That header only exists on the Android
+ * wrapper's include path while this file also compiles for the crawler's own
+ * host `make`, so the value is mirrored here - exactly what src/movie_backfill.c
+ * (MB_CAT_MOVIE) and src/http_api.c do. It is frozen by the data on the phone. */
+#define TM_CAT_MOVIE 1
 
 /* Default config values */
 #define DEFAULT_TCP_TIMEOUT_MS 5000
@@ -1576,6 +1584,31 @@ void *tree_metadata_worker_func(void *arg) {
                 if (!filtered && tree->shared_batch_writer) {
                     if (classifier_classify(&db_meta, &db_meta.classification) == 0) {
                         db_meta.has_classification = 1;
+                    }
+                }
+
+                /* Movie-kind (v10): label the same population the backfill
+                 * engine's predicate would pick up - a classified movie that is
+                 * not adult - but here, before the row is stored, so no pass has
+                 * to walk the table afterwards. The mask travels in db_meta like
+                 * the fastText verdict: batch_writer_add() deep-copies it and
+                 * database.c writes both movie columns inside the same batch
+                 * transaction. Deliberately outside db->mutex and outside
+                 * batch_writer_add(): movie_kind_classify() takes the module's
+                 * own mutex and may load the 478.2 MiB backbone on first use,
+                 * which must never happen under the database lock. A failure (1
+                 * = no verdict) leaves the row unlabelled, exactly like
+                 * classifier_classify(). */
+                if (db_meta.has_classification &&
+                    db_meta.classification.category == TM_CAT_MOVIE &&
+                    db_meta.classification.adult == 0 && movie_kind_enabled()) {
+                    uint16_t movie_kind_mask = 0;
+                    if (movie_kind_classify(db_meta.name, &movie_kind_mask) == 0) {
+                        db_meta.movie_kind_mask = movie_kind_mask;
+                        /* Stamped like classification.clf_ver: the generation
+                         * the verdict was produced at, never a literal. */
+                        db_meta.movie_kind_clf_ver = movie_kind_generation();
+                        db_meta.has_movie_kind = 1;
                     }
                 }
 

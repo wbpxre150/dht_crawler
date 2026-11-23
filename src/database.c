@@ -580,8 +580,9 @@ int database_create_schema(database_t *db) {
     const char *insert_class_sql =
         "INSERT OR IGNORE INTO torrent_class "
         "(torrent_id, category, tv_kind, adult, adult_p, season_lo, season_hi, "
-        " episode_lo, episode_hi, resolution, confidence, clf_ver) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        " episode_lo, episode_hi, resolution, confidence, clf_ver, "
+        " movie_kind_mask, movie_kind_clf_ver) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     rc = sqlite3_prepare_v2(db->db, insert_class_sql, -1, &db->insert_class_stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -1040,6 +1041,19 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
         sqlite3_bind_int(db->insert_class_stmt, 10, c->resolution);
         sqlite3_bind_double(db->insert_class_stmt, 11, c->confidence);
         sqlite3_bind_int64(db->insert_class_stmt, 12, c->clf_ver);
+        /* The movie-kind columns are written here, inline, when the ingest
+         * worker labelled the row (tree_metadata.c). NULL otherwise, which is
+         * what makes the row a candidate for the backfill engine's predicate
+         * (movie_kind_clf_ver IS NULL). The generation is the one the caller
+         * stamped with movie_kind_generation() - a literal would poison every
+         * future generation. */
+        if (torrent->has_movie_kind) {
+            sqlite3_bind_int(db->insert_class_stmt, 13, (int)torrent->movie_kind_mask);
+            sqlite3_bind_int64(db->insert_class_stmt, 14, torrent->movie_kind_clf_ver);
+        } else {
+            sqlite3_bind_null(db->insert_class_stmt, 13);
+            sqlite3_bind_null(db->insert_class_stmt, 14);
+        }
 
         rc = sqlite3_step(db->insert_class_stmt);
         sqlite3_reset(db->insert_class_stmt);

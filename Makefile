@@ -152,16 +152,20 @@ BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/l
 # vendored in the outer repo only (movie-kind Stage A). cJSON is compiled in
 # directly and -lcrypto backs the pinned sha256s.
 MOVIE_KIND_TEST_SRCS = tests/test_movie_kind.c src/movie_kind.c src/movie_kind_render.c \
-                       src/jevhead.c src/classifier.c lib/cJSON/cJSON.c tests/stub_log.c
+                       src/jevhead.c src/classifier.c src/database.c \
+                       src/bloom_filter.c lib/cJSON/cJSON.c tests/stub_log.c
 MOVIE_KIND_TEST_BIN = $(BUILD_DIR)/test_movie_kind
 # The embedding-provider seam (include/movie_kind.h): lets the host test drive
-# the real guarded classify path with synthetic 768-float vectors instead of a
-# 152.8 MiB GGUF. The daemon build defines nothing here and exports no seam.
+# the real guarded classify path with synthetic 1024-float vectors instead of a
+# 478.2 MiB GGUF. The daemon build defines nothing here and exports no seam.
 MOVIE_KIND_TEST_CFLAGS = -DMOVIE_KIND_TEST
 # src/classifier.c is here for clf_sha256_file() alone (include/clf_sha256.h): the
 # manifest gate and the fastText loader must verify with the same code. It links
 # inert on the host (no CLF_ENABLED), so no ftc/tparse is needed.
-MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto
+# src/database.c + src/bloom_filter.c are here for the inline-ingest case: it
+# runs a metadata row through database_insert_batch(), the same write path the
+# daemon uses, and reads the torrent_class row back.
+MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
 
 # The renderer test compiles src/movie_kind_render.c, which is deliberately
 # ungated: the stage-11 P0 was a broken NFC length *inside* the MK_ENABLED half,
@@ -243,7 +247,7 @@ tests-backfill-daemon: libbloom
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(BACKFILL_DAEMON_TEST_SRCS) -o $(BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_DAEMON_TEST_LDFLAGS)
 	./$(BACKFILL_DAEMON_TEST_BIN)
 
-tests-movie-kind:
+tests-movie-kind: libbloom
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
 	./$(MOVIE_KIND_TEST_BIN)

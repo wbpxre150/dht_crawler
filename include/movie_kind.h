@@ -7,12 +7,12 @@
 /*
  * Movie-genre classification (the "movie kind" of a movie torrent).
  *
- * A torrent's *kind* is a 16-bit genre mask produced by the v9 JEV head
- * (`include/jevhead.h`) over the **unnormalised CLS embedding** of
+ * A torrent's *kind* is a 16-bit genre mask produced by the v10 JEV head
+ * (`include/jevhead.h`) over the **unnormalised last-token embedding** of
  *
  *     "Torrent: " + NFC(name) + "\nFilm genres:"
  *
- * encoded by the quantised GGUF backbone (`models/v9/…Q8_0.gguf`) through a
+ * encoded by the quantised GGUF backbone (`models/v10/…Q4_0.gguf`) through a
  * direct `llama_encode` call — not through any `llama-embedding`-shaped
  * harness, whose 512-token padding was the v1 §10.6 blocker. Bit j of the mask
  * is `manifest.genres[j]` (taxonomy index j+1; `none` is not a bit), and a
@@ -58,7 +58,7 @@
 #define MOVIE_KIND_PROMPT_SUFFIX "\nFilm genres:"
 
 /*: Default model directory, cwd-relative like the keyword files and `models/v1`. */
-#define MOVIE_KIND_MODEL_DIR_DEFAULT "models/v9"
+#define MOVIE_KIND_MODEL_DIR_DEFAULT "models/v10"
 
 typedef struct {
     int enabled;                 /* 1 when movie_kind_init() verified the manifest
@@ -68,7 +68,7 @@ typedef struct {
     long long generation;        /* digits of manifest.version ("v9" -> 9); 0 = none */
     int genre_count;             /* manifest.genres entries (bit count) */
     int n_labels;                /* head.n_labels from the manifest */
-    int hidden;                  /* backbone.hidden (the embedding width, 768) */
+    int hidden;                  /* backbone.hidden (the embedding width; 1024 in v10) */
     char model_dir[MOVIE_KIND_PATH_CAP];
     char backbone_sha[MOVIE_KIND_SHA_CAP]; /* pinned sha256 actually verified */
     char head_sha[MOVIE_KIND_SHA_CAP];
@@ -85,15 +85,15 @@ typedef struct {
 /*
  * The embedding provider: the one step that needs llama.cpp - render the
  * serving text, tokenise it with the GGUF's own tokenizer, `llama_encode`, read
- * the pooled CLS vector. Everything downstream of it (the zero-embedding guard,
- * the JEV head, the mask) is plain arithmetic, which is why this step is the
- * module's seam: a host test installs a synthetic provider and drives the real
- * classify path with 768-float vectors, no 152.8 MiB GGUF required.
+ * the pooled last-token vector. Everything downstream of it (the zero-embedding
+ * guard, the JEV head, the mask) is plain arithmetic, which is why this step is
+ * the module's seam: a host test installs a synthetic provider and drives the
+ * real classify path with 1024-float vectors, no 478.2 MiB GGUF required.
  *
  * @param userdata whatever was registered with the provider
  * @param name     raw torrent name, byte-exact from the database
  * @param out      destination, exactly `hidden` floats, *unnormalised*
- * @param hidden   the manifest's backbone.hidden (768 in v9)
+ * @param hidden   the manifest's backbone.hidden (1024 in v10)
  * @return 0 when `out` holds a real embedding; non-zero when none is available
  *         (tokenize/encode failure, or no pooled sequence) - a classify
  *         failure, never a verdict
@@ -103,7 +103,7 @@ typedef int (*movie_kind_embedding_provider_t)(void *userdata, const char *name,
 
 /*
  * Initialise the module for `model_dir` (NULL/empty falls back to
- * "models/v9"). Reads and verifies the manifest; the 152.8 MiB backbone is NOT
+ * "models/v10"). Reads and verifies the manifest; the 478.2 MiB backbone is NOT
  * mapped here — the first movie_kind_classify() call loads it, so a crawler
  * that never backfills never pays for it.
  *
@@ -120,7 +120,7 @@ int movie_kind_init(const char *model_dir);
 /*
  * Classify one torrent name: NFC-normalise, render the serving text, tokenise
  * with the GGUF's own tokenizer, cut to MOVIE_KIND_MAX_TOKENS, one-row
- * `llama_encode`, unnormalised CLS embedding, then the JEV head.
+ * `llama_encode`, unnormalised last-token embedding, then the JEV head.
  *
  * Thread-safe (one model and one context behind an internal mutex) and
  * lazy-loading: the first call pays the model load.

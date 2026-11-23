@@ -99,7 +99,7 @@ typedef struct {
      * pins the manifest whose sha256s gate the load; the thermal ceiling is read
      * by the backfill engine (Stage C) between batches. */
     int movie_kind_enabled;             /* Enable movie-kind classification (0=disabled, default: 1) */
-    char movie_kind_model_dir[512];     /* manifest.json + pinned GGUF/head (default: "models/v9") */
+    char movie_kind_model_dir[512];     /* manifest.json + pinned GGUF/head (default: "models/v10") */
     int movie_kind_threads;             /* llama.cpp encoder threads (default: 4; 8 is slower on this SoC) */
     int movie_kind_thermal_backoff_c;   /* Pause the movie backfill above this CPU temp in °C (default: 82) */
 

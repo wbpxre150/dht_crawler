@@ -1310,9 +1310,13 @@ int main(int argc, char *argv[]) {
      * request. Non-blocking - the thread takes its own first decision. */
     classify_backfill_daemon_start(&g_app_ctx, &g_database);
 
-    /* Same for the movie-kind pass: the v9 module, the database and the HTTP API
-     * are all up, so /stats serves its object from the first request. */
-    movie_backfill_daemon_start(&g_app_ctx, &g_database, config.movie_kind_thermal_backoff_c);
+    /* The movie-kind backfill thread is deliberately NOT started: production
+     * classifies movies inline at ingest (tree_metadata_worker_func), so there
+     * is nothing left for a pass to walk. The engine, the --movie-kind-backfill
+     * / --reset / --movie-kind-bench CLI and its tests stay compiled, and
+     * /stats movie_kind_backfill stays permanently "idle". The shutdown and
+     * destroy calls below are no-ops for a thread that never started
+     * (src/movie_backfill_daemon.c). */
     
     log_msg(LOG_DEBUG, "DHT crawler (thread tree mode) is running.");
     log_msg(LOG_DEBUG, "  Trees: %d, Workers per tree: BEP51=%d, get_peers=%d, metadata=%d",
