@@ -51,6 +51,7 @@ typedef struct supervisor_config {
     /* Shared resources */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
+    struct inflight_set *inflight;   /* Shared in-flight claim set (NULL = dedup disabled) */
     /* Worker counts per tree */
     int num_find_node_workers;
     int num_bep51_workers;
@@ -134,6 +135,7 @@ typedef struct supervisor {
     /* Shared resources (only these are shared between trees) */
     struct batch_writer *batch_writer;
     struct bloom_filter *bloom_filter;
+    struct inflight_set *inflight;             /* Shared in-flight claim set (NULL = dedup disabled) */
     struct bloom_filter *failure_bloom;        /* NEW: Failure bloom filter for two-strike filtering */
     const char *failure_bloom_path;            /* NEW: Persistence path for failure bloom */
     struct bep51_cache *bep51_cache;            /* BEP51 node cache for persistent bootstrap */

@@ -1,6 +1,7 @@
 #include "batch_writer.h"
 #include "dht_crawler.h"
 #include "bloom_filter.h"
+#include "database.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -66,6 +67,10 @@ struct batch_writer {
     char *rclone_dest_path;
     char *rclone_bookmark_path;
 
+    /* Published-count re-derivation (see reseed_cached_counts) */
+    uint64_t reseed_interval_ms;                    /* 0 = never re-seed */
+    uint64_t last_reseed_ms;                        /* CLOCK_MONOTONIC ms, 0 = never */
+
     /* Bloom-filter persistence throttle and counters (see batch_writer_flush) */
     int bloom_persist_interval_sec;                 /* 0 = save on every flush */
     uint64_t bloom_last_save_ms;                    /* CLOCK_MONOTONIC ms, 0 = never saved */
@@ -73,6 +78,87 @@ struct batch_writer {
     atomic_uint_fast64_t bloom_saves_total;         /* Save events (both filters together) */
     atomic_uint_fast64_t bloom_bytes_written_total; /* Bytes written by those saves */
 };
+
+/* Interval between re-derivations of the published torrent/file counts (see
+ * reseed_cached_counts below). Bounds how far /stats can drift from the
+ * database after a purge or a re-ingest, at the cost of one COUNT(*) scan per
+ * interval - which is why it is minutes, not seconds. */
+#ifndef BATCH_WRITER_COUNT_RESEED_INTERVAL_SEC
+#define BATCH_WRITER_COUNT_RESEED_INTERVAL_SEC 900
+#endif
+
+/* Monotonic milliseconds; defined below with the bloom-persist throttle. */
+static uint64_t bloom_save_now_ms(void);
+
+/* Re-derive the published counts from the database.
+ *
+ * cached_torrent_count / cached_file_count are seeded from COUNT(*) once at
+ * startup and then only ever incremented, so anything that removes rows
+ * (--category-filter-update) or re-writes them (a re-ingest after a bloom reset:
+ * the torrents insert is INSERT OR REPLACE, which still reports SQLITE_DONE)
+ * leaves them permanently high. /stats then over-reports until the next restart
+ * re-seeds from COUNT(*), which is exactly when the dashboard appears to "lose"
+ * torrents that were never lost.
+ *
+ * The scan runs on this thread's read connection (database_read_db) so a
+ * multi-second COUNT(*) on a large database never blocks the writer connection,
+ * and under database_read_lock() so a WAL checkpoint cannot run underneath it.
+ * Any failure leaves the cached counts untouched. */
+static void reseed_cached_counts(batch_writer_t *writer) {
+    if (!writer || !writer->db) {
+        return;
+    }
+
+    sqlite3 *read_db = database_read_db(writer->db);
+    if (!read_db) {
+        return;
+    }
+
+    uint64_t torrents = 0;
+    uint64_t files = 0;
+    bool torrents_ok = false;
+    bool files_ok = false;
+
+    database_read_lock(writer->db);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(read_db, "SELECT COUNT(*) FROM torrents", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            torrents = (uint64_t)sqlite3_column_int64(stmt, 0);
+            torrents_ok = true;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    stmt = NULL;
+    if (sqlite3_prepare_v2(read_db, "SELECT COUNT(*) FROM torrent_files", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            files = (uint64_t)sqlite3_column_int64(stmt, 0);
+            files_ok = true;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    database_read_unlock(writer->db);
+
+    if (!torrents_ok) {
+        log_msg(LOG_WARN, "Failed to re-seed the cached torrent count; keeping the old value");
+        return;
+    }
+
+    uv_mutex_lock(&writer->mutex);
+    uint64_t previous = writer->cached_torrent_count;
+    writer->cached_torrent_count = torrents;
+    if (files_ok) {
+        writer->cached_file_count = files;
+    }
+    writer->last_reseed_ms = bloom_save_now_ms();
+    uv_mutex_unlock(&writer->mutex);
+
+    log_msg(LOG_DEBUG, "Re-seeded cached counts from the database: %llu torrents (was %llu), %llu files",
+            (unsigned long long)torrents, (unsigned long long)previous,
+            (unsigned long long)files);
+}
 
 /* Background thread for periodic flush.
  * Uses pthread so it works regardless of whether uv_run() is active. */
@@ -104,6 +190,16 @@ static void* flush_thread_func(void *arg) {
              * rolled-back transactions or FTS5 segment merges without any
              * completed batch flushes. */
             database_wal_checkpoint(writer->db);
+        }
+
+        /* Bounded drift correction for the counts /stats publishes. Only this
+         * thread ever runs it, and only once per reseed_interval_ms. */
+        if (writer->reseed_interval_ms > 0) {
+            uint64_t now_ms = bloom_save_now_ms();
+            if (writer->last_reseed_ms == 0 ||
+                now_ms - writer->last_reseed_ms >= writer->reseed_interval_ms) {
+                reseed_cached_counts(writer);
+            }
         }
     }
 
@@ -208,6 +304,11 @@ batch_writer_t* batch_writer_init(database_t *db, size_t batch_capacity,
     /* Initialize cached counts from database (one-time query at startup) */
     writer->cached_torrent_count = 0;
     writer->cached_file_count = 0;
+    /* The counters above are incremented per flush and never decremented, so
+     * they are re-derived from COUNT(*) every reseed_interval_ms (see
+     * reseed_cached_counts) instead of drifting for the life of the process. */
+    writer->reseed_interval_ms = (uint64_t)BATCH_WRITER_COUNT_RESEED_INTERVAL_SEC * 1000ULL;
+    writer->last_reseed_ms = bloom_save_now_ms();
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(db->db, "SELECT COUNT(*) FROM torrents", -1, &stmt, NULL) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) {

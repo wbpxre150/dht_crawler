@@ -10,6 +10,7 @@
 #include "tree_dispatcher.h"
 #include "tree_response_queue.h"
 #include "bloom_filter.h"
+#include "inflight_set.h"
 #include "bep51_cache.h"
 #include "supervisor.h"
 #include "dht_crawler.h"
@@ -556,11 +557,24 @@ static void *bep51_worker_func(void *arg) {
                     }
                 }
 
-                /* 6. Push infohashes to queue (with bloom check) */
+                /* 6. Push infohashes to queue (bloom check + in-flight claim) */
                 for (int i = 0; i < response.infohash_count; i++) {
                     /* Check bloom filter (shared, thread-safe) */
                     if (tree->shared_bloom && bloom_filter_check(tree->shared_bloom, response.infohashes[i])) {
                         continue;  /* Already seen */
+                    }
+
+                    /* Claim the infohash before queueing it. The bloom filter only
+                     * learns a hash after its metadata fetch succeeds, so without
+                     * this every tree that samples the same infohash in the
+                     * meantime fetches it again, and the batch writer counts each
+                     * re-fetch as a new row (the torrents insert is
+                     * INSERT OR REPLACE, which reports SQLITE_DONE for a
+                     * duplicate). A claim that never reaches the metadata stage is
+                     * released again: queue full here, no peers in
+                     * get_peers_worker_func(), or a tree shutdown. */
+                    if (!inflight_set_claim(tree->shared_inflight, response.infohashes[i], tree->tree_id)) {
+                        continue;  /* Another tree is already working on it */
                     }
 
                     /* Try to push to queue (non-blocking) */
@@ -573,6 +587,10 @@ static void *bep51_worker_func(void *arg) {
                                 tree_start_get_peers_workers(tree);
                             }
                         }
+                    } else {
+                        /* Queue full: nothing will fetch this hash, so hand the
+                         * claim back instead of blocking it until the TTL. */
+                        inflight_set_release(tree->shared_inflight, response.infohashes[i]);
                     }
                 }
 
@@ -1049,7 +1067,15 @@ static void *get_peers_worker_func(void *arg) {
                         tree_start_metadata_workers(tree);
                     }
                 }
+            } else {
+                /* Peers queue full: the metadata workers will never see this
+                 * hash, so release its in-flight claim for a later retry. */
+                inflight_set_release(tree->shared_inflight, infohash);
             }
+        } else {
+            /* No peers for this infohash: the pipeline ends here, so release the
+             * claim rather than leaving it held until the TTL expires. */
+            inflight_set_release(tree->shared_inflight, infohash);
         }
     }
 
@@ -1277,6 +1303,7 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
     tree->bep51_query_interval_ms = config->bep51_query_interval_ms >= 0 ? config->bep51_query_interval_ms : 10;
     tree->bep51_node_cooldown_sec = config->bep51_node_cooldown_sec > 0 ? config->bep51_node_cooldown_sec : 30;
     tree->shared_bloom = config->bloom_filter;
+    tree->shared_inflight = config->inflight;
     tree->failure_bloom = config->failure_bloom;
     tree->failure_strike_count = (config->failure_strike_count >= 1 && config->failure_strike_count <= 2) ? config->failure_strike_count : 2;
 
@@ -1611,6 +1638,12 @@ void thread_tree_destroy(thread_tree_t *tree) {
     pthread_cond_destroy(&tree->throttle_resume);
     pthread_mutex_destroy(&tree->get_peers_throttle_lock);
     pthread_cond_destroy(&tree->get_peers_throttle_resume);
+
+    /* Every worker of this tree has been joined, so no new claim can be taken:
+     * release whatever this tree still holds (queue backlog, shutdown breaks) so
+     * a respawned tree can rediscover those hashes immediately instead of
+     * waiting for the TTL backstop. */
+    inflight_set_release_tree(tree->shared_inflight, tree->tree_id);
 
     log_msg(LOG_DEBUG, "[tree %u] Destroyed (metadata_count=%lu)",
             tree->tree_id, (unsigned long)atomic_load(&tree->metadata_count));

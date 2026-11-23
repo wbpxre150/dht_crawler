@@ -6,6 +6,7 @@
 #include "tree_infohash_queue.h"
 #include "batch_writer.h"
 #include "bloom_filter.h"
+#include "inflight_set.h"
 #include "dht_crawler.h"
 #include "database.h"
 #include "hard_block.h"
@@ -1555,6 +1556,16 @@ void *tree_metadata_worker_func(void *arg) {
             atomic_fetch_add(&tree->metadata_count, 1);
             atomic_store(&tree->last_metadata_time, time(NULL));
 
+            /* Record the hash as known NOW, not at batch commit. The commit can
+             * be up to batch_size rows / flush_interval seconds away, and every
+             * tree sampling this infohash inside that window used to fetch it
+             * again - each re-fetch arriving as INSERT OR REPLACE, which the
+             * batch writer counted as a new row. The post-commit add in
+             * database_insert_batch() is then a no-op. */
+            if (tree->shared_bloom) {
+                bloom_filter_add(tree->shared_bloom, metadata->infohash);
+            }
+
             log_msg(LOG_DEBUG, "[tree %u] Fetched metadata: %s (%lld bytes, %d files, %d peers)",
                     tree->tree_id, metadata->name,
                     (long long)metadata->total_size, metadata->file_count, entry.peer_count);
@@ -1704,6 +1715,13 @@ void *tree_metadata_worker_func(void *arg) {
             /* Free original tree metadata */
             tree_free_metadata(metadata);
         }
+
+        /* The attempt is resolved (stored, filtered, or failed): release the
+         * in-flight claim taken at discovery so a later BEP51 sample can retry a
+         * hash that was not stored. Hashes that were stored (bloom add above) or
+         * dropped (bloom add in the filtered branch) are already in the shared
+         * bloom, so this release cannot cause a duplicate fetch. */
+        inflight_set_release(tree->shared_inflight, entry.infohash);
     }
 
     tree_response_queue_destroy(relookup_queue);

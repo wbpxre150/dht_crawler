@@ -11,6 +11,7 @@
 #include "category_filter_cleanup.h"
 #include "torrent_search.h"
 #include "supervisor.h"
+#include "inflight_set.h"   /* /stats: the dedup counters */
 #include "udp_rate_limit.h"
 #include "thread_tree.h"
 #include "bep51_cache.h"
@@ -1096,6 +1097,24 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         }
 
         cJSON_AddItemToObject(root, "supervisor", supervisor_json);
+
+        /* In-flight claim set: refused counts the duplicate metadata fetches this
+         * process did not start. still_held should track the number of fetches
+         * actually in flight, not grow with uptime. */
+        inflight_stats_t inflight_stats;
+        inflight_set_stats(api->supervisor->inflight, &inflight_stats);
+        cJSON *inflight_json = cJSON_CreateObject();
+        cJSON_AddBoolToObject(inflight_json, "enabled", api->supervisor->inflight != NULL);
+        cJSON_AddNumberToObject(inflight_json, "capacity", (double)inflight_stats.capacity);
+        cJSON_AddNumberToObject(inflight_json, "held", (double)inflight_stats.held);
+        cJSON_AddNumberToObject(inflight_json, "claimed", (double)inflight_stats.claimed);
+        cJSON_AddNumberToObject(inflight_json, "refused", (double)inflight_stats.refused);
+        cJSON_AddNumberToObject(inflight_json, "released", (double)inflight_stats.released);
+        cJSON_AddNumberToObject(inflight_json, "expired", (double)inflight_stats.expired);
+        cJSON_AddNumberToObject(inflight_json, "tree_released",
+                                (double)inflight_stats.tree_released);
+        cJSON_AddNumberToObject(inflight_json, "clears", (double)inflight_stats.clears);
+        cJSON_AddItemToObject(root, "inflight", inflight_json);
 
         /* BEP51 cache global stats */
         cJSON *cache_obj = cJSON_CreateObject();

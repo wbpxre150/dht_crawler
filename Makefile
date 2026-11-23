@@ -122,6 +122,13 @@ DOCS_TEST_SRCS = tests/test_torrent_docs.c src/database.c src/bloom_filter.c \
 DOCS_TEST_BIN = $(BUILD_DIR)/test_torrent_docs
 DOCS_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
+# The in-flight claim set is pure (a mutex over a fixed slot table): no database,
+# no bloom filter, no uv loop, so this test needs only the module plus the log
+# stub. It covers the tombstone/release invariant and the one-winner race.
+INFLIGHT_TEST_SRCS = tests/test_inflight_set.c src/inflight_set.c tests/stub_log.c
+INFLIGHT_TEST_BIN = $(BUILD_DIR)/test_inflight_set
+INFLIGHT_TEST_LDFLAGS = -luv -lpthread
+
 # The backfill test defines its own stub classifier symbols (models_loaded,
 # current_version, write_meta, classify) so it never links src/classifier.c:
 # the host build compiles that module inert, which could never insert a row.
@@ -238,7 +245,7 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-search tests-docs tests-inflight tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
 
@@ -246,6 +253,11 @@ tests-search:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(TEST_SRCS) -o $(TEST_BIN) $(TEST_LDFLAGS)
 	./$(TEST_BIN)
+
+tests-inflight:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(INFLIGHT_TEST_SRCS) -o $(INFLIGHT_TEST_BIN) $(TEST_LDFLAGS) $(INFLIGHT_TEST_LDFLAGS)
+	./$(INFLIGHT_TEST_BIN)
 
 tests-docs: libbloom
 	@mkdir -p $(BUILD_DIR)
@@ -342,4 +354,4 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
 
 clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill

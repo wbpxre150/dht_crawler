@@ -2,6 +2,7 @@
 #include "database.h"
 #include "http_api.h"
 #include "bloom_filter.h"
+#include "inflight_set.h"
 #include "language_filter.h"
 #include "classifier.h"
 #include "hard_block.h"
@@ -35,6 +36,16 @@ static app_context_t g_app_ctx;
 static database_t g_database;
 static http_api_t g_http_api;
 static bloom_filter_t *g_bloom = NULL;
+static inflight_set_t *g_inflight = NULL;   /* Shared in-flight claim set (NULL = dedup disabled) */
+
+/* In-flight claim set sizing: one slot per concurrently in-flight infohash
+ * (queue backlog + get_peers lookups + metadata fetches across all trees).
+ * 262144 slots at 32 bytes is 8 MiB, which is noise next to the two 54 MB bloom
+ * filters, and it clears itself at 3/4 full rather than losing claims. */
+#define INFLIGHT_SET_CAPACITY 262144
+/* Backstop for a claim whose worker never resolved it (a thread torn down
+ * mid-fetch). Trees normally hand their claims back in thread_tree_destroy(). */
+#define INFLIGHT_SET_TTL_SEC 900
 
 /* Stage 6: Thread tree architecture globals */
 static supervisor_t *g_supervisor = NULL;
@@ -790,6 +801,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Shared in-flight claim set (include/inflight_set.h). Non-fatal: a NULL set
+     * makes every claim/release a no-op, which is exactly the pre-existing
+     * duplicate-fetch behaviour - it never suppresses or loses work. */
+    g_inflight = inflight_set_create(INFLIGHT_SET_CAPACITY, INFLIGHT_SET_TTL_SEC);
+    if (!g_inflight) {
+        log_msg(LOG_WARN, "In-flight claim set unavailable: concurrent duplicate "
+                          "metadata fetches will not be suppressed");
+    }
+
     /* Initialize the always-on hard block list (Stage 6). Non-fatal: a missing
      * file only disables the list, and hard_block_init() logs the warning. */
     hard_block_init(config.hard_block_file);
@@ -1243,6 +1263,7 @@ int main(int argc, char *argv[]) {
         .use_keyspace_partitioning = config.use_keyspace_partitioning,
         .batch_writer = g_batch_writer,
         .bloom_filter = g_bloom,
+        .inflight = g_inflight,
         .dht_port = config.dht_port,
         /* Bloom filter settings for failure tracking */
         .failure_bloom_capacity = config.failure_bloom_capacity,
@@ -1505,7 +1526,24 @@ int main(int argc, char *argv[]) {
     hard_block_cleanup();
     language_filter_cleanup();
     bloom_filter_cleanup(g_bloom);
-    
+
+    if (g_inflight) {
+        inflight_stats_t inflight_stats;
+        inflight_set_stats(g_inflight, &inflight_stats);
+        log_msg(LOG_INFO,
+                "In-flight set: claimed=%llu refused=%llu released=%llu expired=%llu "
+                "tree_released=%llu clears=%llu still_held=%llu",
+                (unsigned long long)inflight_stats.claimed,
+                (unsigned long long)inflight_stats.refused,
+                (unsigned long long)inflight_stats.released,
+                (unsigned long long)inflight_stats.expired,
+                (unsigned long long)inflight_stats.tree_released,
+                (unsigned long long)inflight_stats.clears,
+                (unsigned long long)inflight_stats.held);
+    }
+    inflight_set_destroy(g_inflight);
+    g_inflight = NULL;
+
     log_msg(LOG_DEBUG, "DHT Crawler (thread tree mode) stopped.");
     return 0;
 }

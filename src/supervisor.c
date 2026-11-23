@@ -76,6 +76,7 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     /* Store shared resources */
     sup->batch_writer = config->batch_writer;
     sup->bloom_filter = config->bloom_filter;
+    sup->inflight = config->inflight;
     sup->failure_bloom = NULL;  /* Will be initialized during start */
     sup->failure_bloom_path = "data/failure_bloom.dat";
       /* Will be created during bootstrap */
@@ -516,6 +517,7 @@ static thread_tree_t *spawn_tree(supervisor_t *sup, int slot_index, thread_tree_
         /* Shared resources */
         .batch_writer = sup->batch_writer,
         .bloom_filter = sup->bloom_filter,
+        .inflight = sup->inflight,
         .failure_bloom = sup->failure_bloom,
         .failure_strike_count = sup->failure_strike_count,
         .supervisor_ctx = sup,
