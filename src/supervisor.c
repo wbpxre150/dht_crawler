@@ -198,6 +198,15 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     atomic_init(&sup->cumulative_gp_miss_penalties, 0);
     atomic_init(&sup->cumulative_gp_slot_expired_total, 0);
     atomic_init(&sup->cumulative_gp_early_finish_total, 0);
+    /* BEP51 query + dedup-funnel counters (patch 23) */
+    atomic_init(&sup->cumulative_bep51_queries_sent, 0);
+    atomic_init(&sup->cumulative_bep51_responses_received, 0);
+    atomic_init(&sup->cumulative_bep51_timeouts, 0);
+    atomic_init(&sup->cumulative_bep51_samples_offered, 0);
+    atomic_init(&sup->cumulative_bep51_bloom_rejected, 0);
+    atomic_init(&sup->cumulative_bep51_inflight_refused, 0);
+    atomic_init(&sup->cumulative_bep51_queue_full, 0);
+    atomic_init(&sup->cumulative_bep51_samples_pushed, 0);
 
     /* Last-interval (windowed) rate publishing (patch 20) */
     atomic_init(&sup->interval_metadata_attempts, 0);
@@ -1335,6 +1344,14 @@ static void *monitor_thread_func(void *arg) {
                     uint64_t tree_gp_miss_penalties = atomic_load(&tree->gp_miss_penalties);
                     uint64_t tree_gp_slot_expired = atomic_load(&tree->gp_slot_expired_total);
                     uint64_t tree_gp_early_finish = atomic_load(&tree->gp_early_finish_total);
+                    uint64_t tree_bep51_queries_sent = atomic_load(&tree->bep51_queries_sent_total);
+                    uint64_t tree_bep51_responses = atomic_load(&tree->bep51_responses_received_total);
+                    uint64_t tree_bep51_timeouts = atomic_load(&tree->bep51_timeouts_total);
+                    uint64_t tree_bep51_offered = atomic_load(&tree->bep51_samples_offered_total);
+                    uint64_t tree_bep51_bloom = atomic_load(&tree->bep51_bloom_rejected_total);
+                    uint64_t tree_bep51_inflight = atomic_load(&tree->bep51_inflight_refused_total);
+                    uint64_t tree_bep51_queue_full = atomic_load(&tree->bep51_queue_full_total);
+                    uint64_t tree_bep51_pushed = atomic_load(&tree->bep51_samples_pushed_total);
 
                     atomic_fetch_add(&sup->cumulative_metadata_count, tree_metadata);
                     atomic_fetch_add(&sup->cumulative_filtered_count, tree_filtered);
@@ -1365,6 +1382,14 @@ static void *monitor_thread_func(void *arg) {
                     atomic_fetch_add(&sup->cumulative_gp_miss_penalties, tree_gp_miss_penalties);
                     atomic_fetch_add(&sup->cumulative_gp_slot_expired_total, tree_gp_slot_expired);
                     atomic_fetch_add(&sup->cumulative_gp_early_finish_total, tree_gp_early_finish);
+                    atomic_fetch_add(&sup->cumulative_bep51_queries_sent, tree_bep51_queries_sent);
+                    atomic_fetch_add(&sup->cumulative_bep51_responses_received, tree_bep51_responses);
+                    atomic_fetch_add(&sup->cumulative_bep51_timeouts, tree_bep51_timeouts);
+                    atomic_fetch_add(&sup->cumulative_bep51_samples_offered, tree_bep51_offered);
+                    atomic_fetch_add(&sup->cumulative_bep51_bloom_rejected, tree_bep51_bloom);
+                    atomic_fetch_add(&sup->cumulative_bep51_inflight_refused, tree_bep51_inflight);
+                    atomic_fetch_add(&sup->cumulative_bep51_queue_full, tree_bep51_queue_full);
+                    atomic_fetch_add(&sup->cumulative_bep51_samples_pushed, tree_bep51_pushed);
 
                     log_msg(LOG_DEBUG, "[tree %u] Accumulated stats: metadata=%lu, filtered=%lu, 1st_strike=%lu, 2nd_strike=%lu",
                             tree_id, (unsigned long)tree_metadata, (unsigned long)tree_filtered,
@@ -1706,6 +1731,70 @@ void supervisor_getpeers_exit_stats(supervisor_t *sup, uint64_t *out_idle_exits,
     }
     if (out_early_finish) {
         *out_early_finish = early_finish;
+    }
+}
+
+void supervisor_bep51_stats(supervisor_t *sup,
+                            uint64_t *out_queries_sent,
+                            uint64_t *out_responses_received,
+                            uint64_t *out_timeouts,
+                            uint64_t *out_samples_offered,
+                            uint64_t *out_bloom_rejected,
+                            uint64_t *out_inflight_refused,
+                            uint64_t *out_queue_full,
+                            uint64_t *out_samples_pushed) {
+    uint64_t queries_sent = 0, responses_received = 0, timeouts = 0;
+    uint64_t offered = 0, bloom = 0, inflight = 0, queue_full = 0, pushed = 0;
+
+    if (sup) {
+        queries_sent = atomic_load(&sup->cumulative_bep51_queries_sent);
+        responses_received = atomic_load(&sup->cumulative_bep51_responses_received);
+        timeouts = atomic_load(&sup->cumulative_bep51_timeouts);
+        offered = atomic_load(&sup->cumulative_bep51_samples_offered);
+        bloom = atomic_load(&sup->cumulative_bep51_bloom_rejected);
+        inflight = atomic_load(&sup->cumulative_bep51_inflight_refused);
+        queue_full = atomic_load(&sup->cumulative_bep51_queue_full);
+        pushed = atomic_load(&sup->cumulative_bep51_samples_pushed);
+
+        pthread_mutex_lock(&sup->trees_lock);
+        for (int i = 0; i < sup->max_trees; i++) {
+            if (sup->trees[i]) {
+                queries_sent += atomic_load(&sup->trees[i]->bep51_queries_sent_total);
+                responses_received += atomic_load(&sup->trees[i]->bep51_responses_received_total);
+                timeouts += atomic_load(&sup->trees[i]->bep51_timeouts_total);
+                offered += atomic_load(&sup->trees[i]->bep51_samples_offered_total);
+                bloom += atomic_load(&sup->trees[i]->bep51_bloom_rejected_total);
+                inflight += atomic_load(&sup->trees[i]->bep51_inflight_refused_total);
+                queue_full += atomic_load(&sup->trees[i]->bep51_queue_full_total);
+                pushed += atomic_load(&sup->trees[i]->bep51_samples_pushed_total);
+            }
+        }
+        pthread_mutex_unlock(&sup->trees_lock);
+    }
+
+    if (out_queries_sent) {
+        *out_queries_sent = queries_sent;
+    }
+    if (out_responses_received) {
+        *out_responses_received = responses_received;
+    }
+    if (out_timeouts) {
+        *out_timeouts = timeouts;
+    }
+    if (out_samples_offered) {
+        *out_samples_offered = offered;
+    }
+    if (out_bloom_rejected) {
+        *out_bloom_rejected = bloom;
+    }
+    if (out_inflight_refused) {
+        *out_inflight_refused = inflight;
+    }
+    if (out_queue_full) {
+        *out_queue_full = queue_full;
+    }
+    if (out_samples_pushed) {
+        *out_samples_pushed = pushed;
     }
 }
 

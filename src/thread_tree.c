@@ -436,6 +436,10 @@ static void *bep51_worker_func(void *arg) {
     unsigned long responses_received = 0;
     unsigned long timeouts = 0;
 
+    /* The three locals above are per-worker log-throttle cursors only (they
+     * decide which DEBUG lines are printed and are unchanged); the published
+     * counters are the per-tree atomics bumped below. */
+
     while (!atomic_load(&tree->shutdown_requested)) {
         /* 0. Check if we should pause (infohash queue is full enough) */
         if (atomic_load(&tree->discovery_paused)) {
@@ -502,6 +506,7 @@ static void *bep51_worker_func(void *arg) {
         generate_random_target(target);
         int send_result = tree_send_sample_infohashes(tree, sock, tid, tid_len, target, &node.addr);
         queries_sent++;
+        atomic_fetch_add(&tree->bep51_queries_sent_total, 1);
 
         /* DEBUG: Log every send */
         if (queries_sent <= 10 || queries_sent % 100 == 0) {
@@ -519,6 +524,7 @@ static void *bep51_worker_func(void *arg) {
 
         if (rc == 0) {
             responses_received++;
+            atomic_fetch_add(&tree->bep51_responses_received_total, 1);
             /* DEBUG: Log response receipt */
             if (responses_received <= 10 || responses_received % 100 == 0) {
                 log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: RECEIVED response #%lu (TID=%02x%02x%02x)",
@@ -526,6 +532,7 @@ static void *bep51_worker_func(void *arg) {
             }
         } else {
             timeouts++;
+            atomic_fetch_add(&tree->bep51_timeouts_total, 1);
             /* DEBUG: Log timeout */
             if (timeouts <= 10 || timeouts % 100 == 0) {
                 log_msg(LOG_DEBUG, "[tree %u] BEP51 worker %d: TIMEOUT #%lu (TID=%02x%02x%02x)",
@@ -559,8 +566,10 @@ static void *bep51_worker_func(void *arg) {
 
                 /* 6. Push infohashes to queue (bloom check + in-flight claim) */
                 for (int i = 0; i < response.infohash_count; i++) {
+                    atomic_fetch_add(&tree->bep51_samples_offered_total, 1);
                     /* Check bloom filter (shared, thread-safe) */
                     if (tree->shared_bloom && bloom_filter_check(tree->shared_bloom, response.infohashes[i])) {
+                        atomic_fetch_add(&tree->bep51_bloom_rejected_total, 1);
                         continue;  /* Already seen */
                     }
 
@@ -574,11 +583,13 @@ static void *bep51_worker_func(void *arg) {
                      * released again: queue full here, no peers in
                      * get_peers_worker_func(), or a tree shutdown. */
                     if (!inflight_set_claim(tree->shared_inflight, response.infohashes[i], tree->tree_id)) {
+                        atomic_fetch_add(&tree->bep51_inflight_refused_total, 1);
                         continue;  /* Another tree is already working on it */
                     }
 
                     /* Try to push to queue (non-blocking) */
                     if (tree_infohash_queue_try_push(tree->infohash_queue, response.infohashes[i]) == 0) {
+                        atomic_fetch_add(&tree->bep51_samples_pushed_total, 1);
                         if (!first_infohash_found) {
                             first_infohash_found = true;
                             /* Trigger get_peers phase (Stage 4) - use atomic compare-exchange */
@@ -588,6 +599,7 @@ static void *bep51_worker_func(void *arg) {
                             }
                         }
                     } else {
+                        atomic_fetch_add(&tree->bep51_queue_full_total, 1);
                         /* Queue full: nothing will fetch this hash, so hand the
                          * claim back instead of blocking it until the TTL. */
                         inflight_set_release(tree->shared_inflight, response.infohashes[i]);
@@ -1634,6 +1646,16 @@ thread_tree_t *thread_tree_create(uint32_t tree_id, tree_config_t *config) {
 
     /* Initialize BEP51 cache statistics */
     atomic_store(&tree->bep51_nodes_cached, 0);
+
+    /* BEP51 query + dedup-funnel counters (patch 23) */
+    atomic_store(&tree->bep51_queries_sent_total, 0);
+    atomic_store(&tree->bep51_responses_received_total, 0);
+    atomic_store(&tree->bep51_timeouts_total, 0);
+    atomic_store(&tree->bep51_samples_offered_total, 0);
+    atomic_store(&tree->bep51_bloom_rejected_total, 0);
+    atomic_store(&tree->bep51_inflight_refused_total, 0);
+    atomic_store(&tree->bep51_queue_full_total, 0);
+    atomic_store(&tree->bep51_samples_pushed_total, 0);
 
     /* Metadata rate-based respawn configuration */
     tree->min_metadata_rate = config->min_metadata_rate >= 0 ? config->min_metadata_rate : 0.01;

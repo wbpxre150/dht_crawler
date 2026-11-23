@@ -273,6 +273,16 @@ typedef struct supervisor {
     /* get_peers round-completion counters (rev2) */
     atomic_uint_fast64_t cumulative_gp_slot_expired_total;
     atomic_uint_fast64_t cumulative_gp_early_finish_total;
+    /* BEP51 query + dedup-funnel instrumentation accumulated from respawned
+     * trees (patch 23). The per-tree half lives on thread_tree_t. */
+    atomic_uint_fast64_t cumulative_bep51_queries_sent;
+    atomic_uint_fast64_t cumulative_bep51_responses_received;
+    atomic_uint_fast64_t cumulative_bep51_timeouts;
+    atomic_uint_fast64_t cumulative_bep51_samples_offered;
+    atomic_uint_fast64_t cumulative_bep51_bloom_rejected;
+    atomic_uint_fast64_t cumulative_bep51_inflight_refused;
+    atomic_uint_fast64_t cumulative_bep51_queue_full;
+    atomic_uint_fast64_t cumulative_bep51_samples_pushed;
 
     /* Last-interval ("windowed") rate publishing (patch 20). Every counter
      * above is cumulative since process start, so one /stats snapshot cannot
@@ -367,6 +377,23 @@ void supervisor_getpeers_exit_stats(supervisor_t *sup, uint64_t *out_idle_exits,
                                     uint64_t *out_miss_penalties,
                                     uint64_t *out_slot_expired,
                                     uint64_t *out_early_finish);
+
+/**
+ * Get the BEP51 query and dedup-funnel counters (cumulative respawned trees +
+ * live trees): sample_infohashes queries sent, answers received, timeouts, and
+ * the four-gate split of the infohashes a response offered (bloom-rejected,
+ * in-flight-refused, queue-full, pushed). Per window the offered total equals
+ * the sum of the four gates. Any out pointer may be NULL.
+ */
+void supervisor_bep51_stats(supervisor_t *sup,
+                            uint64_t *out_queries_sent,
+                            uint64_t *out_responses_received,
+                            uint64_t *out_timeouts,
+                            uint64_t *out_samples_offered,
+                            uint64_t *out_bloom_rejected,
+                            uint64_t *out_inflight_refused,
+                            uint64_t *out_queue_full,
+                            uint64_t *out_samples_pushed);
 
 /**
  * Get total active connections across all trees

@@ -1082,6 +1082,28 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddNumberToObject(supervisor_get_peers, "early_finish_total", (double)sup_gp_early_finish);
         cJSON_AddItemToObject(supervisor_json, "get_peers", supervisor_get_peers);
 
+        /* BEP51 query + dedup-funnel totals (patch 23): cumulative respawned
+         * trees + live trees, the same fold supervisor_getpeers_stats() uses.
+         * Raw counters only — every ratio is derived by the probe, so a zero
+         * denominator cannot put a NaN into the JSON. Per window the offered
+         * total equals bloom_rejected + inflight_refused + queue_full + pushed. */
+        uint64_t sup_bep51_queries = 0, sup_bep51_responses = 0, sup_bep51_timeouts = 0;
+        uint64_t sup_bep51_offered = 0, sup_bep51_bloom = 0, sup_bep51_inflight = 0;
+        uint64_t sup_bep51_queue_full = 0, sup_bep51_pushed = 0;
+        supervisor_bep51_stats(api->supervisor, &sup_bep51_queries, &sup_bep51_responses,
+                               &sup_bep51_timeouts, &sup_bep51_offered, &sup_bep51_bloom,
+                               &sup_bep51_inflight, &sup_bep51_queue_full, &sup_bep51_pushed);
+        cJSON *supervisor_bep51 = cJSON_CreateObject();
+        cJSON_AddNumberToObject(supervisor_bep51, "queries_sent_total", (double)sup_bep51_queries);
+        cJSON_AddNumberToObject(supervisor_bep51, "responses_received_total", (double)sup_bep51_responses);
+        cJSON_AddNumberToObject(supervisor_bep51, "timeouts_total", (double)sup_bep51_timeouts);
+        cJSON_AddNumberToObject(supervisor_bep51, "samples_offered_total", (double)sup_bep51_offered);
+        cJSON_AddNumberToObject(supervisor_bep51, "bloom_rejected_total", (double)sup_bep51_bloom);
+        cJSON_AddNumberToObject(supervisor_bep51, "inflight_refused_total", (double)sup_bep51_inflight);
+        cJSON_AddNumberToObject(supervisor_bep51, "queue_full_total", (double)sup_bep51_queue_full);
+        cJSON_AddNumberToObject(supervisor_bep51, "samples_pushed_total", (double)sup_bep51_pushed);
+        cJSON_AddItemToObject(supervisor_json, "bep51", supervisor_bep51);
+
         /* Metadata failure attribution: cumulative respawned trees + live trees,
          * the same sum supervisor_stats() publishes for first_strike_failures.
          * Each failed connection is counted once, at the site that first detected
@@ -1399,6 +1421,28 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
                 cJSON_AddNumberToObject(get_peers, "early_finish_total",
                                         (double)atomic_load(&tree->gp_early_finish_total));
                 cJSON_AddItemToObject(tree_json, "get_peers", get_peers);
+
+                /* BEP51 query + dedup-funnel counters (patch 23), additive beside
+                 * bep51_nodes_cached. The four gates partition
+                 * samples_offered_total, so the funnel is auditable per tree. */
+                cJSON *tree_bep51 = cJSON_CreateObject();
+                cJSON_AddNumberToObject(tree_bep51, "queries_sent_total",
+                                        (double)atomic_load(&tree->bep51_queries_sent_total));
+                cJSON_AddNumberToObject(tree_bep51, "responses_received_total",
+                                        (double)atomic_load(&tree->bep51_responses_received_total));
+                cJSON_AddNumberToObject(tree_bep51, "timeouts_total",
+                                        (double)atomic_load(&tree->bep51_timeouts_total));
+                cJSON_AddNumberToObject(tree_bep51, "samples_offered_total",
+                                        (double)atomic_load(&tree->bep51_samples_offered_total));
+                cJSON_AddNumberToObject(tree_bep51, "bloom_rejected_total",
+                                        (double)atomic_load(&tree->bep51_bloom_rejected_total));
+                cJSON_AddNumberToObject(tree_bep51, "inflight_refused_total",
+                                        (double)atomic_load(&tree->bep51_inflight_refused_total));
+                cJSON_AddNumberToObject(tree_bep51, "queue_full_total",
+                                        (double)atomic_load(&tree->bep51_queue_full_total));
+                cJSON_AddNumberToObject(tree_bep51, "samples_pushed_total",
+                                        (double)atomic_load(&tree->bep51_samples_pushed_total));
+                cJSON_AddItemToObject(tree_json, "bep51", tree_bep51);
                 cJSON_AddItemToArray(trees_array, tree_json);
             }
         }

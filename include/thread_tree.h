@@ -254,6 +254,30 @@ typedef struct thread_tree {
     /* BEP51 cache statistics */
     atomic_uint_fast64_t bep51_nodes_cached; /* Nodes submitted to BEP51 cache */
 
+    /* BEP51 query + dedup-funnel instrumentation (patch 23). Per tree, cumulative
+     * since the tree was created; supervisor.c folds them into its cumulative_*
+     * totals when the tree is torn down, so a respawn neither loses nor
+     * double-counts them.
+     *
+     * The funnel half is the part /stats could not see before: one response can
+     * carry up to 100 infohashes (tree_protocol.c) and only the *post*-gate
+     * infohash-queue counters existed, so "how many samples were thrown away,
+     * and by which gate" was unmeasurable. The four gates are mutually
+     * exclusive — every examined sample leaves the loop through exactly one of
+     * them — so per window:
+     *   samples_offered = bloom_rejected + inflight_refused + queue_full
+     *                     + samples_pushed
+     * (an in-flight claim released by queue_full is counted once, as
+     * queue_full, because that is the gate that rejected the sample). */
+    atomic_uint_fast64_t bep51_queries_sent_total;        /* sample_infohashes queries sent */
+    atomic_uint_fast64_t bep51_responses_received_total;  /* answers popped before the 1000 ms wait expired */
+    atomic_uint_fast64_t bep51_timeouts_total;            /* waits that expired with no answer */
+    atomic_uint_fast64_t bep51_samples_offered_total;     /* infohashes examined in a response */
+    atomic_uint_fast64_t bep51_bloom_rejected_total;      /* ... already in the shared bloom */
+    atomic_uint_fast64_t bep51_inflight_refused_total;    /* ... already claimed by another tree */
+    atomic_uint_fast64_t bep51_queue_full_total;          /* ... push refused (claim released) */
+    atomic_uint_fast64_t bep51_samples_pushed_total;      /* ... accepted onto the infohash queue */
+
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;               /* Min metadata rate before respawn (0.01 = 1 metadata per 100 seconds) */
     int rate_check_interval_sec;            /* How often to check rate (default: 60s) */
