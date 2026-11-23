@@ -213,6 +213,7 @@ int main(int argc, char *argv[]) {
     const char *restore_db_path = NULL;
     const char *rebuild_fts_db_path = NULL;
     bool clear_failure_filter = false;
+    bool fetch_bep51_cache = false;
     bool category_filter_update = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -230,6 +231,7 @@ int main(int argc, char *argv[]) {
             printf("  --rebuild-fts <db>       Create the FTS5 search index in an existing database\n");
             printf("                           and rebuild it with the bundled SQLite\n");
             printf("  --clear-failure-filter   Delete the persisted failure bloom filter (data/failure_bloom.dat)\n");
+            printf("  --fetch-bep51-cache      Download bep51_cache_url into bep51_cache_path and exit\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -256,6 +258,8 @@ int main(int argc, char *argv[]) {
             rebuild_fts_db_path = argv[++i];
         } else if (strcmp(argv[i], "--clear-failure-filter") == 0) {
             clear_failure_filter = true;
+        } else if (strcmp(argv[i], "--fetch-bep51-cache") == 0) {
+            fetch_bep51_cache = true;
         }
     }
 
@@ -533,6 +537,32 @@ int main(int argc, char *argv[]) {
             mprog_terminal("rebuild-bloom-filter", 1, 0, bloom_extra);
         }
         return 0;
+    }
+
+    /* Refresh the published BEP51 cache without starting the crawler: the same
+     * fetch the supervisor runs on a cold start, usable from cron/CI. */
+    if (fetch_bep51_cache) {
+        if (config.bep51_cache_url[0] == '\0') {
+            log_msg(LOG_ERROR, "--fetch-bep51-cache: bep51_cache_url is empty in config.ini");
+            return 1;
+        }
+        bep51_cache_t *cache = bep51_cache_create(config.bep51_cache_capacity);
+        if (!cache) {
+            log_msg(LOG_ERROR, "--fetch-bep51-cache: cannot create the cache");
+            return 1;
+        }
+        int frc = bep51_cache_fetch_remote(cache, config.bep51_cache_url, config.bep51_cache_path,
+                                           config.bep51_cache_fetch_timeout_sec,
+                                           config.bep51_cache_ca_file[0] ? config.bep51_cache_ca_file : NULL,
+                                           config.bep51_cache_ca_dir[0] ? config.bep51_cache_ca_dir : NULL);
+        if (frc == 0) {
+            log_msg(LOG_INFO, "--fetch-bep51-cache: %zu nodes in %s",
+                    bep51_cache_get_count(cache), config.bep51_cache_path);
+        } else {
+            log_msg(LOG_ERROR, "--fetch-bep51-cache: failed (existing cache left untouched)");
+        }
+        bep51_cache_destroy(cache);
+        return frc == 0 ? 0 : 1;
     }
 
     /* Remove the two-strike failure bloom filter so infohashes that failed
@@ -1324,6 +1354,10 @@ int main(int argc, char *argv[]) {
     };
     /* Copy BEP51 cache path (can't use string literal in struct initializer) */
     strncpy(sup_config.bep51_cache_path, config.bep51_cache_path, sizeof(sup_config.bep51_cache_path) - 1);
+    strncpy(sup_config.bep51_cache_url, config.bep51_cache_url, sizeof(sup_config.bep51_cache_url) - 1);
+    sup_config.bep51_cache_fetch_timeout_sec = config.bep51_cache_fetch_timeout_sec;
+    strncpy(sup_config.bep51_cache_ca_file, config.bep51_cache_ca_file, sizeof(sup_config.bep51_cache_ca_file) - 1);
+    strncpy(sup_config.bep51_cache_ca_dir, config.bep51_cache_ca_dir, sizeof(sup_config.bep51_cache_ca_dir) - 1);
     strncpy(sup_config.adult_mode, config.adult_mode, sizeof(sup_config.adult_mode) - 1);
     
     g_supervisor = supervisor_create(&sup_config);

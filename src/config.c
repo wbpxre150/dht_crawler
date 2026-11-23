@@ -209,6 +209,11 @@ void config_init_defaults(crawler_config_t *config) {
 
     /* BEP51 cache defaults */
     strncpy(config->bep51_cache_path, "data/bep51_cache.dat", sizeof(config->bep51_cache_path) - 1);
+    strncpy(config->bep51_cache_url, "https://unjumble.au/bep51/bep51_cache.dat",
+            sizeof(config->bep51_cache_url) - 1);
+    config->bep51_cache_fetch_timeout_sec = 30;
+    config->bep51_cache_ca_file[0] = '\0';
+    config->bep51_cache_ca_dir[0] = '\0';
     config->bep51_cache_capacity = 10000;           /* 10000 nodes max */
     config->bep51_cache_submit_percent = 5;         /* 5% submission rate */
     config->bep51_node_cooldown_sec = 30;           /* 30 second cooldown per node */
@@ -716,6 +721,19 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         /* BEP51 cache settings */
         else if (strcmp(key, "bep51_cache_path") == 0) {
             strncpy(config->bep51_cache_path, value, sizeof(config->bep51_cache_path) - 1);
+        } else if (strcmp(key, "bep51_cache_url") == 0) {
+            strncpy(config->bep51_cache_url, value, sizeof(config->bep51_cache_url) - 1);
+            config->bep51_cache_url[sizeof(config->bep51_cache_url) - 1] = '\0';
+        } else if (strcmp(key, "bep51_cache_fetch_timeout_sec") == 0) {
+            config->bep51_cache_fetch_timeout_sec = atoi(value);
+            if (config->bep51_cache_fetch_timeout_sec < 1) config->bep51_cache_fetch_timeout_sec = 1;
+            if (config->bep51_cache_fetch_timeout_sec > 600) config->bep51_cache_fetch_timeout_sec = 600;
+        } else if (strcmp(key, "bep51_cache_ca_file") == 0) {
+            strncpy(config->bep51_cache_ca_file, value, sizeof(config->bep51_cache_ca_file) - 1);
+            config->bep51_cache_ca_file[sizeof(config->bep51_cache_ca_file) - 1] = '\0';
+        } else if (strcmp(key, "bep51_cache_ca_dir") == 0) {
+            strncpy(config->bep51_cache_ca_dir, value, sizeof(config->bep51_cache_ca_dir) - 1);
+            config->bep51_cache_ca_dir[sizeof(config->bep51_cache_ca_dir) - 1] = '\0';
         } else if (strcmp(key, "bep51_cache_capacity") == 0) {
             config->bep51_cache_capacity = atoi(value);
             if (config->bep51_cache_capacity < 1000) config->bep51_cache_capacity = 1000;

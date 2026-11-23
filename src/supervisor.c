@@ -167,6 +167,10 @@ supervisor_t *supervisor_create(supervisor_config_t *config) {
     sup->bep51_cache_capacity = config->bep51_cache_capacity > 0 ? config->bep51_cache_capacity : 10000;
     sup->bep51_cache_submit_percent = config->bep51_cache_submit_percent > 0 ? config->bep51_cache_submit_percent : 5;
     strncpy(sup->bep51_cache_path, config->bep51_cache_path, sizeof(sup->bep51_cache_path) - 1);
+    strncpy(sup->bep51_cache_url, config->bep51_cache_url, sizeof(sup->bep51_cache_url) - 1);
+    sup->bep51_cache_fetch_timeout_sec = config->bep51_cache_fetch_timeout_sec;
+    strncpy(sup->bep51_cache_ca_file, config->bep51_cache_ca_file, sizeof(sup->bep51_cache_ca_file) - 1);
+    strncpy(sup->bep51_cache_ca_dir, config->bep51_cache_ca_dir, sizeof(sup->bep51_cache_ca_dir) - 1);
 
     /* Initialize cumulative statistics */
     atomic_init(&sup->cumulative_metadata_count, 0);
@@ -898,6 +902,24 @@ void supervisor_start(supervisor_t *sup) {
      * ABORTS if fewer than global_bootstrap_target nodes were found (the
      * cache is saved for next attempt). On warm restart the cache is warm
      * and this step is skipped entirely. */
+    /* Cold cache: one HTTP GET of the published cache replaces minutes of router
+     * discovery, and on a fresh data dir it is the difference between starting and
+     * aborting (bootstrap must find global_bootstrap_target nodes or startup
+     * fails). Any failure here is non-fatal by design: log it and fall through to
+     * the router bootstrap exactly as before. */
+    if (bep51_cache_get_count(sup->bep51_cache) < (size_t)sup->global_bootstrap_target &&
+        sup->bep51_cache_url[0] != '\0') {
+        log_msg(LOG_INFO, "[supervisor] BEP51 cache has %zu of %d nodes; fetching %s",
+                bep51_cache_get_count(sup->bep51_cache), sup->global_bootstrap_target,
+                sup->bep51_cache_url);
+        if (bep51_cache_fetch_remote(sup->bep51_cache, sup->bep51_cache_url, sup->bep51_cache_path,
+                                     sup->bep51_cache_fetch_timeout_sec,
+                                     sup->bep51_cache_ca_file[0] ? sup->bep51_cache_ca_file : NULL,
+                                     sup->bep51_cache_ca_dir[0] ? sup->bep51_cache_ca_dir : NULL) != 0) {
+            log_msg(LOG_WARN, "[supervisor] BEP51 cache fetch failed; falling back to router bootstrap");
+        }
+    }
+
     if (bep51_cache_get_count(sup->bep51_cache) < (size_t)sup->global_bootstrap_target) {
         log_msg(LOG_INFO, "BEP51 cache cold (%zu nodes), running supervisor bootstrap",
                 bep51_cache_get_count(sup->bep51_cache));

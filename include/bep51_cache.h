@@ -68,6 +68,26 @@ int bep51_cache_load_from_file(bep51_cache_t *cache, const char *path);
 int bep51_cache_save_to_file(bep51_cache_t *cache, const char *path);
 
 /**
+ * Fetch the published cache over HTTP(S) and install it.
+ *
+ * Downloads @p url to "<path>.download", validates it with the same magic and
+ * sha256 checks bep51_cache_load_from_file() applies (against a scratch cache),
+ * and only then renames it over @p path and merges it into @p cache. A failed,
+ * truncated or corrupt download leaves the existing file and cache untouched, so
+ * the caller keeps its cold-start fallback.
+ *
+ * @param cache       cache to populate on success
+ * @param url         http:// or https:// URL of a .dat cache file
+ * @param path        local cache path to replace
+ * @param timeout_sec total deadline for the transfer; 0 = http_fetch default
+ * @param ca_file     optional CA bundle override (NULL = system store)
+ * @param ca_dir      optional hashed CA directory (NULL = none)
+ * @return 0 on success, -1 otherwise
+ */
+int bep51_cache_fetch_remote(bep51_cache_t *cache, const char *url, const char *path,
+                             int timeout_sec, const char *ca_file, const char *ca_dir);
+
+/**
  * Get current node count in cache (thread-safe)
  * @param cache The cache
  * @return Number of nodes currently cached

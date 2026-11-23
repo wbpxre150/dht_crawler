@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE  /* For usleep */
 
 #include "bep51_cache.h"
+#include "http_fetch.h"
 #include "tree_routing.h"
 #include "dht_crawler.h"
 #include <stdlib.h>
@@ -672,4 +673,60 @@ void bep51_cache_destroy(bep51_cache_t *cache) {
 
     pthread_mutex_destroy(&cache->lock);
     free(cache);
+}
+
+int bep51_cache_fetch_remote(bep51_cache_t *cache, const char *url, const char *path,
+                             int timeout_sec, const char *ca_file, const char *ca_dir) {
+    if (!cache || !url || !*url || !path || !*path) {
+        return -1;
+    }
+
+    size_t tmp_len = strlen(path) + 16;
+    char *tmp = malloc(tmp_len);
+    if (!tmp) {
+        log_msg(LOG_ERROR, "[bep51_cache] Out of memory for the download path");
+        return -1;
+    }
+    snprintf(tmp, tmp_len, "%s.download", path);
+
+    char err[256] = {0};
+    if (http_fetch_to_file(url, tmp, 0, timeout_sec, ca_file, ca_dir, err, sizeof(err)) != 0) {
+        log_msg(LOG_WARN, "[bep51_cache] Fetch of %s failed: %s", url, err);
+        unlink(tmp);
+        free(tmp);
+        return -1;
+    }
+
+    /* Validate before touching anything that already works: the same strict
+     * loader (magic + version + sha256 trailer) runs against a scratch cache. */
+    bep51_cache_t *scratch = bep51_cache_create(cache->capacity);
+    if (!scratch) {
+        unlink(tmp);
+        free(tmp);
+        return -1;
+    }
+    if (bep51_cache_load_from_file(scratch, tmp) != 0 || bep51_cache_get_count(scratch) == 0) {
+        log_msg(LOG_WARN, "[bep51_cache] Downloaded %s failed validation; keeping the existing cache", url);
+        bep51_cache_destroy(scratch);
+        unlink(tmp);
+        free(tmp);
+        return -1;
+    }
+    size_t fetched = bep51_cache_get_count(scratch);
+    bep51_cache_destroy(scratch);
+
+    if (rename(tmp, path) != 0) {
+        log_msg(LOG_WARN, "[bep51_cache] Cannot install %s: %s", path, strerror(errno));
+        unlink(tmp);
+        free(tmp);
+        return -1;
+    }
+    free(tmp);
+
+    if (bep51_cache_load_from_file(cache, path) != 0) {
+        log_msg(LOG_WARN, "[bep51_cache] Installed %s but could not load it", path);
+        return -1;
+    }
+    log_msg(LOG_INFO, "[bep51_cache] Fetched %zu nodes from %s", fetched, url);
+    return 0;
 }

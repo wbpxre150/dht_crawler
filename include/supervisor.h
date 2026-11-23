@@ -65,6 +65,10 @@ typedef struct supervisor_config {
     /* BEP51 cache settings */
     char bep51_cache_path[512];          /* Cache file path */
     int bep51_cache_capacity;            /* Max nodes in cache */
+    char bep51_cache_url[512];           /* Published cache URL; empty = never fetch */
+    int bep51_cache_fetch_timeout_sec;   /* Total transfer deadline for that fetch */
+    char bep51_cache_ca_file[512];       /* CA bundle override; empty = system store */
+    char bep51_cache_ca_dir[512];        /* Hashed CA dir override; empty = none */
     int bep51_cache_submit_percent;      /* % of BEP51 responses to cache */
 
     /* Stage 3 settings (BEP51) */
@@ -165,6 +169,10 @@ typedef struct supervisor {
     /* BEP51 cache settings */
     char bep51_cache_path[512];
     int bep51_cache_capacity;
+    char bep51_cache_url[512];
+    int bep51_cache_fetch_timeout_sec;
+    char bep51_cache_ca_file[512];
+    char bep51_cache_ca_dir[512];
     int bep51_cache_submit_percent;
 
     /* Stage 3 settings (BEP51) */

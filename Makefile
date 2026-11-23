@@ -23,7 +23,7 @@ LIB_OBJS = $(BUILD_DIR)/bencode.o \
 # Target executable
 TARGET = dht_crawler
 
-.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb check-clf-deps
+.PHONY: all clean dirs install-deps libbloom patch-bencode patch-civetweb clf clf-backfill full check-llama models llama
 
 all: dirs patch-bencode patch-civetweb libbloom $(TARGET)
 
@@ -166,6 +166,15 @@ META_PEER_FAIL_TEST_LDFLAGS = -lpthread
 # Point CRAM_MODEL_DIR at another generation to test that one instead. The path
 # is cwd-relative like FIXTURE_DIR, which is how the test already resolves its
 # other fixtures -- and it therefore also works from the Gradle-prepared copy.
+# The HTTP(S) fetcher behind the BEP51 cache download. Forked scripted servers
+# answer each case over a real socket: plain HTTP for the framing/redirect/cap
+# paths, and TLS against the committed self-signed fixture for both "reject an
+# untrusted certificate" and "accept it when the CA is trusted".
+HTTP_FETCH_TEST_SRCS = tests/test_http_fetch.c src/http_fetch.c
+HTTP_FETCH_TEST_BIN = $(BUILD_DIR)/test_http_fetch
+HTTP_FETCH_TEST_CFLAGS =
+HTTP_FETCH_TEST_LDFLAGS = -lssl -lcrypto -lpthread
+
 CRAM_MODEL_DIR ?= tests/fixtures/cram/models/v15
 CRAM_TEST_SRCS = tests/test_cram.c src/cram.c tests/stub_log.c lib/cJSON/cJSON.c
 CRAM_TEST_BIN = $(BUILD_DIR)/test_cram
@@ -228,7 +237,7 @@ MOVIE_KIND_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/bui
 RENDER_TEST_SRCS = tests/test_movie_kind_render.c src/movie_kind_render.c
 RENDER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_render
 RENDER_TEST_NFC_BIN = $(BUILD_DIR)/test_movie_kind_render_nfc
-UTF8PROC_DIR = tests/vendor/utf8proc
+UTF8PROC_DIR = vendor/utf8proc
 RENDER_NFC_CFLAGS = -DMK_NFC_ENABLED -I$(UTF8PROC_DIR)
 RENDER_NFC_SRCS = $(RENDER_TEST_SRCS) $(UTF8PROC_DIR)/utf8proc.c
 
@@ -288,9 +297,14 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-http-fetch tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
+
+tests-http-fetch:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(HTTP_FETCH_TEST_SRCS) -o $(HTTP_FETCH_TEST_BIN) $(TEST_LDFLAGS) $(HTTP_FETCH_TEST_LDFLAGS)
+	./$(HTTP_FETCH_TEST_BIN)
 
 tests-search:
 	@mkdir -p $(BUILD_DIR)
@@ -392,44 +406,91 @@ tests-asan-movie-backfill:
 tests-asan-movie-backfill-daemon:
 	$(MAKE) tests-movie-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
-# CLF-enabled host build for --classify-backfill maintenance runs: the plain
-# build keeps src/classifier.c inert (no -DCLF_ENABLED); this flavor adds it,
-# the vendored tparse/ftc headers, and links the prebuilt host students.
-# Override TPARSE_LIB / FTC_LIB if the classifier-model build lives elsewhere.
-TPARSE_LIB ?= $(HOME)/apps/classifier-model/build/tparse/libtparse.a
-FTC_LIB ?= $(HOME)/apps/classifier-model/build/ftc/libftc.a
+# ---------------------------------------------------------------------------
+# Optional classifier flavours
+#
+# Plain `make` compiles both classifiers INERT: src/classifier.c needs
+# -DCLF_ENABLED and src/movie_kind.c needs -DMK_ENABLED, and neither is defined
+# above. That is deliberate -- it keeps the default build free of tparse and
+# llama.cpp -- but it means a plain binary only crawls. Two flavours turn the
+# engines on:
+#
+#   make clf    CRAM (category + tv_kind + adult) only. Links the vendored
+#               tparse; no llama.cpp, no weights.
+#   make full   CRAM + movie-kind. Needs `make llama` first (pinned llama.cpp
+#               under build/llama-install, or LLAMA_INSTALL=<prefix>) and
+#               compiles MK_NFC_ENABLED against the vendored utf8proc, i.e.
+#               exactly the feature set the shipped Android binary has.
+#
+# Neither flavour embeds weights: `make models` fetches the pinned v13/v15
+# files into ./models, which is where the compiled-in defaults look.
+# ---------------------------------------------------------------------------
+
+# tparse: libc-only C11 release-name / file-list parser, vendored verbatim from
+# the classifier-model repo (native/tparse). See tparse/README.md.
+TPARSE_DIR = tparse
+TPARSE_SRCS = $(TPARSE_DIR)/tparse.c $(TPARSE_DIR)/name.c
+CLF_INCLUDES = -I$(TPARSE_DIR)
+
+# llama.cpp install prefix: static, CPU-only, pinned 18ab62a8. `make llama`
+# produces it; point LLAMA_INSTALL elsewhere to reuse another build of the pin.
+LLAMA_INSTALL ?= build/llama-install
+LLAMA_LIBS = $(LLAMA_INSTALL)/lib/libllama.a $(LLAMA_INSTALL)/lib/libggml.a \
+             $(LLAMA_INSTALL)/lib/libggml-cpu.a $(LLAMA_INSTALL)/lib/libggml-base.a
+
 CLF_DIR = build/clf
 CLF_TARGET = $(CLF_DIR)/dht_crawler
 CLF_OBJS = $(SRCS:$(SRC_DIR)/%.c=$(CLF_DIR)/%.o)
-# Only this optional target needs the Android wrapper: it compiles the real
-# classifier half (-DCLF_ENABLED), which requires the wrapper's tparse/ftc
-# headers and the prebuilt host students. `make` and `make tests` do not touch
-# it -- the test suite is hermetic (see the CRAM and render targets above).
-# Absolute on purpose: this target is also built from the Gradle-prepared copy
-# (app/build/native/src/dht_crawler), where ../dht_crawler-android does not
-# resolve.
-CLF_ANDROID_DIR ?= $(HOME)/apps/torrent_kotlin_app/app/src/main/cpp/dht_crawler-android
-CLF_INCLUDES = -I$(CLF_ANDROID_DIR)/tparse -I$(CLF_ANDROID_DIR)/ftc
+
+FULL_DIR = build/full
+FULL_TARGET = $(FULL_DIR)/dht_crawler
+FULL_OBJS = $(SRCS:$(SRC_DIR)/%.c=$(FULL_DIR)/%.o)
+FULL_DEFS = -DCLF_ENABLED -DMK_ENABLED -DMK_NFC_ENABLED
+FULL_INCLUDES = $(CLF_INCLUDES) -I$(UTF8PROC_DIR) -I$(LLAMA_INSTALL)/include
+FULL_LIBS = $(TPARSE_SRCS) $(UTF8PROC_DIR)/utf8proc.c $(LLAMA_LIBS)
 
 $(CLF_DIR):
 	mkdir -p $(CLF_DIR)
 
-$(CLF_DIR)/%.o: $(SRC_DIR)/%.c | $(CLF_DIR) check-clf-deps
+$(CLF_DIR)/%.o: $(SRC_DIR)/%.c | $(CLF_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -DCLF_ENABLED $(CLF_INCLUDES) -c $< -o $@
 
-$(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(CLF_OBJS) $(LIB_OBJS) $(LDFLAGS) -lstdc++ $(TPARSE_LIB) $(FTC_LIB)
+$(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS) $(TPARSE_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(CLF_OBJS) $(LIB_OBJS) $(TPARSE_SRCS) $(LDFLAGS)
 
-# Fail with a readable message instead of a wall of "tparse/taxonomy.h: No such
-# file" for anyone who runs this without the classifier model checkout.
-check-clf-deps:
-	@if [ ! -d "$(CLF_ANDROID_DIR)/tparse" ] || [ ! -d "$(CLF_ANDROID_DIR)/ftc" ]; then \
-		echo "clf-backfill: $(CLF_ANDROID_DIR) has no tparse/ or ftc/ headers."; \
-		echo "  Override CLF_ANDROID_DIR, TPARSE_LIB and FTC_LIB for your checkout,"; \
-		echo "  or use plain 'make' (the crawler and 'make tests' need none of this)."; \
-		exit 1; \
-	fi
+clf: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
+	@echo "built $(CLF_TARGET) (CRAM enabled; run 'make models' if ./models is empty)"
 
-clf-backfill: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
+# Historical name: the same flavour was used for --classify-backfill runs.
+clf-backfill: clf
 
-.PHONY: run debug asan tsan valgrind tests tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon clf-backfill
+# Fail with a readable message instead of a wall of "llama.h: No such file".
+check-llama:
+	@for l in $(LLAMA_LIBS); do \
+		[ -f "$$l" ] || { \
+			echo "full: missing $$l"; \
+			echo "  run 'make llama' (builds the pinned 18ab62a8), or set"; \
+			echo "  LLAMA_INSTALL=<prefix> for an existing build of that pin."; \
+			exit 1; }; \
+	done
+
+$(FULL_DIR):
+	mkdir -p $(FULL_DIR)
+
+$(FULL_DIR)/%.o: $(SRC_DIR)/%.c | $(FULL_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) $(FULL_DEFS) $(FULL_INCLUDES) -c $< -o $@
+
+$(FULL_TARGET): check-llama $(FULL_OBJS) $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(FULL_OBJS) $(LIB_OBJS) $(FULL_LIBS) $(LDFLAGS) -lstdc++
+
+full: dirs patch-bencode patch-civetweb libbloom $(FULL_TARGET)
+	@echo "built $(FULL_TARGET) (CRAM + movie-kind; run 'make models' if ./models is empty)"
+
+# Weights and the llama.cpp toolchain. Both are cached and sha-pinned.
+models:
+	tools/fetch-models.sh
+
+llama:
+	tools/build-llama.sh --prefix $(LLAMA_INSTALL)
+
+.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon

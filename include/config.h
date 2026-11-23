@@ -190,6 +190,14 @@ typedef struct {
     /* BEP51 cache settings */
     char bep51_cache_path[512];          /* Cache file path (default: "data/bep51_cache.dat") */
     int bep51_cache_capacity;            /* Max nodes in cache (default: 10000) */
+    /* Published cache: when the local cache is below global_bootstrap_target,
+     * one HTTP(S) GET of bep51_cache_url replaces minutes of router discovery.
+     * Any failure is non-fatal and falls through to the router bootstrap. Empty
+     * url disables the fetch entirely. */
+    char bep51_cache_url[512];           /* (default: "https://unjumble.au/bep51/bep51_cache.dat") */
+    int bep51_cache_fetch_timeout_sec;   /* Total transfer deadline (default: 30) */
+    char bep51_cache_ca_file[512];       /* CA bundle override; empty = system store */
+    char bep51_cache_ca_dir[512];        /* Hashed CA dir override; empty = none */
     int bep51_cache_submit_percent;      /* % of BEP51 responses to cache (default: 5) */
     int bep51_node_cooldown_sec;         /* Cooldown between queries to same node (default: 30) */
 } crawler_config_t;
