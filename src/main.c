@@ -200,6 +200,7 @@ int main(int argc, char *argv[]) {
     bool check_db = false;
     bool recover_db = false;
     const char *restore_db_path = NULL;
+    bool clear_failure_filter = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
@@ -213,6 +214,7 @@ int main(int argc, char *argv[]) {
             printf("                           database, then replacing the original\n");
             printf("  --restore-database <sql> Replay an uncompressed SQL dump into a fresh database\n");
             printf("                           and replace the configured database with it\n");
+            printf("  --clear-failure-filter   Delete the persisted failure bloom filter (data/failure_bloom.dat)\n");
             printf("  --help, -h               Show this help message and exit\n");
             return 0;
         } else if (strcmp(argv[i], "--rebuild-bloom-filter") == 0) {
@@ -231,6 +233,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             restore_db_path = argv[++i];
+        } else if (strcmp(argv[i], "--clear-failure-filter") == 0) {
+            clear_failure_filter = true;
         }
     }
 
@@ -466,6 +470,22 @@ int main(int argc, char *argv[]) {
         bloom_filter_cleanup(bloom);
         log_msg(LOG_INFO, "Bloom filter rebuilt and saved to %s.", config.bloom_path);
         return 0;
+    }
+
+    /* Remove the two-strike failure bloom filter so infohashes that failed
+     * metadata fetch (and were suppressed from retry) become eligible again.
+     * The crawler re-creates an empty filter on its next start. */
+    if (clear_failure_filter) {
+        if (unlink("data/failure_bloom.dat") == 0) {
+            log_msg(LOG_INFO, "--clear-failure-filter: removed data/failure_bloom.dat");
+            return 0;
+        }
+        if (errno == ENOENT) {
+            log_msg(LOG_INFO, "--clear-failure-filter: data/failure_bloom.dat not present; nothing to remove");
+            return 0;
+        }
+        log_msg(LOG_ERROR, "--clear-failure-filter: failed to remove data/failure_bloom.dat: %s", strerror(errno));
+        return 1;
     }
 
     /*******************************************************************
