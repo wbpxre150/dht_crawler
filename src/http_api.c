@@ -423,6 +423,13 @@ static int send_json_results(struct mg_connection *conn, search_result_t *result
         format_hex(results[i].info_hash, 20, hex);
         cJSON_AddStringToObject(item, "info_hash", hex);
         cJSON_AddStringToObject(item, "name", results[i].name);
+        /* IMDb button: expose the crawler's own extracted media title so the
+         * search page can query the clean title/year, matching the /torrent
+         * page's filtered_name (http_torrent_page.c). */
+        char *filtered_name = extract_media_title(results[i].name);
+        if (!filtered_name) filtered_name = strdup(results[i].name ? results[i].name : "");
+        cJSON_AddStringToObject(item, "filtered_name", filtered_name ? filtered_name : "");
+        free(filtered_name);
 
         char size_str[64];
         format_size(results[i].size_bytes, size_str, sizeof(size_str));
