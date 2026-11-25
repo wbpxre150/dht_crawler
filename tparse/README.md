@@ -22,8 +22,7 @@ A plain `make` never sees it.
 `tparse` emits `__adult_jav`, `__adult_site` and `__adult_set` **unconditionally**, while the frozen model
 was trained on a corpus that carries those tokens on ~20 of 270,390 rows. `cram_strip_adult_tokens()`
 (`src/cram.c`) removes them after `tp_feature_text()` and before `cram_features()`. If you re-sync this
-directory, re-run `make tests-cram` — the strip behaviour is asserted there, and it is also what keeps the
-`--adult-backfill` one-shot from gating every row out (that path scans the *raw* feature text on purpose).
+directory, re-run `make tests-cram` — the strip behaviour is asserted there.
 
 ## Re-syncing
 
