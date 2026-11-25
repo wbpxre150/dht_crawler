@@ -21,7 +21,7 @@ typedef struct {
      *   - classifier.c (classifier_enabled, classifier_model_dir,
      *     adult_hide_threshold, adult_mode)
      *   - movie_kind.c (movie_kind_enabled, movie_kind_model_dir,
-     *     movie_kind_threads; the backfill engine reads movie_kind_thermal_backoff_c)
+     *     movie_kind_threads)
      *   - tree_metadata.c (adult_mode), hard_block.c (hard_block_file)
      *   - failure_bloom filter (failure_bloom_capacity)
      */
@@ -95,20 +95,12 @@ typedef struct {
     double adult_hide_threshold;        /* Classifier adult tag threshold (default: 0.375, CRAM v15's
                                          * recall-0.90 point); 0 = take it from the manifest */
     char hard_block_file[512];          /* Always-on blocklist, one term per line (default: "hard_block.txt") */
-    /* Which pass the classify-backfill daemon runs. "all" (default) keeps the
-     * historical full re-classify, "adult" runs only the token-gated adult
-     * pass, "off" makes the daemon never touch the database. The app pins
-     * this to "off" for the v11 release so the deliberate write is driven by
-     * the adult-backfill maintenance action instead of by launch. */
-    char classify_backfill_mode[8];
 
     /* Movie-kind (genre mask) settings — movie-kind Stage B. The model directory
-     * pins the manifest whose sha256s gate the load; the thermal ceiling is read
-     * by the backfill engine (Stage C) between batches. */
+     * pins the manifest whose sha256s gate the load. */
     int movie_kind_enabled;             /* Enable movie-kind classification (0=disabled, default: 1) */
     char movie_kind_model_dir[512];     /* manifest.json + pinned GGUF/head (default: "models/v13") */
     int movie_kind_threads;             /* llama.cpp encoder threads (default: 4; 8 is slower on this SoC) */
-    int movie_kind_thermal_backoff_c;   /* Pause the movie backfill above this CPU temp in °C (default: 82) */
 
     /* "Categories to save" (see category_filter_cleanup.h). Both are bitmasks
      * over the tparse taxonomy and default to every bit set, which means "save
