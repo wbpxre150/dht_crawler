@@ -202,11 +202,6 @@ int database_integrity_check(const char *db_path);
  * Returns number of torrent rows recovered, or -1 on fatal error. */
 int database_recover(const char *src_path, const char *dst_path);
 
-/* Replay a plain (uncompressed) SQL dump into a fresh dst_path database,
- * creating the full schema first. Returns the number of statements
- * replayed, or -1 on fatal error (dst_path is unlinked on failure). */
-int database_restore(const char *sql_path, const char *dst_path);
-
 /* Create the FTS5 tables + triggers in an existing db_path database,
  * rebuild the external-content index (torrent_search) and backfill the
  * contentless torrent_docs index with the bundled SQLite. The WAL is

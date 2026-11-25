@@ -419,4 +419,4 @@ models:
 llama:
 	tools/build-llama.sh --prefix $(LLAMA_INSTALL)
 
-.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-movie-kind tests-movie-kind-render tests-movie-kind-filter tests-asan tests-asan-cram
+.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-movie-kind tests-movie-kind-render tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-movie-kind

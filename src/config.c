@@ -85,12 +85,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->bloom_persist_interval_sec = 300;   /* min seconds between bloom-filter disk saves (0=every flush) */
     strncpy(config->bloom_path, "data/bloom.dat", sizeof(config->bloom_path) - 1);
 
-    /* Metadata fetcher defaults */
-    config->max_concurrent_connections = 2000;
-    config->tcp_connect_timeout_sec = 10;  /* 10s TCP connection timeout */
-    config->connection_timeout_sec = 30;  /* 30s idle timeout - resets on activity */
-    config->max_connection_lifetime_sec = 300;  /* 5 minutes max total connection time */
-
     /* Phase 5: Batch Writer defaults */
     config->batch_size = 500;
     config->flush_interval = 300;
@@ -196,9 +190,6 @@ void config_init_defaults(crawler_config_t *config) {
     config->respawn_spawn_threshold = 20;              /* Spawn replacement at 20 connections */
     config->respawn_drain_timeout_sec = 180;           /* Force destroy after 180 seconds */
     config->max_draining_trees = 16;                   /* Max 16 draining trees simultaneously */
-
-    /* Thread tree mode toggle - stable and production-ready */
-    config->use_thread_trees = 1;                   /* 1=thread tree architecture */
 
     /* Keyspace partitioning - enabled by default */
     config->use_keyspace_partitioning = 1;          /* 1=enabled (evenly distributed node IDs) */
@@ -383,16 +374,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             strncpy(config->rclone_dest_path, value, sizeof(config->rclone_dest_path) - 1);
         } else if (strcmp(key, "rclone_bookmark_path") == 0) {
             strncpy(config->rclone_bookmark_path, value, sizeof(config->rclone_bookmark_path) - 1);
-        }
-        /* Metadata fetcher settings */
-        else if (strcmp(key, "max_concurrent_connections") == 0) {
-            config->max_concurrent_connections = atoi(value);
-        } else if (strcmp(key, "tcp_connect_timeout_sec") == 0) {
-            config->tcp_connect_timeout_sec = atoi(value);
-        } else if (strcmp(key, "connection_timeout_sec") == 0) {
-            config->connection_timeout_sec = atoi(value);
-        } else if (strcmp(key, "max_connection_lifetime_sec") == 0) {
-            config->max_connection_lifetime_sec = atoi(value);
         }
         /* Language filter settings */
         else if (strcmp(key, "language_filter_non_latin_threshold") == 0 ||
@@ -661,10 +642,6 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
             config->max_draining_trees = atoi(value);
             if (config->max_draining_trees < 1) config->max_draining_trees = 1;
             if (config->max_draining_trees > 32) config->max_draining_trees = 32;  /* Can't drain more than total trees */
-        }
-        /* Thread tree mode toggle */
-        else if (strcmp(key, "use_thread_trees") == 0) {
-            config->use_thread_trees = atoi(value);
         }
         /* Keyspace partitioning toggle */
         else if (strcmp(key, "use_keyspace_partitioning") == 0) {

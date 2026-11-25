@@ -55,12 +55,6 @@ typedef struct {
     char bloom_path[512];
     int bloom_persist_interval_sec;  /* min seconds between bloom-filter disk saves (0=every flush, else 30-3600; default: 300) */
 
-    /* Metadata fetcher settings */
-    int max_concurrent_connections;
-    int tcp_connect_timeout_sec;        /* TCP connection establishment timeout */
-    int connection_timeout_sec;         /* Idle timeout - resets on activity */
-    int max_connection_lifetime_sec;    /* Max total connection time (0=unlimited) */
-
     /* Phase 5: Batch Writer settings */
     int batch_size;                  /* Rows buffered before a commit (default: 500) */
     int flush_interval;              /* Flush interval in seconds (default: 300) */
@@ -160,9 +154,6 @@ typedef struct {
     int respawn_spawn_threshold;            /* Spawn replacement when connections drop below this (default: 20) */
     int respawn_drain_timeout_sec;          /* Force destroy draining tree after this timeout (default: 180) */
     int max_draining_trees;                 /* Maximum trees allowed in draining state (default: 16) */
-
-    /* Thread tree mode toggle (kept for build compatibility; removed by main.c branch in Stage 3) */
-    int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
 
     /* Keyspace partitioning settings */
     int use_keyspace_partitioning;       /* Enable keyspace partitioning (0=random node IDs, 1=partitioned, default: 1) */
