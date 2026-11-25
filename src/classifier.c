@@ -447,8 +447,7 @@ static int clf_build_features(const torrent_metadata_t *meta, clf_features_t *ou
      * tparse renders them unconditionally, so the CRAM path drops them here --
      * after the render (the text itself is unchanged) and before any consumer, so
      * `classifier_classify()` and `classifier_classify_adult()` cannot disagree
-     * about the input. `src/adult_backfill.c` scans the RAW text with its own
-     * gate and is deliberately not routed through this. */
+     * about the input. */
     cram_strip_adult_tokens(out->feature);
     free(files);
     return 0;

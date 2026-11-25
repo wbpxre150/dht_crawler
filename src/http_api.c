@@ -5,9 +5,7 @@
 #include "batch_writer.h"
 #include "language_filter.h"
 #include "classifier.h"
-#include "classify_backfill_daemon.h"
 #include "movie_kind.h"
-#include "movie_backfill_daemon.h"
 #include "category_filter_cleanup.h"
 #include "torrent_search.h"
 #include "supervisor.h"
@@ -873,50 +871,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddItemToObject(root, "classifier", classifier);
     }
 
-    /* Classifier backfill: live progress of the background re-classification
-     * pass (present in every build, "disabled" when the classifier is inert). */
-    {
-        classify_backfill_daemon_stats_t cb_stats;
-        classify_backfill_daemon_get_stats(&cb_stats);
-
-        cJSON *classifier_backfill = cJSON_CreateObject();
-        cJSON_AddStringToObject(classifier_backfill, "state", cb_stats.state);
-        cJSON_AddNumberToObject(classifier_backfill, "target_clf_ver", cb_stats.target_clf_ver);
-        cJSON_AddNumberToObject(classifier_backfill, "rows_left", (double)cb_stats.rows_left);
-        cJSON_AddNumberToObject(classifier_backfill, "rows_processed",
-                                (double)cb_stats.rows_processed);
-        cJSON_AddNumberToObject(classifier_backfill, "rows_total", (double)cb_stats.rows_total);
-        cJSON_AddNumberToObject(classifier_backfill, "started_at", (double)cb_stats.started_at);
-        cJSON_AddNumberToObject(classifier_backfill, "finished_at", (double)cb_stats.finished_at);
-        cJSON_AddStringToObject(classifier_backfill, "last_error", cb_stats.last_error);
-        cJSON_AddItemToObject(root, "classifier_backfill", classifier_backfill);
-    }
-
-    /* Adult backfill: the token-gated pass. Its own object because it reports
-     * its own counters (gated_out/scored/updated) and because "off" - the
-     * shipped classify_backfill_mode - must be visible as such rather than as a
-     * full re-classify that never happened. */
-    {
-        classify_backfill_daemon_adult_stats_t ab_stats;
-        classify_backfill_daemon_get_adult_stats(&ab_stats);
-
-        cJSON *adult_backfill = cJSON_CreateObject();
-        cJSON_AddStringToObject(adult_backfill, "state", ab_stats.state);
-        cJSON_AddNumberToObject(adult_backfill, "target_adult_clf_ver",
-                                (double)ab_stats.target_adult_clf_ver);
-        cJSON_AddNumberToObject(adult_backfill, "rows_total", (double)ab_stats.rows_total);
-        cJSON_AddNumberToObject(adult_backfill, "rows_gated_out",
-                                (double)ab_stats.rows_gated_out);
-        cJSON_AddNumberToObject(adult_backfill, "rows_scored", (double)ab_stats.rows_scored);
-        cJSON_AddNumberToObject(adult_backfill, "rows_updated", (double)ab_stats.rows_updated);
-        cJSON_AddNumberToObject(adult_backfill, "rows_failed", (double)ab_stats.rows_failed);
-        cJSON_AddNumberToObject(adult_backfill, "last_id", (double)ab_stats.last_id);
-        cJSON_AddNumberToObject(adult_backfill, "started_at", (double)ab_stats.started_at);
-        cJSON_AddNumberToObject(adult_backfill, "finished_at", (double)ab_stats.finished_at);
-        cJSON_AddStringToObject(adult_backfill, "last_error", ab_stats.last_error);
-        cJSON_AddItemToObject(root, "adult_backfill", adult_backfill);
-    }
-
     /* Movie-kind (v9 JEV head): counters, present even at zero, so a dashboard
      * can tell "no data yet" from "not built in". Independent of the fastText
      * objects above, which this pass never touches. */
@@ -960,33 +914,6 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddItemToObject(movie_kind, "by_genre", mk_by_genre);
 
         cJSON_AddItemToObject(root, "movie_kind", movie_kind);
-    }
-
-    /* Movie-kind backfill: live progress of the background movie pass (present
-     * in every build, "disabled" when the module is inert). */
-    {
-        movie_backfill_daemon_stats_t mb_stats;
-        movie_backfill_daemon_get_stats(&mb_stats);
-
-        cJSON *movie_kind_backfill = cJSON_CreateObject();
-        cJSON_AddStringToObject(movie_kind_backfill, "state", mb_stats.state);
-        cJSON_AddNumberToObject(movie_kind_backfill, "target_clf_ver",
-                                mb_stats.target_clf_ver);
-        cJSON_AddNumberToObject(movie_kind_backfill, "rows_left", (double)mb_stats.rows_left);
-        cJSON_AddNumberToObject(movie_kind_backfill, "rows_processed",
-                                (double)mb_stats.rows_processed);
-        cJSON_AddNumberToObject(movie_kind_backfill, "rows_total",
-                                (double)mb_stats.rows_total);
-        cJSON_AddNumberToObject(movie_kind_backfill, "started_at",
-                                (double)mb_stats.started_at);
-        cJSON_AddNumberToObject(movie_kind_backfill, "finished_at",
-                                (double)mb_stats.finished_at);
-        cJSON_AddStringToObject(movie_kind_backfill, "last_error", mb_stats.last_error);
-        cJSON_AddNumberToObject(movie_kind_backfill, "thermal_pauses",
-                                (double)mb_stats.thermal_pauses);
-        cJSON_AddNumberToObject(movie_kind_backfill, "model_load_failures",
-                                (double)mb_stats.model_load_failures);
-        cJSON_AddItemToObject(root, "movie_kind_backfill", movie_kind_backfill);
     }
 
     /* "Categories to save": ingest drops caused by save_categories /

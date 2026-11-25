@@ -246,8 +246,7 @@ cram_status_t cram_predict(cram_model_t *model, const cram_row_t *row,
  *
  * The frozen model's training corpus carries these tokens on 20 of 270,390 rows
  * while the vendored parser emits them unconditionally, so the serving path
- * canonicalises to the training distribution. `src/adult_backfill.c` keeps its
- * own gate over the RAW text and must not go through this (plan assumption 13).
+ * canonicalises to the training distribution (plan assumption 13).
  *
  * In place, no allocation, idempotent: stripping an already-stripped string
  * removes nothing.

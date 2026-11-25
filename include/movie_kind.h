@@ -77,8 +77,7 @@ typedef struct {
     uint64_t failures;           /* classify() calls that produced no verdict */
     uint64_t model_load_failures;/* unusable manifest (counted once) plus each
                                   * model/head that failed to load or verify */
-    uint64_t thermal_pauses;     /* back-off pauses reported by the caller
-                                  * (classify_backfill-style engine, Stage C) */
+    uint64_t thermal_pauses;     /* back-off pauses reported by the caller */
     uint64_t by_genre[MOVIE_KIND_MAX_GENRES]; /* per genre bit, all verdicts */
 } movie_kind_stats_t;
 

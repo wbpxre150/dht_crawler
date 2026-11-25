@@ -33,7 +33,7 @@
  * --recover-database (286.7M torrent_files rows) would emit ~2,860 lines and
  * evict everything printed before it.
  *
- * Header-only on purpose: src/main.c, src/database.c and src/movie_backfill.c
+ * Header-only on purpose: src/main.c and src/database.c
  * all need the emitters, and a new .c file would have to be added to the host
  * Makefile's explicit per-test source lists (and would only reach the Android
  * build through a CMake re-glob). static inline keeps one definition with no

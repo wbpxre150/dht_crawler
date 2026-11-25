@@ -596,14 +596,10 @@ static int is_ft_space(char c) {
  * result is byte-identical to what tparse would have rendered without those
  * tokens. Every other byte is left alone.
  *
- * Why this lives here rather than in tparse: `src/adult_backfill.c` carries its
- * own token gate (`ab_gate_text()` / `AB_TOKEN`) that renders the feature text
- * itself and scans the RAW tokens, so stripping them upstream would silently
- * turn the `--adult-backfill` one-shot into a no-op. The frozen v15 model was
- * trained on a corpus that carries these tokens on 20 of 270,390 rows while the
- * vendored parser emits them unconditionally, so serving canonicalises and the
- * gate keeps seeing them (plan assumption 13, Revision 1). The tokens are
- * struct-only markers: they hit columns 0..2 exactly and never join a bigram,
+ * Why this lives here rather than in tparse: serving canonicalises the feature
+ * text before the model sees it -- the frozen v15 model was trained on a
+ * corpus that carries these tokens on 20 of 270,390 rows while the vendored
+ * parser emits them unconditionally. The tokens are struct-only markers: they hit columns 0..2 exactly and never join a bigram,
  * which is what makes dropping them a pure column removal.
  *
  * Pure C99, in place, no allocation, idempotent: the scan restarts at the cut,

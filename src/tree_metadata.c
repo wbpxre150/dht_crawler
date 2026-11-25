@@ -52,8 +52,8 @@
 /* torrent_class.category value for a movie: TP_CAT_MOVIE from the vendored
  * dht_crawler-android/tparse/taxonomy.h. That header only exists on the Android
  * wrapper's include path while this file also compiles for the crawler's own
- * host `make`, so the value is mirrored here - exactly what src/movie_backfill.c
- * (MB_CAT_MOVIE) and src/http_api.c do. It is frozen by the data on the phone. */
+ * host `make`, so the value is mirrored here - exactly what src/http_api.c does.
+ * It is frozen by the data on the phone. */
 #define TM_CAT_MOVIE 1
 
 /* Default config values */

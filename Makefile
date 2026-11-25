@@ -203,28 +203,6 @@ CRAM_TEST_BIN = $(BUILD_DIR)/test_cram
 CRAM_TEST_CFLAGS = -DCRAM_TEST_MODEL_DIR='"$(CRAM_MODEL_DIR)"'
 CRAM_TEST_LDFLAGS = -lm -lpthread
 
-# The backfill test defines its own stub classifier symbols (models_loaded,
-# current_version, write_meta, classify) so it never links src/classifier.c:
-# the host build compiles that module inert, which could never insert a row.
-BACKFILL_TEST_SRCS = tests/test_classify_backfill.c src/classify_backfill.c \
-                     src/database.c src/bloom_filter.c tests/stub_log.c
-BACKFILL_TEST_BIN = $(BUILD_DIR)/test_classify_backfill
-BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
-
-# The daemon-thread test drives src/classify_backfill_daemon.c through its test
-# hooks (-DCLF_BACKFILL_DAEMON_TEST), so the engine and the classifier are fakes
-# and no database, model files or 60 s poll interval are involved.
-# src/classify_backfill.c is still linked, for the real state names and the
-# progress accessor; its classifier dependencies are answered by the test's own
-# stubs, exactly like the backfill test above.
-BACKFILL_DAEMON_TEST_SRCS = tests/test_classify_backfill_daemon.c \
-                            src/classify_backfill_daemon.c \
-                            src/classify_backfill.c src/adult_backfill.c \
-                            src/database.c src/bloom_filter.c tests/stub_log.c
-BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_classify_backfill_daemon
-BACKFILL_DAEMON_TEST_CFLAGS = -DCLF_BACKFILL_DAEMON_TEST
-BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
-
 # The movie-kind test links the real src/movie_kind.c and src/jevhead.c. Both
 # compile without MK_ENABLED: the manifest/sha256 half is plain C99 + cJSON +
 # OpenSSL, and jevhead.c is pure arithmetic, so the host test exercises the
@@ -263,48 +241,6 @@ UTF8PROC_DIR = vendor/utf8proc
 RENDER_NFC_CFLAGS = -DMK_NFC_ENABLED -I$(UTF8PROC_DIR)
 RENDER_NFC_SRCS = $(RENDER_TEST_SRCS) $(UTF8PROC_DIR)/utf8proc.c
 
-# The movie-kind backfill engine test links the real src/movie_backfill.c and the
-# real src/movie_kind.c (host flavour: manifest/sha256 only), and drives the
-# engine's seams with -DMOVIE_BACKFILL_TEST so a pass can label rows without a
-# model and pause for heat without a hot CPU. src/database.c builds the fixture
-# through the ingest path, exactly like the fastText backfill test.
-MOVIE_BACKFILL_TEST_SRCS = tests/test_movie_backfill.c src/movie_backfill.c \
-                           src/movie_kind.c src/movie_kind_render.c src/jevhead.c \
-                           src/classifier.c src/database.c src/bloom_filter.c \
-                           lib/cJSON/cJSON.c tests/stub_log.c
-MOVIE_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_movie_backfill
-MOVIE_BACKFILL_TEST_CFLAGS = -DMOVIE_BACKFILL_TEST
-MOVIE_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
-
-# The daemon-thread test drives src/movie_backfill_daemon.c through its test hooks
-# (-DMOVIE_BACKFILL_DAEMON_TEST): the engine and the movie-kind module are fakes,
-# so no database, model files or 60 s poll interval are involved. The real engine
-# and movie-kind modules are still linked, for the state names and the defaults.
-MOVIE_BACKFILL_DAEMON_TEST_SRCS = tests/test_movie_backfill_daemon.c \
-                                  src/movie_backfill_daemon.c src/movie_backfill.c \
-                                  src/movie_kind.c src/movie_kind_render.c \
-                                  src/jevhead.c src/classifier.c src/database.c \
-                                  src/bloom_filter.c lib/cJSON/cJSON.c \
-                                  tests/stub_log.c
-MOVIE_BACKFILL_DAEMON_TEST_BIN = $(BUILD_DIR)/test_movie_backfill_daemon
-MOVIE_BACKFILL_DAEMON_TEST_CFLAGS = -DMOVIE_BACKFILL_DAEMON_TEST
-MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm -lcrypto lib/libbloom/build/libbloom.a
-
-# The adult-backfill engine test links the real src/adult_backfill.c and drives
-# it with -DADULT_BACKFILL_TEST, which exposes the verdict seam AND the gate
-# seam. The token gate needs tparse, which this build does not have, so the real
-# gate answers "nothing gated out"; the test installs its own gate instead and
-# drives the SQL, the gate, the UPDATE and the watermark path with canned
-# verdicts - exactly what the model-free host build can verify (the real gate is
-# covered by the clf-backfill smoke run and by G1's parser parity). It defines
-# its own classifier symbols instead of linking src/classifier.c, which compiles
-# inert on the host (same trick tests-backfill plays).
-ADULT_BACKFILL_TEST_SRCS = tests/test_adult_backfill.c src/adult_backfill.c \
-                           src/database.c src/bloom_filter.c tests/stub_log.c
-ADULT_BACKFILL_TEST_BIN = $(BUILD_DIR)/test_adult_backfill
-ADULT_BACKFILL_TEST_CFLAGS = -DADULT_BACKFILL_TEST
-ADULT_BACKFILL_TEST_LDFLAGS = -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
-
 # The movie-kind filter test compiles src/http_api.c INTO its translation unit
 # (#include "../src/http_api.c"): cls_filter_t, append_class_conditions() and
 # bind_class_filter() are file-local there, and going through the real fragment
@@ -319,9 +255,8 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-http-fetch tests-model-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
-       tests-movie-kind tests-movie-kind-render tests-movie-backfill \
-       tests-movie-backfill-daemon tests-movie-kind-filter
+tests: tests-http-fetch tests-model-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram \
+       tests-movie-kind tests-movie-kind-render tests-movie-kind-filter
 
 tests-http-fetch:
 	@mkdir -p $(BUILD_DIR)
@@ -368,16 +303,6 @@ tests-docs: libbloom
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(DOCS_TEST_SRCS) -o $(DOCS_TEST_BIN) $(TEST_LDFLAGS) $(DOCS_TEST_LDFLAGS)
 	./$(DOCS_TEST_BIN)
 
-tests-backfill: libbloom
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(BACKFILL_TEST_SRCS) -o $(BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_TEST_LDFLAGS)
-	./$(BACKFILL_TEST_BIN)
-
-tests-backfill-daemon: libbloom
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(BACKFILL_DAEMON_TEST_SRCS) -o $(BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(BACKFILL_DAEMON_TEST_LDFLAGS)
-	./$(BACKFILL_DAEMON_TEST_BIN)
-
 tests-movie-kind: libbloom
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_TEST_SRCS) -o $(MOVIE_KIND_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_TEST_LDFLAGS)
@@ -390,25 +315,10 @@ tests-movie-kind-render:
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(RENDER_NFC_CFLAGS) $(INCLUDES) $(RENDER_NFC_SRCS) -o $(RENDER_TEST_NFC_BIN) $(TEST_LDFLAGS)
 	./$(RENDER_TEST_NFC_BIN)
 
-tests-movie-backfill: libbloom
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_BACKFILL_TEST_CFLAGS) $(INCLUDES) $(MOVIE_BACKFILL_TEST_SRCS) -o $(MOVIE_BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_BACKFILL_TEST_LDFLAGS)
-	./$(MOVIE_BACKFILL_TEST_BIN)
-
-tests-movie-backfill-daemon: libbloom
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_BACKFILL_DAEMON_TEST_CFLAGS) $(INCLUDES) $(MOVIE_BACKFILL_DAEMON_TEST_SRCS) -o $(MOVIE_BACKFILL_DAEMON_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_BACKFILL_DAEMON_TEST_LDFLAGS)
-	./$(MOVIE_BACKFILL_DAEMON_TEST_BIN)
-
 tests-movie-kind-filter: libbloom
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(MOVIE_KIND_FILTER_TEST_CFLAGS) $(INCLUDES) $(MOVIE_KIND_FILTER_TEST_SRCS) -o $(MOVIE_KIND_FILTER_TEST_BIN) $(TEST_LDFLAGS) $(MOVIE_KIND_FILTER_TEST_LDFLAGS)
 	./$(MOVIE_KIND_FILTER_TEST_BIN)
-
-tests-adult-backfill: libbloom
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(ADULT_BACKFILL_TEST_CFLAGS) $(INCLUDES) $(ADULT_BACKFILL_TEST_SRCS) -o $(ADULT_BACKFILL_TEST_BIN) $(TEST_LDFLAGS) $(ADULT_BACKFILL_TEST_LDFLAGS)
-	./$(ADULT_BACKFILL_TEST_BIN)
 
 tests-asan:
 	$(MAKE) tests TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
@@ -419,24 +329,8 @@ tests-asan:
 tests-asan-cram:
 	$(MAKE) tests-cram TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
-# Scoped sanitizer gate for the backfill engine: builds and runs only that test
-# binary, so its leak/UB verdict never depends on the other test binaries.
-tests-asan-backfill:
-	$(MAKE) tests-backfill TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
-
-# Same scoped gate for the daemon-thread test (threads + sanitizers).
-tests-asan-backfill-daemon:
-	$(MAKE) tests-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
-
-# Scoped sanitizer gates for the two movie-kind backfill test binaries.
 tests-asan-movie-kind:
 	$(MAKE) tests-movie-kind TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
-
-tests-asan-movie-backfill:
-	$(MAKE) tests-movie-backfill TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
-
-tests-asan-movie-backfill-daemon:
-	$(MAKE) tests-movie-backfill-daemon TEST_CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer" TEST_LDFLAGS="-fsanitize=address,undefined"
 
 # ---------------------------------------------------------------------------
 # Optional classifier flavours
@@ -525,4 +419,4 @@ models:
 llama:
 	tools/build-llama.sh --prefix $(LLAMA_INSTALL)
 
-.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon
+.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-movie-kind tests-movie-kind-render tests-movie-kind-filter tests-asan tests-asan-cram
