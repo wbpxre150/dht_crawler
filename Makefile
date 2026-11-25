@@ -387,7 +387,7 @@ $(CLF_TARGET): $(CLF_OBJS) $(LIB_OBJS) $(TPARSE_SRCS)
 clf: dirs patch-bencode patch-civetweb libbloom $(CLF_TARGET)
 	@echo "built $(CLF_TARGET) (CRAM enabled; run 'make models' if ./models is empty)"
 
-# Historical name: the same flavour was used for --classify-backfill runs.
+# Historical alias for the clf flavour, kept for older scripts.
 clf-backfill: clf
 
 # Fail with a readable message instead of a wall of "llama.h: No such file".

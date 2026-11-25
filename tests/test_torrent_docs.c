@@ -302,7 +302,7 @@ int main(void) {
     expect_match(db.db, "150", NULL, 0);
     expect_match(db.db, "ac", AC_ROWIDS, 1);
 
-    /* --- --rebuild-docs, twice: idempotent backfill ----------------------- */
+    /* --- --rebuild-docs, twice: idempotent rebuild ----------------------- */
     if (database_rebuild_docs(TEST_DB) != 0) {
         fail("database_rebuild_docs (first run)", "returned -1");
     }

@@ -181,7 +181,7 @@ int database_rebuild_bloom(const char *db_path, struct bloom_filter *bloom);
  * table is an index-only scan, so it costs milliseconds, not minutes. */
 long long database_count_torrents(const char *db_path);
 
-/* Backfill the schema-v2 torrent-level word index (torrent_docs) of an existing
+/* Rebuild the schema-v2 torrent-level word index (torrent_docs) of an existing
  * db_path database from its base tables, in bounded id chunks. Idempotent (a
  * re-run replaces each chunk's rowid range); the WAL is checkpointed and
  * truncated so the file is self-contained. Returns 0 on success, -1 on
@@ -203,7 +203,7 @@ int database_integrity_check(const char *db_path);
 int database_recover(const char *src_path, const char *dst_path);
 
 /* Create the FTS5 tables + triggers in an existing db_path database,
- * rebuild the external-content index (torrent_search) and backfill the
+ * rebuild the external-content index (torrent_search) and rebuild the
  * contentless torrent_docs index with the bundled SQLite. The WAL is
  * checkpointed and truncated so the file is self-contained. Returns 0 on
  * success, -1 on fatal error. */

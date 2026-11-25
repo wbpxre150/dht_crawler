@@ -396,8 +396,8 @@ typedef struct {
  * Render the feature text of one torrent: cap the evidence at CLF_FILE_CAP
  * files, run tparse, then tp_feature_text(). This exists ONCE so the ingest
  * path and the adult-only path can never disagree about the cap or the text
- * (a backfilled verdict and an ingest verdict are produced from byte-identical
- * input).
+ * (an adult-scored verdict and an ingest verdict are produced from
+ * byte-identical input).
  *
  * @return 0 with *out filled; 1 when tparse rejected the name or the file array
  *         could not be allocated (the caller decides how loud that is).
@@ -543,9 +543,9 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
     return 0;
 }
 
-/* Adult-only scoring, the token-gated backfill's entry point. It runs the SAME
+/* Adult-only scoring, the entry point for the adult-scoring pass. It runs the SAME
  * capped-50 -> tparse -> feature text -> CRAM forward pass as the ingest path
- * (clf_build_features() is shared), so a backfilled verdict and an ingest
+ * (clf_build_features() is shared), so an adult-scored verdict and an ingest
  * verdict are produced from byte-identical input and cannot disagree about the
  * evidence or the boundary; only the fields returned differ. */
 int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
@@ -577,7 +577,7 @@ int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double
     if (p > 1.0) p = 1.0;
     if (adult_p) *adult_p = p;
     if (adult) *adult = verdict.adult; /* same >= boundary as the ingest path */
-    /* Deliberately no stats bump: these are backfill rows, not ingest rows, and
+    /* Deliberately no stats bump: these are adult-scored rows, not ingest rows, and
      * folding them into total_classified would distort mean_us_per_item (which
      * measures the full ingest call). */
     return 0;
@@ -735,7 +735,7 @@ int classifier_classify(const torrent_metadata_t *meta, classification_t *out) {
 }
 
 /* This flavour has no models and no tparse, so it never produces an adult
- * verdict; every adult-backfill run reports DISABLED before it gets here. */
+ * verdict. */
 int classifier_classify_adult(const torrent_metadata_t *meta, int *adult, double *adult_p) {
     (void)meta;
     if (adult) *adult = 0;

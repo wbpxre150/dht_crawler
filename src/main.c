@@ -279,7 +279,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* --rebuild-docs <db>: backfill the schema-v2 torrent-level word index
+    /* --rebuild-docs <db>: rebuild the schema-v2 torrent-level word index
      * (torrent_docs) of an existing database from its base tables. One-shot
      * maintenance, dispatched before the daemon initialises anything, so it
      * needs no configuration, no app context and no cleanup call. Scanned in
@@ -619,7 +619,7 @@ int main(int argc, char *argv[]) {
     /*******************************************************************
      * --rebuild-fts <db>: create the FTS5 tables + triggers in an
      * existing database, rebuild the external-content torrent_search
-     * index and backfill the contentless torrent_docs index with the
+     * index and rebuild the contentless torrent_docs index with the
      * bundled SQLite, which always has FTS5 compiled in (unlike the
      * platform SQLite). The restore path bulk-imports the base tables
      * from the Kotlin side first, then calls this on the TEMP database
@@ -727,11 +727,11 @@ int main(int argc, char *argv[]) {
      * is stored (tag) or discarded (drop). Set once, before any worker thread. */
     classifier_set_adult_mode(config.adult_mode);
 
-    /* Movie-kind (v9) classifier: manifest/sha256 gated and lazy - the 152.8 MiB
-     * backbone is only mapped by the first classify, so a crawler that never
-     * backfills never pays for it. Non-fatal: a phone without the v9 assets
-     * leaves the module disabled, and the backfill daemon then reports
-     * "disabled" without touching the database. */
+    /* Movie-kind classifier: manifest/sha256 gated and lazy - the backbone is
+     * only mapped by the first classify, so a crawler that never labels a
+     * movie row never pays for it. Non-fatal: a phone without the model files
+     * leaves the module disabled and every movie row unlabelled (both
+     * movie_kind columns NULL) - /stats movie_kind reports model_ready=false. */
     if (config.movie_kind_enabled) {
         if (movie_kind_init(config.movie_kind_model_dir) == 0) {
             movie_kind_set_threads(config.movie_kind_threads);

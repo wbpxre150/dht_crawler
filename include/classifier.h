@@ -132,15 +132,15 @@ void classifier_init(const char *model_dir, double adult_hide_threshold);
 int classifier_classify(const torrent_metadata_t *meta, classification_t *out);
 
 /*
- * Score the adult verdict for one torrent (the token-gated backfill's entry
- * point).
+ * Score the adult verdict for one torrent (the entry point for the adult-
+ * scoring pass).
  *
  * It runs the same capped-50 -> tparse -> feature text -> CRAM forward pass as
- * classifier_classify() (the feature helper is shared), so a backfilled verdict
+ * classifier_classify() (the feature helper is shared), so an adult-scored verdict
  * and an ingest verdict are produced from byte-identical input; only the fields
  * returned differ. The verdict is the CRAM adult marginal, tagged with the same
  * rule as the ingest path (adult = adult_p >= the effective adult hide
- * threshold), so a backfilled row and a freshly ingested one can never disagree
+ * threshold), so an adult-scored row and a freshly ingested one can never disagree
  * about the boundary.
  *
  * @return 0 and both out-parameters filled on success; 1 when no verdict is

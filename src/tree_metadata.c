@@ -1819,8 +1819,8 @@ void *tree_metadata_worker_func(void *arg) {
                     }
                 }
 
-                /* Movie-kind (v10): label the same population the backfill
-                 * engine's predicate would pick up - a classified movie that is
+                /* Movie-kind (v10): label the same population the unlabelled-row
+                 * predicate would pick up - a classified movie that is
                  * not adult - but here, before the row is stored, so no pass has
                  * to walk the table afterwards. The mask travels in db_meta like
                  * the fastText verdict: batch_writer_add() deep-copies it and

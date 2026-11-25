@@ -867,7 +867,7 @@ static void do_backup(batch_writer_t *writer) {
      * delete triggers since the backup is append-only. The backup never
      * populates torrent_docs either: it is contentless, so its rows cannot be
      * copied by INSERT…SELECT — a restored backup gets that index from the
-     * --rebuild-docs backfill. */
+     * --rebuild-docs one-shot. */
     char *err = NULL;
     rc = sqlite3_exec(bak,
         "CREATE TABLE IF NOT EXISTS torrents ("

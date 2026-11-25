@@ -104,7 +104,7 @@ typedef int (*movie_kind_embedding_provider_t)(void *userdata, const char *name,
  * Initialise the module for `model_dir` (NULL/empty falls back to
  * "models/v10"). Reads and verifies the manifest; the 478.2 MiB backbone is NOT
  * mapped here — the first movie_kind_classify() call loads it, so a crawler
- * that never backfills never pays for it.
+ * that never labels a movie row never pays for it.
  *
  * Non-fatal by contract, like classifier_init(): an unreadable manifest, a
  * missing/short/wrong-sha file or a manifest without a usable generation only
@@ -166,7 +166,7 @@ int movie_kind_manifest_ok(void);
 int movie_kind_model_ready(void);
 
 /* Model generation from the manifest ("v9" -> 9), for `movie_kind_clf_ver`
- * and for generation-scoped backfill resumes. 0 when no manifest was read. */
+ * 0 when no manifest was read. */
 long long movie_kind_generation(void);
 
 /* manifest.genres count, and bit -> name in manifest order (NULL when the
@@ -177,7 +177,7 @@ const char *movie_kind_genre_name(int index);
 /* Copy the current counters into *out (whole-struct copy under the mutex). */
 void movie_kind_get_stats(movie_kind_stats_t *out);
 
-/* Count one thermal back-off pause (the backfill engine reports it here). */
+/* Count one thermal back-off pause (reported by the caller here). */
 void movie_kind_note_thermal_pause(void);
 
 #ifdef MOVIE_KIND_TEST

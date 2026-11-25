@@ -70,7 +70,7 @@ static const char *CREATE_TABLES_SQL =
      * adult_p values of this row. Appended after the movie-kind pair on
      * purpose - the ingest binds 13/14 and the backup's INSERT ... SELECT *
      * copy both key off this order. NULL means "never adult-scored by the
-     * token-gated pass", which is exactly the backfill engine's candidate
+     * token-gated pass", which is exactly the unlabelled-row candidate
      * predicate. Additive and nullable: a database that predates the column
      * simply has no row marked, and a mask-style 0 verdict does not exist
      * here (adult is 0/1), so the generation - never the label - is the
@@ -619,11 +619,11 @@ int database_create_schema(database_t *db) {
 /* Rebuild the schema-v2 torrent-level word index (torrent_docs) of an existing
  * database from its base tables. Used by `--rebuild-docs <db>`: the table, its
  * delete trigger and the ingest path all ship with the daemon, but a database
- * that predates them has an empty torrent_docs and has to be backfilled once.
+ * that predates them has an empty torrent_docs and has to be rebuilt once.
  *
  * The index is contentless (content='', contentless_delete=1), so rows are
  * inserted explicitly with the same body the flush path builds: the torrent
- * name plus every leaf filename of that torrent. The backfill runs in bounded
+ * name plus every leaf filename of that torrent. The rebuild runs in bounded
  * chunks of torrent ids, one transaction per chunk, deleting the chunk's rowid
  * range first so a re-run is idempotent (rowids in a gap are harmless). On a
  * chunk failure the chunk is rolled back; earlier chunks stay committed and a
@@ -1054,7 +1054,7 @@ static int database_insert_torrent_unsafe(database_t *db, const torrent_metadata
         sqlite3_bind_int64(db->insert_class_stmt, 12, c->clf_ver);
         /* The movie-kind columns are written here, inline, when the ingest
          * worker labelled the row (tree_metadata.c). NULL otherwise, which is
-         * what makes the row a candidate for the backfill engine's predicate
+         * what makes the row a candidate for the unlabelled-row predicate
          * (movie_kind_clf_ver IS NULL). The generation is the one the caller
          * stamped with movie_kind_generation() - a literal would poison every
          * future generation. */
@@ -1766,7 +1766,7 @@ int database_recover(const char *src_path, const char *dst_path) {
 
 /* Create the FTS5 tables + triggers in an existing database, rebuild the
  * external-content torrent_search index with the bundled SQLite (FTS5 is
- * always compiled in, unlike the platform SQLite) and backfill the
+ * always compiled in, unlike the platform SQLite) and rebuild the
  * contentless torrent_docs index. Used by `--rebuild-fts <db>` after a
  * bulk import has filled the base tables: the FTS objects are created
  * here (all IF NOT EXISTS) and the FTS5 'rebuild' command regenerates
@@ -1838,9 +1838,9 @@ int database_rebuild_fts(const char *db_path) {
      * the idempotent, contentless_delete-aware database_rebuild_docs()
      * (also used by --rebuild-docs) does, including its own WAL
      * checkpoint/truncate so the file stays self-contained. */
-    log_msg(LOG_INFO, "rebuild-fts: backfilling torrent_docs ...");
+    log_msg(LOG_INFO, "rebuild-fts: rebuilding torrent_docs ...");
     if (database_rebuild_docs(db_path) != 0) {
-        log_msg(LOG_ERROR, "rebuild-fts: torrent_docs backfill failed; database left unchanged.");
+        log_msg(LOG_ERROR, "rebuild-fts: torrent_docs rebuild failed; database left unchanged.");
         return -1;
     }
 
