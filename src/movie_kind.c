@@ -498,6 +498,43 @@ void movie_kind_note_thermal_pause(void) {
  * it once, on the first model load (not at init, which must stay cheap). */
 static int mk_backend_ready = 0;
 
+/* llama.cpp's default log callback (llama-impl.cpp:84 at the pin) ignores the
+ * level and fputs every line to stderr, which the app captures verbatim into
+ * files/logs/dht_crawler.log. One model load therefore buries the crawler's own
+ * lines under llama.cpp's load diagnostics - the ~500 `llama_graph_n_input_tensors`
+ * lines from sched_reserve() are DEBUG, but the GGUF metadata dump, print_info,
+ * load_tensors and llama_context/llama_kv_cache blocks are INFO and add ~230 more
+ * - with no timestamp and no level. Route llama.cpp through log_msg and hold all
+ * of it at DEBUG: the crawler's own one-line `MovieKind: model loaded (...)` is
+ * the load summary worth reading at INFO, and llama.cpp's WARN/ERROR (a failed
+ * encode, an unsupported op) still surface there. */
+static log_level_t mk_llama_log_level(enum ggml_log_level level) {
+    switch (level) {
+        case GGML_LOG_LEVEL_ERROR: return LOG_ERROR;
+        case GGML_LOG_LEVEL_WARN:  return LOG_WARN;
+        default:                   return LOG_DEBUG;  /* DEBUG, INFO and CONT's fallback */
+    }
+}
+
+static void mk_llama_log(enum ggml_log_level level, const char *text, void *userdata) {
+    /* GGML_LOG_LEVEL_CONT continues the previous message, so it carries no level
+     * of its own. Benign as a plain static: every llama.cpp call this module
+     * makes is serialised under `mk.mutex`. */
+    static log_level_t last = LOG_INFO;
+    (void)userdata;
+
+    if (level == GGML_LOG_LEVEL_NONE) return;
+    if (level != GGML_LOG_LEVEL_CONT) last = mk_llama_log_level(level);
+    if (!text || !*text) return;
+
+    /* log_msg() appends the newline and reads its argument as a printf format,
+     * so llama.cpp's text must be neither newline-terminated nor interpolated. */
+    size_t len = strlen(text);
+    while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r')) len--;
+    if (len == 0) return;
+    log_msg(last, "%.*s", (int)len, text);
+}
+
 /* Load the backbone (and the head it has to agree with) on first use. Called
  * with `mutex` held. */
 static int mk_model_ensure_locked(void) {
@@ -508,6 +545,9 @@ static int mk_model_ensure_locked(void) {
 
     if (!mk_backend_ready) {
         llama_backend_init();
+        /* Installed before the first model load, because that is where the
+         * ~500-line graph dump happens (llama_init_from_model -> sched_reserve). */
+        llama_log_set(mk_llama_log, NULL);
         mk_backend_ready = 1;
     }
 
