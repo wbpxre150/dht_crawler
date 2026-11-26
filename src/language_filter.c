@@ -46,7 +46,6 @@ static int is_non_latin(uint32_t cp) {
     if (cp <= 0x036F) return 0;           /* Latin Basic + Extended A/B + combining diacritics */
     if (cp >= 0x1E00 && cp <= 0x1EFF) return 0; /* Latin Extended Additional */
     if (cp >= 0xA720 && cp <= 0xA7FF) return 0; /* Remaining Latin forms */
-    if (cp <= 0x0040) return 0;           /* ASCII control + punctuation — neutral */
     if (cp >= 0x2000 && cp <= 0x206F) return 0; /* General punctuation — neutral */
     if (cp >= 0x2100 && cp <= 0x214F) return 0; /* Letterlike symbols — neutral */
     return 1;
@@ -86,11 +85,17 @@ void language_filter_cleanup(void) {
     lf_state.threshold = 0;
 }
 
+/* "At or above threshold", compared exactly: nl/total >= threshold/100 without
+ * the integer truncation the percentage form would introduce. A torrent that is
+ * exactly at the threshold is filtered - the log line and the config comment
+ * both say "at or above", and the header comment used to say "exceed", which
+ * disagreed with this comparison. */
 static int exceeds_threshold(const char *str, int threshold) {
     int l, nl;
     count_script_chars(str, &l, &nl);
     int total = l + nl;
-    return total > 0 && (nl * 100 / total) >= threshold;
+    if (total <= 0) return 0;
+    return (int64_t)nl * 100 >= (int64_t)threshold * total;
 }
 
 int language_filter_check(const torrent_metadata_t *metadata) {
@@ -118,7 +123,7 @@ filtered:
     lf_state.stats.total_filtered++;
     pthread_mutex_unlock(&lf_state.stats_mutex);
 
-    log_msg(LOG_DEBUG, "Language filter: filtered non-Latin (>%d%%): %s",
+    log_msg(LOG_DEBUG, "Language filter: filtered non-Latin (>=%d%%): %s",
             lf_state.threshold, metadata->name ? metadata->name : "(no name)");
     return 1;
 }
@@ -127,5 +132,9 @@ void language_filter_get_stats(language_filter_stats_t *stats) {
     if (!stats) return;
     pthread_mutex_lock(&lf_state.stats_mutex);
     *stats = lf_state.stats;
+    /* The effective state lives on lf_state, not in the counters: derive it here
+     * so a disabled filter can never be reported as "enabled with no data". */
+    stats->enabled = (lf_state.initialized && lf_state.threshold > 0) ? 1 : 0;
+    stats->threshold = lf_state.threshold;
     pthread_mutex_unlock(&lf_state.stats_mutex);
 }

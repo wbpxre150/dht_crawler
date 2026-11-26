@@ -111,8 +111,12 @@ void config_init_defaults(crawler_config_t *config) {
     config->global_bootstrap_timeout_sec = 600;
     config->global_bootstrap_workers = 20;
 
-    /* Language filter defaults 
-    config->language_filter_non_latin_threshold = 33; /* Filter if >33% non-Latin characters */
+    /* Language filter defaults: drop a torrent whose name or any file path is
+     * at or above this share of non-Latin script characters (0 = disabled).
+     * This assignment used to sit inside this comment block, which left the
+     * field at 0 from the memset above and silently disabled the filter on
+     * every install that did not write the key in config.ini. */
+    config->language_filter_non_latin_threshold = 33;
 
     /* Ingest-time classifier defaults (Stage 5, tag mode) */
     config->classifier_enabled = 1;                 /* On by default; tag mode only */

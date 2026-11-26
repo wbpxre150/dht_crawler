@@ -129,6 +129,14 @@ INFLIGHT_TEST_SRCS = tests/test_inflight_set.c src/inflight_set.c tests/stub_log
 INFLIGHT_TEST_BIN = $(BUILD_DIR)/test_inflight_set
 INFLIGHT_TEST_LDFLAGS = -luv -lpthread
 
+# The language filter is pure string logic (UTF-8 decode + script classification)
+# over torrent_metadata_t: no database, no bloom filter, no uv loop, so this
+# binary needs the module and the log stub only. It pins the threshold semantics
+# the /stats block publishes: at-or-above filters, 0 disables and counts nothing.
+LANG_TEST_SRCS = tests/test_language_filter.c src/language_filter.c tests/stub_log.c
+LANG_TEST_BIN = $(BUILD_DIR)/test_language_filter
+LANG_TEST_LDFLAGS = -lpthread
+
 # The last-interval stats sampler is pure arithmetic over four counters: no
 # database, no bloom filter, no uv loop, no civetweb, no logging, so this test
 # needs only the module and the test itself. It covers the first-tick zeros, the
@@ -311,7 +319,7 @@ MOVIE_KIND_FILTER_TEST_BIN = $(BUILD_DIR)/test_movie_kind_filter
 MOVIE_KIND_FILTER_TEST_CFLAGS = -ffunction-sections -fdata-sections
 MOVIE_KIND_FILTER_TEST_LDFLAGS = -Wl,--gc-sections -lsqlite3 -luv -lpthread -lm lib/libbloom/build/libbloom.a
 
-tests: tests-http-fetch tests-model-fetch tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
+tests: tests-http-fetch tests-model-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill \
        tests-movie-kind tests-movie-kind-render tests-movie-backfill \
        tests-movie-backfill-daemon tests-movie-kind-filter
 
@@ -334,6 +342,11 @@ tests-inflight:
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(INFLIGHT_TEST_SRCS) -o $(INFLIGHT_TEST_BIN) $(TEST_LDFLAGS) $(INFLIGHT_TEST_LDFLAGS)
 	./$(INFLIGHT_TEST_BIN)
+
+tests-language-filter:
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) $(INCLUDES) $(LANG_TEST_SRCS) -o $(LANG_TEST_BIN) $(TEST_LDFLAGS) $(LANG_TEST_LDFLAGS)
+	./$(LANG_TEST_BIN)
 
 tests-stats-window:
 	@mkdir -p $(BUILD_DIR)
@@ -512,4 +525,4 @@ models:
 llama:
 	tools/build-llama.sh --prefix $(LLAMA_INSTALL)
 
-.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon
+.PHONY: run debug asan tsan valgrind tests tests-http-fetch tests-search tests-docs tests-inflight tests-language-filter tests-stats-window tests-meta-peer-fail tests-cram tests-backfill tests-backfill-daemon tests-adult-backfill tests-movie-kind tests-movie-kind-render tests-movie-backfill tests-movie-backfill-daemon tests-movie-kind-filter tests-asan tests-asan-cram tests-asan-backfill tests-asan-backfill-daemon tests-asan-movie-backfill tests-asan-movie-backfill-daemon

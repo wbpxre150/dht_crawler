@@ -4,6 +4,7 @@
 #include "bloom_filter.h"
 #include "inflight_set.h"
 #include "language_filter.h"
+#include "language_filter_cleanup.h"
 #include "classifier.h"
 #include "hard_block.h"
 #include "category_filter_cleanup.h"
@@ -220,6 +221,7 @@ int main(int argc, char *argv[]) {
     const char *models_dir = NULL;
     bool models_force = false;
     bool category_filter_update = false;
+    bool language_filter_cleanup_db = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n\n", argv[0]);
@@ -227,6 +229,8 @@ int main(int argc, char *argv[]) {
             printf("  --rebuild-bloom-filter   Rebuild the bloom filter from the existing database\n");
             printf("  --category-filter-update Remove torrents outside save_categories/save_tv_kinds\n");
             printf("                           and adult-tagged torrents from the database\n");
+            printf("  --language-filter-cleanup Remove torrents whose name or a file path is at or\n");
+            printf("                           above language_filter_non_latin_threshold non-Latin\n");
             printf("  --compact                Compact the database by writing a fresh copy and replacing the original\n");
             printf("  --check-database         Run an integrity check on the database and report any errors\n");
             printf("  --recover-database       Recover the database by copying all readable rows to a fresh\n");
@@ -245,6 +249,8 @@ int main(int argc, char *argv[]) {
             rebuild_bloom = true;
         } else if (strcmp(argv[i], "--category-filter-update") == 0) {
             category_filter_update = true;
+        } else if (strcmp(argv[i], "--language-filter-cleanup") == 0) {
+            language_filter_cleanup_db = true;
         } else if (strcmp(argv[i], "--compact") == 0) {
             compact_db = true;
         } else if (strcmp(argv[i], "--check-database") == 0) {
@@ -1248,6 +1254,44 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         log_msg(LOG_INFO, "category filter update complete");
+        cleanup_app_context(&g_app_ctx);
+        return 0;
+    }
+
+    /*******************************************************************
+     * --language-filter-cleanup: delete every stored torrent whose name or a
+     * file path is at or above language_filter_non_latin_threshold, then exit.
+     * The ingest filter only applies to rows discovered after it is enabled,
+     * so a database collected while the filter was off (it defaulted to 0 for
+     * as long as the assignment in config_init_defaults() was commented out)
+     * needs this pass to catch up. language_filter_cleanup_run() reads the
+     * threshold from the module, so language_filter_init() above must have
+     * already run - it has. Never prompts: the app runs it with no TTY.
+     *******************************************************************/
+    if (language_filter_cleanup_db) {
+        if (config.language_filter_non_latin_threshold <= 0) {
+            log_msg(LOG_ERROR, "--language-filter-cleanup: language_filter_non_latin_threshold "
+                               "is 0 (disabled) in config.ini; nothing to sweep");
+            database_cleanup(&g_database);
+            torrent_search_cleanup();
+            hard_block_cleanup();
+            language_filter_cleanup();
+            bloom_filter_cleanup(g_bloom);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+        int lfrc = language_filter_cleanup_run(&g_database, g_app_ctx.db_path, 0);
+        database_cleanup(&g_database);
+        torrent_search_cleanup();
+        hard_block_cleanup();
+        language_filter_cleanup();
+        bloom_filter_cleanup(g_bloom);
+        if (lfrc != 0) {
+            log_msg(LOG_ERROR, "language filter cleanup failed (%d); the database was left in place", lfrc);
+            cleanup_app_context(&g_app_ctx);
+            return 1;
+        }
+        log_msg(LOG_INFO, "language filter cleanup complete");
         cleanup_app_context(&g_app_ctx);
         return 0;
     }

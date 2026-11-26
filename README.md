@@ -140,7 +140,7 @@ warning rather than rejected. Defaults worth knowing:
 | get_peers | `tree_get_peers_deadline_ms` (6000), `_fanout` (8), `_max_queries` (16), `_timeout_ms` (1500) |
 | metadata | `tree_tcp_connect_timeout_ms` (2000), `tree_parallel_peers` (2), `tree_metadata_timeout_ms` (60000), `tree_metadata_fresh_peer_retries` (1) |
 | Respawn | `min_metadata_rate` (0.01), `dynamic_rate_margin` (0.02), `tree_rate_check_interval_sec` (60), `respawn_drain_timeout_sec` (120) |
-| Filtering | `adult_mode` (`tag`), `adult_hide_threshold` (0.375), `hard_block_file` (`hard_block.txt`), `language_filter_non_latin_threshold` (0 = off), `save_categories`, `save_tv_kinds` (unset = save everything) |
+| Filtering | `adult_mode` (`tag`), `adult_hide_threshold` (0.375), `hard_block_file` (`hard_block.txt`), `language_filter_non_latin_threshold` (33, 0 = off), `save_categories`, `save_tv_kinds` (unset = save everything) |
 | Models | `classifier_model_dir` (`models/v15`), `movie_kind_model_dir` (`models/v13`), `movie_kind_threads` (4), `movie_kind_thermal_backoff_c` (82), `classify_backfill_mode` (`all`) |
 
 Two groups are documented separately because they are opt-in and were measured
@@ -236,8 +236,14 @@ Ingest-time, optional per build flavour:
   mask (action, comedy, drama, horror, thriller, scifi, fantasy, animation,
   documentary, romance, crime, adventure, family, mystery, war, western). The
   `movie_kind` filter is conjunctive: a row must carry every requested genre.
-- **Always-on filters:** `hard_block.txt` (one term per line) and the optional
-  non-Latin ratio filter.
+- **Non-Latin filter (on by default):** a torrent whose name — or any of its file
+  paths — is at or above `language_filter_non_latin_threshold` percent non-Latin
+  script characters (default 33, `0` disables) is dropped at ingest. ASCII digits,
+  punctuation and Latin-with-diacritics count as neutral or Latin. The ratio is
+  per string over the whole path, so a CJK directory with an ASCII filename can
+  stay under the threshold. Rows stored while the filter was off (or below a
+  later-lowered threshold) need `--language-filter-cleanup`.
+- **Always-on filter:** `hard_block.txt`, one term per line.
 - **Ingest gating:** `save_categories` / `save_tv_kinds` narrow what is stored;
   unset means everything. `--category-filter-update` applies the same selection to
   an existing database and also purges adult-tagged rows.
@@ -259,6 +265,7 @@ These modes do their work and exit without starting the crawler.
 | `--rebuild-docs <db>` | backfill the `torrent_docs` word index from the base tables |
 | `--print-schema` | print the schema DDL and exit |
 | `--category-filter-update` | purge rows outside `save_categories`/`save_tv_kinds`, plus adult-tagged rows |
+| `--language-filter-cleanup` | purge stored torrents at or above `language_filter_non_latin_threshold`; refuses when the threshold is 0 |
 | `--classify-backfill <db>` | re-classify with the loaded generation; dry run unless `--write`, `--classify-backfill-limit <n>` |
 | `--adult-backfill <db>` | token-gated adult pass only; dry run unless `--write`, `--adult-backfill-limit <n>` |
 | `--movie-kind-backfill <db>` | genre masks; `--dry-run`, `--limit <n>`, `--reset`, `--dump-masks` |
@@ -269,8 +276,9 @@ These modes do their work and exit without starting the crawler.
 ## Tests
 
 ```bash
-make tests      # 16 host binaries: search, docs, cram, backfills, movie-kind,
-                # model fetch, http fetch, inflight set, stats window, meta-peer-fail
+make tests      # 17 host binaries: search, docs, cram, backfills, movie-kind,
+                # model fetch, http fetch, inflight set, language filter,
+                # stats window, meta-peer-fail
 make tests-asan # the same under ASan/UBSan (tests-asan-cram, -backfill, …)
 make asan       # build the crawler with ASan + UBSan
 make tsan       # build the crawler with ThreadSanitizer

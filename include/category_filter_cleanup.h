@@ -98,7 +98,10 @@ void category_filter_get_stats(category_filter_stats_t *out);
  * The db-wide language rescan the pass used to run is gone: the ingest-time
  * language filter is always on (language_filter.c + the
  * language_filter_non_latin_threshold config key), so every stored row already
- * passed it. The rescan deleted 0 rows and added hours to the run.
+ * passed it. The rescan deleted 0 rows and added hours to the run. Rows stored
+ * while the filter was disabled (it used to default to 0 by accident) are swept
+ * by the dedicated --language-filter-cleanup pass instead, which keeps the
+ * expensive db-wide rescan off this path.
  *
  * Aborts — before deleting anything — when the union of the three rules would
  * remove every row in the database; the config parser cannot produce that state

@@ -764,17 +764,26 @@ static int stats_handler(struct mg_connection *conn, void *cbdata) {
         cJSON_AddItemToObject(root, "config", config_json);
     }
 
-    /* Add language filter statistics */
-    language_filter_stats_t lf_stats;
-    language_filter_get_stats(&lf_stats);
-    if (lf_stats.total_checked > 0) {
+    /* Language filter statistics. Published unconditionally, for the same reason
+     * the classifier block below is: a disabled filter must be distinguishable
+     * from "no torrents seen yet", and the effective threshold has to travel
+     * with the counters. `filter_rate_percent` is omitted rather than reported
+     * as 0 until something has actually been checked. */
+    {
+        language_filter_stats_t lf_stats;
+        language_filter_get_stats(&lf_stats);
+
         cJSON *language_filter = cJSON_CreateObject();
+        cJSON_AddBoolToObject(language_filter, "enabled", lf_stats.enabled ? 1 : 0);
+        cJSON_AddNumberToObject(language_filter, "threshold_percent", (double)lf_stats.threshold);
         cJSON_AddNumberToObject(language_filter, "total_checked", (double)lf_stats.total_checked);
         cJSON_AddNumberToObject(language_filter, "total_filtered", (double)lf_stats.total_filtered);
         cJSON_AddNumberToObject(language_filter, "filtered_by_non_latin", (double)lf_stats.filtered_by_non_latin);
 
-        double filter_rate = (lf_stats.total_filtered * 100.0) / lf_stats.total_checked;
-        cJSON_AddNumberToObject(language_filter, "filter_rate_percent", filter_rate);
+        if (lf_stats.total_checked > 0) {
+            double filter_rate = (lf_stats.total_filtered * 100.0) / lf_stats.total_checked;
+            cJSON_AddNumberToObject(language_filter, "filter_rate_percent", filter_rate);
+        }
 
         cJSON_AddItemToObject(root, "language_filter", language_filter);
     }

@@ -84,7 +84,7 @@ typedef struct {
     char rclone_bookmark_path[1024]; /* local bookmark file */
 
     /* Language filter settings */
-    int language_filter_non_latin_threshold; /* Filter torrents where non-Latin chars exceed this % (0=disabled, default: 33) */
+    int language_filter_non_latin_threshold; /* Drop a torrent whose name or a file path is >= this % non-Latin script (0=disabled, default: 33) */
 
     /* Ingest-time classifier settings (Stage 5, tag mode) */
     int classifier_enabled;             /* Enable ingest-time classification (0=disabled, default: 1) */

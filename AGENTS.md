@@ -43,6 +43,7 @@ those names.
               [--recover-database] [--restore-database <dump.sql>]
               [--rebuild-fts <db>] [--rebuild-docs <db>] [--print-schema]
               [--clear-failure-filter] [--category-filter-update]
+              [--language-filter-cleanup]
               [--fetch-bep51-cache] [--fetch-models]
               [--classify-backfill <db> [--write] [--classify-backfill-limit <n>]]
               [--adult-backfill <db> [--write] [--adult-backfill-limit <n>]]
@@ -74,6 +75,14 @@ The supervisor runs the same fetch automatically when its cache is below
 
 `--category-filter-update` purges rows outside `save_categories`/`save_tv_kinds`
 and every adult-tagged row (`torrent_class.adult = 1`).
+
+`--language-filter-cleanup` runs `language_filter_cleanup_run()` over the
+configured database: it backs up on request, scans every `torrents` row, applies
+`language_filter_check()` and deletes the matches in 5000-row batches inside one
+transaction. It reads the threshold from the already-initialized module, so it
+refuses (exit 1, database untouched) when
+`language_filter_non_latin_threshold` is 0, and it never prompts — the app runs
+it with no TTY.
 
 ## Architecture
 
@@ -142,7 +151,8 @@ counter that must survive a respawn has to be folded there, like the `gp_*` and
 | `src/movie_kind.c`, `src/jevhead.c` | movie-kind genre mask |
 | `src/model_fetch.c` | `--fetch-models` |
 | `src/http_fetch.c` | HTTPS fetch (OpenSSL on host, mbedTLS on Android) |
-| `src/meta_peer_fail.c`, `src/inflight_set.c`, `src/stats_window.c` | pure, host-tested helpers |
+| `src/meta_peer_fail.c`, `src/inflight_set.c`, `src/stats_window.c`, `src/language_filter.c` | pure, host-tested helpers |
+| `src/language_filter_cleanup.c` | `--language-filter-cleanup` sweep over stored rows |
 | `src/config.c` | defaults (`config_init_defaults`) + INI parser (`config_load_file`) |
 
 Per-tree state: routing table, infohash/peers/response queues, socket handle,
@@ -337,9 +347,14 @@ working directory and warns when it is missing. Values are parsed with `atoi`
 - Every default lives in `config_init_defaults()`; the struct comments in
   `include/config.h` are not always in step with it (e.g. it claims
   `tree_tcp_connect_timeout_ms` 5000, the code sets 2000).
-- `language_filter_non_latin_threshold` **defaults to 0 (disabled)**, not 33: the
-  assignment in `config_init_defaults()` sits inside a comment block that was
-  never closed before it. Fix it deliberately, not as a drive-by.
+- `language_filter_non_latin_threshold` defaults to **33** and the comparison is
+  **at or above** (`nl * 100 >= threshold * total`, exact, no truncation), so a
+  torrent that is exactly 33 % non-Latin is dropped. It used to default to 0 by
+  accident — the assignment sat inside a comment block that was never closed —
+  which silently disabled the filter; the field is now set outside any comment
+  and `tests-language-filter` pins the boundary. `0` disables the filter and
+  counts nothing, and `/stats` publishes `language_filter.enabled` /
+  `threshold_percent` unconditionally so a disabled filter is visible.
 - `config_parse_args()` exists but `main()` never calls it, so `-c/--config` is
   not a working flag. Do not document it as one.
 - `use_thread_trees` / `use_keyspace_partitioning` are 1 and there is no second
@@ -347,9 +362,11 @@ working directory and warns when it is missing. Values are parsed with `atoi`
 
 ## Testing notes
 
-`make tests` builds 16 standalone host binaries (no network, no submodule patches;
+`make tests` builds 17 standalone host binaries (no network, no submodule patches;
 the CRAM fixture and utf8proc are vendored). `make tests-asan` repeats them under
-ASan/UBSan. `tests/test_movie_kind_filter.c` compiles `src/http_api.c` into its
+ASan/UBSan. `tests-language-filter` covers the UTF-8 script classification, the
+at-or-above boundary, the clamps and the fail-open/disabled paths.
+`tests/test_movie_kind_filter.c` compiles `src/http_api.c` into its
 translation unit on purpose — the predicate fragments are file-local there, and
 `-ffunction-sections`/`--gc-sections` keep the rest out of the link. Tests that
 touch `src/database.c` also compile `src/bloom_filter.c` and link libbloom +
