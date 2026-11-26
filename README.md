@@ -10,7 +10,7 @@ Android app ships).
 
 ## What it does
 
-- **Supervisor + thread trees.** `num_trees` (default 4) independent trees, each
+- **Supervisor + thread trees.** `num_trees` (default 64) independent trees, each
   owning a Kademlia routing table, queues and a UDP socket; the supervisor
   respawns trees whose metadata rate collapses.
 - **Dual-stack DHT.** One IPv6 socket with `IPV6_V6ONLY` off, so IPv4 and IPv4-
@@ -21,7 +21,7 @@ Android app ships).
   failure bloom, and an in-flight claim set (262,144 slots, 900 s TTL) that stops
   two workers fetching the same infohash.
 - **Batched writes.** Rows are buffered and committed in transactions
-  (`batch_size` 1000, `flush_interval` 60 s) with a `wal_checkpoint(RESTART)`
+  (`batch_size` 500, `flush_interval` 300 s) with a `wal_checkpoint(RESTART)`
   after each flush.
 - **Warm start.** The BEP 51 node cache is persisted, and a published copy is
   fetched when the local cache is too small (see below).
@@ -127,19 +127,23 @@ start that fell back to router discovery is visible: `last_result` is `ok`,
 
 `config.ini` is read from the working directory. Keys are `key = value`, parsed
 with `atoi` (so `= true` is `0`), and out-of-range values are clamped with a
-warning rather than rejected. Defaults worth knowing:
+warning rather than rejected. The compiled defaults mirror the Android app's
+shipped crawler settings (`CrawlerSettings` + its seeded `config.ini.default`),
+except `http_port`/`http_bind`/`nice_level`, which keep host values here.
+`config.ini.example` lists every key with the same numbers and a note per key.
+Defaults worth knowing:
 
 | group | keys (default) |
 |---|---|
-| DHT | `dht_port` (6881), `udp_rate_limit_pps` (2500, 0 = off) |
+| DHT | `dht_port` (6881), `udp_rate_limit_pps` (3700, 0 = off) |
 | Database | `db_path` (`data/torrents.db`) |
 | HTTP | `http_port` (8080), `http_bind` (`0.0.0.0`), `nice_level` (0) |
-| Trees | `num_trees` (4), `tree_find_node_workers` (10), `tree_bep51_workers` (10), `tree_get_peers_workers` (8), `tree_metadata_workers` (2) |
-| Dedup | `bloom_capacity` (10000000), `failure_bloom_capacity` (30000000), `failure_strike_count` (2), `bloom_error_rate` (0.001) |
-| Writes | `batch_size` (1000), `flush_interval` (60) |
+| Trees | `num_trees` (64), `tree_find_node_workers` (3), `tree_bep51_workers` (5), `tree_get_peers_workers` (22), `tree_metadata_workers` (12) |
+| Dedup | `bloom_capacity` (30000000), `failure_bloom_capacity` (30000000), `failure_strike_count` (2), `bloom_error_rate` (0.001) |
+| Writes | `batch_size` (500), `flush_interval` (300) |
 | get_peers | `tree_get_peers_deadline_ms` (6000), `_fanout` (8), `_max_queries` (16), `_timeout_ms` (1500) |
-| metadata | `tree_tcp_connect_timeout_ms` (2000), `tree_parallel_peers` (2), `tree_metadata_timeout_ms` (60000), `tree_metadata_fresh_peer_retries` (1) |
-| Respawn | `min_metadata_rate` (0.01), `dynamic_rate_margin` (0.02), `tree_rate_check_interval_sec` (60), `respawn_drain_timeout_sec` (120) |
+| metadata | `tree_tcp_connect_timeout_ms` (2000), `tree_parallel_peers` (2), `tree_metadata_timeout_ms` (60000), `tree_metadata_fresh_peer_retries` (1), `tree_metadata_peer_blacklist_ttl_sec` (600) |
+| Respawn | `min_metadata_rate` (0.005), `dynamic_rate_margin` (0.01), `tree_rate_check_interval_sec` (120), `tree_min_lifetime_minutes` (8), `respawn_spawn_threshold` (20), `respawn_drain_timeout_sec` (180), `max_draining_trees` (16) |
 | Filtering | `adult_mode` (`tag`), `adult_hide_threshold` (0.375), `hard_block_file` (`hard_block.txt`), `language_filter_non_latin_threshold` (33, 0 = off), `save_categories`, `save_tv_kinds` (unset = save everything) |
 | Models | `classifier_model_dir` (`models/v15`), `movie_kind_model_dir` (`models/v13`), `movie_kind_threads` (4), `movie_kind_thermal_backoff_c` (82), `classify_backfill_mode` (`all`) |
 
@@ -148,11 +152,15 @@ net-negative on device:
 
 - **get_peers / metadata tuning** (`tree_get_peers_round_idle_ms`,
   `_penalize_misses`, `_slot_budget_ms`, `_finish_on_peers`,
-  `tree_metadata_piece_idle_ms`, `tree_metadata_peer_blacklist_ttl_sec`) — every
-  one ships at `0` (off). See `CONFIG_INI.md` for semantics, clamps and the
-  measured cost of each.
-- **Bootstrap routers** are hardcoded in `src/supervisor.c` (`BOOTSTRAP_HOSTS`);
-  the `/refresh` thread has its own list in `src/refresh_thread.c`.
+  `tree_metadata_piece_idle_ms`) — every one ships at `0` (off).
+  `tree_metadata_peer_blacklist_ttl_sec` is the one measured exception: it ships
+  at `600` because that A/B was a win, and `0` still disables it. See
+  `CONFIG_INI.md` for semantics, clamps and the measured cost of each.
+- **Bootstrap routers** are hardcoded in `src/supervisor.c` (`BOOTSTRAP_HOSTS`,
+  verified live 2026-11-26 — the 2024-era list was mostly NXDOMAIN) and in
+  `src/refresh_thread.c` (`REFRESH_BOOTSTRAP_HOSTS`); the `/refresh` thread has
+  its own list there. Every address a router resolves to is queried, because a
+  router's AAAA is frequently dead while its A records answer.
 
 The full key inventory is `include/config.h` plus the parser in
 `src/config.c:config_load_file`.
@@ -322,9 +330,10 @@ can sum to more than the failed-attempt count by design.
 
 ## Android / Termux
 
-- Android caps a process at roughly 10,000 threads; with the default
-  `num_trees` 4 the crawler stays far below that. Raising `num_trees` multiplies
-  every per-tree worker count.
+- Android caps a process at roughly 10,000 threads; the default `num_trees` 64
+  with 3 + 5 + 22 + 12 = 42 workers per tree estimates to ~2,750 threads
+  including the fixed overhead, so it stays below that cap. Raising `num_trees`
+  multiplies every per-tree worker count.
 - The Android build links mbedTLS instead of OpenSSL and uses
   `/system/etc/security/cacerts` as the default CA directory.
 - `nice_level` lets the crawler yield to the rest of the system.

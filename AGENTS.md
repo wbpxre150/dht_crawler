@@ -102,13 +102,17 @@ Supervisor (supervisor.c)
     └── UDP socket + dispatcher         — SO_REUSEPORT, routes responses by txn id
 ```
 
-`num_trees` defaults to **4**, not 32: `config_init_defaults()` in
-`src/config.c` is the single source of truth for every default (workers 10
-find_node / 10 BEP51 / 8 get_peers / 2 metadata per tree).
+`num_trees` defaults to **64**, matching the Android app's shipped settings, and
+`config_init_defaults()` in `src/config.c` is the single source of truth for
+every default (workers 3 find_node / 5 BEP51 / 22 get_peers / 12 metadata per
+tree — 42 per tree, ~2,750 threads with the fixed overhead). `config.ini.example`
+mirrors those numbers key by key.
 
 ### Five-stage pipeline (per tree)
 
-1. **Bootstrap** — hardcoded routers (`BOOTSTRAP_HOSTS` in `src/supervisor.c`) plus
+1. **Bootstrap** — hardcoded routers (`BOOTSTRAP_HOSTS` in `src/supervisor.c`,
+   probed live 2026-11-26; `bootstrap_phase_a_url_lookup` tries **every**
+   resolved address of each host, not just the first) plus
    a sample of the BEP51 cache; a cold cache is first filled by a parallel URL
    bootstrap.
 2. **find_node** (`tree_protocol.c`) — discovers nodes, fills `tree_routing.c`.
@@ -232,10 +236,10 @@ thread writes. `rate = value / stats_interval_sec`.
 
 ### Per-address connect-failure memory (`meta_peer_fail.c`)
 
-`tree_metadata_peer_blacklist_ttl_sec` (default **0 = off**, clamp 60..3600) keys
-one supervisor-shared map: 131,072 slots × 32 B = 4 MiB, open addressing with
-FNV-1a + linear probing, one mutex, lazy TTL ageing on lookup/insert only (no
-thread, no sweep), load-factor clear at 3/4 = 98,304 slots.
+`tree_metadata_peer_blacklist_ttl_sec` (default **600**, clamp 60..3600, `0` =
+off) keys one supervisor-shared map: 131,072 slots × 32 B = 4 MiB, open
+addressing with FNV-1a + linear probing, one mutex, lazy TTL ageing on
+lookup/insert only (no thread, no sweep), load-factor clear at 3/4 = 98,304 slots.
 
 - **Fail-open is absolute.** `ttl_sec = 0` never creates the map; every lookup
   answers "do not skip" and every record is a no-op, so peer selection is
@@ -344,9 +348,11 @@ already in the database and enqueues a get_peers query on the refresh thread.
 working directory and warns when it is missing. Values are parsed with `atoi`
 (`= true` is 0) and out-of-range values are clamped with `LOG_WARN`, not rejected.
 
-- Every default lives in `config_init_defaults()`; the struct comments in
-  `include/config.h` are not always in step with it (e.g. it claims
-  `tree_tcp_connect_timeout_ms` 5000, the code sets 2000).
+- Every default lives in `config_init_defaults()`; `config.ini.example` mirrors
+  it key by key. The struct comments in `include/config.h` / `supervisor.h` /
+  `thread_tree.h` are documentation only and drift easily — trust the code.
+- `global_bootstrap_timeout_sec` is clamped into **10..600** (it used to stop at
+  300, which silently shortened the shipped 600 default).
 - `language_filter_non_latin_threshold` defaults to **33** and the comparison is
   **at or above** (`nl * 100 >= threshold * total`, exact, no truncation), so a
   torrent that is exactly 33 % non-Latin is dropped. It used to default to 0 by

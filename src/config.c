@@ -48,10 +48,19 @@ void config_init_defaults(crawler_config_t *config) {
     }
 
     memset(config, 0, sizeof(crawler_config_t));
-    
+
+    /* These defaults mirror the Android app's shipped crawler settings
+     * (torrent_kotlin_app: `CrawlerSettings` in app/src/main/java/com/torrent/app/
+     * config/AppConfig.kt plus the seeded assets/dht_crawler/config.ini.default),
+     * so `make && ./dht_crawler` crawls with the same tuning the phone runs.
+     * Three keys deliberately keep host values instead of the app's:
+     * http_port 8080 and http_bind 0.0.0.0 (the app points at its authenticated
+     * loopback proxy on 8081) and nice_level 0 (the app yields CPU on a phone).
+     * config.ini.example carries the same numbers with a note per key. */
+
     /* DHT defaults */
     config->dht_port = 6881;
-    config->udp_rate_limit_pps = 2500;              /* Outbound DHT UDP packets/sec (0=disabled) */
+    config->udp_rate_limit_pps = 3700;              /* Outbound DHT UDP packets/sec (0=disabled) */
 
     /* Database defaults */
     strncpy(config->db_path, "data/torrents.db", sizeof(config->db_path) - 1);
@@ -68,7 +77,7 @@ void config_init_defaults(crawler_config_t *config) {
     
     /* Phase 2: Bloom Filter defaults */
     config->bloom_enabled = 1;
-    config->bloom_capacity = 10000000;
+    config->bloom_capacity = 30000000;            /* 30M infohashes (same as the failure bloom) */
     config->failure_bloom_capacity = 30000000;  /* 30M entries (same as main bloom) */
     config->failure_strike_count = 2;           /* Two-strike policy */
     config->bloom_error_rate = 0.001;
@@ -83,8 +92,8 @@ void config_init_defaults(crawler_config_t *config) {
     config->max_connection_lifetime_sec = 300;  /* 5 minutes max total connection time */
 
     /* Phase 5: Batch Writer defaults */
-    config->batch_size = 1000;
-    config->flush_interval = 60;
+    config->batch_size = 500;
+    config->flush_interval = 300;
 
     /* Daily backup defaults */
     config->backup_enabled = 0;
@@ -150,19 +159,19 @@ void config_init_defaults(crawler_config_t *config) {
     config->save_tv_kind_mask = CATEGORY_FILTER_ALL_TV_KINDS;
 
     /* Thread tree defaults (Stage 1) */
-    config->num_trees = 4;                          /* 4 concurrent thread trees */
+    config->num_trees = 64;                         /* 64 concurrent thread trees */
 
     /* Thread tree Stage 2 defaults (find_node/bootstrap) */
-    config->tree_find_node_workers = 10;            /* 10 find_node workers per tree */
+    config->tree_find_node_workers = 3;             /* 3 find_node workers per tree */
 
     /* Thread tree Stage 3 defaults (BEP51) */
-    config->tree_bep51_workers = 10;                /* 10 BEP51 workers per tree */
-    config->tree_infohash_queue_capacity = 5000;    /* 5000 infohash queue capacity */
-    config->tree_bep51_query_interval_ms = 10;      /* 10ms between BEP51 queries */
+    config->tree_bep51_workers = 5;                 /* 5 BEP51 workers per tree */
+    config->tree_infohash_queue_capacity = 500;     /* 500 infohash queue capacity */
+    config->tree_bep51_query_interval_ms = 5;       /* 5ms between BEP51 queries */
 
     /* Thread tree Stage 4 defaults (get_peers) */
-    config->tree_get_peers_workers = 8;             /* 8 get_peers workers per tree */
-    config->tree_peers_queue_capacity = 2000;       /* 2000 peers queue capacity */
+    config->tree_get_peers_workers = 22;            /* 22 get_peers workers per tree */
+    config->tree_peers_queue_capacity = 500;        /* 500 peers queue capacity */
     config->tree_get_peers_timeout_ms = 1500;       /* 1.5s get_peers timeout */
     config->tree_get_peers_deadline_ms = 6000;      /* 6s get_peers lookup deadline (500-8000) */
     config->tree_get_peers_fanout = 8;              /* 8 concurrent get_peers queries per round (2-12) */
@@ -173,27 +182,27 @@ void config_init_defaults(crawler_config_t *config) {
     config->tree_get_peers_finish_on_peers = 0;     /* shipped off (opt-in): end a lookup as soon as peers are found (0-1) */
 
     /* Thread tree Stage 5 defaults (metadata) */
-    config->tree_metadata_workers = 2;              /* 2 metadata workers per tree */
+    config->tree_metadata_workers = 12;             /* 12 metadata workers per tree */
     config->tree_tcp_connect_timeout_ms = 2000;     /* 2 second TCP connect timeout */
     config->tree_parallel_peers = 2;                /* 2 parallel peer connections per infohash (1-4) */
     config->tree_metadata_fresh_peer_retries = 1;   /* 1 fresh-peer re-lookup before a strike (0 = off) */
     config->tree_metadata_timeout_ms = 60000;       /* 60s metadata fetch deadline */
     config->tree_metadata_piece_idle_ms = 0;        /* shipped off (opt-in): evict a conn with no new piece after N ms (0 = off, 3000-60000) */
-    config->tree_metadata_peer_blacklist_ttl_sec = 0; /* shipped off (opt-in): skip an address whose TCP connect failed, for N s (0 = off, 60-3600) */
+    config->tree_metadata_peer_blacklist_ttl_sec = 600; /* skip an address whose TCP connect failed, for N s (0 = off, 60-3600); 600 is the measured A/B winner */
 
     /* Thread tree metadata rate-based respawn defaults */
-    config->min_metadata_rate = 0.01;                  /* Floor for dynamic threshold */
-    config->dynamic_rate_margin = 0.02;                /* Margin from per-tree average */
-    config->tree_rate_check_interval_sec = 60;         /* Check every 60 seconds */
+    config->min_metadata_rate = 0.005;                 /* Floor for dynamic threshold */
+    config->dynamic_rate_margin = 0.01;                /* Margin from per-tree average */
+    config->tree_rate_check_interval_sec = 120;        /* Check every 120 seconds */
     config->tree_rate_grace_period_sec = 30;           /* 30 second grace period */
-    config->tree_min_lifetime_minutes = 10;            /* 10 minute minimum lifetime */
-    config->tree_require_empty_queue = 1;              /* Require empty queue before respawn */
+    config->tree_min_lifetime_minutes = 8;             /* 8 minute minimum lifetime */
+    config->tree_require_empty_queue = 0;              /* Do not require an empty queue before respawn */
     config->tree_rate_ema_alpha = 0.3;                 /* EMA smoothing alpha (default: 0.3) */
 
     /* Tree respawn overlapping defaults */
-    config->respawn_spawn_threshold = 50;              /* Spawn replacement at 50 connections */
-    config->respawn_drain_timeout_sec = 120;           /* Force destroy after 120 seconds */
-    config->max_draining_trees = 8;                    /* Max 8 draining trees simultaneously */
+    config->respawn_spawn_threshold = 20;              /* Spawn replacement at 20 connections */
+    config->respawn_drain_timeout_sec = 180;           /* Force destroy after 180 seconds */
+    config->max_draining_trees = 16;                   /* Max 16 draining trees simultaneously */
 
     /* Thread tree mode toggle - stable and production-ready */
     config->use_thread_trees = 1;                   /* 1=thread tree architecture */
@@ -221,9 +230,9 @@ void config_init_defaults(crawler_config_t *config) {
     config->bep51_cache_fetch_timeout_sec = 30;
     config->bep51_cache_ca_file[0] = '\0';
     config->bep51_cache_ca_dir[0] = '\0';
-    config->bep51_cache_capacity = 10000;           /* 10000 nodes max */
-    config->bep51_cache_submit_percent = 5;         /* 5% submission rate */
-    config->bep51_node_cooldown_sec = 30;           /* 30 second cooldown per node */
+    config->bep51_cache_capacity = 50000;           /* 50000 nodes max */
+    config->bep51_cache_submit_percent = 17;        /* 17% submission rate */
+    config->bep51_node_cooldown_sec = 3;            /* 3 second cooldown per node */
 }
 
 /* Load config from INI-style file */
@@ -473,7 +482,10 @@ int config_load_file(crawler_config_t *config, const char *config_file) {
         } else if (strcmp(key, "global_bootstrap_timeout_sec") == 0) {
             config->global_bootstrap_timeout_sec = atoi(value);
             if (config->global_bootstrap_timeout_sec < 10) config->global_bootstrap_timeout_sec = 10;
-            if (config->global_bootstrap_timeout_sec > 300) config->global_bootstrap_timeout_sec = 300;
+            /* The compiled default is 600, so the clamp has to admit it: a cap
+             * of 300 silently shortened every install that wrote the default
+             * value into config.ini. */
+            if (config->global_bootstrap_timeout_sec > 600) config->global_bootstrap_timeout_sec = 600;
         } else if (strcmp(key, "global_bootstrap_workers") == 0) {
             config->global_bootstrap_workers = atoi(value);
             if (config->global_bootstrap_workers < 1) config->global_bootstrap_workers = 1;

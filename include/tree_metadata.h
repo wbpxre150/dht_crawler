@@ -33,7 +33,7 @@ typedef struct tree_torrent_metadata {
  * Configuration for metadata fetching
  */
 typedef struct tree_metadata_config {
-    int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 2000) */
     int metadata_timeout_ms;        /* Overall metadata fetch timeout (default: 60000) */
     int max_metadata_size;          /* Max metadata size in bytes (default: 10MB) */
     int parallel_peers;             /* Number of peers to connect in parallel (default: 2, max 4) */

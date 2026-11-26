@@ -1,0 +1,417 @@
+# ============================================================================
+# dht_crawler — example configuration
+#
+# Copy this file to `config.ini` in the working directory (it is gitignored)
+# and edit what you need. Every key below is shown at its compiled default, so
+# an untouched copy changes nothing. `src/config.c:config_init_defaults()` is
+# the single source of truth; `src/config.c:config_load_file()` is the parser.
+#
+# These defaults mirror the Android app's shipped crawler settings
+# (torrent_kotlin_app: CrawlerSettings + assets/dht_crawler/config.ini.default).
+# Three keys deliberately differ there: `http_port`, `http_bind` and
+# `nice_level` keep host values here, because the app points at its own
+# authenticated loopback proxy and yields CPU on a phone.
+#
+# PARSER RULES (they bite):
+#   * Format is `key = value`, one per line.
+#   * `#` starts a comment ONLY in column 1. A comment after a value on the
+#     same line is NOT stripped — keep every comment on its own line.
+#   * `;` is not a comment character.
+#   * Integers and doubles are parsed with atoi/atof: `= true` is 0, `= 12abc`
+#     is 12. There is no boolean type — use 0 / 1.
+#   * Out-of-range values are CLAMPED with a LOG_WARN, never rejected.
+#   * Unknown keys are ignored silently (no warning) — a typo is invisible.
+#   * Lines longer than 511 bytes are truncated.
+#   * The file is optional: absent or unreadable, the crawler warns and runs on
+#     the compiled defaults.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# DHT / database / logging
+# ----------------------------------------------------------------------------
+# UDP port the crawler sends from and listens on.
+dht_port = 6881
+
+# Outbound DHT UDP packets per second, process-wide. 0 = unlimited;
+# otherwise clamped into 100..20000.
+udp_rate_limit_pps = 3700
+
+# SQLite database file. Created on first run; its directory must exist.
+db_path = data/torrents.db
+
+# DEBUG | INFO | WARN | ERROR (numeric 0..3 also accepted). Default INFO.
+log_level = INFO
+
+
+# ----------------------------------------------------------------------------
+# HTTP API (JSON only; the crawler serves no HTML)
+# ----------------------------------------------------------------------------
+# Port for the HTTP API. Clamped 1..65535.
+# (The Android app uses 8081 on loopback and lets its authenticated proxy own
+#  the LAN port; a standalone host normally wants the crawler itself on 8080.)
+http_port = 8080
+
+# Bind address. 0.0.0.0 = all interfaces; 127.0.0.1 = loopback only.
+http_bind = 0.0.0.0
+
+
+# ----------------------------------------------------------------------------
+# Process
+# ----------------------------------------------------------------------------
+# setpriority(2) nice level applied at startup, clamped -20..19. Positive
+# values make the crawler yield CPU to other processes (the app ships 10).
+nice_level = 0
+
+
+# ----------------------------------------------------------------------------
+# Bloom filters (infohash dedup + two-strike failure tracking)
+# ----------------------------------------------------------------------------
+bloom_enabled = 1
+
+# Expected distinct infohashes. 30M at error rate 0.001.
+bloom_capacity = 30000000
+
+# Expected distinct failing infohashes (the second, irreversible bloom).
+failure_bloom_capacity = 30000000
+
+# Failures before an infohash is blocked permanently: 1 = immediate,
+# 2 = two-strike. Clamped 1..2.
+failure_strike_count = 2
+
+# Target false-positive rate. Lower = more memory per entry.
+bloom_error_rate = 0.001
+
+# Persist both blooms to disk (1) or keep them in memory only (0).
+bloom_persist = 1
+
+# Minimum seconds between bloom disk saves: 0 = every flush, otherwise
+# clamped into 30..3600.
+bloom_persist_interval_sec = 300
+
+# Infohash bloom file. The failure bloom is derived from it
+# (`bloom.dat` -> `failure_bloom.dat` in the same directory).
+bloom_path = data/bloom.dat
+
+
+# ----------------------------------------------------------------------------
+# Batched writes
+# ----------------------------------------------------------------------------
+# Rows buffered before one transaction commit.
+batch_size = 500
+
+# Seconds between flushes even when batch_size has not been reached.
+flush_interval = 300
+
+
+# ----------------------------------------------------------------------------
+# Backups (all optional; off by default)
+# ----------------------------------------------------------------------------
+# Daily file copy. backup_path is the destination; %DATE% is replaced with
+# YYYY-MM-DD. Change the compiled default to a path that exists for you.
+backup_enabled = 0
+backup_path = /home/adam/external_hdd/dht_crawler_backup/torrent.db.bak
+
+# SSH incremental backup: streams new rows as compressed SQL to a remote host
+# (files named incremental_YYYYMMDD_START-END.sql.zst). Requires zstd,
+# sqlite3, passwordless SSH key auth and the host in known_hosts.
+ssh_backup_enabled = 0
+ssh_host =
+ssh_user =
+ssh_dest_path = /backups/dht
+ssh_key_path =
+ssh_bookmark_path = data/ssh_backup_ids.txt
+
+# rclone incremental backup: same shape, uploaded with `rclone rcat`.
+# Requires zstd, sqlite3 and a configured rclone remote.
+rclone_backup_enabled = 0
+rclone_remote =
+rclone_dest_path =
+rclone_bookmark_path = data/rclone_backup_ids.txt
+
+
+# ----------------------------------------------------------------------------
+# Legacy metadata-fetcher keys — PARSED BUT UNUSED
+# ----------------------------------------------------------------------------
+# The thread-tree pipeline sizes metadata concurrency from the tree_* keys
+# below; these four are leftovers of the pre-thread-tree fetcher and have no
+# effect. They stay on the parser so old config.ini files keep loading.
+max_concurrent_connections = 2000
+tcp_connect_timeout_sec = 10
+connection_timeout_sec = 30
+max_connection_lifetime_sec = 300
+
+
+# ----------------------------------------------------------------------------
+# Language filter
+# ----------------------------------------------------------------------------
+# Drop a torrent whose name — or any of its file paths — is AT OR ABOVE this
+# percentage of non-Latin script characters. 0 disables the filter and counts
+# nothing; otherwise clamped 0..100. ASCII digits, punctuation and
+# Latin-with-diacritics count as neutral or Latin.
+language_filter_non_latin_threshold = 33
+
+# Deprecated alias for the key above: writing either one sets the same field.
+# Left commented out so only one spelling is live.
+# porn_filter_non_latin_threshold = 33
+
+
+# ----------------------------------------------------------------------------
+# Ingest-time classifier (CRAM v15: category, tv_kind, adult)
+# ----------------------------------------------------------------------------
+# Needs a build with -DCLF_ENABLED and the weights in classifier_model_dir
+# (`make clf` or `make full`; weights via `--fetch-models` or `make models`).
+# Without them the classifier degrades all-or-nothing and /stats says so.
+classifier_enabled = 1
+classifier_model_dir = models/v15
+
+# tag = keep adult rows (hidden at/above adult_hide_threshold);
+# drop = refuse them at ingest. The hard-block list always drops.
+adult_mode = tag
+
+# Adult probability at or above which a row is hidden or dropped.
+# 0.375 is CRAM v15's recall-0.90 operating point; 0 = take the threshold from
+# models/v15/manifest.json. config.ini beats the manifest, so a value here wins.
+adult_hide_threshold = 0.375
+
+# Which pass the classify-backfill daemon runs: all | adult | off.
+# (The Android app pins "off" and drives the adult pass from maintenance.)
+classify_backfill_mode = all
+
+# Always-on name-substring block list, one term per line.
+hard_block_file = hard_block.txt
+
+# Taxonomy to keep at ingest. Unset or empty = save everything (default).
+# Unknown names are logged and ignored. Names:
+#   save_categories = unknown,movie,tv,anime,music,audiobook,ebook,comic,software,game,image,other
+#   save_tv_kinds   = none,episode,multi_episode,season_pack,multi_season,complete_series,daily
+# A list with no valid entry at all also means "save everything".
+# save_categories =
+# save_tv_kinds =
+
+
+# ----------------------------------------------------------------------------
+# Movie-kind classifier (JEVH head over a llama.cpp Q4_0 backbone)
+# ----------------------------------------------------------------------------
+# Needs a build with -DMK_ENABLED (`make full`) and the weights in
+# movie_kind_model_dir. 0 stops inline genre classification at ingest; rows
+# already classified stay valid.
+movie_kind_enabled = 1
+movie_kind_model_dir = models/v13
+
+# Encoder threads, clamped 1..8.
+movie_kind_threads = 4
+
+# Pause the movie-kind BACKFILL above this CPU temperature in degrees Celsius.
+# 0 disables the thermal gate.
+movie_kind_thermal_backoff_c = 82
+
+
+# ----------------------------------------------------------------------------
+# Supervisor bootstrap (cold start only)
+# ----------------------------------------------------------------------------
+# A cold BEP51 cache is first filled from bep51_cache_url; if that fails, the
+# supervisor runs a parallel find_node bootstrap. It aborts startup when fewer
+# than global_bootstrap_target nodes were collected within the timeout (the
+# cache is still saved for the next attempt). A warm cache skips all of this.
+global_bootstrap_target = 200
+# Clamped 10..600. 600 is the shipped default and the value the app writes: a
+# cold, router-only bootstrap measured 200 nodes in 54 s here, so the cap is
+# headroom for a slow network rather than a limit you should lower.
+global_bootstrap_timeout_sec = 600
+global_bootstrap_workers = 20
+
+
+# ----------------------------------------------------------------------------
+# Thread trees (the whole crawler is N independent trees)
+# ----------------------------------------------------------------------------
+# 1..64. 64 with the worker counts below is ~2,750 threads including the fixed
+# overhead — still under the ~10,000-thread cap on Android.
+num_trees = 64
+
+# Kept for compatibility; 1 (thread-tree architecture) is the only supported
+# value. There is no second implementation to switch back to.
+use_thread_trees = 1
+
+# Spread tree node IDs evenly over the keyspace (1) instead of random IDs (0).
+use_keyspace_partitioning = 1
+
+# Consecutive zero-metadata respawns before a partition is migrated (1..20).
+dead_partition_threshold = 3
+
+# Max trees allowed in one partition (1..64).
+max_trees_per_partition = 4
+
+
+# ----------------------------------------------------------------------------
+# Per-tree worker counts and queues (multiplied by num_trees)
+# ----------------------------------------------------------------------------
+# find_node workers per tree (1..100).
+tree_find_node_workers = 3
+
+# BEP51 sample_infohashes workers per tree (1..100).
+tree_bep51_workers = 5
+
+# Infohash queue capacity per tree (>= 100).
+tree_infohash_queue_capacity = 500
+
+# Delay between BEP51 queries per worker, in ms (>= 0).
+tree_bep51_query_interval_ms = 5
+
+# Cooldown before the same node is queried again for samples, in seconds
+# (>= 0).
+bep51_node_cooldown_sec = 3
+
+# get_peers workers per tree (1..1000).
+tree_get_peers_workers = 22
+
+# Peers queue capacity per tree (>= 100).
+tree_peers_queue_capacity = 500
+
+# Per-query get_peers response timeout in ms (>= 100).
+tree_get_peers_timeout_ms = 1500
+
+# Whole-lookup deadline per infohash in ms (500..8000).
+tree_get_peers_deadline_ms = 6000
+
+# Concurrent get_peers queries per round (2..12).
+tree_get_peers_fanout = 8
+
+# Total get_peers packets per infohash (8..32). Raised to fanout if lower.
+tree_get_peers_max_queries = 16
+
+# ---- Opt-in get_peers tuning: all shipped OFF (0) because a same-hour A/B on
+# ---- the reference device measured them net-negative. See CONFIG_INI.md.
+
+# End a round after this much silence since the last answer, in ms
+# (0 = off, else 250..6000).
+tree_get_peers_round_idle_ms = 0
+
+# Charge every unanswered round slot against its node; an answer resets it
+# (0/1). At 1 it cost 10.8 pp of yield.
+tree_get_peers_penalize_misses = 0
+
+# Per-slot answer budget in ms: one dead node cannot pin its round
+# (0 = off, else 500..6000).
+tree_get_peers_slot_budget_ms = 0
+
+# End the lookup as soon as peers are found instead of waiting for every slot
+# (0/1). Costs peer-list width: one responder instead of up to eight.
+tree_get_peers_finish_on_peers = 0
+
+# Metadata workers per tree (>= 1).
+tree_metadata_workers = 12
+
+# TCP connect timeout for a metadata fetch, in ms (>= 1000).
+tree_tcp_connect_timeout_ms = 2000
+
+# Peer connections attempted in parallel per infohash (1..4 =
+# MAX_PARALLEL_PEERS). 2 ships because 4 measured -6.2 % metadata/s.
+tree_parallel_peers = 2
+
+# Fresh-peer re-lookups before a failure strike is recorded (0..3).
+tree_metadata_fresh_peer_retries = 1
+
+# Metadata fetch deadline per tree, in ms (5000..600000).
+tree_metadata_timeout_ms = 60000
+
+# Evict a fetch whose peer copies no new piece for this long, in ms
+# (0 = off, else 3000..60000).
+tree_metadata_piece_idle_ms = 0
+
+# Remember a peer address whose TCP connect failed for this many seconds and
+# step over it when picking metadata peers (0 = off, else 60..3600).
+# 600 is the measured A/B winner (W3: metadata/s 6.128 -> 6.706, connect share
+# 83.2 % -> 72.4 %, failure mass -28.7 %). 0 never creates the map.
+tree_metadata_peer_blacklist_ttl_sec = 600
+
+
+# ----------------------------------------------------------------------------
+# Rate-based respawn (the supervisor respawns trees whose rate collapses)
+# ----------------------------------------------------------------------------
+# Floor of the dynamic threshold, in metadata/s (>= 0).
+min_metadata_rate = 0.005
+
+# How far below the per-tree average a tree may fall before it is respawned
+# (>= 0).
+dynamic_rate_margin = 0.01
+
+# Seconds between rate checks (>= 10).
+tree_rate_check_interval_sec = 120
+
+# Seconds a tree must stay below threshold before it is respawned (>= 10).
+tree_rate_grace_period_sec = 30
+
+# EMA smoothing alpha for the per-tree rate (0.01..1.0).
+tree_rate_ema_alpha = 0.3
+
+# Minimum lifetime before rate checks apply, in minutes (>= 0).
+tree_min_lifetime_minutes = 8
+
+# Only respawn when the tree's queues are empty (0/1).
+tree_require_empty_queue = 0
+
+
+# ----------------------------------------------------------------------------
+# Overlapping respawn (old tree drains while the replacement runs)
+# ----------------------------------------------------------------------------
+# Spawn the replacement once the old tree is below this many connections
+# (>= 0).
+respawn_spawn_threshold = 20
+
+# Force-destroy a draining tree after this many seconds (>= 10).
+respawn_drain_timeout_sec = 180
+
+# Max trees in the draining state at once (1..32).
+max_draining_trees = 16
+
+
+# ----------------------------------------------------------------------------
+# BEP51 node cache (warm start)
+# ----------------------------------------------------------------------------
+bep51_cache_path = data/bep51_cache.dat
+
+# Published cache: fetched once when the local cache holds fewer than
+# global_bootstrap_target nodes. A failed fetch is non-fatal and falls through
+# to the router bootstrap. Empty = never fetch.
+bep51_cache_url = https://unjumble.au/bep51/bep51_cache.dat
+
+# Total transfer deadline for that fetch, in seconds (1..600).
+bep51_cache_fetch_timeout_sec = 30
+
+# CA overrides for the fetch. Empty = the system trust store.
+bep51_cache_ca_file =
+bep51_cache_ca_dir =
+
+# Max nodes held in the cache (1000..100000).
+bep51_cache_capacity = 50000
+
+# Percentage of BEP51 responses whose nodes are cached (1..100).
+bep51_cache_submit_percent = 17
+
+
+# ----------------------------------------------------------------------------
+# Refresh thread (backs the /refresh HTTP endpoint)
+# ----------------------------------------------------------------------------
+# Retries when /refresh returns 0 peers (0..5).
+refresh_retry_count = 1
+
+# Nodes sampled from the shared pool per refresh (100..10000).
+refresh_bootstrap_sample_size = 1000
+
+# Routing table size the refresh thread aims for (50..2000).
+refresh_routing_table_target = 500
+
+# Workers for the refresh thread. ping 0..10, find_node/get_peers 1..10.
+refresh_ping_workers = 1
+refresh_find_node_workers = 1
+refresh_get_peers_workers = 1
+
+# Refresh request queue capacity (>= 10).
+refresh_request_queue_capacity = 100
+
+# Per-query get_peers timeout for refresh, in ms (>= 100).
+refresh_get_peers_timeout_ms = 500
+
+# Max get_peers iterations per refresh (1..10).
+refresh_max_iterations = 3

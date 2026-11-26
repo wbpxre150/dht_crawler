@@ -30,7 +30,7 @@ typedef struct {
     int dht_port;
 
     /* Process-wide UDP send rate limiting (Stage 2) */
-    int udp_rate_limit_pps;  /* Outbound DHT UDP packets/sec (0=disabled, else 100-20000; default: 2500) */
+    int udp_rate_limit_pps;  /* Outbound DHT UDP packets/sec (0=disabled, else 100-20000; default: 3700) */
 
     /* Database settings */
     char db_path[512];
@@ -47,7 +47,7 @@ typedef struct {
 
     /* Phase 2: Bloom Filter settings */
     int bloom_enabled;
-    uint64_t bloom_capacity;
+    uint64_t bloom_capacity;          /* Infohash bloom capacity (default: 30000000) */
     uint64_t failure_bloom_capacity;  /* NEW: Capacity for failure bloom filter */
     int failure_strike_count;         /* Failures before permanent block (1=immediate, 2=two-strike, default: 2) */
     double bloom_error_rate;
@@ -62,8 +62,8 @@ typedef struct {
     int max_connection_lifetime_sec;    /* Max total connection time (0=unlimited) */
 
     /* Phase 5: Batch Writer settings */
-    int batch_size;
-    int flush_interval;              /* seconds */
+    int batch_size;                  /* Rows buffered before a commit (default: 500) */
+    int flush_interval;              /* Flush interval in seconds (default: 300) */
 
     /* Daily backup settings */
     int backup_enabled;
@@ -117,7 +117,7 @@ typedef struct {
     uint16_t save_tv_kind_mask;         /* bit i = tp_tv_kind_t i (7 bits, 0 = none) */
 
     /* Thread tree settings (Stage 1) */
-    int num_trees;                       /* Number of concurrent thread trees (default: 4) */
+    int num_trees;                       /* Number of concurrent thread trees (default: 64) */
 
     /* Thread tree Stage 2 settings (Global Bootstrap - NEW) */
     /* Thread tree Stage 2 settings (Global Bootstrap - REMOVED in Stage 5) */
@@ -128,16 +128,16 @@ typedef struct {
     int global_bootstrap_workers;      /* Default: 20. Parallel find_node workers for supervisor bootstrap. */
 
     /* Thread tree Stage 2 settings (find_node/bootstrap) */
-    int tree_find_node_workers;          /* find_node workers per tree for bootstrap (default: 10) */
+    int tree_find_node_workers;          /* find_node workers per tree for bootstrap (default: 3) */
 
     /* Thread tree Stage 3 settings (BEP51) */
-    int tree_bep51_workers;              /* BEP51 workers per tree (default: 10) */
-    int tree_infohash_queue_capacity;    /* Infohash queue size per tree (default: 5000) */
-    int tree_bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 10) */
+    int tree_bep51_workers;              /* BEP51 workers per tree (default: 5) */
+    int tree_infohash_queue_capacity;    /* Infohash queue size per tree (default: 500) */
+    int tree_bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 5) */
 
     /* Thread tree Stage 4 settings (get_peers) */
-    int tree_get_peers_workers;          /* get_peers workers per tree (default: 8) */
-    int tree_peers_queue_capacity;       /* Peers queue size per tree (default: 2000) */
+    int tree_get_peers_workers;          /* get_peers workers per tree (default: 22) */
+    int tree_peers_queue_capacity;       /* Peers queue size per tree (default: 500) */
     int tree_get_peers_timeout_ms;       /* get_peers response timeout (default: 1500) */
     int tree_get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
     int tree_get_peers_fanout;           /* concurrent get_peers queries per round (default: 8, 2-12) */
@@ -147,27 +147,27 @@ typedef struct {
     int tree_get_peers_slot_budget_ms;   /* per-slot answer budget before a round stops waiting on that slot (default: 0 = off, 500-6000) */
     int tree_get_peers_finish_on_peers;  /* 1 = end the lookup as soon as peers are found (default: 0, 0-1) */
     /* Thread tree Stage 5 settings (metadata) */
-    int tree_metadata_workers;           /* Metadata workers per tree (default: 2) */
-    int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int tree_metadata_workers;           /* Metadata workers per tree (default: 12) */
+    int tree_tcp_connect_timeout_ms;     /* TCP connect timeout (default: 2000) */
     int tree_parallel_peers;             /* Parallel peer connections per infohash (default: 2, 1-4 = MAX_PARALLEL_PEERS) */
     int tree_metadata_fresh_peer_retries;/* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
     int tree_metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
     int tree_metadata_piece_idle_ms;     /* Evict a conn that copies no new piece for this long (default: 0 = off, 3000-60000) */
-    int tree_metadata_peer_blacklist_ttl_sec; /* Remember a failed TCP connect per peer address for this long (default: 0 = off, 60-3600) */
+    int tree_metadata_peer_blacklist_ttl_sec; /* Remember a failed TCP connect per peer address for this long (default: 600; 0 = off, 60-3600) */
 
     /* Thread tree metadata rate-based respawn settings */
-    double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.01) */
-    double dynamic_rate_margin;             /* Margin subtracted from per-tree average (default: 0.02) */
-    int tree_rate_check_interval_sec;       /* Rate check interval (default: 60) */
+    double min_metadata_rate;               /* Floor for dynamic threshold (default: 0.005) */
+    double dynamic_rate_margin;             /* Margin subtracted from per-tree average (default: 0.01) */
+    int tree_rate_check_interval_sec;       /* Rate check interval (default: 120) */
     int tree_rate_grace_period_sec;         /* Grace period before respawn (default: 30) */
-    int tree_min_lifetime_minutes;          /* Min lifetime before rate checks (default: 10) */
-    int tree_require_empty_queue;           /* Only respawn if queue empty (default: 1) */
+    int tree_min_lifetime_minutes;          /* Min lifetime before rate checks (default: 8) */
+    int tree_require_empty_queue;           /* Only respawn if queue empty (default: 0) */
     double tree_rate_ema_alpha;             /* EMA smoothing alpha for metadata rate (default: 0.3) */
 
     /* Tree respawn overlapping configuration */
-    int respawn_spawn_threshold;            /* Spawn replacement when connections drop below this (default: 50) */
-    int respawn_drain_timeout_sec;          /* Force destroy draining tree after this timeout (default: 120) */
-    int max_draining_trees;                 /* Maximum trees allowed in draining state (default: 8) */
+    int respawn_spawn_threshold;            /* Spawn replacement when connections drop below this (default: 20) */
+    int respawn_drain_timeout_sec;          /* Force destroy draining tree after this timeout (default: 180) */
+    int max_draining_trees;                 /* Maximum trees allowed in draining state (default: 16) */
 
     /* Thread tree mode toggle (kept for build compatibility; removed by main.c branch in Stage 3) */
     int use_thread_trees;                /* 0=old architecture, 1=new thread tree architecture */
@@ -190,7 +190,7 @@ typedef struct {
 
     /* BEP51 cache settings */
     char bep51_cache_path[512];          /* Cache file path (default: "data/bep51_cache.dat") */
-    int bep51_cache_capacity;            /* Max nodes in cache (default: 10000) */
+    int bep51_cache_capacity;            /* Max nodes in cache (default: 50000) */
     /* Published cache: when the local cache is below global_bootstrap_target,
      * one HTTP(S) GET of bep51_cache_url replaces minutes of router discovery.
      * Any failure is non-fatal and falls through to the router bootstrap. Empty
@@ -199,8 +199,8 @@ typedef struct {
     int bep51_cache_fetch_timeout_sec;   /* Total transfer deadline (default: 30) */
     char bep51_cache_ca_file[512];       /* CA bundle override; empty = system store */
     char bep51_cache_ca_dir[512];        /* Hashed CA dir override; empty = none */
-    int bep51_cache_submit_percent;      /* % of BEP51 responses to cache (default: 5) */
-    int bep51_node_cooldown_sec;         /* Cooldown between queries to same node (default: 30) */
+    int bep51_cache_submit_percent;      /* % of BEP51 responses to cache (default: 17) */
+    int bep51_node_cooldown_sec;         /* Cooldown between queries to same node (default: 3) */
 } crawler_config_t;
 
 /* Initialize config with default values */

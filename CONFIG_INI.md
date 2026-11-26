@@ -7,8 +7,9 @@ and semantics. It is not a full `config.ini` reference — for the complete key 
 `app/src/main/assets/dht_crawler/config.ini.default`, which carries these seven keys with comments.
 
 Patch 21 (in-tree) adds one key to this page,
-`tree_metadata_peer_blacklist_ttl_sec` — the per-address TCP connect-failure memory — under the same
-fail-open contract: `0` is the shipped value and restores legacy peer selection exactly. The two later
+`tree_metadata_peer_blacklist_ttl_sec` — the per-address TCP connect-failure memory. It is the one key here
+whose shipped default is **not** `0`: it now ships at `600`, the measured A/B winner, and `0` still restores
+legacy peer selection exactly. The two later
 patches of this run add **no key**: patch 22 only resizes that
 map's capacity, and patch 23 only adds `/stats` counters — see the
 last section for both.
@@ -17,9 +18,10 @@ Not covered here: the published-cache download keys (`bep51_cache_url`,
 `bep51_cache_fetch_timeout_sec`, `bep51_cache_ca_file`, `bep51_cache_ca_dir`) — see
 the "BEP51 cache" section of `README.md`.
 
-All values are parsed with `atoi`, so `= true` parses as `0`. **Every one of these keys ships at its legacy
-value — the tuning is opt-in.** Five of the seven treat `0` as "disabled / pre-patch behaviour"; all of them
-are fail-open to the old code path. The shipped defaults are the measured result: five 30-minute on-device
+All values are parsed with `atoi`, so `= true` parses as `0`. **The tuning is opt-in except for
+`tree_metadata_peer_blacklist_ttl_sec`, which ships at its measured winner (`600`).** Five of the keys treat
+`0` as "disabled / pre-patch behaviour" — including the blacklist memory, where `0` still restores legacy
+peer selection exactly — and all of them are fail-open to the old code path. The shipped defaults are the measured result: five 30-minute on-device
 windows showed the tuning to be net-negative (TUNED vs LEGACY on the same build in the same hour: lookups/s
 −1.5 %, yield −3.4 pp, packets/lookup +6 %, metadata/s −13 %), while the instrumentation that produced that
 finding is what patch 19 actually ships enabled. See the run report `measurements.md` for the numbers.
@@ -31,7 +33,7 @@ finding is what patch 19 actually ships enabled. See the run report `measurement
 | `tree_get_peers_slot_budget_ms` | `0` (off) | `0`, or `500..6000` | stop waiting on a slot once its own answer budget has run out |
 | `tree_get_peers_finish_on_peers` | `0` (off) | `0`/`1` (any non-zero value is coerced to `1`) | end a lookup as soon as it has peers |
 | `tree_metadata_piece_idle_ms` | `0` (off) | `0`, or `3000..60000` | evict a metadata connection that copies no new piece for this long |
-| `tree_metadata_peer_blacklist_ttl_sec` | `0` (off) | `0`, or `60..3600` | remember a peer address whose TCP connect failed and step over it when picking metadata peers (patch 21) |
+| `tree_metadata_peer_blacklist_ttl_sec` | `600` | `0`, or `60..3600` | remember a peer address whose TCP connect failed and step over it when picking metadata peers (patch 21) |
 | `tree_parallel_peers` | `2` (legacy) | `1..4` (clamp narrowed from `1..10`) | parallel peer connections per infohash |
 | `tree_metadata_timeout_ms` | `60000` (legacy) | `5000..600000` (unchanged) | per-tree metadata fetch deadline |
 
@@ -122,9 +124,9 @@ ageing, no thread). Window selection then steps over an address the map still re
 skipped **slot** in `metadata_peer_fail.metadata_peers_skipped_total` (peers are not deduplicated, so one
 address can be skipped several times per attempt).
 
-- `0` (shipped) does not even create the map: every lookup answers "do not skip" and every record is a
-  no-op, so peer selection is byte-identical to legacy. A creation failure is non-fatal and lands in the
-  same disabled state.
+- `600` (shipped) is the W3 A/B winner the Android app also pins; `0` does not even create the map: every
+  lookup answers "do not skip" and every record is a no-op, so peer selection is byte-identical to legacy.
+  A creation failure is non-fatal and lands in the same disabled state.
 - Any non-zero value is clamped into `60..3600` and logged at `LOG_WARN`; `0` is never clamped.
 - Only **connect** failures are remembered — handshake, stall, hash and deadline outcomes say nothing about
   reachability, and the eight `metadata_failures` counters keep their exact count-once meaning (the record
@@ -157,8 +159,12 @@ except for the `tree_parallel_peers` correctness fix noted above:
   knobs in the only contemporaneous comparison, and the deadline accounts for ≤0.2 % of the failure mass, so
   it is not justified by measurement either.
 
-Both govern fresh installs and absent keys only: `config.ini` is written by the app's settings form, and an
-existing file keeps whatever it already pins. Any of these keys can be re-enabled as an advanced
+- `tree_metadata_peer_blacklist_ttl_sec` moved from `0` to **600** (patch 21's measured winner, W3:
+  metadata/s 6.128 → 6.706, connect share 83.2 % → 72.4 %, failure mass −28.7 %). The map is created only
+  for a non-zero TTL, so `0` stays the documented fail-open escape hatch.
+
+All three govern fresh installs and absent keys only: `config.ini` is written by the app's settings form,
+and an existing file keeps whatever it already pins. Any of these keys can be re-enabled as an advanced
 override in the app's crawler settings (they are on the Kotlin allow-list) — re-measure, do not assume.
 
 ## Where these show up in `/stats`

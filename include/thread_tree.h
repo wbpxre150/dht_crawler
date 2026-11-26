@@ -62,7 +62,7 @@ typedef struct tree_config {
     struct tree_socket *shared_socket;
     struct tree_dispatcher *shared_dispatcher;
 
-    int num_find_node_workers;      /* Continuous find_node workers (default: 30) */
+    int num_find_node_workers;      /* Continuous find_node workers (default: 3) */
     int num_bep51_workers;
     int num_get_peers_workers;
     int num_metadata_workers;
@@ -70,12 +70,12 @@ typedef struct tree_config {
     int find_node_target_nodes;       /* Routing target — sourced from supervisor's bep51_cache_capacity */
 
     /* Stage 3: BEP51 settings */
-    int infohash_queue_capacity;    /* Infohash queue size (default: 5000) */
-    int bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 10) */
-    int bep51_node_cooldown_sec;    /* Cooldown between BEP51 queries to same node (default: 30) */
+    int infohash_queue_capacity;    /* Infohash queue size (default: 500) */
+    int bep51_query_interval_ms;    /* Delay between BEP51 queries (default: 5) */
+    int bep51_node_cooldown_sec;    /* Cooldown between BEP51 queries to same node (default: 3) */
 
     /* Stage 4: Get_peers settings */
-    int peers_queue_capacity;       /* Peers queue size (default: 2000) */
+    int peers_queue_capacity;       /* Peers queue size (default: 500) */
     int get_peers_timeout_ms;       /* Get_peers response timeout (default: 1500) */
     int get_peers_deadline_ms;      /* Get_peers lookup deadline (default: 6000, 500-8000) */
     int get_peers_fanout;           /* Get_peers queries per lookup (default: 8, 2-12) */
@@ -86,18 +86,18 @@ typedef struct tree_config {
     int get_peers_finish_on_peers;  /* End the lookup as soon as peers are found (default: 0, 0-1) */
 
     /* Stage 5: Metadata fetcher settings */
-    int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 5000) */
+    int tcp_connect_timeout_ms;     /* TCP connect timeout (default: 2000) */
     int parallel_peers;             /* Parallel peer connections per infohash (default: 2, 1-4) */
     int fresh_peer_retries;         /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
     int metadata_timeout_ms;        /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
     int metadata_piece_idle_ms;     /* Piece-progress eviction window in ms (default: 0 = off, 3000-60000) */
 
     /* Metadata rate-based respawn settings */
-    double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.01) */
-    int rate_check_interval_sec;        /* Rate check interval (default: 60) */
+    double min_metadata_rate;           /* Min metadata rate before respawn (default: 0.005) */
+    int rate_check_interval_sec;        /* Rate check interval (default: 120) */
     int rate_grace_period_sec;          /* Grace period before respawn (default: 30) */
-    int min_lifetime_minutes;           /* Min lifetime before rate checks (default: 10) */
-    bool require_empty_queue;           /* Only respawn if queue empty (default: true) */
+    int min_lifetime_minutes;           /* Min lifetime before rate checks (default: 8) */
+    bool require_empty_queue;           /* Only respawn if queue empty (default: false) */
     double ema_alpha;                   /* EMA smoothing alpha for metadata rate (default: 0.3) */
 
     /* Stage 6 adult handling */

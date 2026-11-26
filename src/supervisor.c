@@ -111,15 +111,22 @@ void supervisor_bep51_fetch_stats(supervisor_t *sup, bep51_fetch_stats_t *out) {
     pthread_mutex_unlock(&sup->bep51_fetch_lock);
 }
 
-    /* Built-in DHT bootstrap routers for supervisor-level bootstrap */
+    /* Built-in DHT bootstrap routers for supervisor-level bootstrap.
+     *
+     * Verified live 2026-11-26 with a direct BEP 5 find_node probe. The list is
+     * ordered best-first. Every entry that NXDOMAIN'd or never answered is
+     * gone: router.utorrent.com, dht.aelitis.com, dht.vuze.com,
+     * router.bitcomet.com, dht.anacrolix.link and router.bittorrent.cloud
+     * (qBittorrent removed the first three in 2024 for the same reason).
+     * router.silotis.us is IPv6-only, so it can only seed a dual-stack host.
+     * The published BEP51 cache (bep51_cache_url) is the primary path; this
+     * list is the fallback when the cache is cold and its fetch failed. */
     static const char *BOOTSTRAP_HOSTS[] = {
-        "router.bittorrent.com", "dht.transmissionbt.com", "dht.libtorrent.org",
-        "dht.aelitis.com", "router.bitcomet.com", "dht.anacrolix.link",
-        "router.utorrent.com", "dht.vuze.com", "router.bittorrent.cloud",
-        "router.silotis.us",
+        "router.bt.ouinet.work", "dht.libtorrent.org", "dht.transmissionbt.com",
+        "milda.intelib.org", "router.bittorrent.com", "router.silotis.us",
         NULL
     };
-    static const int BOOTSTRAP_PORTS[] = { 6881, 6881, 25401, 6881, 6881, 42069, 6881, 6881, 42069, 6881 };
+    static const int BOOTSTRAP_PORTS[] = { 6881, 25401, 6881, 51413, 6881, 6881 };
 
 /* Worker context for supervisor bootstrap iterative phase */
 typedef struct {
@@ -449,7 +456,19 @@ static void *supervisor_bootstrap_worker_func(void *arg) {
     return NULL;
 }
 
-/* Phase A: resolve bootstrap hosts and query them for nodes */
+/* Phase A: resolve bootstrap hosts and query them for nodes.
+ *
+ * Every address a host resolves to is tried, not just res->ai_addr. A router's
+ * AAAA routinely does not answer while its A records do — dht.transmissionbt.com
+ * is exactly that case (glibc sorts its dead AAAA first), so taking only the
+ * first result threw away the best seed the crawler has. Each address gets
+ * BOOTSTRAP_ATTEMPTS sends because a single UDP query is trivially lost, and
+ * the phase stops early once the routing table holds BOOTSTRAP_SEED_TARGET
+ * nodes; the iterative workers fill the rest from there. */
+#define BOOTSTRAP_SEED_TARGET          100
+#define BOOTSTRAP_ATTEMPTS             2
+#define BOOTSTRAP_RESPONSE_TIMEOUT_MS  1500
+
 static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
                                           tree_socket_t *sock,
                                           tree_dispatcher_t *dispatcher,
@@ -458,44 +477,86 @@ static void bootstrap_phase_a_url_lookup(tree_routing_table_t *rt,
     FILE *ur = fopen("/dev/urandom", "rb");
     if (ur) { fread(our_id, 1, 20, ur); fclose(ur); }
     else { for (int i = 0; i < 20; i++) our_id[i] = (unsigned char)(rand() % 256); }
-    int bootstrapped = 0;
-    for (int i = 0; BOOTSTRAP_HOSTS[i] != NULL && time(NULL) < deadline; i++) {
-        struct addrinfo hints, *res;
-        memset(&hints, 0, sizeof(hints));
-       hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_DGRAM;
+
+    tree_response_queue_t *q = tree_response_queue_create(8);
+    if (!q) {
+        log_msg(LOG_ERROR, "[supervisor_bootstrap] URL lookup: no response queue");
+        return;
+    }
+
+    int queries = 0, answers = 0;
+    for (int i = 0; BOOTSTRAP_HOSTS[i] != NULL; i++) {
+        if (time(NULL) >= deadline) break;
+        if (tree_routing_get_count(rt) >= BOOTSTRAP_SEED_TARGET) break;
+
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", BOOTSTRAP_PORTS[i]);
+
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
         int ret = getaddrinfo(BOOTSTRAP_HOSTS[i], port_str, &hints, &res);
-        if (ret != 0) {
-            log_msg(LOG_WARN, "[supervisor_bootstrap] DNS failed for %s", BOOTSTRAP_HOSTS[i]);
+        if (ret != 0 || !res) {
+            log_msg(LOG_WARN, "[supervisor_bootstrap] DNS failed for %s:%s (%s)",
+                    BOOTSTRAP_HOSTS[i], port_str, gai_strerror(ret));
             continue;
         }
-        struct sockaddr_storage addr;
-        memcpy(&addr, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
-        uint8_t target[20];
-        for (int j = 0; j < 20; j++) target[j] = (unsigned char)(rand() % 256);
-        uint8_t tid[4];
-        int tid_len = tree_protocol_gen_tid(tid);
-        tree_response_queue_t *q = tree_response_queue_create(4);
-        tree_dispatcher_register_tid(dispatcher, tid, tid_len, q);
-        int send_rc = tree_send_find_node(our_id, sock, tid, tid_len, target, &addr);
-        tree_response_t response_pkt;
-        if (send_rc > 0 && tree_response_queue_pop(q, &response_pkt, 1500) == 0) {
-            refresh_find_node_response_t resp;
-            if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
-                                                  &response_pkt.from, &resp) == 0) {
-                for (int n = 0; n < resp.node_count; n++) {
-                    tree_routing_add_node(rt, resp.nodes[n], &resp.addrs[n]);
+
+        int host_answers = 0;
+        for (struct addrinfo *ai = res; ai && !host_answers && time(NULL) < deadline;
+             ai = ai->ai_next) {
+            struct sockaddr_storage addr;
+            memset(&addr, 0, sizeof(addr));
+            memcpy(&addr, ai->ai_addr, ai->ai_addrlen);
+
+            for (int attempt = 0; attempt < BOOTSTRAP_ATTEMPTS && time(NULL) < deadline;
+                 attempt++) {
+                uint8_t target[20];
+                for (int j = 0; j < 20; j++) target[j] = (unsigned char)(rand() % 256);
+                uint8_t tid[4];
+                int tid_len = tree_protocol_gen_tid(tid);
+                if (tree_dispatcher_register_tid(dispatcher, tid, tid_len, q) != 0) break;
+
+                int send_rc = tree_send_find_node(our_id, sock, tid, tid_len, target, &addr);
+                tree_response_t response_pkt;
+                int popped = send_rc > 0
+                             ? tree_response_queue_pop(q, &response_pkt,
+                                                       BOOTSTRAP_RESPONSE_TIMEOUT_MS)
+                             : -1;
+                tree_dispatcher_unregister_tid(dispatcher, tid, tid_len);
+
+                if (send_rc <= 0) break;    /* unreachable address: next one */
+                queries++;
+                if (popped != 0) continue;  /* lost query: retry this address */
+
+                refresh_find_node_response_t resp;
+                if (refresh_parse_find_node_response(response_pkt.data, response_pkt.len,
+                                                      &response_pkt.from, &resp) == 0) {
+                    for (int n = 0; n < resp.node_count; n++) {
+                        tree_routing_add_node(rt, resp.nodes[n], &resp.addrs[n]);
+                    }
+                    answers++;
+                    host_answers++;
+                    break;  /* answered: move on to the next host */
                 }
             }
         }
-        if (tree_routing_get_count(rt) >= 100 || bootstrapped >= 2) break;
+        freeaddrinfo(res);
+
+        log_msg(host_answers ? LOG_DEBUG : LOG_WARN,
+                "[supervisor_bootstrap] %s:%s -> %d answer(s), RT=%d",
+                BOOTSTRAP_HOSTS[i], port_str, host_answers, tree_routing_get_count(rt));
     }
-    if (tree_routing_get_count(rt) < 100) {
+
+    tree_response_queue_destroy(q);
+
+    int seeded = tree_routing_get_count(rt);
+    log_msg(LOG_INFO, "[supervisor_bootstrap] URL lookup: %d quer%s, %d answer(s), %d seed nodes",
+            queries, queries == 1 ? "y" : "ies", answers, seeded);
+    if (seeded < BOOTSTRAP_SEED_TARGET) {
         log_msg(LOG_WARN, "[supervisor_bootstrap] URL bootstrap got only %d nodes; relying on iterative workers",
-                tree_routing_get_count(rt));
+                seeded);
     }
 }
 

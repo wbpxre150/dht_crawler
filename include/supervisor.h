@@ -72,27 +72,27 @@ typedef struct supervisor_config {
     int bep51_cache_submit_percent;      /* % of BEP51 responses to cache */
 
     /* Stage 3 settings (BEP51) */
-    int infohash_queue_capacity;    /* Infohash queue capacity per tree (default: 5000) */
-    int bep51_query_interval_ms;    /* BEP51 query interval (default: 10) */
-    int bep51_node_cooldown_sec;    /* Cooldown between BEP51 queries to same node (default: 30) */
+    int infohash_queue_capacity;    /* Infohash queue capacity per tree (default: 500) */
+    int bep51_query_interval_ms;    /* BEP51 query interval (default: 5) */
+    int bep51_node_cooldown_sec;    /* Cooldown between BEP51 queries to same node (default: 3) */
 
     /* Stage 4 settings (get_peers) */
-    int peers_queue_capacity;       /* Peers queue capacity per tree (default: 2000) */
+    int peers_queue_capacity;       /* Peers queue capacity per tree (default: 500) */
     int get_peers_timeout_ms;       /* get_peers timeout (default: 1500) */
     int get_peers_deadline_ms;      /* get_peers lookup deadline in ms (default: 6000, 500-8000) */
     int get_peers_fanout;           /* get_peers queries per lookup (default: 8, 2-12) */
     int get_peers_max_queries;      /* get_peers query budget (default: 16, 8-32, >= fanout) */
-    int get_peers_round_idle_ms;    /* per-round silence cap (default: 1500, 0 = off, 250-6000) */
+    int get_peers_round_idle_ms;    /* per-round silence cap (default: 0 = off, 250-6000) */
     int get_peers_penalize_misses;  /* 1 = charge unanswered round slots against the node (default: 0, 0-1) */
-    int get_peers_slot_budget_ms;   /* per-slot answer budget in ms (default: 2000, 0 = off, 500-6000) */
-    int get_peers_finish_on_peers;  /* 1 = end a lookup as soon as peers are found (default: 1, 0-1) */
+    int get_peers_slot_budget_ms;   /* per-slot answer budget in ms (default: 0 = off, 500-6000) */
+    int get_peers_finish_on_peers;  /* 1 = end a lookup as soon as peers are found (default: 0, 0-1) */
     /* Stage 5 settings */
     int tcp_connect_timeout_ms;
     int parallel_peers;
     int fresh_peer_retries;          /* Fresh-peer re-lookups before failure strike (default: 1, 0-3) */
-    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 30000, 5000-600000) */
-    int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 15000, 0 = off) */
-    int metadata_peer_blacklist_ttl_sec; /* Per-address TCP connect-failure memory window (default: 0 = off, 60-3600) */
+    int metadata_timeout_ms;         /* Metadata fetch deadline in ms (default: 60000, 5000-600000) */
+    int metadata_piece_idle_ms;      /* Piece-progress eviction window in ms (default: 0 = off, 3000-60000) */
+    int metadata_peer_blacklist_ttl_sec; /* Per-address TCP connect-failure memory window (default: 600; 0 = off, 60-3600) */
 
     /* Metadata rate-based respawn settings */
     double min_metadata_rate;          /* Floor for dynamic threshold */

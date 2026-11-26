@@ -312,12 +312,18 @@ int refresh_thread_submit_request(refresh_thread_t *thread,
 /*                          BOOTSTRAP THREAD                                  */
 /* ========================================================================== */
 
-/* Built-in DHT bootstrap routers for refresh thread */
+/* Built-in DHT bootstrap routers for refresh thread.
+ *
+ * Same verified-live set as BOOTSTRAP_HOSTS in supervisor.c (probed
+ * 2026-11-26); the refresh thread only needs a couple of working seeds because
+ * it walks find_node itself from there. router.silotis.us is IPv6-only and is
+ * left out here — this path resolves a single address per host. */
 static const char *REFRESH_BOOTSTRAP_HOSTS[] = {
-    "dht.transmissionbt.com", "dht.libtorrent.org", "router.silotis.us",
+    "router.bt.ouinet.work", "dht.libtorrent.org", "dht.transmissionbt.com",
+    "milda.intelib.org", "router.bittorrent.com",
     NULL
 };
-static const int REFRESH_BOOTSTRAP_PORTS[] = { 6881, 25401, 6881 };
+static const int REFRESH_BOOTSTRAP_PORTS[] = { 6881, 25401, 6881, 51413, 6881 };
 /* Helper: resolve hostname to sockaddr_storage for refresh thread */
 static int refresh_resolve_hostname(const char *hostname, int port, struct sockaddr_storage *addr) {
     struct addrinfo hints, *res;
