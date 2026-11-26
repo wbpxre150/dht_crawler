@@ -640,7 +640,22 @@ static int mk_llama_embed(void *userdata, const char *name, float *out, int hidd
         return -1;
     }
 
-    struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
+    /* Every token is an output. llama_batch_get_one() leaves logits == NULL,
+     * which llama_batch_compat reads as "only the last token is an output";
+     * with embeddings on, llama_batch_allocr then warns "some input tokens were
+     * not marked as outputs -> overriding" once per classified item and fills
+     * the flags in itself. Building the batch explicitly states the intent,
+     * drops that per-item warning, and hands the backend the same all-output
+     * mask the override produced. */
+    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    memcpy(batch.token, tokens, (size_t)n_tokens * sizeof(llama_token));
+    batch.n_tokens = n_tokens;
+    for (int32_t i = 0; i < n_tokens; i++) {
+        batch.pos[i]       = i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = 1;
+    }
     int32_t ran;
     if (has_encoder) {
         /* llama_encode does not use the KV cache, so it needs no memory clear. */
@@ -653,6 +668,7 @@ static int mk_llama_embed(void *userdata, const char *name, float *out, int hidd
         ran = llama_decode(mk.context, batch);
     }
     free(tokens);
+    llama_batch_free(batch);
     if (ran != 0) {
         log_msg(LOG_WARN, "MovieKind: llama_encode/llama_decode failed (%d)", ran);
         return -1;
