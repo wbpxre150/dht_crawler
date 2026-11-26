@@ -63,8 +63,9 @@ dht_crawler
 # Make output (object files, libbloom archive)
 build/
 
-# Claude files
+# Agent tool state (never commit)
 .claude
+.pi
 
 # Live configuration (may hold backup hosts/credentials) — never commit
 config.ini
