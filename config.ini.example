@@ -130,17 +130,6 @@ rclone_dest_path =
 rclone_bookmark_path = data/rclone_backup_ids.txt
 
 
-# ----------------------------------------------------------------------------
-# Legacy metadata-fetcher keys — PARSED BUT UNUSED
-# ----------------------------------------------------------------------------
-# The thread-tree pipeline sizes metadata concurrency from the tree_* keys
-# below; these four are leftovers of the pre-thread-tree fetcher and have no
-# effect. They stay on the parser so old config.ini files keep loading.
-max_concurrent_connections = 2000
-tcp_connect_timeout_sec = 10
-connection_timeout_sec = 30
-max_connection_lifetime_sec = 300
-
 
 # ----------------------------------------------------------------------------
 # Language filter
@@ -174,10 +163,6 @@ adult_mode = tag
 # models/v15/manifest.json. config.ini beats the manifest, so a value here wins.
 adult_hide_threshold = 0.375
 
-# Which pass the classify-backfill daemon runs: all | adult | off.
-# (The Android app pins "off" and drives the adult pass from maintenance.)
-classify_backfill_mode = all
-
 # Always-on name-substring block list, one term per line.
 hard_block_file = hard_block.txt
 
@@ -202,10 +187,6 @@ movie_kind_model_dir = models/v13
 # Encoder threads, clamped 1..8.
 movie_kind_threads = 4
 
-# Pause the movie-kind BACKFILL above this CPU temperature in degrees Celsius.
-# 0 disables the thermal gate.
-movie_kind_thermal_backoff_c = 82
-
 
 # ----------------------------------------------------------------------------
 # Supervisor bootstrap (cold start only)
@@ -228,10 +209,6 @@ global_bootstrap_workers = 20
 # 1..64. 64 with the worker counts below is ~2,750 threads including the fixed
 # overhead — still under the ~10,000-thread cap on Android.
 num_trees = 64
-
-# Kept for compatibility; 1 (thread-tree architecture) is the only supported
-# value. There is no second implementation to switch back to.
-use_thread_trees = 1
 
 # Spread tree node IDs evenly over the keyspace (1) instead of random IDs (0).
 use_keyspace_partitioning = 1
