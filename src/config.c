@@ -89,10 +89,13 @@ void config_init_defaults(crawler_config_t *config) {
     config->batch_size = 500;
     config->flush_interval = 300;
 
-    /* Daily backup defaults */
+    /* Daily backup defaults. The destination is relative to the working
+     * directory, like db_path and bloom_path above, so a standalone build that
+     * flips backup_enabled alone still writes somewhere it can reach. It used to
+     * be a developer's absolute host path, which put that path in every shipped
+     * binary (and in the APK) while being unusable anywhere but that host. */
     config->backup_enabled = 0;
-    strncpy(config->backup_path,
-            "/home/adam/external_hdd/dht_crawler_backup/torrent.db.bak",
+    strncpy(config->backup_path, "data/torrents.db.bak",
             sizeof(config->backup_path) - 1);
 
     /* SSH incremental backup defaults */

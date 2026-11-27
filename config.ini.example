@@ -108,9 +108,10 @@ flush_interval = 300
 # Backups (all optional; off by default)
 # ----------------------------------------------------------------------------
 # Daily file copy. backup_path is the destination; %DATE% is replaced with
-# YYYY-MM-DD. Change the compiled default to a path that exists for you.
+# YYYY-MM-DD. Relative paths resolve against the working directory, so point it
+# at storage that outlives the crawler's own disk.
 backup_enabled = 0
-backup_path = /home/adam/external_hdd/dht_crawler_backup/torrent.db.bak
+backup_path = data/torrents.db.bak
 
 # SSH incremental backup: streams new rows as compressed SQL to a remote host
 # (files named incremental_YYYYMMDD_START-END.sql.zst). Requires zstd,

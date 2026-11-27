@@ -1,8 +1,8 @@
 {
  "note": "Stage 5b G4 spot check: look each name up in the live-ingested DB by exact name; count only names PRESENT. Need >=20 present known-adult with adult=1 and >=20 present known-clean with adult=0.",
  "source": {
-  "names": "/home/adam/apps/cram/tvkind/data/clean_v1/records.jsonl",
-  "labels": "/home/adam/apps/cram/tvkind/data/clean_v3/scored_all.jsonl"
+  "names": "teacher run: clean_v1/records.jsonl",
+  "labels": "teacher run: clean_v3/scored_all.jsonl"
  },
  "known_adult": [
   {
